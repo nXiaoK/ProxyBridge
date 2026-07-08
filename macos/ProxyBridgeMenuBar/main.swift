@@ -104,6 +104,42 @@ struct APIError: Decodable {
     let error: String
 }
 
+struct GitHubRelease: Decodable {
+    let tagName: String
+    let assets: [GitHubAsset]
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case assets
+    }
+}
+
+struct GitHubAsset: Decodable {
+    let name: String
+    let browserDownloadURL: String
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case browserDownloadURL = "browser_download_url"
+    }
+}
+
+struct CommandResult {
+    let status: Int32
+    let output: String
+}
+
+enum ProxyBridgeError: LocalizedError {
+    case message(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .message(let message):
+            return message
+        }
+    }
+}
+
 final class BridgeAPI {
     let baseURL: URL
 
@@ -269,13 +305,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latestStatus: StatusPayload?
     private var refreshTimer: Timer?
     private var lastError: String?
+    private var startupStatus: String?
     private var statusMenu = NSMenu()
     private var backendLogHandle: FileHandle?
     private var consoleWindowController: ConsoleWindowController?
+    private let pythonReleaseAPI = URL(string: "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest")!
 
     private var appSupportURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         return base.appendingPathComponent("ProxyBridge", isDirectory: true)
+    }
+
+    private var pythonRuntimeURL: URL {
+        appSupportURL.appendingPathComponent("python-runtime", isDirectory: true)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -283,7 +325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         installMainMenu()
         configureStatusItem()
         migrateWorkspaceStateIfNeeded()
-        startBackend()
+        bootstrapBackend()
         refreshTimer = Timer.scheduledTimer(timeInterval: 4, target: self, selector: #selector(refreshNow), userInfo: nil, repeats: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.refreshNow()
@@ -373,21 +415,356 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return FileManager.default.fileExists(atPath: source.path) ? source : nil
     }
 
-    private func startBackend() {
+    private func bootstrapBackend() {
+        updateStartupStatus("正在准备 Python 运行时")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            do {
+                let pythonExecutable = try self.resolvePythonExecutable()
+                DispatchQueue.main.async { [weak self] in
+                    self?.startBackend(pythonExecutable: pythonExecutable)
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.startupStatus = nil
+                    self?.lastError = "Python 运行时准备失败：\(error.localizedDescription)"
+                    self?.rebuildMenu()
+                }
+            }
+        }
+    }
+
+    private func updateStartupStatus(_ message: String?) {
+        let apply = { [weak self] in
+            guard let self else { return }
+            self.startupStatus = message
+            if message != nil {
+                self.lastError = nil
+            }
+            self.rebuildMenu()
+        }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.async(execute: apply)
+        }
+    }
+
+    private func resolvePythonExecutable() throws -> URL {
+        try FileManager.default.createDirectory(at: appSupportURL, withIntermediateDirectories: true)
+        if let bundled = bundledPythonExecutable() {
+            updateStartupStatus("使用内置 Python 运行时")
+            return bundled
+        }
+        if let privateRuntime = privatePythonExecutable() {
+            updateStartupStatus("使用已安装的 Python 运行时")
+            return privateRuntime
+        }
+        if let systemRuntime = systemPythonExecutable() {
+            updateStartupStatus("使用本机 Python 运行时")
+            return systemRuntime
+        }
+        return try installPythonRuntime()
+    }
+
+    private func bundledPythonExecutable() -> URL? {
+        guard let resourceURL = Bundle.main.resourceURL else { return nil }
+        let candidates = [
+            resourceURL.appendingPathComponent("python-runtime/python/bin/python3"),
+            resourceURL.appendingPathComponent("bridge/python-runtime/python/bin/python3")
+        ]
+        return firstUsablePythonExecutable(in: candidates)
+    }
+
+    private func privatePythonExecutable() -> URL? {
+        let direct = pythonRuntimeURL.appendingPathComponent("python/bin/python3")
+        if isUsablePythonExecutable(direct) {
+            return direct
+        }
+        return findPythonExecutable(in: pythonRuntimeURL).flatMap { isUsablePythonExecutable($0) ? $0 : nil }
+    }
+
+    private func systemPythonExecutable() -> URL? {
+        let candidates = [
+            URL(fileURLWithPath: "/opt/homebrew/bin/python3"),
+            URL(fileURLWithPath: "/usr/local/bin/python3"),
+            URL(fileURLWithPath: "/Library/Frameworks/Python.framework/Versions/Current/bin/python3")
+        ]
+        return firstUsablePythonExecutable(in: candidates)
+    }
+
+    private func firstUsablePythonExecutable(in candidates: [URL]) -> URL? {
+        for candidate in candidates where isUsablePythonExecutable(candidate) {
+            return candidate
+        }
+        return nil
+    }
+
+    private func isUsablePythonExecutable(_ url: URL) -> Bool {
+        guard FileManager.default.isExecutableFile(atPath: url.path) else { return false }
+        let script = "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+        do {
+            let result = try runProcess(url.path, ["-c", script], timeout: 15)
+            return result.status == 0
+        } catch {
+            return false
+        }
+    }
+
+    private func installPythonRuntime() throws -> URL {
+        updateStartupStatus("正在查询 Python 运行时版本")
+        let asset = try latestPythonRuntimeAsset()
+        updateStartupStatus("正在下载 Python 运行时")
+
+        let fileManager = FileManager.default
+        let tempRoot = appSupportURL.appendingPathComponent("python-runtime-install-\(UUID().uuidString)", isDirectory: true)
+        let extractRoot = tempRoot.appendingPathComponent("extract", isDirectory: true)
+        let stagedRuntime = appSupportURL.appendingPathComponent("python-runtime-staged-\(UUID().uuidString)", isDirectory: true)
+        defer {
+            try? fileManager.removeItem(at: tempRoot)
+            try? fileManager.removeItem(at: stagedRuntime)
+        }
+
+        try fileManager.createDirectory(at: extractRoot, withIntermediateDirectories: true)
+        let archiveURL = tempRoot.appendingPathComponent(asset.name)
+        try downloadPythonArchive(asset: asset, to: archiveURL)
+
+        updateStartupStatus("正在安装 Python 运行时")
+        let extractResult = try runProcess("/usr/bin/tar", ["-xzf", archiveURL.path, "-C", extractRoot.path], timeout: 180)
+        guard extractResult.status == 0 else {
+            throw ProxyBridgeError.message("解压 Python 运行时失败：\(trimmedOutput(extractResult.output))")
+        }
+
+        guard let extractedPython = findPythonExecutable(in: extractRoot) else {
+            throw ProxyBridgeError.message("下载的 Python 运行时中没有找到 python3")
+        }
+
+        let pythonHome = extractedPython.deletingLastPathComponent().deletingLastPathComponent()
+        try fileManager.createDirectory(at: stagedRuntime, withIntermediateDirectories: true)
+        try fileManager.moveItem(at: pythonHome, to: stagedRuntime.appendingPathComponent("python", isDirectory: true))
+
+        if fileManager.fileExists(atPath: pythonRuntimeURL.path) {
+            try fileManager.removeItem(at: pythonRuntimeURL)
+        }
+        try fileManager.moveItem(at: stagedRuntime, to: pythonRuntimeURL)
+
+        let installedPython = pythonRuntimeURL.appendingPathComponent("python/bin/python3")
+        if !fileManager.isExecutableFile(atPath: installedPython.path) {
+            try fileManager.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: installedPython.path)
+        }
+        guard isUsablePythonExecutable(installedPython) else {
+            throw ProxyBridgeError.message("安装后的 Python 运行时无法启动")
+        }
+        updateStartupStatus("Python 运行时已安装")
+        return installedPython
+    }
+
+    private func latestPythonRuntimeAsset() throws -> GitHubAsset {
+        var request = URLRequest(url: pythonReleaseAPI)
+        request.timeoutInterval = 30
+        request.addValue("ProxyBridge/0.1", forHTTPHeaderField: "User-Agent")
+        request.addValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+
+        let data = try fetchData(request: request, timeout: 35)
+        let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+        let arch = hostPythonAssetArch()
+        let ranked = release.assets
+            .map { (pythonAssetScore(name: $0.name, arch: arch), $0) }
+            .filter { $0.0 >= 0 }
+            .sorted { $0.0 > $1.0 }
+        guard let asset = ranked.first?.1 else {
+            throw ProxyBridgeError.message("未找到适配 macOS/\(arch) 的 Python 运行时资源")
+        }
+        return asset
+    }
+
+    private func hostPythonAssetArch() -> String {
+        if let result = try? runProcess("/usr/bin/uname", ["-m"], timeout: 5) {
+            let machine = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if machine == "arm64" {
+                return "aarch64"
+            }
+            if machine == "x86_64" {
+                return "x86_64"
+            }
+        }
+        #if arch(arm64)
+        return "aarch64"
+        #else
+        return "x86_64"
+        #endif
+    }
+
+    private func pythonAssetScore(name: String, arch: String) -> Int {
+        let lower = name.lowercased()
+        guard lower.hasSuffix(".tar.gz"),
+              lower.contains("cpython-"),
+              lower.contains("\(arch)-apple-darwin"),
+              lower.contains("install_only"),
+              !lower.contains("debug"),
+              !lower.contains("freethreaded") else {
+            return -1
+        }
+        guard let version = parsePythonVersion(from: lower),
+              version.major == 3,
+              version.minor >= 10,
+              version.isStable else {
+            return -1
+        }
+
+        var score = version.minor * 10_000 + version.patch * 100
+        if lower.contains("install_only_stripped") {
+            score += 1_000
+        }
+        return score
+    }
+
+    private func parsePythonVersion(from name: String) -> (major: Int, minor: Int, patch: Int, isStable: Bool)? {
+        guard let prefixRange = name.range(of: "cpython-") else { return nil }
+        let remainder = name[prefixRange.upperBound...]
+        let versionText = remainder.split(whereSeparator: { $0 == "+" || $0 == "-" }).first ?? Substring(remainder)
+        let parts = versionText.split(separator: ".")
+        guard parts.count >= 2,
+              let major = Int(parts[0]),
+              let minor = Int(parts[1]) else {
+            return nil
+        }
+        let patchText = parts.count >= 3 ? String(parts[2]) : "0"
+        let patchDigits = patchText.prefix { $0.isNumber }
+        guard !patchDigits.isEmpty, let patch = Int(patchDigits) else { return nil }
+        let isStable = patchDigits.count == patchText.count
+        return (major, minor, patch, isStable)
+    }
+
+    private func downloadPythonArchive(asset: GitHubAsset, to archiveURL: URL) throws {
+        guard let downloadURL = URL(string: asset.browserDownloadURL) else {
+            throw ProxyBridgeError.message("Python 运行时下载地址无效")
+        }
+        let result = try runProcess(
+            "/usr/bin/curl",
+            [
+                "--fail",
+                "--location",
+                "--retry", "2",
+                "--connect-timeout", "20",
+                "--user-agent", "ProxyBridge/0.1",
+                "--silent",
+                "--show-error",
+                "--output", archiveURL.path,
+                downloadURL.absoluteString
+            ],
+            timeout: 900
+        )
+        guard result.status == 0 else {
+            throw ProxyBridgeError.message("下载 Python 运行时失败：\(trimmedOutput(result.output))")
+        }
+    }
+
+    private func findPythonExecutable(in root: URL) -> URL? {
+        let fileManager = FileManager.default
+        let direct = root.appendingPathComponent("python/bin/python3")
+        if fileManager.isExecutableFile(atPath: direct.path) {
+            return direct
+        }
+        guard fileManager.fileExists(atPath: root.path),
+              let enumerator = fileManager.enumerator(at: root, includingPropertiesForKeys: nil) else {
+            return nil
+        }
+        for case let url as URL in enumerator {
+            if url.lastPathComponent == "python3",
+               url.deletingLastPathComponent().lastPathComponent == "bin",
+               fileManager.isExecutableFile(atPath: url.path) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private func fetchData(request: URLRequest, timeout: TimeInterval) throws -> Data {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<(Data, URLResponse), Error>?
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                result = .failure(error)
+            } else if let data, let response {
+                result = .success((data, response))
+            } else {
+                result = .failure(ProxyBridgeError.message("网络请求没有返回数据"))
+            }
+            semaphore.signal()
+        }
+        task.resume()
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            task.cancel()
+            throw ProxyBridgeError.message("请求 GitHub 超时")
+        }
+        switch result {
+        case .success(let (data, response)):
+            if let httpResponse = response as? HTTPURLResponse,
+               !(200...299).contains(httpResponse.statusCode) {
+                throw ProxyBridgeError.message("GitHub 返回 HTTP \(httpResponse.statusCode)")
+            }
+            return data
+        case .failure(let error):
+            throw error
+        case .none:
+            throw ProxyBridgeError.message("网络请求失败")
+        }
+    }
+
+    private func runProcess(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> CommandResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        let semaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in semaphore.signal() }
+        try process.run()
+
+        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                process.waitUntilExit()
+            }
+            throw ProxyBridgeError.message("\(URL(fileURLWithPath: executable).lastPathComponent) 执行超时")
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return CommandResult(status: process.terminationStatus, output: output)
+    }
+
+    private func trimmedOutput(_ output: String) -> String {
+        let value = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            return "无详细输出"
+        }
+        return value
+    }
+
+    private func startBackend(pythonExecutable: URL) {
         do {
             try FileManager.default.createDirectory(at: appSupportURL, withIntermediateDirectories: true)
             guard let script = resourceBridgeScript() else {
                 lastError = "找不到 app.py 后端脚本"
+                startupStatus = nil
+                api = nil
                 rebuildMenu()
                 return
             }
             api = BridgeAPI(port: backendPort)
 
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = ["python3", script.path]
+            process.executableURL = pythonExecutable
+            process.arguments = [script.path]
             var env = ProcessInfo.processInfo.environment
-            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env["PATH"] = "\(pythonExecutable.deletingLastPathComponent().path):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+            env.removeValue(forKey: "PYTHONHOME")
+            env.removeValue(forKey: "PYTHONPATH")
             env["PROXY_BRIDGE_PORT"] = "\(backendPort)"
             env["PROXY_BRIDGE_WORKDIR"] = appSupportURL.path
             env["PROXY_BRIDGE_PARENT_PID"] = "\(ProcessInfo.processInfo.processIdentifier)"
@@ -407,8 +784,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             backendLogHandle = logHandle
             backendProcess = process
+            startupStatus = nil
             lastError = nil
         } catch {
+            startupStatus = nil
+            api = nil
             lastError = error.localizedDescription
             rebuildMenu()
         }
@@ -464,6 +844,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(disabledItem("sing-box: \(status.cores["sing-box"]??.isEmpty == false ? "ready" : "missing")"))
             menu.addItem(disabledItem("xray: \(status.cores["xray"]??.isEmpty == false ? "ready" : "missing")"))
             menu.addItem(disabledItem("节点 \(status.nodes.count) · 运行 \(running.count)"))
+        } else if let startupStatus {
+            menu.addItem(disabledItem("状态：\(startupStatus)"))
         } else if let lastError {
             menu.addItem(disabledItem("状态：\(lastError)"))
         } else {
@@ -471,10 +853,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        menu.addItem(actionItem("打开控制台", #selector(showConsole)))
-        menu.addItem(actionItem("导入订阅 URL...", #selector(showImportURLDialog)))
-        menu.addItem(actionItem("导入原始订阅...", #selector(showImportRawDialog)))
-        menu.addItem(actionItem("刷新", #selector(refreshNow)))
+        let backendReady = api != nil
+        let consoleItem = actionItem("打开控制台", #selector(showConsole))
+        consoleItem.isEnabled = backendReady
+        menu.addItem(consoleItem)
+        let importURLItem = actionItem("导入订阅 URL...", #selector(showImportURLDialog))
+        importURLItem.isEnabled = backendReady
+        menu.addItem(importURLItem)
+        let importRawItem = actionItem("导入原始订阅...", #selector(showImportRawDialog))
+        importRawItem.isEnabled = backendReady
+        menu.addItem(importRawItem)
+        let refreshItem = actionItem("刷新", #selector(refreshNow))
+        refreshItem.isEnabled = backendReady
+        menu.addItem(refreshItem)
 
         if let status = latestStatus {
             if !status.subscriptions.isEmpty {
@@ -510,6 +901,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func tooltipTitle(runningCount: Int) -> String {
         if let lastError {
             return "Proxy Bridge：\(lastError)"
+        }
+        if let startupStatus {
+            return "Proxy Bridge：\(startupStatus)"
         }
         if runningCount > 0 {
             return "Proxy Bridge：\(runningCount) 个 SOCKS5 端口运行中"

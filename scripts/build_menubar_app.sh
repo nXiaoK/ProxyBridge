@@ -23,7 +23,8 @@ for arg in "$@"; do
       cat <<'EOF'
 Usage: scripts/build_menubar_app.sh [--bundle-cores]
 
-默认构建轻量 App,不内置 sing-box/xray。首次运行时会自动下载代理核心到
+默认构建轻量 App,不内置 Python/sing-box/xray。首次运行时会自动下载 Python
+运行时到 ~/Library/Application Support/ProxyBridge/python-runtime,并下载代理核心到
 ~/Library/Application Support/ProxyBridge/proxy-cores。
 
 Options:
@@ -149,7 +150,7 @@ rm -rf "$CORE_DIR"
 if [[ "$BUNDLE_CORES" == "1" ]]; then
   bundle_proxy_cores
 else
-  echo "Skipping bundled proxy cores; runtime will auto-download sing-box/xray on first launch."
+  echo "Skipping bundled proxy cores; runtime will auto-download Python and sing-box/xray on first launch."
 fi
 
 chmod +x "$MACOS_DIR/ProxyBridgeMenuBar"

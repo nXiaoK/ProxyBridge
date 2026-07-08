@@ -16,8 +16,8 @@
 ## 运行要求
 
 - Apple Silicon Mac，macOS 13+。
-- 目标 Mac 需要有 `python3`，菜单栏 App 内部后端由 Python 启动。
-- 默认轻量 App 首次运行需要能访问 GitHub,用于自动下载 `sing-box` / `xray` 代理核心。
+- 菜单栏 App 不再要求目标 Mac 预装 `python3`；首次运行会自动下载独立 Python 运行时。
+- 默认轻量 App 首次运行需要能访问 GitHub,用于自动下载 Python 运行时和 `sing-box` / `xray` 代理核心。
 
 ## 构建机准备
 
@@ -70,7 +70,7 @@ outputs/ProxyBridgeMenuBar.app
 ~/Library/Application Support/ProxyBridge
 ```
 
-浏览器 Profile 会保存在同一目录下的 `browser_profiles/`(按节点隔离,持久保留 Cookies、LocalStorage、SessionStorage);代理核心自动安装在 `proxy-cores/`;指纹内核安装在 `fingerprint-chromium/`。方案 B 使用打过补丁的 Chromium 指纹内核(基于 Ungoogled Chromium),从 C++ 底层伪造 Canvas、WebGL、AudioContext、字体、屏幕分辨率、`hardwareConcurrency`、`deviceMemory`、Client Hints、User-Agent 等全部指纹维度:
+浏览器 Profile 会保存在同一目录下的 `browser_profiles/`(按节点隔离,持久保留 Cookies、LocalStorage、SessionStorage);Python 运行时自动安装在 `python-runtime/`;代理核心自动安装在 `proxy-cores/`;指纹内核安装在 `fingerprint-chromium/`。方案 B 使用打过补丁的 Chromium 指纹内核(基于 Ungoogled Chromium),从 C++ 底层伪造 Canvas、WebGL、AudioContext、字体、屏幕分辨率、`hardwareConcurrency`、`deviceMemory`、Client Hints、User-Agent 等全部指纹维度:
 
 - 每个节点从 `node_id` 确定性派生固定的 `--fingerprint` 种子——**同一节点每次启动指纹完全一致(环境可恢复),不同节点指纹互不相同(避免被网站关联为同一设备)**。
 - 时区(`--timezone`)与语言(`--lang` / `--accept-lang`)按节点地区自动匹配,使浏览器时区/语言与代理出口地区一致,降低不一致被风控识别的概率。
@@ -99,6 +99,8 @@ xattr -dr com.apple.quarantine /Applications/ProxyBridgeMenuBar.app
 ```
 
 ## Web 控制台兼容模式
+
+直接运行 Web 控制台仍需要本机命令行环境提供 `python3`：
 
 ```bash
 python3 app.py
