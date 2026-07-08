@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zipfile
 from pathlib import Path
 
 import app
@@ -101,6 +102,33 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(app._pick_sing_box_asset(release, "x86_64")["browser_download_url"], "https://example/sing-amd")
         self.assertEqual(app._pick_xray_asset(release, "arm64")["browser_download_url"], "https://example/xray-arm")
         self.assertEqual(app._pick_xray_asset(release, "x86_64")["browser_download_url"], "https://example/xray-amd")
+
+    def test_xray_runtime_install_only_requires_binary(self):
+        old_work_root = app.WORK_ROOT
+        old_download_asset = app._download_asset
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.ensure_dirs()
+
+                def fake_download(_asset: dict, target: Path) -> None:
+                    with zipfile.ZipFile(target, "w") as archive:
+                        archive.writestr("xray", "#!/bin/sh\nexit 0\n")
+
+                app._download_asset = fake_download
+                installed = app._install_core_from_asset(
+                    "xray",
+                    {"name": "Xray-macos-arm64-v8a.zip", "browser_download_url": "https://example/xray.zip"},
+                    "v-test",
+                )
+
+                self.assertEqual(installed, str(app.proxy_core_bin_dir() / "xray"))
+                self.assertTrue((app.proxy_core_bin_dir() / "xray").is_file())
+                self.assertTrue((app.proxy_core_bin_dir() / "xray-core").is_file())
+                self.assertFalse((app.proxy_core_bin_dir() / "xray-assets").exists())
+        finally:
+            app.WORK_ROOT = old_work_root
+            app._download_asset = old_download_asset
 
     def test_launch_browser_uses_node_profile_and_proxy(self):
         old_work_root = app.WORK_ROOT

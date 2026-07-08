@@ -941,7 +941,7 @@ def _write_xray_wrapper() -> None:
     wrapper.write_text(
         '#!/bin/sh\n'
         'HERE="$(cd "$(dirname "$0")" && pwd)"\n'
-        'XRAY_LOCATION_ASSET="${XRAY_LOCATION_ASSET:-$HERE/xray-assets}" exec "$HERE/xray-core" "$@"\n',
+        'exec "$HERE/xray-core" "$@"\n',
         encoding="utf-8",
     )
     wrapper.chmod(0o755)
@@ -966,17 +966,9 @@ def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
             return str(proxy_core_bin_dir() / "sing-box")
 
         binary = _find_extracted_file(extract_root, {"xray", "xray-core"})
-        geoip = _find_extracted_file(extract_root, {"geoip.dat"})
-        geosite = _find_extracted_file(extract_root, {"geosite.dat"})
         if not binary:
             raise RuntimeError("Xray 压缩包中未找到 xray 可执行文件")
-        if not geoip or not geosite:
-            raise RuntimeError("Xray 压缩包中未找到 geoip.dat/geosite.dat")
         _install_executable(binary, proxy_core_bin_dir() / "xray-core")
-        assets_dir = proxy_core_bin_dir() / "xray-assets"
-        assets_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(geoip, assets_dir / "geoip.dat")
-        shutil.copy2(geosite, assets_dir / "geosite.dat")
         _write_xray_wrapper()
         version_path = proxy_core_root() / "xray.version"
         version_path.write_text(f"{tag}\n{_asset_name(asset)}\n", encoding="utf-8")

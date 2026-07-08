@@ -93,64 +93,25 @@ resolve_mach_o_binary() {
   exit 1
 }
 
-resolve_xray_asset_dir() {
-  local wrapper_path="$1"
-  local real_binary="$2"
-  local parsed=""
-  local wrapper_kind=""
-  local candidates=()
-
-  if [[ -n "${XRAY_ASSET_DIR:-}" ]]; then
-    candidates+=("$XRAY_ASSET_DIR")
-  fi
-
-  wrapper_kind="$(file -b "$wrapper_path")"
-  if [[ "$wrapper_kind" != *"Mach-O"* ]]; then
-    parsed="$(sed -n 's/.*XRAY_LOCATION_ASSET="${XRAY_LOCATION_ASSET:-\([^}]*\)}".*/\1/p' "$wrapper_path" | sed -n '1p')"
-  fi
-  candidates+=(
-    "$parsed"
-    "$(dirname "$wrapper_path")/../share/xray"
-    "$(dirname "$real_binary")/../share/xray"
-    "/opt/homebrew/opt/xray/share/xray"
-    "/usr/local/opt/xray/share/xray"
-  )
-
-  local candidate=""
-  for candidate in "${candidates[@]}"; do
-    if [[ -n "$candidate" && -f "$candidate/geoip.dat" && -f "$candidate/geosite.dat" ]]; then
-      printf '%s\n' "$candidate"
-      return
-    fi
-  done
-
-  echo "找不到 Xray 资源文件 geoip.dat / geosite.dat。请通过 XRAY_ASSET_DIR=/path/to/share/xray 指定。" >&2
-  exit 1
-}
-
 bundle_proxy_cores() {
   local sing_box_source=""
   local sing_box_binary=""
   local xray_source=""
   local xray_binary=""
-  local xray_asset_dir=""
 
   sing_box_source="$(find_required_binary "sing-box" "SING_BOX_BIN" "sing-box")"
   sing_box_binary="$(resolve_mach_o_binary "sing-box" "$sing_box_source")"
   xray_source="$(find_required_binary "xray" "XRAY_BIN" "xray")"
   xray_binary="$(resolve_mach_o_binary "xray" "$xray_source")"
-  xray_asset_dir="$(resolve_xray_asset_dir "$xray_source" "$xray_binary")"
 
-  mkdir -p "$CORE_DIR" "$CORE_DIR/xray-assets"
+  mkdir -p "$CORE_DIR"
   install -m 0755 "$sing_box_binary" "$CORE_DIR/sing-box"
   install -m 0755 "$xray_binary" "$CORE_DIR/xray-core"
-  cp "$xray_asset_dir/geoip.dat" "$CORE_DIR/xray-assets/geoip.dat"
-  cp "$xray_asset_dir/geosite.dat" "$CORE_DIR/xray-assets/geosite.dat"
 
   cat > "$CORE_DIR/xray" <<'EOS'
 #!/bin/sh
 HERE="$(cd "$(dirname "$0")" && pwd)"
-XRAY_LOCATION_ASSET="${XRAY_LOCATION_ASSET:-$HERE/xray-assets}" exec "$HERE/xray-core" "$@"
+exec "$HERE/xray-core" "$@"
 EOS
   chmod +x "$CORE_DIR/xray"
 

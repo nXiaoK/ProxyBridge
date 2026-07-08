@@ -39,7 +39,6 @@ brew install xray
 ```bash
 SING_BOX_BIN=/path/to/sing-box \
 XRAY_BIN=/path/to/xray \
-XRAY_ASSET_DIR=/path/to/share/xray \
 scripts/build_menubar_app.sh --bundle-cores
 ```
 
@@ -87,7 +86,7 @@ outputs/ProxyBridgeMenuBar.app
 scripts/build_menubar_app.sh
 ```
 
-构建脚本会自动生成图标。默认不会复制代理核心，因此包体更小；如需内置 `sing-box`、`xray`、`geoip.dat`、`geosite.dat` 到 App 的 `Contents/Resources/bridge/bin/`，使用：
+构建脚本会自动生成图标。默认不会复制代理核心，因此包体更小；如需内置 `sing-box` 和 `xray` 到 App 的 `Contents/Resources/bridge/bin/`，使用：
 
 ```bash
 scripts/build_menubar_app.sh --bundle-cores
