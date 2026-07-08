@@ -47,6 +47,9 @@ STATE_LOCK = threading.RLock()
 PROCESS_LOCK = threading.RLock()
 TRAFFIC_LOCK = threading.RLock()
 SHUTTING_DOWN = threading.Event()
+PATH_CACHE_LOCK = threading.RLock()
+FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
+FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
 
 
 @dataclass
@@ -774,7 +777,20 @@ def _bundle_executable(app_dir: Path) -> Path | None:
     return None
 
 
-def fingerprint_chromium_path() -> str | None:
+def invalidate_fingerprint_chromium_cache() -> None:
+    with PATH_CACHE_LOCK:
+        FINGERPRINT_CHROMIUM_CACHE.update({"key": None, "path": None, "checked_at": 0.0})
+
+
+def _fingerprint_chromium_cache_key() -> tuple[str | None, str, str]:
+    return (
+        os.environ.get("PROXY_BRIDGE_FP_CHROMIUM"),
+        str(fingerprint_chromium_root()),
+        str(Path.home() / "Applications"),
+    )
+
+
+def _resolve_fingerprint_chromium_path() -> str | None:
     # 定位指纹内核可执行文件。优先级:环境变量 > 工作目录安装位 > 系统 Applications。
     # 指纹内核必须是打过补丁的 Chromium(而非本机 Google Chrome),否则无法在底层伪造指纹。
     env_path = os.environ.get("PROXY_BRIDGE_FP_CHROMIUM")
@@ -787,23 +803,48 @@ def fingerprint_chromium_path() -> str | None:
             if exe:
                 return str(exe)
 
-    search_dirs = [fingerprint_chromium_root(), Path("/Applications"), Path.home() / "Applications"]
-    for base in search_dirs:
-        if not base.is_dir():
-            continue
-        # 递归查找 Chromium.app,兼容 dmg 解压后可能带有中间目录层级的情况。
-        for app_dir in sorted(base.glob("**/Chromium.app")):
+    # 下载器会把内核安装到工作目录下,这里允许递归查找以兼容 dmg 内部层级。
+    install_root = fingerprint_chromium_root()
+    if install_root.is_dir():
+        direct_app = install_root / "Chromium.app"
+        candidates = [direct_app] if direct_app.is_dir() else []
+        candidates.extend(app_dir for app_dir in install_root.glob("**/Chromium.app") if app_dir != direct_app)
+        for app_dir in candidates:
             exe = _bundle_executable(app_dir)
             if exe:
                 return str(exe)
+
+    # 系统应用目录只检查常见直接安装位置。递归扫描整个 /Applications 在状态轮询中代价太高。
+    for app_dir in (Path("/Applications/Chromium.app"), Path.home() / "Applications/Chromium.app"):
+        exe = _bundle_executable(app_dir)
+        if exe:
+            return str(exe)
     return None
+
+
+def fingerprint_chromium_path(force_refresh: bool = False) -> str | None:
+    key = _fingerprint_chromium_cache_key()
+    now = time.monotonic()
+    with PATH_CACHE_LOCK:
+        cached_path = FINGERPRINT_CHROMIUM_CACHE.get("path")
+        if (
+            not force_refresh
+            and FINGERPRINT_CHROMIUM_CACHE.get("key") == key
+            and now - float(FINGERPRINT_CHROMIUM_CACHE.get("checked_at") or 0.0) < FINGERPRINT_CHROMIUM_CACHE_TTL
+            and (not cached_path or Path(str(cached_path)).exists())
+        ):
+            return str(cached_path) if cached_path else None
+
+        resolved = _resolve_fingerprint_chromium_path()
+        FINGERPRINT_CHROMIUM_CACHE.update({"key": key, "path": resolved, "checked_at": now})
+        return resolved
 
 
 def status_payload() -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
-        sync_process_status(state)
-        save_state(state)
+        if sync_process_status(state):
+            save_state(state)
         return {
             "cores": core_paths(),
             "chrome": chrome_path(),
@@ -1275,8 +1316,8 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         node = find_node(state, node_id)
-        sync_process_status(state)
-        save_state(state)
+        if sync_process_status(state):
+            save_state(state)
         bridge = active_bridge_for_node(state, node_id)
 
     if not bridge:
@@ -1384,8 +1425,8 @@ def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
     stopped_bridges: list[str] = []
     with STATE_LOCK:
         state = load_state()
-        sync_process_status(state)
-        save_state(state)
+        if sync_process_status(state):
+            save_state(state)
         bridge = active_bridge_for_node(state, node_id)
     if bridge and bridge.get("id"):
         stop_bridge(str(bridge["id"]))
@@ -1526,7 +1567,8 @@ def download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
         elif host_arch == "arm64" and binary_arch == "x86_64":
             arch_warning = "提示:下载到的是 x86_64 内核,将通过 Rosetta 在 Apple Silicon 上运行。"
 
-    resolved = fingerprint_chromium_path()
+    invalidate_fingerprint_chromium_cache()
+    resolved = fingerprint_chromium_path(force_refresh=True)
     return {
         "ok": True,
         "already_installed": False,
@@ -1554,8 +1596,8 @@ def core_log_payload(core: str) -> dict[str, Any]:
 
     with STATE_LOCK:
         state = load_state()
-        sync_process_status(state)
-        save_state(state)
+        if sync_process_status(state):
+            save_state(state)
         bridges = [dict(bridge) for bridge in state.get("bridges", []) if bridge.get("core") == core]
 
     entries = []
@@ -2073,28 +2115,42 @@ def stop_all_bridges() -> dict[str, Any]:
     return {"ok": True}
 
 
-def sync_process_status(state: dict[str, Any]) -> None:
+def apply_updates(target: dict[str, Any], updates: dict[str, Any]) -> bool:
+    changed = False
+    for key, value in updates.items():
+        if target.get(key) != value:
+            target[key] = value
+            changed = True
+    return changed
+
+
+def sync_process_status(state: dict[str, Any]) -> bool:
+    changed = False
     for bridge in state.get("bridges", []):
         bridge_id = bridge.get("id")
         with PROCESS_LOCK:
             process = PROCESS_TABLE.get(bridge_id)
             proxy = LOG_PROXY_TABLE.get(bridge_id)
         if process and process.poll() is None and proxy and proxy.is_alive():
-            if wait_for_port(int(bridge.get("port")), timeout=0.05):
-                bridge["status"] = "running"
-            else:
-                bridge["status"] = "starting"
-            bridge["enabled"] = True
-            bridge["pid"] = process.pid
-            bridge.update(bridge_traffic_snapshot(str(bridge_id)))
-            bridge.pop("error", None)
+            status = "running" if wait_for_port(int(bridge.get("port")), timeout=0.05) else "starting"
+            changed |= apply_updates(
+                bridge,
+                {
+                    "status": status,
+                    "enabled": True,
+                    "pid": process.pid,
+                    **bridge_traffic_snapshot(str(bridge_id)),
+                },
+            )
+            if "error" in bridge:
+                bridge.pop("error", None)
+                changed = True
         elif bridge.get("status") in ACTIVE_BRIDGE_STATUSES:
             traffic = traffic_defaults(bridge.get("upload_bytes"), bridge.get("download_bytes"))
             if bridge_id:
                 traffic = stop_process(str(bridge_id))
-            bridge["status"] = "stopped"
-            bridge["pid"] = None
-            bridge.update(traffic)
+            changed |= apply_updates(bridge, {"status": "stopped", "pid": None, **traffic})
+    return changed
 
 
 def copy_to_clipboard(text: str) -> dict[str, Any]:
