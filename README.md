@@ -10,18 +10,24 @@
 - 为节点生成本地代理端口,同一端口同时支持 `socks5://127.0.0.1:端口` 与 `http://127.0.0.1:端口`。
 - HTTP 代理模式支持普通 HTTP 请求和 HTTPS CONNECT,兼容不支持 SOCKS5 的软件。
 - 普通协议走 `sing-box`，`VLESS + XHTTP` 自动走 `xray` fallback。
-- 菜单栏 App 可内置 `sing-box` / `xray`，复制到其他 Apple Silicon Mac 后无需再单独安装代理核心。
+- 菜单栏 App 默认不内置 `sing-box` / `xray`，首次运行时会自动下载到用户数据目录;也可构建时选择内置核心。
 - 节点操作列可启动**独立指纹浏览器**(每节点独立指纹 + 独立 Profile),并自动绑定该节点的本地代理。
 
 ## 运行要求
 
 - Apple Silicon Mac，macOS 13+。
 - 目标 Mac 需要有 `python3`，菜单栏 App 内部后端由 Python 启动。
-- 构建出的 App 已内置 `sing-box` / `xray` 代理核心。
+- 默认轻量 App 首次运行需要能访问 GitHub,用于自动下载 `sing-box` / `xray` 代理核心。
 
 ## 构建机准备
 
-构建 App 时会从构建机复制 `sing-box` / `xray` 到 App 内部，因此构建机需要先安装：
+默认构建轻量 App，不会把 `sing-box` / `xray` 打进 App 包里：
+
+```bash
+scripts/build_menubar_app.sh
+```
+
+如果希望构建离线版/内置核心版，携带 `--bundle-cores` 参数；此时会从构建机复制 `sing-box` / `xray` 到 App 内部，因此构建机需要先安装：
 
 ```bash
 brew install sing-box
@@ -34,7 +40,7 @@ brew install xray
 SING_BOX_BIN=/path/to/sing-box \
 XRAY_BIN=/path/to/xray \
 XRAY_ASSET_DIR=/path/to/share/xray \
-scripts/build_menubar_app.sh
+scripts/build_menubar_app.sh --bundle-cores
 ```
 
 ## 菜单栏 App
@@ -65,7 +71,7 @@ outputs/ProxyBridgeMenuBar.app
 ~/Library/Application Support/ProxyBridge
 ```
 
-浏览器 Profile 会保存在同一目录下的 `browser_profiles/`(按节点隔离,持久保留 Cookies、LocalStorage、SessionStorage);指纹内核安装在 `fingerprint-chromium/`。方案 B 使用打过补丁的 Chromium 指纹内核(基于 Ungoogled Chromium),从 C++ 底层伪造 Canvas、WebGL、AudioContext、字体、屏幕分辨率、`hardwareConcurrency`、`deviceMemory`、Client Hints、User-Agent 等全部指纹维度:
+浏览器 Profile 会保存在同一目录下的 `browser_profiles/`(按节点隔离,持久保留 Cookies、LocalStorage、SessionStorage);代理核心自动安装在 `proxy-cores/`;指纹内核安装在 `fingerprint-chromium/`。方案 B 使用打过补丁的 Chromium 指纹内核(基于 Ungoogled Chromium),从 C++ 底层伪造 Canvas、WebGL、AudioContext、字体、屏幕分辨率、`hardwareConcurrency`、`deviceMemory`、Client Hints、User-Agent 等全部指纹维度:
 
 - 每个节点从 `node_id` 确定性派生固定的 `--fingerprint` 种子——**同一节点每次启动指纹完全一致(环境可恢复),不同节点指纹互不相同(避免被网站关联为同一设备)**。
 - 时区(`--timezone`)与语言(`--lang` / `--accept-lang`)按节点地区自动匹配,使浏览器时区/语言与代理出口地区一致,降低不一致被风控识别的概率。
@@ -81,7 +87,11 @@ outputs/ProxyBridgeMenuBar.app
 scripts/build_menubar_app.sh
 ```
 
-构建脚本会自动生成图标，并把 `sing-box`、`xray`、`geoip.dat`、`geosite.dat` 复制到 App 的 `Contents/Resources/bridge/bin/`。
+构建脚本会自动生成图标。默认不会复制代理核心，因此包体更小；如需内置 `sing-box`、`xray`、`geoip.dat`、`geosite.dat` 到 App 的 `Contents/Resources/bridge/bin/`，使用：
+
+```bash
+scripts/build_menubar_app.sh --bundle-cores
+```
 
 如果复制到其他 Mac 后提示“无法验证开发者”或“已损坏”，可以在目标 Mac 执行：
 

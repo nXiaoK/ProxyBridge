@@ -15,11 +15,14 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,6 +54,8 @@ PROCESS_LOCK = threading.RLock()
 TRAFFIC_LOCK = threading.RLock()
 SHUTTING_DOWN = threading.Event()
 PATH_CACHE_LOCK = threading.RLock()
+CORE_INSTALL_LOCK = threading.RLock()
+CORE_AUTO_INSTALL_STARTED = threading.Event()
 FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
 FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
 
@@ -116,9 +121,18 @@ def now_ts() -> int:
     return int(time.time())
 
 
+def proxy_core_root() -> Path:
+    return WORK_ROOT / "proxy-cores"
+
+
+def proxy_core_bin_dir() -> Path:
+    return proxy_core_root() / "bin"
+
+
 def ensure_dirs() -> None:
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    proxy_core_bin_dir().mkdir(parents=True, exist_ok=True)
     browser_profiles_root().mkdir(parents=True, exist_ok=True)
 
 
@@ -776,16 +790,245 @@ def core_paths() -> dict[str, str | None]:
     sing_box = (
         executable(Path(os.environ.get("PROXY_BRIDGE_SING_BOX", "")))
         or executable(core_dir / "sing-box")
+        or executable(proxy_core_bin_dir() / "sing-box")
         or shutil.which("sing-box")
     )
     xray = (
         executable(Path(os.environ.get("PROXY_BRIDGE_XRAY", "")))
         or executable(core_dir / "xray")
         or executable(core_dir / "xray-core")
+        or executable(proxy_core_bin_dir() / "xray")
+        or executable(proxy_core_bin_dir() / "xray-core")
         or shutil.which("xray")
         or shutil.which("xray-core")
     )
     return {"sing-box": sing_box, "xray": xray}
+
+
+SING_BOX_RELEASES_API = "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+XRAY_RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+
+
+def _github_json(url: str) -> Any:
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "ProxyBridge/0.1", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8", errors="replace"))
+
+
+def _asset_url(asset: dict[str, Any]) -> str:
+    return str(asset.get("browser_download_url") or "")
+
+
+def _asset_name(asset: dict[str, Any]) -> str:
+    return str(asset.get("name") or "")
+
+
+def _pick_sing_box_asset(release: dict[str, Any], host_arch: str) -> dict[str, Any] | None:
+    assets = release.get("assets") or []
+    arch_terms = ("arm64", "aarch64") if host_arch == "arm64" else ("amd64", "x86_64", "x64")
+    os_terms = ("darwin", "macos", "apple")
+    archive_terms = (".tar.gz", ".tgz", ".zip")
+
+    def score(asset: dict[str, Any]) -> int:
+        name = _asset_name(asset).lower()
+        if not _asset_url(asset) or not name.startswith("sing-box"):
+            return -1
+        if not any(name.endswith(term) for term in archive_terms):
+            return -1
+        if not any(term in name for term in os_terms):
+            return -1
+        if not any(term in name for term in arch_terms):
+            return -1
+        if any(skip in name for skip in ("android", "openwrt", "windows", "linux", ".apk", ".ipk", ".deb", ".rpm")):
+            return -1
+        value = 0
+        if "darwin" in name:
+            value += 20
+        if "apple" in name:
+            value += 10
+        if name.endswith(".tar.gz") or name.endswith(".tgz"):
+            value += 5
+        return value
+
+    candidates = [(score(asset), asset) for asset in assets]
+    candidates = [item for item in candidates if item[0] >= 0]
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1] if candidates else None
+
+
+def _pick_xray_asset(release: dict[str, Any], host_arch: str) -> dict[str, Any] | None:
+    assets = release.get("assets") or []
+
+    def score(asset: dict[str, Any]) -> int:
+        name = _asset_name(asset).lower()
+        if not _asset_url(asset) or not name.endswith(".zip"):
+            return -1
+        if "macos" not in name and "darwin" not in name:
+            return -1
+        if host_arch == "arm64":
+            if not any(term in name for term in ("arm64", "aarch64", "arm64-v8a")):
+                return -1
+            return 20
+        if any(term in name for term in ("arm64", "aarch64", "arm64-v8a")):
+            return -1
+        if any(term in name for term in ("64", "amd64", "x64", "x86_64")):
+            return 20
+        return -1
+
+    candidates = [(score(asset), asset) for asset in assets]
+    candidates = [item for item in candidates if item[0] >= 0]
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1] if candidates else None
+
+
+def _download_asset(asset: dict[str, Any], target: Path) -> None:
+    url = _asset_url(asset)
+    if not url:
+        raise RuntimeError("GitHub release 资源缺少下载地址")
+    request = urllib.request.Request(url, headers={"User-Agent": "ProxyBridge/0.1"})
+    with urllib.request.urlopen(request, timeout=600) as response, target.open("wb") as out:
+        shutil.copyfileobj(response, out)
+
+
+def _safe_extract_zip(archive_path: Path, dest: Path) -> None:
+    root = dest.resolve()
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            target = (dest / member.filename).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError("压缩包包含非法路径")
+        archive.extractall(dest)
+
+
+def _safe_extract_tar(archive_path: Path, dest: Path) -> None:
+    root = dest.resolve()
+    with tarfile.open(archive_path) as archive:
+        for member in archive.getmembers():
+            target = (dest / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError("压缩包包含非法路径")
+        archive.extractall(dest)
+
+
+def _extract_archive(archive_path: Path, dest: Path) -> None:
+    name = archive_path.name.lower()
+    if name.endswith(".zip"):
+        _safe_extract_zip(archive_path, dest)
+    elif name.endswith((".tar.gz", ".tgz", ".tar")):
+        _safe_extract_tar(archive_path, dest)
+    else:
+        raise RuntimeError(f"不支持的核心压缩包格式:{archive_path.name}")
+
+
+def _find_extracted_file(root: Path, names: set[str]) -> Path | None:
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.name in names:
+            return path
+    return None
+
+
+def _install_executable(source: Path, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, dest)
+    dest.chmod(0o755)
+
+
+def _write_xray_wrapper() -> None:
+    wrapper = proxy_core_bin_dir() / "xray"
+    wrapper.write_text(
+        '#!/bin/sh\n'
+        'HERE="$(cd "$(dirname "$0")" && pwd)"\n'
+        'XRAY_LOCATION_ASSET="${XRAY_LOCATION_ASSET:-$HERE/xray-assets}" exec "$HERE/xray-core" "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+
+
+def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
+    ensure_dirs()
+    with tempfile.TemporaryDirectory(prefix=f"proxybridge-{core}-", dir=str(proxy_core_root())) as temp_dir:
+        temp_root = Path(temp_dir)
+        archive_path = temp_root / _asset_name(asset)
+        extract_root = temp_root / "extract"
+        extract_root.mkdir()
+        _download_asset(asset, archive_path)
+        _extract_archive(archive_path, extract_root)
+        if core == "sing-box":
+            binary = _find_extracted_file(extract_root, {"sing-box"})
+            if not binary:
+                raise RuntimeError("sing-box 压缩包中未找到 sing-box 可执行文件")
+            _install_executable(binary, proxy_core_bin_dir() / "sing-box")
+            version_path = proxy_core_root() / "sing-box.version"
+            version_path.write_text(f"{tag}\n{_asset_name(asset)}\n", encoding="utf-8")
+            return str(proxy_core_bin_dir() / "sing-box")
+
+        binary = _find_extracted_file(extract_root, {"xray", "xray-core"})
+        geoip = _find_extracted_file(extract_root, {"geoip.dat"})
+        geosite = _find_extracted_file(extract_root, {"geosite.dat"})
+        if not binary:
+            raise RuntimeError("Xray 压缩包中未找到 xray 可执行文件")
+        if not geoip or not geosite:
+            raise RuntimeError("Xray 压缩包中未找到 geoip.dat/geosite.dat")
+        _install_executable(binary, proxy_core_bin_dir() / "xray-core")
+        assets_dir = proxy_core_bin_dir() / "xray-assets"
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(geoip, assets_dir / "geoip.dat")
+        shutil.copy2(geosite, assets_dir / "geosite.dat")
+        _write_xray_wrapper()
+        version_path = proxy_core_root() / "xray.version"
+        version_path.write_text(f"{tag}\n{_asset_name(asset)}\n", encoding="utf-8")
+        return str(proxy_core_bin_dir() / "xray")
+
+
+def ensure_core_installed(core: str) -> str:
+    paths = core_paths()
+    if paths.get(core):
+        return str(paths[core])
+    if core not in {"sing-box", "xray"}:
+        raise ValueError("核心只能是 sing-box 或 xray")
+
+    with CORE_INSTALL_LOCK:
+        paths = core_paths()
+        if paths.get(core):
+            return str(paths[core])
+        host_arch = _macos_arch_token()
+        if core == "sing-box":
+            release = _github_json(SING_BOX_RELEASES_API)
+            asset = _pick_sing_box_asset(release if isinstance(release, dict) else {}, host_arch)
+        else:
+            release = _github_json(XRAY_RELEASES_API)
+            asset = _pick_xray_asset(release if isinstance(release, dict) else {}, host_arch)
+        if not asset:
+            raise RuntimeError(f"未找到适配 macOS/{host_arch} 的 {core} release 资源")
+        tag = str(release.get("tag_name") or release.get("name") or "")
+        log_event(f"正在下载 {core}:{_asset_name(asset)}", category="核心")
+        installed = _install_core_from_asset(core, asset, tag)
+        log_event(f"已安装 {core}:{installed}", category="核心")
+        return installed
+
+
+def ensure_proxy_cores_installed() -> None:
+    for core in ("sing-box", "xray"):
+        ensure_core_installed(core)
+
+
+def start_core_auto_install() -> None:
+    if CORE_AUTO_INSTALL_STARTED.is_set():
+        return
+    if all(core_paths().get(core) for core in ("sing-box", "xray")):
+        return
+    CORE_AUTO_INSTALL_STARTED.set()
+
+    def worker() -> None:
+        try:
+            ensure_proxy_cores_installed()
+        except Exception as exc:
+            log_event(f"自动安装代理核心失败:{exc}", level="error", category="核心")
+
+    threading.Thread(target=worker, name="proxy-core-auto-install", daemon=True).start()
 
 
 def chrome_path() -> str | None:
@@ -1237,7 +1480,7 @@ def generate_config(core: str, node: dict[str, Any], local_port: int) -> dict[st
 
 def core_command(core: str, config_path: Path) -> list[str]:
     paths = core_paths()
-    binary = paths.get(core)
+    binary = paths.get(core) or ensure_core_installed(core)
     if not binary:
         raise FileNotFoundError(f"找不到 {core}，请先安装对应核心")
     if core == "xray":
@@ -2690,6 +2933,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, handle_shutdown_signal)
     port = safe_int(os.environ.get("PROXY_BRIDGE_PORT"), DEFAULT_SERVER_PORT)
     start_parent_monitor()
+    start_core_auto_install()
     restore_enabled_bridges()
     server = ProxyBridgeHTTPServer(("127.0.0.1", port), AppHandler)
     log_event(f"Proxy Bridge 已启动,监听 http://127.0.0.1:{port}", category="系统")

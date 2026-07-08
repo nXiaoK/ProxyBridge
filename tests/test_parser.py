@@ -54,6 +54,54 @@ class ParserTests(unittest.TestCase):
             if old_xray is not None:
                 os.environ["PROXY_BRIDGE_XRAY"] = old_xray
 
+    def test_core_paths_finds_runtime_downloaded_binaries(self):
+        old_app_root = app.APP_ROOT
+        old_work_root = app.WORK_ROOT
+        old_core_dir = os.environ.pop("PROXY_BRIDGE_CORE_DIR", None)
+        old_sing_box = os.environ.pop("PROXY_BRIDGE_SING_BOX", None)
+        old_xray = os.environ.pop("PROXY_BRIDGE_XRAY", None)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                app.APP_ROOT = root / "app"
+                app.WORK_ROOT = root / "work"
+                bin_dir = app.proxy_core_bin_dir()
+                bin_dir.mkdir(parents=True)
+                for name in ("sing-box", "xray"):
+                    binary = bin_dir / name
+                    binary.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                    binary.chmod(0o755)
+
+                paths = app.core_paths()
+                self.assertEqual(paths["sing-box"], str(bin_dir / "sing-box"))
+                self.assertEqual(paths["xray"], str(bin_dir / "xray"))
+        finally:
+            app.APP_ROOT = old_app_root
+            app.WORK_ROOT = old_work_root
+            if old_core_dir is not None:
+                os.environ["PROXY_BRIDGE_CORE_DIR"] = old_core_dir
+            if old_sing_box is not None:
+                os.environ["PROXY_BRIDGE_SING_BOX"] = old_sing_box
+            if old_xray is not None:
+                os.environ["PROXY_BRIDGE_XRAY"] = old_xray
+
+    def test_release_asset_pickers_select_macos_archives(self):
+        release = {
+            "assets": [
+                {"name": "sing-box_1.0.0_linux_arm64.tar.gz", "browser_download_url": "https://example/linux"},
+                {"name": "sing-box_1.0.0_darwin_arm64.tar.gz", "browser_download_url": "https://example/sing-arm"},
+                {"name": "sing-box_1.0.0_darwin_amd64.tar.gz", "browser_download_url": "https://example/sing-amd"},
+                {"name": "Xray-linux-64.zip", "browser_download_url": "https://example/xray-linux"},
+                {"name": "Xray-macos-arm64-v8a.zip", "browser_download_url": "https://example/xray-arm"},
+                {"name": "Xray-macos-64.zip", "browser_download_url": "https://example/xray-amd"},
+            ]
+        }
+
+        self.assertEqual(app._pick_sing_box_asset(release, "arm64")["browser_download_url"], "https://example/sing-arm")
+        self.assertEqual(app._pick_sing_box_asset(release, "x86_64")["browser_download_url"], "https://example/sing-amd")
+        self.assertEqual(app._pick_xray_asset(release, "arm64")["browser_download_url"], "https://example/xray-arm")
+        self.assertEqual(app._pick_xray_asset(release, "x86_64")["browser_download_url"], "https://example/xray-amd")
+
     def test_launch_browser_uses_node_profile_and_proxy(self):
         old_work_root = app.WORK_ROOT
         old_runtime_root = app.RUNTIME_ROOT

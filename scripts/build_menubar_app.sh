@@ -12,6 +12,32 @@ ICON_PATH="$ROOT_DIR/macos/ProxyBridgeMenuBar/AppIcon.icns"
 WEB_ICON_PATH="$ROOT_DIR/static/assets/app-icon.png"
 PREVIEW_ICON_PATH="$ROOT_DIR/outputs/ProxyBridgeAppIcon.png"
 ICON_TOOL="$ROOT_DIR/work/generate_app_icon"
+BUNDLE_CORES=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --bundle-cores|--with-cores)
+      BUNDLE_CORES=1
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: scripts/build_menubar_app.sh [--bundle-cores]
+
+默认构建轻量 App,不内置 sing-box/xray。首次运行时会自动下载代理核心到
+~/Library/Application Support/ProxyBridge/proxy-cores。
+
+Options:
+  --bundle-cores, --with-cores  从构建机复制 sing-box/xray 到 App 内部。
+  -h, --help                   显示帮助。
+EOF
+      exit 0
+      ;;
+    *)
+      echo "未知参数：$arg" >&2
+      exit 1
+      ;;
+  esac
+done
 
 mkdir -p "$APP_DIR" "$CONTENTS_DIR" "$MACOS_DIR" "$RESOURCES_DIR" "$BRIDGE_DIR" "$ROOT_DIR/outputs"
 mkdir -p "$ROOT_DIR/static/assets"
@@ -158,7 +184,12 @@ cp "$ROOT_DIR/macos/ProxyBridgeMenuBar/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$ICON_PATH" "$RESOURCES_DIR/AppIcon.icns"
 cp "$ROOT_DIR/app.py" "$BRIDGE_DIR/app.py"
 ditto "$ROOT_DIR/static" "$BRIDGE_DIR/static"
-bundle_proxy_cores
+rm -rf "$CORE_DIR"
+if [[ "$BUNDLE_CORES" == "1" ]]; then
+  bundle_proxy_cores
+else
+  echo "Skipping bundled proxy cores; runtime will auto-download sing-box/xray on first launch."
+fi
 
 chmod +x "$MACOS_DIR/ProxyBridgeMenuBar"
 codesign --force --deep --sign - "$APP_DIR"
