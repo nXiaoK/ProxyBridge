@@ -36,6 +36,7 @@ RUNTIME_ROOT = WORK_ROOT / "runtime"
 STATE_PATH = WORK_ROOT / "state.json"
 DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
+DEFAULT_BROWSER_START_URL = "https://ip.skk.moe/"
 REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
 HTTP_PROXY_HEADER_LIMIT = 65536
@@ -134,10 +135,15 @@ def ensure_dirs() -> None:
     RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
     proxy_core_bin_dir().mkdir(parents=True, exist_ok=True)
     browser_profiles_root().mkdir(parents=True, exist_ok=True)
+    browser_extensions_root().mkdir(parents=True, exist_ok=True)
 
 
 def browser_profiles_root() -> Path:
     return WORK_ROOT / "browser_profiles"
+
+
+def browser_extensions_root() -> Path:
+    return WORK_ROOT / "browser_extensions"
 
 
 def clean_name(value: str | None, fallback: str) -> str:
@@ -254,6 +260,31 @@ REGION_LOCALE_MAP: dict[str, tuple[str, str, str]] = {
 }
 # 无法识别地区时的兜底 locale。
 DEFAULT_LOCALE = ("America/Los_Angeles", "en-US", "en-US,en;q=0.9")
+GOOGLE_SEARCH_PROVIDER = {
+    "enabled": True,
+    "name": "Google",
+    "keyword": "google.com",
+    "search_url": "https://www.google.com/search?q={searchTerms}",
+    "suggest_url": "https://www.google.com/complete/search?output=chrome&q={searchTerms}",
+    "icon_url": "https://www.google.com/favicon.ico",
+    "encoding": "UTF-8",
+}
+GOOGLE_SEARCH_EXTENSION_MANIFEST = {
+    "manifest_version": 3,
+    "name": "ProxyBridge Google Search",
+    "version": "1.0.0",
+    "chrome_settings_overrides": {
+        "search_provider": {
+            "name": "Google",
+            "keyword": "google.com",
+            "search_url": "https://www.google.com/search?q={searchTerms}",
+            "suggest_url": "https://www.google.com/complete/search?output=chrome&q={searchTerms}",
+            "favicon_url": "https://www.google.com/favicon.ico",
+            "encoding": "UTF-8",
+            "is_default": True,
+        }
+    },
+}
 
 
 def region_locale(region: str) -> tuple[str, str, str]:
@@ -267,6 +298,37 @@ def fingerprint_seed(node_id: str) -> int:
     digest = hashlib.sha256(f"fp-seed::{node_id}".encode("utf-8")).digest()
     seed = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
     return seed or 1
+
+
+def configure_browser_profile_defaults(profile_path: Path) -> None:
+    default_dir = profile_path / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    prefs_path = default_dir / "Preferences"
+    prefs: dict[str, Any] = {}
+    if prefs_path.exists():
+        try:
+            with prefs_path.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                prefs = loaded
+        except Exception:
+            prefs = {}
+    prefs["default_search_provider"] = dict(GOOGLE_SEARCH_PROVIDER)
+    tmp = prefs_path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(prefs, f, ensure_ascii=False, indent=2)
+    tmp.replace(prefs_path)
+
+
+def ensure_google_search_extension() -> Path:
+    extension_dir = browser_extensions_root() / "google_search"
+    extension_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = extension_dir / "manifest.json"
+    tmp = manifest_path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(GOOGLE_SEARCH_EXTENSION_MANIFEST, f, ensure_ascii=False, indent=2)
+    tmp.replace(manifest_path)
+    return extension_dir
 
 
 def guess_transport(params: dict[str, str], fallback: str = "") -> str:
@@ -1233,6 +1295,21 @@ def active_bridge_for_node(state: dict[str, Any], node_id: str) -> dict[str, Any
     )
 
 
+def remembered_port_for_node(state: dict[str, Any], node_id: str) -> int | None:
+    bridges = [
+        bridge
+        for bridge in state.get("bridges", [])
+        if bridge.get("node_id") == node_id and safe_int(bridge.get("port"), 0) > 0
+    ]
+    bridges.sort(
+        key=lambda bridge: max(safe_int(bridge.get("started_at"), 0), safe_int(bridge.get("stopped_at"), 0)),
+        reverse=True,
+    )
+    if not bridges:
+        return None
+    return safe_int(bridges[0].get("port"), 0) or None
+
+
 def is_port_free(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1511,7 +1588,8 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
         core = node.get("preferred_core") if requested_core == "auto" else requested_core
         if core not in {"sing-box", "xray"}:
             raise ValueError("核心只能是 sing-box、xray 或 auto")
-        local_port = next_free_port(requested_port)
+        preferred_port = requested_port or remembered_port_for_node(state, node_id)
+        local_port = next_free_port(preferred_port)
         core_port = next_free_port(max(local_port + 1000, 23080))
         bridge_id = stable_id(node_id, str(local_port), core)
         config = generate_config(core, node, core_port)
@@ -1611,7 +1689,10 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("当前节点没有可用的本地代理端口")
 
     profile_path = browser_profiles_root() / stable_id(node_id)
+    first_profile_launch = not profile_path.exists()
     profile_path.mkdir(parents=True, exist_ok=True)
+    configure_browser_profile_defaults(profile_path)
+    search_extension_path = ensure_google_search_extension()
     proxy = f"socks5://127.0.0.1:{local_port}"
 
     # 每个节点派生固定指纹种子,并按地区匹配时区/语言,使指纹与代理出口地区一致。
@@ -1634,9 +1715,10 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--no-first-run",
         "--no-default-browser-check",
+        f"--load-extension={search_extension_path}",
         f"--proxy-server={proxy}",
         "--new-window",
-        "about:blank",
+        DEFAULT_BROWSER_START_URL if first_profile_launch else "about:blank",
     ]
     process = subprocess.Popen(
         command,
@@ -1689,12 +1771,7 @@ def active_browser_node_ids() -> list[str]:
     return [node_id for node_id in node_ids if prune_browser_processes(node_id)]
 
 
-def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
-    # 停止某节点的指纹浏览器:先结束全部浏览器进程组,再停止该节点对应的本地代理桥接。
-    node_id = str(payload.get("node_id") or "")
-    if not node_id:
-        raise ValueError("缺少节点 ID")
-
+def stop_browser_processes_for_node(node_id: str) -> int:
     with PROCESS_LOCK:
         procs = BROWSER_TABLE.pop(node_id, [])
     killed = 0
@@ -1703,23 +1780,21 @@ def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
             # 浏览器以 start_new_session 启动,终结整个进程组以带走全部子进程。
             terminate_process(process)
             killed += 1
+    return killed
 
-    # 同步停止该节点当前活跃的本地代理桥接(浏览器与代理成对出现,一起关闭)。
-    stopped_bridges: list[str] = []
-    with STATE_LOCK:
-        state = load_state()
-        if sync_process_status(state):
-            save_state(state)
-        bridge = active_bridge_for_node(state, node_id)
-    if bridge and bridge.get("id"):
-        stop_bridge(str(bridge["id"]))
-        stopped_bridges.append(str(bridge["id"]))
 
+def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    # 停止某节点的指纹浏览器:只结束浏览器进程组,保留该节点已启用的本地代理端口。
+    node_id = str(payload.get("node_id") or "")
+    if not node_id:
+        raise ValueError("缺少节点 ID")
+
+    killed = stop_browser_processes_for_node(node_id)
     return {
         "ok": True,
         "node_id": node_id,
         "killed_browsers": killed,
-        "stopped_bridges": stopped_bridges,
+        "stopped_bridges": [],
     }
 
 
@@ -2469,11 +2544,23 @@ class Socks5LogProxy:
 
     def _relay(self, client: socket.socket, upstream: socket.socket) -> dict[str, int]:
         counters = {"upload": 0, "download": 0}
+        relay_done = threading.Event()
+
+        def shutdown_pair() -> None:
+            for sock in (client, upstream):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
         def pump(src: socket.socket, dst: socket.socket, key: str) -> None:
             try:
-                while True:
-                    data = src.recv(65536)
+                src.settimeout(1.0)
+                while not relay_done.is_set() and not self._stop.is_set():
+                    try:
+                        data = src.recv(65536)
+                    except socket.timeout:
+                        continue
                     if not data:
                         break
                     dst.sendall(data)
@@ -2481,10 +2568,8 @@ class Socks5LogProxy:
             except OSError:
                 pass
             finally:
-                try:
-                    dst.shutdown(socket.SHUT_WR)
-                except OSError:
-                    pass
+                relay_done.set()
+                shutdown_pair()
 
         upload = threading.Thread(target=pump, args=(client, upstream, "upload"), daemon=True)
         download = threading.Thread(target=pump, args=(upstream, client, "download"), daemon=True)
@@ -2630,8 +2715,14 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
 
 def stop_bridge(bridge_id: str) -> dict[str, Any]:
     with STATE_LOCK:
-        traffic = stop_process(bridge_id)
         state = load_state()
+        bridge_node_id = ""
+        for bridge in state["bridges"]:
+            if bridge.get("id") == bridge_id:
+                bridge_node_id = str(bridge.get("node_id") or "")
+                break
+        killed_browsers = stop_browser_processes_for_node(bridge_node_id) if bridge_node_id else 0
+        traffic = stop_process(bridge_id)
         for bridge in state["bridges"]:
             if bridge.get("id") == bridge_id:
                 bridge["status"] = "stopped"
@@ -2641,11 +2732,14 @@ def stop_bridge(bridge_id: str) -> dict[str, Any]:
                 bridge.update(traffic)
                 bridge.pop("error", None)
         save_state(state)
-    return {"ok": True}
+    return {"ok": True, "killed_browsers": killed_browsers}
 
 
 def stop_all_bridges() -> dict[str, Any]:
     with STATE_LOCK:
+        with PROCESS_LOCK:
+            browser_node_ids = list(BROWSER_TABLE.keys())
+        killed_browsers = sum(stop_browser_processes_for_node(node_id) for node_id in browser_node_ids)
         with PROCESS_LOCK:
             bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
         traffic_by_bridge = {}
@@ -2661,7 +2755,7 @@ def stop_all_bridges() -> dict[str, Any]:
                 bridge.update(traffic_by_bridge[bridge.get("id")])
             bridge.pop("error", None)
         save_state(state)
-    return {"ok": True}
+    return {"ok": True, "killed_browsers": killed_browsers}
 
 
 def apply_updates(target: dict[str, Any], updates: dict[str, Any]) -> bool:

@@ -217,6 +217,21 @@ class ParserTests(unittest.TestCase):
                 profile_path = Path(profile_arg.split("=", 1)[1])
                 self.assertTrue(profile_path.is_dir())
                 self.assertEqual(profile_path.parent, app.browser_profiles_root())
+                self.assertEqual(command[-1], "https://ip.skk.moe/")
+                prefs_path = profile_path / "Default" / "Preferences"
+                prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+                provider = prefs["default_search_provider"]
+                self.assertTrue(provider["enabled"])
+                self.assertEqual(provider["name"], "Google")
+                self.assertEqual(provider["search_url"], "https://www.google.com/search?q={searchTerms}")
+                load_extension_args = [arg for arg in command if arg.startswith("--load-extension=")]
+                self.assertEqual(len(load_extension_args), 1)
+                extension_path = Path(load_extension_args[0].split("=", 1)[1])
+                manifest = json.loads((extension_path / "manifest.json").read_text(encoding="utf-8"))
+                search_provider = manifest["chrome_settings_overrides"]["search_provider"]
+                self.assertEqual(search_provider["name"], "Google")
+                self.assertEqual(search_provider["search_url"], "https://www.google.com/search?q={searchTerms}")
+                self.assertTrue(search_provider["is_default"])
         finally:
             app.WORK_ROOT = old_work_root
             app.RUNTIME_ROOT = old_runtime_root
@@ -231,6 +246,338 @@ class ParserTests(unittest.TestCase):
                 os.environ.pop("PROXY_BRIDGE_FP_CHROMIUM", None)
             else:
                 os.environ["PROXY_BRIDGE_FP_CHROMIUM"] = old_fp_kernel
+
+    def test_stop_browser_keeps_active_socks_bridge_running(self):
+        old_work_root = app.WORK_ROOT
+        old_runtime_root = app.RUNTIME_ROOT
+        old_state_path = app.STATE_PATH
+        old_browser_table = {key: list(value) for key, value in app.BROWSER_TABLE.items()}
+        old_process_table = dict(app.PROCESS_TABLE)
+        old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
+        old_terminate_process = app.terminate_process
+        old_wait_for_port = app.wait_for_port
+
+        class FakeProcess:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def poll(self) -> None:
+                return None
+
+        class FakeProxy:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+            def is_alive(self) -> bool:
+                return not self.stopped
+
+        killed_pids: list[int] = []
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.RUNTIME_ROOT = Path(temp_dir) / "runtime"
+                app.STATE_PATH = Path(temp_dir) / "state.json"
+                app.ensure_dirs()
+                node_id = "node-browser-stop"
+                bridge_id = "bridge-browser-stop"
+                app.STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "subscriptions": [],
+                            "nodes": [
+                                {
+                                    "id": node_id,
+                                    "name": "Browser Stop Node",
+                                    "protocol": "socks",
+                                    "server": "127.0.0.1",
+                                    "port": 1,
+                                    "region": "本地",
+                                    "source": "test",
+                                    "raw": "",
+                                    "settings": {},
+                                    "tags": [],
+                                    "transport": "tcp",
+                                    "security": "",
+                                    "preferred_core": "sing-box",
+                                }
+                            ],
+                            "bridges": [
+                                {
+                                    "id": bridge_id,
+                                    "node_id": node_id,
+                                    "node_name": "Browser Stop Node",
+                                    "core": "sing-box",
+                                    "status": "running",
+                                    "enabled": True,
+                                    "port": 25180,
+                                    "pid": 5151,
+                                    "started_at": 10,
+                                }
+                            ],
+                            "tests": {},
+                            "request_logs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                app.BROWSER_TABLE.clear()
+                app.BROWSER_TABLE[node_id] = [FakeProcess(6161)]
+                app.PROCESS_TABLE.clear()
+                app.PROCESS_TABLE[bridge_id] = FakeProcess(5151)
+                app.LOG_PROXY_TABLE.clear()
+                app.LOG_PROXY_TABLE[bridge_id] = FakeProxy()
+                app.terminate_process = lambda process: killed_pids.append(process.pid)
+                app.wait_for_port = lambda port, timeout=2.0: True
+
+                result = app.stop_browser({"node_id": node_id})
+                state = app.load_state()
+                bridge = state["bridges"][0]
+
+                self.assertEqual(result["killed_browsers"], 1)
+                self.assertEqual(result["stopped_bridges"], [])
+                self.assertEqual(killed_pids, [6161])
+                self.assertEqual(bridge["status"], "running")
+                self.assertTrue(bridge["enabled"])
+                self.assertEqual(bridge["pid"], 5151)
+        finally:
+            app.WORK_ROOT = old_work_root
+            app.RUNTIME_ROOT = old_runtime_root
+            app.STATE_PATH = old_state_path
+            app.terminate_process = old_terminate_process
+            app.wait_for_port = old_wait_for_port
+            app.BROWSER_TABLE.clear()
+            app.BROWSER_TABLE.update(old_browser_table)
+            app.PROCESS_TABLE.clear()
+            app.PROCESS_TABLE.update(old_process_table)
+            app.LOG_PROXY_TABLE.clear()
+            app.LOG_PROXY_TABLE.update(old_log_proxy_table)
+
+    def test_stop_bridge_stops_browser_for_same_node(self):
+        old_work_root = app.WORK_ROOT
+        old_runtime_root = app.RUNTIME_ROOT
+        old_state_path = app.STATE_PATH
+        old_browser_table = {key: list(value) for key, value in app.BROWSER_TABLE.items()}
+        old_process_table = dict(app.PROCESS_TABLE)
+        old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
+        old_traffic_table = dict(app.TRAFFIC_TABLE)
+        old_terminate_process = app.terminate_process
+
+        class FakeProcess:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def poll(self) -> None:
+                return None
+
+        class FakeProxy:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+            def is_alive(self) -> bool:
+                return not self.stopped
+
+        killed_pids: list[int] = []
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.RUNTIME_ROOT = Path(temp_dir) / "runtime"
+                app.STATE_PATH = Path(temp_dir) / "state.json"
+                app.ensure_dirs()
+                node_id = "node-stop-bridge"
+                bridge_id = "bridge-stop-bridge"
+                app.STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "subscriptions": [],
+                            "nodes": [
+                                {
+                                    "id": node_id,
+                                    "name": "Stop Bridge Node",
+                                    "protocol": "socks",
+                                    "server": "127.0.0.1",
+                                    "port": 1,
+                                    "region": "本地",
+                                    "source": "test",
+                                    "raw": "",
+                                    "settings": {},
+                                    "tags": [],
+                                    "transport": "tcp",
+                                    "security": "",
+                                    "preferred_core": "sing-box",
+                                }
+                            ],
+                            "bridges": [
+                                {
+                                    "id": bridge_id,
+                                    "node_id": node_id,
+                                    "node_name": "Stop Bridge Node",
+                                    "core": "sing-box",
+                                    "status": "running",
+                                    "enabled": True,
+                                    "port": 25280,
+                                    "pid": 5252,
+                                    "started_at": 10,
+                                }
+                            ],
+                            "tests": {},
+                            "request_logs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                app.BROWSER_TABLE.clear()
+                app.BROWSER_TABLE[node_id] = [FakeProcess(6262)]
+                app.PROCESS_TABLE.clear()
+                app.PROCESS_TABLE[bridge_id] = FakeProcess(5252)
+                app.LOG_PROXY_TABLE.clear()
+                app.LOG_PROXY_TABLE[bridge_id] = FakeProxy()
+                app.TRAFFIC_TABLE.clear()
+                app.init_bridge_traffic(bridge_id)
+                app.terminate_process = lambda process: killed_pids.append(process.pid)
+
+                result = app.stop_bridge(bridge_id)
+                state = app.load_state()
+                bridge = state["bridges"][0]
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["killed_browsers"], 1)
+                self.assertEqual(killed_pids, [6262, 5252])
+                self.assertNotIn(node_id, app.BROWSER_TABLE)
+                self.assertEqual(bridge["status"], "stopped")
+                self.assertFalse(bridge["enabled"])
+                self.assertIsNone(bridge["pid"])
+        finally:
+            app.WORK_ROOT = old_work_root
+            app.RUNTIME_ROOT = old_runtime_root
+            app.STATE_PATH = old_state_path
+            app.terminate_process = old_terminate_process
+            app.BROWSER_TABLE.clear()
+            app.BROWSER_TABLE.update(old_browser_table)
+            app.PROCESS_TABLE.clear()
+            app.PROCESS_TABLE.update(old_process_table)
+            app.LOG_PROXY_TABLE.clear()
+            app.LOG_PROXY_TABLE.update(old_log_proxy_table)
+            app.TRAFFIC_TABLE.clear()
+            app.TRAFFIC_TABLE.update(old_traffic_table)
+
+    def test_stop_all_bridges_stops_all_associated_browsers(self):
+        old_work_root = app.WORK_ROOT
+        old_runtime_root = app.RUNTIME_ROOT
+        old_state_path = app.STATE_PATH
+        old_browser_table = {key: list(value) for key, value in app.BROWSER_TABLE.items()}
+        old_process_table = dict(app.PROCESS_TABLE)
+        old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
+        old_traffic_table = dict(app.TRAFFIC_TABLE)
+        old_terminate_process = app.terminate_process
+
+        class FakeProcess:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def poll(self) -> None:
+                return None
+
+        class FakeProxy:
+            def __init__(self) -> None:
+                self.stopped = False
+
+            def stop(self) -> None:
+                self.stopped = True
+
+            def is_alive(self) -> bool:
+                return not self.stopped
+
+        killed_pids: list[int] = []
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.RUNTIME_ROOT = Path(temp_dir) / "runtime"
+                app.STATE_PATH = Path(temp_dir) / "state.json"
+                app.ensure_dirs()
+                node_a = "node-stop-all-a"
+                node_b = "node-stop-all-b"
+                bridge_a = "bridge-stop-all-a"
+                bridge_b = "bridge-stop-all-b"
+                app.STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "subscriptions": [],
+                            "nodes": [],
+                            "bridges": [
+                                {
+                                    "id": bridge_a,
+                                    "node_id": node_a,
+                                    "node_name": "Stop All A",
+                                    "core": "sing-box",
+                                    "status": "running",
+                                    "enabled": True,
+                                    "port": 25380,
+                                    "pid": 5353,
+                                    "started_at": 10,
+                                },
+                                {
+                                    "id": bridge_b,
+                                    "node_id": node_b,
+                                    "node_name": "Stop All B",
+                                    "core": "sing-box",
+                                    "status": "running",
+                                    "enabled": True,
+                                    "port": 25381,
+                                    "pid": 5354,
+                                    "started_at": 11,
+                                },
+                            ],
+                            "tests": {},
+                            "request_logs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                app.BROWSER_TABLE.clear()
+                app.BROWSER_TABLE[node_a] = [FakeProcess(6363)]
+                app.BROWSER_TABLE[node_b] = [FakeProcess(6364)]
+                app.PROCESS_TABLE.clear()
+                app.PROCESS_TABLE[bridge_a] = FakeProcess(5353)
+                app.PROCESS_TABLE[bridge_b] = FakeProcess(5354)
+                app.LOG_PROXY_TABLE.clear()
+                app.LOG_PROXY_TABLE[bridge_a] = FakeProxy()
+                app.LOG_PROXY_TABLE[bridge_b] = FakeProxy()
+                app.TRAFFIC_TABLE.clear()
+                app.init_bridge_traffic(bridge_a)
+                app.init_bridge_traffic(bridge_b)
+                app.terminate_process = lambda process: killed_pids.append(process.pid)
+
+                result = app.stop_all_bridges()
+                state = app.load_state()
+
+                self.assertTrue(result["ok"])
+                self.assertEqual(result["killed_browsers"], 2)
+                self.assertCountEqual(killed_pids, [6363, 6364, 5353, 5354])
+                self.assertEqual(app.BROWSER_TABLE, {})
+                self.assertTrue(all(bridge["status"] == "stopped" for bridge in state["bridges"]))
+                self.assertTrue(all(not bridge["enabled"] for bridge in state["bridges"]))
+        finally:
+            app.WORK_ROOT = old_work_root
+            app.RUNTIME_ROOT = old_runtime_root
+            app.STATE_PATH = old_state_path
+            app.terminate_process = old_terminate_process
+            app.BROWSER_TABLE.clear()
+            app.BROWSER_TABLE.update(old_browser_table)
+            app.PROCESS_TABLE.clear()
+            app.PROCESS_TABLE.update(old_process_table)
+            app.LOG_PROXY_TABLE.clear()
+            app.LOG_PROXY_TABLE.update(old_log_proxy_table)
+            app.TRAFFIC_TABLE.clear()
+            app.TRAFFIC_TABLE.update(old_traffic_table)
 
     def test_load_state_keeps_running_bridges_enabled_for_restore(self):
         old_work_root = app.WORK_ROOT
@@ -414,6 +761,122 @@ class ParserTests(unittest.TestCase):
             app.LOG_PROXY_TABLE.clear()
             app.LOG_PROXY_TABLE.update(old_log_proxy_table)
 
+    def test_start_bridge_reuses_last_node_port_after_stop(self):
+        old_work_root = app.WORK_ROOT
+        old_runtime_root = app.RUNTIME_ROOT
+        old_state_path = app.STATE_PATH
+        old_generate_config = app.generate_config
+        old_core_command = app.core_command
+        old_wait_for_port = app.wait_for_port
+        old_popen = app.subprocess.Popen
+        old_proxy_class = app.Socks5LogProxy
+        old_is_port_free = app.is_port_free
+        old_process_table = dict(app.PROCESS_TABLE)
+        old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
+
+        class FakePopen:
+            def __init__(self, command: list[str], **kwargs: object) -> None:
+                self.pid = 4343
+
+            def poll(self) -> None:
+                return None
+
+        class FakeProxy:
+            def __init__(
+                self,
+                *,
+                bridge_id: str,
+                node_id: str,
+                node_name: str,
+                listen_port: int,
+                upstream_port: int,
+            ) -> None:
+                self.listen_port = listen_port
+                self.started = False
+
+            def start(self) -> None:
+                self.started = True
+
+            def stop(self) -> None:
+                self.started = False
+
+            def is_alive(self) -> bool:
+                return self.started
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.RUNTIME_ROOT = Path(temp_dir) / "runtime"
+                app.STATE_PATH = Path(temp_dir) / "state.json"
+                app.ensure_dirs()
+                node_id = "node-port-memory"
+                remembered_port = 25123
+                app.STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "subscriptions": [],
+                            "nodes": [
+                                {
+                                    "id": node_id,
+                                    "name": "Port Memory",
+                                    "protocol": "socks",
+                                    "server": "127.0.0.1",
+                                    "port": 1,
+                                    "region": "本地",
+                                    "source": "test",
+                                    "raw": "",
+                                    "settings": {},
+                                    "tags": [],
+                                    "transport": "tcp",
+                                    "security": "",
+                                    "preferred_core": "sing-box",
+                                }
+                            ],
+                            "bridges": [
+                                {
+                                    "id": "old-bridge",
+                                    "node_id": node_id,
+                                    "node_name": "Port Memory",
+                                    "core": "sing-box",
+                                    "status": "stopped",
+                                    "enabled": False,
+                                    "port": remembered_port,
+                                    "started_at": 10,
+                                }
+                            ],
+                            "tests": {},
+                            "request_logs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                app.generate_config = lambda core, node, port: {"test": True}
+                app.core_command = lambda core, path: [app.sys.executable, "-c", "pass"]
+                app.wait_for_port = lambda port, timeout=2.0: True
+                app.subprocess.Popen = FakePopen
+                app.Socks5LogProxy = FakeProxy
+                app.is_port_free = lambda port: True
+
+                bridge = app.start_bridge({"node_id": node_id, "core": "auto"})
+
+                self.assertEqual(bridge["port"], remembered_port)
+                self.assertEqual(bridge["socks_url"], f"socks5://127.0.0.1:{remembered_port}")
+                self.assertEqual(bridge["http_url"], f"http://127.0.0.1:{remembered_port}")
+        finally:
+            app.WORK_ROOT = old_work_root
+            app.RUNTIME_ROOT = old_runtime_root
+            app.STATE_PATH = old_state_path
+            app.generate_config = old_generate_config
+            app.core_command = old_core_command
+            app.wait_for_port = old_wait_for_port
+            app.subprocess.Popen = old_popen
+            app.Socks5LogProxy = old_proxy_class
+            app.is_port_free = old_is_port_free
+            app.PROCESS_TABLE.clear()
+            app.PROCESS_TABLE.update(old_process_table)
+            app.LOG_PROXY_TABLE.clear()
+            app.LOG_PROXY_TABLE.update(old_log_proxy_table)
+
     def test_parse_vless_reality_vision(self):
         raw = (
             "vless://11111111-1111-1111-1111-111111111111@example.com:443"
@@ -588,6 +1051,39 @@ class ParserTests(unittest.TestCase):
             app.update_request_log = old_update
             app.TRAFFIC_TABLE.clear()
             app.TRAFFIC_TABLE.update(old_traffic_table)
+
+    def test_relay_returns_when_one_side_closes_and_peer_stays_open(self):
+        proxy = Socks5LogProxy(
+            bridge_id="bridge-half-close",
+            node_id="node-test",
+            node_name="测试节点",
+            listen_port=1,
+            upstream_port=2,
+        )
+        client_proxy, client_peer = socket.socketpair()
+        upstream_proxy, upstream_peer = socket.socketpair()
+        result: dict[str, dict[str, int]] = {}
+
+        def run_relay() -> None:
+            result["counters"] = proxy._relay(client_proxy, upstream_proxy)
+
+        relay_thread = threading.Thread(target=run_relay, daemon=True)
+        relay_thread.start()
+        try:
+            client_peer.sendall(b"hello")
+            self.assertEqual(read_exact(upstream_peer, 5), b"hello")
+            client_peer.close()
+            relay_thread.join(timeout=0.5)
+            self.assertFalse(relay_thread.is_alive())
+            self.assertEqual(result["counters"]["upload"], 5)
+        finally:
+            proxy._stop.set()
+            for sock in (client_proxy, client_peer, upstream_proxy, upstream_peer):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            relay_thread.join(timeout=1.0)
 
     def test_http_connect_proxy_records_connect(self):
         upstream_port = free_port()

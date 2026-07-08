@@ -402,7 +402,7 @@ function renderNodes() {
               <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="用独立指纹浏览器启动 ${escapeHtml(node.name)}" title="用独立指纹浏览器启动：伪造指纹 + 独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
               ${
                 browserActive
-                  ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器和本地代理" title="结束该节点的指纹浏览器进程，并停止其本地代理">${icon("stop")}<span>停止浏览器</span></button>`
+                  ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器</span></button>`
                   : ""
               }
             </div>
@@ -718,11 +718,11 @@ async function launchBrowser(nodeId) {
   return result;
 }
 
-// 停止某节点的指纹浏览器进程,并一并停止其本地代理。
+// 停止某节点的指纹浏览器进程,保留其本地代理。
 async function stopBrowser(nodeId) {
   const result = await api("/api/browser/stop", { node_id: nodeId });
   await loadStatus();
-  showToast("已停止浏览器和本地代理");
+  showToast("已停止浏览器，SOCKS5 端口保持运行");
   return result;
 }
 
@@ -765,14 +765,14 @@ async function handleAction(event) {
     } else if (action === "copy") {
       await copyText(button.dataset.text);
     } else if (action === "stop") {
-      await api("/api/bridges/stop", { id: button.dataset.id });
+      const result = await api("/api/bridges/stop", { id: button.dataset.id });
       await loadStatus();
-      showToast("已停止");
+      showToast(result.killed_browsers ? "已停止端口，关联浏览器已关闭" : "已停止端口");
     } else if (action === "restart") {
-      await api("/api/bridges/stop", { id: button.dataset.id });
+      const stopped = await api("/api/bridges/stop", { id: button.dataset.id });
       await api("/api/bridges/start", { node_id: button.dataset.node, core: "auto" });
       await loadStatus();
-      showToast("已重启服务");
+      showToast(stopped.killed_browsers ? "已重启服务，关联浏览器已关闭" : "已重启服务");
     } else if (action === "refresh-sub") {
       await api("/api/subscriptions/refresh", { id: button.dataset.id });
       await loadStatus();
@@ -869,9 +869,9 @@ function bindEvents() {
   });
   $("#stopAll").addEventListener("click", async () => {
     try {
-      await api("/api/bridges/stop-all", {});
+      const result = await api("/api/bridges/stop-all", {});
       await loadStatus();
-      showToast("已停止全部端口");
+      showToast(result.killed_browsers ? "已停止全部端口，关联浏览器已关闭" : "已停止全部端口");
     } catch (error) {
       showToast(error.message, "error");
     }
