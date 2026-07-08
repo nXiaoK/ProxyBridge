@@ -8,6 +8,7 @@ const appState = {
   bridges: [],
   tests: {},
   requestLogs: [],
+  activeView: "nodes",
   filters: {
     protocol: "all",
     region: "all",
@@ -22,6 +23,38 @@ const appState = {
 
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
+
+// 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
+const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs"];
+
+// 切换当前视图:高亮对应侧边栏项、显示对应内容区,并记住上次选择。
+function setActiveView(view) {
+  if (!VIEW_IDS.includes(view)) view = "nodes";
+  appState.activeView = view;
+  try { localStorage.setItem("pb-view", view); } catch (e) {}
+  document.querySelectorAll(".nav-item").forEach((item) => {
+    item.setAttribute("aria-current", item.dataset.view === view ? "true" : "false");
+  });
+  document.querySelectorAll(".view").forEach((section) => {
+    section.hidden = section.dataset.view !== view;
+  });
+}
+
+// 更新单个侧边栏计数徽标;为 0 时通过 data-zero 隐藏,避免视觉噪音。
+function setNavCount(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = String(value);
+  el.dataset.zero = value ? "false" : "true";
+}
+
+// 刷新四个视图的侧边栏计数徽标。
+function renderNav() {
+  setNavCount("navCountNodes", appState.nodes.length);
+  setNavCount("navCountSubs", appState.subscriptions.length);
+  setNavCount("navCountBridges", runningBridges().length);
+  setNavCount("navCountLogs", (appState.requestLogs || []).length);
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -151,6 +184,7 @@ async function loadStatus() {
 }
 
 function render() {
+  renderNav();
   renderCores();
   renderSubscriptions();
   renderFilters();
@@ -178,6 +212,8 @@ function renderCores() {
 
 function renderSubscriptions() {
   const list = $("#subscriptionList");
+  const count = $("#subsCount");
+  if (count) count.textContent = `${appState.subscriptions.length} 个订阅`;
   if (!appState.subscriptions.length) {
     list.innerHTML = '<div class="subscription-empty">暂无订阅，粘贴订阅 URL 或原始链接后即可导入。</div>';
     return;
@@ -370,28 +406,22 @@ function renderNodes() {
 function renderBridges() {
   const list = $("#bridgeList");
   const bridges = runningBridges();
+  const count = $("#bridgesCount");
+  if (count) count.textContent = `${bridges.length} 个运行中`;
   $("#stopAll").disabled = bridges.length === 0;
 
   if (!bridges.length) {
     list.innerHTML = `
-      <div class="bridge-dashboard is-idle">
-        <div class="bridge-hero">
-          <div class="status-orb idle">${icon("minus")}</div>
-          <div class="bridge-state">
-            <strong>未运行</strong>
-            <span>启动一个节点后，它会在这里显示为一张独立的端口卡片</span>
-          </div>
-        </div>
-        <div class="help-card">
-          <strong>使用说明</strong>
-          <span>启动节点后，把复制出来的 socks5:// 地址填入需要代理的软件。多个节点同时运行时，每个都会拥有独立的本地端口。</span>
-        </div>
+      <div class="bridge-empty">
+        <div class="status-orb idle">${icon("minus")}</div>
+        <strong>暂无运行中的 SOCKS5</strong>
+        <span>在「节点」里启动一个节点后，它会在这里显示为一张独立的端口卡片。把复制出来的 socks5:// 地址填入需要代理的软件即可，多个节点同时运行时每个都拥有独立的本地端口。</span>
       </div>
     `;
     return;
   }
 
-  const cards = bridges.map((bridge) => {
+  list.innerHTML = bridges.map((bridge) => {
     const endpoint = endpointParts(bridge.socks_url, bridge.port);
     const uploadBytes = Number(bridge.upload_bytes || 0);
     const downloadBytes = Number(bridge.download_bytes || 0);
@@ -451,15 +481,6 @@ function renderBridges() {
       </article>
     `;
   }).join("");
-
-  list.innerHTML = `
-    <div class="bridge-dashboard">
-      <div class="bridge-summary">
-        <span class="bridge-count"><strong>${bridges.length}</strong> 个本地 SOCKS5 正在运行</span>
-      </div>
-      <div class="bridge-cards">${cards}</div>
-    </div>
-  `;
 }
 
 function renderRequestLogs() {
@@ -726,6 +747,10 @@ async function handleImport(event) {
 }
 
 function bindEvents() {
+  // 侧边栏导航:点击切换视图。
+  document.querySelectorAll(".nav-item").forEach((item) => {
+    item.addEventListener("click", () => setActiveView(item.dataset.view));
+  });
   $("#importForm").addEventListener("submit", handleImport);
   document.addEventListener("click", handleAction);
   $("#refreshStatus").addEventListener("click", async () => {
@@ -811,5 +836,7 @@ function bindEvents() {
 }
 
 bindEvents();
+// 初始视图:优先使用上次记忆的选择(在 <html> 上的 data-initial-view)。
+setActiveView(document.documentElement.getAttribute("data-initial-view") || "nodes");
 loadStatus().catch((error) => showToast(error.message, "error"));
 window.setInterval(() => loadStatus().catch(() => {}), 3500);
