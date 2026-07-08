@@ -315,6 +315,7 @@ function filteredRequestLogs() {
       statusLabel(entry.status),
       entry.message,
       entry.command,
+      entry.proxy_protocol,
     ].some((value) => String(value || "").toLowerCase().includes(search));
   });
 }
@@ -394,13 +395,14 @@ function renderNodes() {
             <div class="row-actions">
               ${
                 bridge
-                  ? `<button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}">${icon("copy")}<span>复制</span></button>`
+                  ? `<button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}">${icon("copy")}<span>SOCKS</span></button>
+                    <button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.http_url || bridge.socks_url)}">${icon("copy")}<span>HTTP</span></button>`
                   : `<button class="row-button primary-row" data-action="start" data-node="${escapeHtml(node.id)}">${icon("play")}<span>启动并复制</span></button>`
               }
-              <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="用独立指纹浏览器启动 ${escapeHtml(node.name)}" title="用独立指纹浏览器启动：伪造指纹 + 独立 Profile + 绑定该节点 SOCKS5">${icon("browser")}<span>浏览器</span></button>
+              <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="用独立指纹浏览器启动 ${escapeHtml(node.name)}" title="用独立指纹浏览器启动：伪造指纹 + 独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
               ${
                 browserActive
-                  ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器和 SOCKS5" title="结束该节点的指纹浏览器进程，并停止其 SOCKS5">${icon("stop")}<span>停止浏览器</span></button>`
+                  ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器和本地代理" title="结束该节点的指纹浏览器进程，并停止其本地代理">${icon("stop")}<span>停止浏览器</span></button>`
                   : ""
               }
             </div>
@@ -422,8 +424,8 @@ function renderBridges() {
     list.innerHTML = `
       <div class="bridge-empty">
         <div class="status-orb idle">${icon("minus")}</div>
-        <strong>暂无运行中的 SOCKS5</strong>
-        <span>在「节点」里启动一个节点后，它会在这里显示为一张独立的端口卡片。把复制出来的 socks5:// 地址填入需要代理的软件即可，多个节点同时运行时每个都拥有独立的本地端口。</span>
+        <strong>暂无运行中的本地代理</strong>
+        <span>在「节点」里启动一个节点后，它会在这里显示为一张独立的端口卡片。同一端口同时支持 SOCKS5、HTTP 代理和 HTTPS CONNECT。</span>
       </div>
     `;
     return;
@@ -431,6 +433,7 @@ function renderBridges() {
 
   list.innerHTML = bridges.map((bridge) => {
     const endpoint = endpointParts(bridge.socks_url, bridge.port);
+    const httpUrl = bridge.http_url || `http://127.0.0.1:${bridge.port}`;
     const uploadBytes = Number(bridge.upload_bytes || 0);
     const downloadBytes = Number(bridge.download_bytes || 0);
     const totalBytes = Number(bridge.total_bytes || uploadBytes + downloadBytes);
@@ -446,7 +449,7 @@ function renderBridges() {
             <div class="bridge-meta">${escapeHtml(bridge.region || "-")} · ${escapeHtml(bridge.protocol || "-")} · ${escapeHtml(bridge.core || "-")}</div>
           </div>
         </header>
-        <div class="traffic-strip" aria-label="SOCKS5 流量统计">
+        <div class="traffic-strip" aria-label="本地代理流量统计">
           <div class="traffic-metric">
             <span class="traffic-label">上行</span>
             <strong class="traffic-value">${escapeHtml(formatBytes(uploadBytes))}</strong>
@@ -473,13 +476,21 @@ function renderBridges() {
               <span class="endpoint-label">监听地址</span>
               <span class="endpoint-value">${escapeHtml(endpoint.address)}</span>
             </div>
-            <button class="row-button copy-icon" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}" aria-label="复制 SOCKS5 地址" title="复制 SOCKS5 地址">${icon("copy")}</button>
+            <button class="row-button copy-icon" data-action="copy" data-text="${escapeHtml(endpoint.address)}" aria-label="复制监听地址" title="复制监听地址">${icon("copy")}</button>
           </div>
           <div class="endpoint-row endpoint-url">
             <div>
               <span class="endpoint-label">SOCKS5 URL</span>
               <span class="endpoint-value mono" title="${escapeHtml(bridge.socks_url)}">${escapeHtml(bridge.socks_url)}</span>
             </div>
+            <button class="row-button copy-icon" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}" aria-label="复制 SOCKS5 地址" title="复制 SOCKS5 地址">${icon("copy")}</button>
+          </div>
+          <div class="endpoint-row endpoint-url">
+            <div>
+              <span class="endpoint-label">HTTP / HTTPS 代理 URL</span>
+              <span class="endpoint-value mono" title="${escapeHtml(httpUrl)}">${escapeHtml(httpUrl)}</span>
+            </div>
+            <button class="row-button copy-icon" data-action="copy" data-text="${escapeHtml(httpUrl)}" aria-label="复制 HTTP/HTTPS 代理地址" title="复制 HTTP/HTTPS 代理地址">${icon("copy")}</button>
           </div>
         </div>
         <div class="bridge-actions">
@@ -511,12 +522,16 @@ function renderRequestLogs() {
       const download = formatBytes(entry.download_bytes);
       const duration = entry.duration_ms == null ? "-" : `${entry.duration_ms} ms`;
       const target = entry.target || `${entry.target_host || "-"}:${entry.target_port || "-"}`;
+      const protocol = entry.proxy_protocol ? String(entry.proxy_protocol).toUpperCase() : "";
+      const command = entry.command ? String(entry.command).toUpperCase() : "";
+      const meta = [protocol, command].filter(Boolean).join(" · ");
       return `
         <tr>
           <td><span class="mono">${escapeHtml(formatLogTime(entry.started_at))}</span></td>
           <td>
             <div class="log-target">
               <span>${escapeHtml(target)}</span>
+              ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
               ${entry.message ? `<small>${escapeHtml(entry.message)}</small>` : ""}
             </div>
           </td>
@@ -703,11 +718,11 @@ async function launchBrowser(nodeId) {
   return result;
 }
 
-// 停止某节点的指纹浏览器进程,并一并停止其 SOCKS5。
+// 停止某节点的指纹浏览器进程,并一并停止其本地代理。
 async function stopBrowser(nodeId) {
   const result = await api("/api/browser/stop", { node_id: nodeId });
   await loadStatus();
-  showToast("已停止浏览器和 SOCKS5");
+  showToast("已停止浏览器和本地代理");
   return result;
 }
 

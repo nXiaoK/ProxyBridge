@@ -34,7 +34,7 @@
           </div>
           <div class="brand-text">
             <strong>Proxy Bridge</strong>
-            <span>订阅节点 · 本地 SOCKS5</span>
+            <span>订阅节点 · 本地代理</span>
           </div>
         </div>
 
@@ -52,7 +52,7 @@
           </button>
           <button class="nav-item" type="button" data-view="bridges">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 11V7a6 6 0 0 1 12 0v4"/><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M12 15v2"/></svg>
-            <span class="nav-label">本地 SOCKS5</span>
+            <span class="nav-label">本地代理</span>
             <span class="nav-count" id="navCountBridges">0</span>
           </button>
           <button class="nav-item" type="button" data-view="logs">
@@ -176,11 +176,11 @@
           </div>
         </section>
 
-        <!-- ---------- 本地 SOCKS5 视图 ---------- -->
+        <!-- ---------- 本地代理视图 ---------- -->
         <section class="view" data-view="bridges" aria-labelledby="bridgesTitle" hidden>
           <header class="view-toolbar">
             <div class="view-heading">
-              <h1 id="bridgesTitle">本地 SOCKS5</h1>
+              <h1 id="bridgesTitle">本地代理</h1>
               <span class="countline" id="bridgesCount">0 个运行中</span>
             </div>
             <div class="toolbar-controls">
@@ -229,7 +229,7 @@
             </div>
           </header>
           <div class="view-body">
-            <p class="view-hint">显示通过本地 SOCKS5 的 CONNECT 目标、节点、流量和耗时。</p>
+            <p class="view-hint">显示通过本地代理的 CONNECT/HTTP 目标、节点、流量和耗时。</p>
             <div class="log-table-shell">
               <table class="log-table">
                 <thead>
@@ -277,7 +277,7 @@
             </div>
           </header>
           <div class="view-body">
-            <p class="view-hint">记录软件运行中的关键事件(启动、订阅、SOCKS5 启停、测试、报错等),用于排查使用问题。</p>
+            <p class="view-hint">记录软件运行中的关键事件(启动、订阅、本地代理启停、测试、报错等),用于排查使用问题。</p>
             <div class="log-table-shell">
               <table class="log-table system-log-table">
                 <thead>

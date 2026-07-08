@@ -35,6 +35,7 @@ DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
 REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
+HTTP_PROXY_HEADER_LIMIT = 65536
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
@@ -54,7 +55,7 @@ FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
 FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
 
 # 系统日志:App 自身运行事件的内存环形缓冲区,用于在控制台「系统日志」视图里
-# 排查软件使用中的问题(启动、订阅导入、SOCKS5 启停、测试、报错等)。
+# 排查软件使用中的问题(启动、订阅导入、本地代理启停、测试、报错等)。
 # 与「连接日志」(per-connection)、「核心日志」(sing-box/xray 输出)是三条独立的日志线。
 SYSTEM_LOGS: "collections.deque[dict[str, Any]]" = collections.deque(maxlen=SYSTEM_LOG_LIMIT)
 SYSTEM_LOG_LOCK = threading.RLock()
@@ -667,6 +668,8 @@ def load_state(reset_running: bool = False) -> dict[str, Any]:
             bridge["enabled"] = bool(bridge.get("enabled"))
         if bridge.get("port") and not bridge.get("socks_url"):
             bridge["socks_url"] = f"socks5://127.0.0.1:{bridge.get('port')}"
+        if bridge.get("port") and not bridge.get("http_url"):
+            bridge["http_url"] = f"http://127.0.0.1:{bridge.get('port')}"
         traffic = traffic_defaults(bridge.get("upload_bytes"), bridge.get("download_bytes"))
         bridge.update(traffic)
     if reset_running:
@@ -1260,7 +1263,7 @@ def terminate_process(process: subprocess.Popen) -> None:
 
 def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
     if SHUTTING_DOWN.is_set():
-        raise RuntimeError("程序正在退出，不能启动新的 SOCKS5")
+        raise RuntimeError("程序正在退出，不能启动新的本地代理")
     node_id = str(payload.get("node_id") or "")
     requested_port = safe_int(payload.get("port"), 0) or None
     requested_core = str(payload.get("core") or "auto")
@@ -1329,6 +1332,8 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
             "port": local_port,
             "core_port": core_port,
             "socks_url": f"socks5://127.0.0.1:{local_port}",
+            "http_url": f"http://127.0.0.1:{local_port}",
+            "supported_proxy_protocols": ["socks5", "http", "https-connect"],
             "status": "running" if started else "starting",
             "enabled": True,
             "pid": process.pid,
@@ -1368,7 +1373,7 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
 
     local_port = safe_int(bridge.get("port"), 0)
     if local_port <= 0:
-        raise RuntimeError("当前节点没有可用的 SOCKS5 端口")
+        raise RuntimeError("当前节点没有可用的本地代理端口")
 
     profile_path = browser_profiles_root() / stable_id(node_id)
     profile_path.mkdir(parents=True, exist_ok=True)
@@ -1423,7 +1428,7 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         "region": region,
         "timezone": timezone,
         "language": language,
-        "isolation": "fingerprint-chromium 底层指纹伪造 + 独立 Profile + 节点 SOCKS5 代理",
+        "isolation": "fingerprint-chromium 底层指纹伪造 + 独立 Profile + 节点本地代理",
         "fingerprint_note": (
             "已按节点派生独立指纹(Canvas/WebGL/Audio/字体/屏幕/硬件并发/设备内存/Client Hints),"
             "时区与语言按节点地区匹配,并已禁止 WebRTC 非代理 UDP。"
@@ -1450,7 +1455,7 @@ def active_browser_node_ids() -> list[str]:
 
 
 def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
-    # 停止某节点的指纹浏览器:先结束全部浏览器进程组,再停止该节点对应的 SOCKS5 桥接。
+    # 停止某节点的指纹浏览器:先结束全部浏览器进程组,再停止该节点对应的本地代理桥接。
     node_id = str(payload.get("node_id") or "")
     if not node_id:
         raise ValueError("缺少节点 ID")
@@ -1464,7 +1469,7 @@ def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
             terminate_process(process)
             killed += 1
 
-    # 同步停止该节点当前活跃的 SOCKS5 桥接(浏览器与代理成对出现,一起关闭)。
+    # 同步停止该节点当前活跃的本地代理桥接(浏览器与代理成对出现,一起关闭)。
     stopped_bridges: list[str] = []
     with STATE_LOCK:
         state = load_state()
@@ -1733,7 +1738,7 @@ def restore_enabled_bridges() -> None:
                     state = load_state()
                     state["bridges"] = [b for b in state.get("bridges", []) if b.get("id") != previous_id]
                     save_state(state)
-            log_event(f"已恢复 SOCKS5:{restored.get('node_name')} → {restored.get('socks_url')}", category="SOCKS5")
+            log_event(f"已恢复本地代理:{restored.get('node_name')} → {restored.get('socks_url')}", category="代理")
         except Exception as exc:
             with STATE_LOCK:
                 state = load_state()
@@ -1746,7 +1751,7 @@ def restore_enabled_bridges() -> None:
                         bridge["pid"] = None
                         bridge["error"] = str(exc)
                 save_state(state)
-            log_event(f"恢复 SOCKS5 失败:{previous.get('node_name') or node_id}:{exc}", level="error", category="SOCKS5")
+            log_event(f"恢复本地代理失败:{previous.get('node_name') or node_id}:{exc}", level="error", category="代理")
 
 
 def read_exact(sock: socket.socket, length: int) -> bytes:
@@ -1817,14 +1822,29 @@ class Socks5LogProxy:
             threading.Thread(target=self._handle_client, args=(client, address), daemon=True).start()
 
     def _handle_client(self, client: socket.socket, address: tuple[str, int]) -> None:
+        try:
+            client.settimeout(2.0)
+            first = read_exact(client, 1)
+            if first == b"\x05":
+                self._handle_socks5_client(client, address, first)
+            elif first.isalpha():
+                self._handle_http_proxy_client(client, address, first)
+        except Exception:
+            pass
+        finally:
+            try:
+                client.close()
+            except OSError:
+                pass
+
+    def _handle_socks5_client(self, client: socket.socket, address: tuple[str, int], first: bytes) -> None:
         log_id = ""
         started = time.monotonic()
         upstream: socket.socket | None = None
         counters = {"upload": 0, "download": 0}
         client_label = f"{address[0]}:{address[1]}"
         try:
-            client.settimeout(2.0)
-            header = read_exact(client, 2)
+            header = first + read_exact(client, 1)
             if header[0] != 5:
                 return
             methods = read_exact(client, header[1])
@@ -1851,6 +1871,7 @@ class Socks5LogProxy:
                     "target_port": target_port,
                     "target": target,
                     "command": "connect" if command == 1 else str(command),
+                    "proxy_protocol": "socks5",
                     "status": "connecting",
                     "started_at": now_ts(),
                     "upload_bytes": 0,
@@ -1862,14 +1883,7 @@ class Socks5LogProxy:
                 update_request_log(log_id, {"status": "failed", "message": "仅支持 SOCKS5 CONNECT", "ended_at": now_ts()})
                 return
 
-            upstream = socket.create_connection(("127.0.0.1", self.upstream_port), timeout=12.0)
-            upstream.settimeout(12.0)
-            upstream.sendall(b"\x05\x01\x00")
-            upstream_greeting = read_exact(upstream, 2)
-            if upstream_greeting != b"\x05\x00":
-                raise RuntimeError("核心 SOCKS5 握手失败")
-            upstream.sendall(request_head + request_tail)
-            reply = self._read_socks_reply(upstream)
+            upstream, reply = self._connect_upstream_for_socks_request(request_head + request_tail)
             client.sendall(reply)
             if len(reply) < 2 or reply[1] != 0:
                 update_request_log(
@@ -1916,12 +1930,253 @@ class Socks5LogProxy:
             except OSError:
                 pass
         finally:
-            for sock in (client, upstream):
-                if sock:
-                    try:
-                        sock.close()
-                    except OSError:
-                        pass
+            if upstream:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+    def _handle_http_proxy_client(self, client: socket.socket, address: tuple[str, int], first: bytes) -> None:
+        log_id = ""
+        started = time.monotonic()
+        upstream: socket.socket | None = None
+        response_started = False
+        counters = {"upload": 0, "download": 0}
+        client_label = f"{address[0]}:{address[1]}"
+        try:
+            header_bytes, body_prefix = self._read_http_request(client, first)
+            request = self._parse_http_request(header_bytes)
+            target_host, target_port, forward_head, is_connect = self._http_forward_plan(request)
+            target = f"{target_host}:{target_port}"
+            command = "connect" if is_connect else str(request["method"]).lower()
+            log_id = stable_id("request", self.bridge_id, client_label, target, str(time.time_ns()))
+            append_request_log(
+                {
+                    "id": log_id,
+                    "bridge_id": self.bridge_id,
+                    "node_id": self.node_id,
+                    "node_name": self.node_name,
+                    "client": client_label,
+                    "target_host": target_host,
+                    "target_port": target_port,
+                    "target": target,
+                    "command": command,
+                    "proxy_protocol": "http",
+                    "status": "connecting",
+                    "started_at": now_ts(),
+                    "upload_bytes": 0,
+                    "download_bytes": 0,
+                }
+            )
+
+            upstream = self._open_upstream_tunnel(target_host, target_port)
+            if is_connect:
+                client.sendall(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: ProxyBridge\r\n\r\n")
+                response_started = True
+                if body_prefix:
+                    upstream.sendall(body_prefix)
+                    self._record_transfer(counters, "upload", len(body_prefix))
+            else:
+                upstream.sendall(forward_head)
+                self._record_transfer(counters, "upload", len(forward_head))
+                if body_prefix:
+                    upstream.sendall(body_prefix)
+                    self._record_transfer(counters, "upload", len(body_prefix))
+
+            update_request_log(log_id, {"status": "connected"})
+            client.settimeout(None)
+            upstream.settimeout(None)
+            relay_counters = self._relay(client, upstream)
+            counters["upload"] += relay_counters["upload"]
+            counters["download"] += relay_counters["download"]
+            elapsed_ms = int(round((time.monotonic() - started) * 1000))
+            update_request_log(
+                log_id,
+                {
+                    "status": "closed",
+                    "ended_at": now_ts(),
+                    "duration_ms": elapsed_ms,
+                    "upload_bytes": counters["upload"],
+                    "download_bytes": counters["download"],
+                },
+            )
+        except Exception as exc:
+            if log_id:
+                elapsed_ms = int(round((time.monotonic() - started) * 1000))
+                update_request_log(
+                    log_id,
+                    {
+                        "status": "failed",
+                        "message": str(exc),
+                        "ended_at": now_ts(),
+                        "duration_ms": elapsed_ms,
+                        "upload_bytes": counters["upload"],
+                        "download_bytes": counters["download"],
+                    },
+                )
+            if not response_started:
+                try:
+                    self._send_http_error(client, 502 if log_id else 400, str(exc) or "Proxy Error")
+                except OSError:
+                    pass
+        finally:
+            if upstream:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+    def _connect_upstream_for_socks_request(self, request: bytes) -> tuple[socket.socket, bytes]:
+        upstream = socket.create_connection(("127.0.0.1", self.upstream_port), timeout=12.0)
+        try:
+            upstream.settimeout(12.0)
+            upstream.sendall(b"\x05\x01\x00")
+            upstream_greeting = read_exact(upstream, 2)
+            if upstream_greeting != b"\x05\x00":
+                raise RuntimeError("核心 SOCKS5 握手失败")
+            upstream.sendall(request)
+            reply = self._read_socks_reply(upstream)
+            return upstream, reply
+        except Exception:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+            raise
+
+    def _open_upstream_tunnel(self, host: str, port: int) -> socket.socket:
+        request = b"\x05\x01\x00" + self._socks_address_tail(host, port)
+        upstream, reply = self._connect_upstream_for_socks_request(request)
+        if len(reply) < 2 or reply[1] != 0:
+            try:
+                upstream.close()
+            except OSError:
+                pass
+            raise RuntimeError(f"核心返回 SOCKS5 状态码 {reply[1] if len(reply) > 1 else '-'}")
+        return upstream
+
+    def _socks_address_tail(self, host: str, port: int) -> bytes:
+        host = host.strip().strip("[]")
+        if port <= 0 or port > 65535:
+            raise RuntimeError("目标端口不合法")
+        try:
+            return b"\x01" + socket.inet_pton(socket.AF_INET, host) + port.to_bytes(2, "big")
+        except OSError:
+            pass
+        try:
+            return b"\x04" + socket.inet_pton(socket.AF_INET6, host) + port.to_bytes(2, "big")
+        except OSError:
+            pass
+        raw = host.encode("idna")
+        if not raw or len(raw) > 255:
+            raise RuntimeError("目标域名不合法")
+        return b"\x03" + bytes([len(raw)]) + raw + port.to_bytes(2, "big")
+
+    def _read_http_request(self, client: socket.socket, first: bytes) -> tuple[bytes, bytes]:
+        data = bytearray(first)
+        while b"\r\n\r\n" not in data:
+            if len(data) > HTTP_PROXY_HEADER_LIMIT:
+                raise RuntimeError("HTTP 代理请求头过大")
+            chunk = client.recv(4096)
+            if not chunk:
+                raise RuntimeError("HTTP 代理请求提前关闭")
+            data.extend(chunk)
+        header, body_prefix = bytes(data).split(b"\r\n\r\n", 1)
+        return header + b"\r\n\r\n", body_prefix
+
+    def _parse_http_request(self, header_bytes: bytes) -> dict[str, Any]:
+        text = header_bytes.decode("iso-8859-1", errors="replace")
+        lines = text.split("\r\n")
+        parts = lines[0].split(" ", 2)
+        if len(parts) != 3 or not parts[2].startswith("HTTP/"):
+            raise RuntimeError("HTTP 代理请求行不合法")
+        method, target, version = parts[0].upper(), parts[1], parts[2]
+        headers: list[tuple[str, str]] = []
+        header_map: dict[str, str] = {}
+        for line in lines[1:]:
+            if not line:
+                continue
+            if ":" not in line:
+                raise RuntimeError("HTTP 代理请求头不合法")
+            name, value = line.split(":", 1)
+            name = name.strip()
+            value = value.strip()
+            headers.append((name, value))
+            header_map[name.lower()] = value
+        return {"method": method, "target": target, "version": version, "headers": headers, "header_map": header_map}
+
+    def _http_forward_plan(self, request: dict[str, Any]) -> tuple[str, int, bytes, bool]:
+        method = str(request["method"])
+        target = str(request["target"])
+        headers = request["header_map"]
+        if method == "CONNECT":
+            host, port = self._split_host_port(target, 443)
+            return host, port, b"", True
+
+        parsed = urllib.parse.urlsplit(target)
+        if parsed.scheme and parsed.netloc:
+            scheme = parsed.scheme.lower()
+            if scheme not in {"http", "https"}:
+                raise RuntimeError(f"不支持的 HTTP 代理协议:{scheme}")
+            if scheme == "https":
+                raise RuntimeError("HTTPS 代理请求需要使用 CONNECT 方法")
+            if not parsed.hostname:
+                raise RuntimeError("HTTP 代理目标缺少主机名")
+            host = parsed.hostname
+            port = parsed.port or 80
+            path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        else:
+            host, port = self._split_host_port(str(headers.get("host") or ""), 80)
+            path = target or "/"
+
+        return host, port, self._build_http_forward_head(request, host, port, path), False
+
+    def _build_http_forward_head(self, request: dict[str, Any], host: str, port: int, path: str) -> bytes:
+        lines = [f"{request['method']} {path} {request['version']}\r\n"]
+        has_host = False
+        for name, value in request["headers"]:
+            lowered = str(name).lower()
+            if lowered in {"proxy-authorization", "proxy-connection"}:
+                continue
+            if lowered == "host":
+                has_host = True
+            lines.append(f"{name}: {value}\r\n")
+        if not has_host:
+            lines.append(f"Host: {self._format_host_header(host, port)}\r\n")
+        lines.append("\r\n")
+        return "".join(lines).encode("iso-8859-1", errors="replace")
+
+    def _split_host_port(self, authority: str, default_port: int) -> tuple[str, int]:
+        value = authority.strip()
+        if not value:
+            raise RuntimeError("HTTP 代理目标缺少 Host")
+        if "@" in value:
+            value = value.rsplit("@", 1)[-1]
+        if value.startswith("["):
+            end = value.find("]")
+            if end < 0:
+                raise RuntimeError("IPv6 Host 格式不合法")
+            host = value[1:end]
+            rest = value[end + 1 :]
+            port = safe_int(rest[1:], default_port) if rest.startswith(":") else default_port
+        else:
+            host = value
+            port = default_port
+            if value.count(":") == 1:
+                maybe_host, maybe_port = value.rsplit(":", 1)
+                if maybe_port.isdigit():
+                    host = maybe_host
+                    port = safe_int(maybe_port, default_port)
+        host = host.strip()
+        if not host:
+            raise RuntimeError("HTTP 代理目标缺少 Host")
+        if port <= 0 or port > 65535:
+            raise RuntimeError("HTTP 代理目标端口不合法")
+        return host, port
+
+    def _format_host_header(self, host: str, port: int) -> str:
+        display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        return f"{display_host}:{port}"
 
     def _read_address(self, sock: socket.socket, atyp: int) -> tuple[str, int, bytes]:
         if atyp == 1:
@@ -1960,6 +2215,23 @@ class Socks5LogProxy:
     def _send_socks_reply(self, client: socket.socket, status: int) -> None:
         client.sendall(b"\x05" + bytes([status]) + b"\x00\x01" + b"\x00\x00\x00\x00\x00\x00")
 
+    def _send_http_error(self, client: socket.socket, status: int, message: str) -> None:
+        reason = {400: "Bad Request", 502: "Bad Gateway"}.get(status, "Proxy Error")
+        body = f"{status} {reason}: {message}\n".encode("utf-8", errors="replace")
+        head = (
+            f"HTTP/1.1 {status} {reason}\r\n"
+            "Connection: close\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "\r\n"
+        ).encode("ascii")
+        client.sendall(head + body)
+
+    def _record_transfer(self, counters: dict[str, int], key: str, byte_count: int) -> None:
+        counters[key] += byte_count
+        traffic_key = "upload_bytes" if key == "upload" else "download_bytes"
+        add_bridge_traffic(self.bridge_id, traffic_key, byte_count)
+
     def _relay(self, client: socket.socket, upstream: socket.socket) -> dict[str, int]:
         counters = {"upload": 0, "download": 0}
 
@@ -1970,10 +2242,7 @@ class Socks5LogProxy:
                     if not data:
                         break
                     dst.sendall(data)
-                    byte_count = len(data)
-                    counters[key] += byte_count
-                    traffic_key = "upload_bytes" if key == "upload" else "download_bytes"
-                    add_bridge_traffic(self.bridge_id, traffic_key, byte_count)
+                    self._record_transfer(counters, key, len(data))
             except OSError:
                 pass
             finally:
@@ -2292,14 +2561,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 log_event("删除订阅", category="订阅")
             elif self.path == "/api/bridges/start":
                 result = start_bridge(payload)
-                log_event(f"启动 SOCKS5:{result.get('node_name', '')} → {result.get('socks_url', '')}", category="SOCKS5")
+                log_event(f"启动本地代理:{result.get('node_name', '')} → {result.get('socks_url', '')}", category="代理")
                 json_response(self, result)
             elif self.path == "/api/bridges/stop":
                 json_response(self, stop_bridge(str(payload.get("id") or "")))
-                log_event("停止 SOCKS5", category="SOCKS5")
+                log_event("停止本地代理", category="代理")
             elif self.path == "/api/bridges/stop-all":
                 json_response(self, stop_all_bridges())
-                log_event("停止全部 SOCKS5", category="SOCKS5")
+                log_event("停止全部本地代理", category="代理")
             elif self.path == "/api/nodes/test":
                 result = test_node(payload)
                 ok = result.get("ok")

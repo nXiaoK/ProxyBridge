@@ -191,6 +191,7 @@ class ParserTests(unittest.TestCase):
                 self.assertEqual(state["bridges"][0]["status"], "running")
                 self.assertTrue(state["bridges"][0]["enabled"])
                 self.assertEqual(state["bridges"][0]["socks_url"], "socks5://127.0.0.1:21080")
+                self.assertEqual(state["bridges"][0]["http_url"], "http://127.0.0.1:21080")
         finally:
             app.WORK_ROOT = old_work_root
             app.RUNTIME_ROOT = old_runtime_root
@@ -505,6 +506,172 @@ class ParserTests(unittest.TestCase):
             self.assertGreaterEqual(traffic["upload_bytes"], 4)
             self.assertGreaterEqual(traffic["download_bytes"], 4)
             self.assertEqual(traffic["total_bytes"], traffic["upload_bytes"] + traffic["download_bytes"])
+        finally:
+            proxy.stop()
+            app.append_request_log = old_append
+            app.update_request_log = old_update
+            app.TRAFFIC_TABLE.clear()
+            app.TRAFFIC_TABLE.update(old_traffic_table)
+
+    def test_http_connect_proxy_records_connect(self):
+        upstream_port = free_port()
+        listen_port = free_port()
+        logs: list[dict] = []
+
+        def append_log(entry: dict) -> None:
+            logs.append(dict(entry))
+
+        def update_log(log_id: str, updates: dict) -> None:
+            for entry in logs:
+                if entry["id"] == log_id:
+                    entry.update(updates)
+                    break
+
+        def read_http_head(sock: socket.socket) -> bytes:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            return data
+
+        def upstream_server() -> None:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind(("127.0.0.1", upstream_port))
+                server.listen(1)
+                conn, _ = server.accept()
+                with conn:
+                    self.assertEqual(read_exact(conn, 3), b"\x05\x01\x00")
+                    conn.sendall(b"\x05\x00")
+                    head = read_exact(conn, 4)
+                    self.assertEqual(head[:3], b"\x05\x01\x00")
+                    self.assertEqual(head[3], 3)
+                    size = read_exact(conn, 1)[0]
+                    self.assertEqual(read_exact(conn, size), b"example.com")
+                    self.assertEqual(int.from_bytes(read_exact(conn, 2), "big"), 443)
+                    conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                    self.assertEqual(conn.recv(4), b"ping")
+                    conn.sendall(b"pong")
+
+        old_append = app.append_request_log
+        old_update = app.update_request_log
+        old_traffic_table = dict(app.TRAFFIC_TABLE)
+        app.append_request_log = append_log
+        app.update_request_log = update_log
+        app.TRAFFIC_TABLE.clear()
+        app.init_bridge_traffic("bridge-test")
+        proxy = Socks5LogProxy(
+            bridge_id="bridge-test",
+            node_id="node-test",
+            node_name="测试节点",
+            listen_port=listen_port,
+            upstream_port=upstream_port,
+        )
+        try:
+            server_thread = threading.Thread(target=upstream_server, daemon=True)
+            server_thread.start()
+            proxy.start()
+            with socket.create_connection(("127.0.0.1", listen_port), timeout=3) as client:
+                client.sendall(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                response_head = read_http_head(client)
+                self.assertIn(b"200 Connection Established", response_head)
+                client.sendall(b"ping")
+                self.assertEqual(read_exact(client, 4), b"pong")
+            server_thread.join(timeout=2)
+            time.sleep(0.1)
+            self.assertEqual(logs[0]["target"], "example.com:443")
+            self.assertEqual(logs[0]["proxy_protocol"], "http")
+            self.assertEqual(logs[0]["command"], "connect")
+            self.assertEqual(logs[0]["status"], "closed")
+        finally:
+            proxy.stop()
+            app.append_request_log = old_append
+            app.update_request_log = old_update
+            app.TRAFFIC_TABLE.clear()
+            app.TRAFFIC_TABLE.update(old_traffic_table)
+
+    def test_http_proxy_rewrites_absolute_form_request(self):
+        upstream_port = free_port()
+        listen_port = free_port()
+        logs: list[dict] = []
+
+        def append_log(entry: dict) -> None:
+            logs.append(dict(entry))
+
+        def update_log(log_id: str, updates: dict) -> None:
+            for entry in logs:
+                if entry["id"] == log_id:
+                    entry.update(updates)
+                    break
+
+        def read_http_head(sock: socket.socket) -> bytes:
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = sock.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            return data
+
+        def upstream_server() -> None:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind(("127.0.0.1", upstream_port))
+                server.listen(1)
+                conn, _ = server.accept()
+                with conn:
+                    self.assertEqual(read_exact(conn, 3), b"\x05\x01\x00")
+                    conn.sendall(b"\x05\x00")
+                    head = read_exact(conn, 4)
+                    self.assertEqual(head[:3], b"\x05\x01\x00")
+                    self.assertEqual(head[3], 3)
+                    size = read_exact(conn, 1)[0]
+                    self.assertEqual(read_exact(conn, size), b"example.com")
+                    self.assertEqual(int.from_bytes(read_exact(conn, 2), "big"), 80)
+                    conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                    request_head = read_http_head(conn)
+                    self.assertTrue(request_head.startswith(b"GET /path?q=1 HTTP/1.1\r\n"))
+                    self.assertIn(b"Host: example.com\r\n", request_head)
+                    self.assertNotIn(b"Proxy-Connection:", request_head)
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK")
+
+        old_append = app.append_request_log
+        old_update = app.update_request_log
+        old_traffic_table = dict(app.TRAFFIC_TABLE)
+        app.append_request_log = append_log
+        app.update_request_log = update_log
+        app.TRAFFIC_TABLE.clear()
+        app.init_bridge_traffic("bridge-test")
+        proxy = Socks5LogProxy(
+            bridge_id="bridge-test",
+            node_id="node-test",
+            node_name="测试节点",
+            listen_port=listen_port,
+            upstream_port=upstream_port,
+        )
+        try:
+            server_thread = threading.Thread(target=upstream_server, daemon=True)
+            server_thread.start()
+            proxy.start()
+            with socket.create_connection(("127.0.0.1", listen_port), timeout=3) as client:
+                client.sendall(
+                    b"GET http://example.com/path?q=1 HTTP/1.1\r\n"
+                    b"Host: example.com\r\n"
+                    b"Proxy-Connection: keep-alive\r\n"
+                    b"\r\n"
+                )
+                response = read_http_head(client)
+                self.assertIn(b"HTTP/1.1 200 OK", response)
+            server_thread.join(timeout=2)
+            time.sleep(0.1)
+            self.assertEqual(logs[0]["target"], "example.com:80")
+            self.assertEqual(logs[0]["proxy_protocol"], "http")
+            self.assertEqual(logs[0]["command"], "get")
+            self.assertEqual(logs[0]["status"], "closed")
+            self.assertGreater(logs[0]["upload_bytes"], 0)
+            self.assertGreater(logs[0]["download_bytes"], 0)
         finally:
             proxy.stop()
             app.append_request_log = old_append
