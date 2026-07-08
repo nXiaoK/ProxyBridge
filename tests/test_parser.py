@@ -59,6 +59,7 @@ class ParserTests(unittest.TestCase):
         old_runtime_root = app.RUNTIME_ROOT
         old_state_path = app.STATE_PATH
         old_chrome = os.environ.get("PROXY_BRIDGE_CHROME")
+        old_fp_kernel = os.environ.get("PROXY_BRIDGE_FP_CHROMIUM")
         old_popen = app.subprocess.Popen
         old_start_bridge = app.start_bridge
 
@@ -77,6 +78,11 @@ class ParserTests(unittest.TestCase):
                 chrome.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
                 chrome.chmod(0o755)
                 os.environ["PROXY_BRIDGE_CHROME"] = str(chrome)
+                # 方案 B:浏览器改用指纹内核,测试用一个可执行桩文件模拟 fingerprint-chromium。
+                fp_kernel = root / "Chromium"
+                fp_kernel.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                fp_kernel.chmod(0o755)
+                os.environ["PROXY_BRIDGE_FP_CHROMIUM"] = str(fp_kernel)
                 app.WORK_ROOT = root / "work"
                 app.RUNTIME_ROOT = app.WORK_ROOT / "runtime"
                 app.STATE_PATH = app.WORK_ROOT / "state.json"
@@ -121,8 +127,16 @@ class ParserTests(unittest.TestCase):
                 self.assertEqual(result["pid"], 4242)
                 self.assertEqual(len(FakePopen.calls), 1)
                 command = FakePopen.calls[0][0]
-                self.assertEqual(command[0], str(chrome))
+                self.assertEqual(command[0], str(fp_kernel))
                 self.assertIn("--proxy-server=socks5://127.0.0.1:25080", command)
+                # 校验方案 B 的指纹伪造标志已下发。
+                self.assertTrue(any(arg.startswith("--fingerprint=") for arg in command))
+                self.assertIn("--fingerprint-platform=macos", command)
+                self.assertIn("--webrtc-ip-handling-policy=disable_non_proxied_udp", command)
+                self.assertTrue(any(arg.startswith("--timezone=") for arg in command))
+                self.assertTrue(any(arg.startswith("--lang=") for arg in command))
+                # 同一节点两次启动应派生完全相同的指纹种子(环境可恢复)。
+                self.assertEqual(result["fingerprint_seed"], app.fingerprint_seed(node_id))
                 profile_arg = next(arg for arg in command if arg.startswith("--user-data-dir="))
                 profile_path = Path(profile_arg.split("=", 1)[1])
                 self.assertTrue(profile_path.is_dir())
@@ -137,6 +151,10 @@ class ParserTests(unittest.TestCase):
                 os.environ.pop("PROXY_BRIDGE_CHROME", None)
             else:
                 os.environ["PROXY_BRIDGE_CHROME"] = old_chrome
+            if old_fp_kernel is None:
+                os.environ.pop("PROXY_BRIDGE_FP_CHROMIUM", None)
+            else:
+                os.environ["PROXY_BRIDGE_FP_CHROMIUM"] = old_fp_kernel
 
     def test_load_state_keeps_running_bridges_enabled_for_restore(self):
         old_work_root = app.WORK_ROOT

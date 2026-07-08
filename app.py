@@ -7,6 +7,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import platform
 import re
 import shutil
 import signal
@@ -37,6 +38,9 @@ CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
 CORE_LOG_ENTRY_LIMIT = 30
 PROCESS_TABLE: dict[str, subprocess.Popen] = {}
+# 记录每个节点已启动的指纹浏览器进程(可能因单例复用产生多个短命进程,故用列表);
+# 用于「停止浏览器」时结束进程组,并据此在前端显示停止按钮。
+BROWSER_TABLE: dict[str, list[subprocess.Popen]] = {}
 LOG_PROXY_TABLE: dict[str, "Socks5LogProxy"] = {}
 TRAFFIC_TABLE: dict[str, dict[str, int]] = {}
 STATE_LOCK = threading.RLock()
@@ -170,6 +174,39 @@ def node_region(name: str, server: str = "") -> str:
             if re.search(rf"(^|[^a-z0-9]){re.escape(term)}([^a-z0-9]|$)", haystack):
                 return region
     return "未分类"
+
+
+# 地区 -> (时区, 主语言, Accept-Language)。用于让浏览器指纹的时区/语言与该节点
+# SOCKS5 代理的出口地区保持一致,避免"IP 在美国、浏览器时区在中国"这类不一致被风控识别。
+REGION_LOCALE_MAP: dict[str, tuple[str, str, str]] = {
+    "香港": ("Asia/Hong_Kong", "zh-HK", "zh-HK,zh;q=0.9,en;q=0.8"),
+    "日本": ("Asia/Tokyo", "ja-JP", "ja-JP,ja;q=0.9,en;q=0.8"),
+    "新加坡": ("Asia/Singapore", "en-SG", "en-SG,en;q=0.9,zh;q=0.8"),
+    "台湾": ("Asia/Taipei", "zh-TW", "zh-TW,zh;q=0.9,en;q=0.8"),
+    "韩国": ("Asia/Seoul", "ko-KR", "ko-KR,ko;q=0.9,en;q=0.8"),
+    "美国": ("America/Los_Angeles", "en-US", "en-US,en;q=0.9"),
+    "英国": ("Europe/London", "en-GB", "en-GB,en;q=0.9"),
+    "德国": ("Europe/Berlin", "de-DE", "de-DE,de;q=0.9,en;q=0.8"),
+    "法国": ("Europe/Paris", "fr-FR", "fr-FR,fr;q=0.9,en;q=0.8"),
+    "加拿大": ("America/Toronto", "en-CA", "en-CA,en;q=0.9,fr;q=0.8"),
+    "澳大利亚": ("Australia/Sydney", "en-AU", "en-AU,en;q=0.9"),
+    "荷兰": ("Europe/Amsterdam", "nl-NL", "nl-NL,nl;q=0.9,en;q=0.8"),
+}
+# 无法识别地区时的兜底 locale。
+DEFAULT_LOCALE = ("America/Los_Angeles", "en-US", "en-US,en;q=0.9")
+
+
+def region_locale(region: str) -> tuple[str, str, str]:
+    # 根据节点地区返回 (时区, 语言, Accept-Language),用于指纹内核的 --timezone/--lang/--accept-lang。
+    return REGION_LOCALE_MAP.get(region or "", DEFAULT_LOCALE)
+
+
+def fingerprint_seed(node_id: str) -> int:
+    # 从节点 ID 确定性派生 32 位指纹种子:同一节点每次启动得到完全相同的指纹(可恢复环境),
+    # 不同节点得到互不相同的指纹(避免被网站关联为同一设备)。取正数并避开 0(0 在部分构建中表示关闭)。
+    digest = hashlib.sha256(f"fp-seed::{node_id}".encode("utf-8")).digest()
+    seed = int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+    return seed or 1
 
 
 def guess_transport(params: dict[str, str], fallback: str = "") -> str:
@@ -720,6 +757,48 @@ def chrome_path() -> str | None:
     return shutil.which("google-chrome") or shutil.which("chrome") or shutil.which("google-chrome-stable")
 
 
+def fingerprint_chromium_root() -> Path:
+    # 指纹内核(fingerprint-chromium,基于 Ungoogled Chromium)统一安装在工作目录下,
+    # 与本机 Google Chrome 完全分离,避免污染用户日常浏览器。
+    return WORK_ROOT / "fingerprint-chromium"
+
+
+def _bundle_executable(app_dir: Path) -> Path | None:
+    # 从 macOS .app 包中定位真正的可执行二进制:Contents/MacOS/ 下的第一个可执行文件。
+    macos_dir = app_dir / "Contents" / "MacOS"
+    if not macos_dir.is_dir():
+        return None
+    for entry in sorted(macos_dir.iterdir()):
+        if entry.is_file() and os.access(entry, os.X_OK):
+            return entry
+    return None
+
+
+def fingerprint_chromium_path() -> str | None:
+    # 定位指纹内核可执行文件。优先级:环境变量 > 工作目录安装位 > 系统 Applications。
+    # 指纹内核必须是打过补丁的 Chromium(而非本机 Google Chrome),否则无法在底层伪造指纹。
+    env_path = os.environ.get("PROXY_BRIDGE_FP_CHROMIUM")
+    if env_path:
+        candidate = Path(env_path).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        if candidate.suffix == ".app" and candidate.is_dir():
+            exe = _bundle_executable(candidate)
+            if exe:
+                return str(exe)
+
+    search_dirs = [fingerprint_chromium_root(), Path("/Applications"), Path.home() / "Applications"]
+    for base in search_dirs:
+        if not base.is_dir():
+            continue
+        # 递归查找 Chromium.app,兼容 dmg 解压后可能带有中间目录层级的情况。
+        for app_dir in sorted(base.glob("**/Chromium.app")):
+            exe = _bundle_executable(app_dir)
+            if exe:
+                return str(exe)
+    return None
+
+
 def status_payload() -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
@@ -728,6 +807,8 @@ def status_payload() -> dict[str, Any]:
         return {
             "cores": core_paths(),
             "chrome": chrome_path(),
+            "fingerprint_chromium": fingerprint_chromium_path(),
+            "active_browsers": active_browser_node_ids(),
             "subscriptions": state["subscriptions"],
             "nodes": [public_node(node) for node in state["nodes"]],
             "bridges": state["bridges"],
@@ -1182,9 +1263,14 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
     if not node_id:
         raise ValueError("缺少节点 ID")
-    chrome = chrome_path()
-    if not chrome:
-        raise RuntimeError("未找到 Google Chrome，请安装 Chrome 或设置 PROXY_BRIDGE_CHROME")
+    # 方案 B:使用打过补丁的指纹内核(fingerprint-chromium),从底层伪造 Canvas/WebGL/Audio/
+    # 字体/屏幕/硬件并发/设备内存/Client Hints 等全部指纹维度;若内核缺失则明确提示去下载。
+    fp_chromium = fingerprint_chromium_path()
+    if not fp_chromium:
+        raise RuntimeError(
+            "未找到指纹内核 fingerprint-chromium。请点击「下载指纹内核」自动安装,"
+            "或手动下载后设置 PROXY_BRIDGE_FP_CHROMIUM 指向 Chromium 可执行文件。"
+        )
 
     with STATE_LOCK:
         state = load_state()
@@ -1203,9 +1289,25 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     profile_path = browser_profiles_root() / stable_id(node_id)
     profile_path.mkdir(parents=True, exist_ok=True)
     proxy = f"socks5://127.0.0.1:{local_port}"
+
+    # 每个节点派生固定指纹种子,并按地区匹配时区/语言,使指纹与代理出口地区一致。
+    seed = fingerprint_seed(node_id)
+    region = node.get("region") or node_region(node.get("name") or "", node.get("server") or "")
+    timezone, language, accept_language = region_locale(region)
+
     command = [
-        chrome,
+        fp_chromium,
         f"--user-data-dir={profile_path}",
+        # --fingerprint 是指纹伪造的总开关:同种子必得同指纹,不同种子必得不同指纹。
+        f"--fingerprint={seed}",
+        "--fingerprint-platform=macos",
+        f"--timezone={timezone}",
+        f"--lang={language}",
+        f"--accept-lang={accept_language}",
+        # 使用代理时强制 WebRTC 只走代理,禁止非代理 UDP,防止通过 STUN 泄漏真实 IP。
+        # 用标准 Chromium 开关 --webrtc-ip-handling-policy + 枚举值(经内核二进制验证存在),
+        # 而非独立布尔开关 --disable-non-proxied-udp(该 build 中不存在,会被静默忽略)。
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--no-first-run",
         "--no-default-browser-check",
         f"--proxy-server={proxy}",
@@ -1219,6 +1321,11 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    # 记录浏览器进程,便于后续「停止浏览器」结束整个进程组;同时清理已退出的旧句柄。
+    with PROCESS_LOCK:
+        procs = [p for p in BROWSER_TABLE.get(node_id, []) if p.poll() is None]
+        procs.append(process)
+        BROWSER_TABLE[node_id] = procs
     return {
         "ok": True,
         "pid": process.pid,
@@ -1227,9 +1334,208 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         "proxy": proxy,
         "bridge_id": bridge.get("id"),
         "profile_path": str(profile_path),
-        "chrome_path": chrome,
-        "isolation": "Chrome user-data-dir + SOCKS5 proxy",
-        "fingerprint_note": "本功能隔离 Profile 数据并绑定代理，但不会伪造 Canvas/WebGL/Audio 等浏览器指纹。",
+        "chromium_path": fp_chromium,
+        "fingerprint_seed": seed,
+        "region": region,
+        "timezone": timezone,
+        "language": language,
+        "isolation": "fingerprint-chromium 底层指纹伪造 + 独立 Profile + 节点 SOCKS5 代理",
+        "fingerprint_note": (
+            "已按节点派生独立指纹(Canvas/WebGL/Audio/字体/屏幕/硬件并发/设备内存/Client Hints),"
+            "时区与语言按节点地区匹配,并已禁止 WebRTC 非代理 UDP。"
+        ),
+    }
+
+
+def prune_browser_processes(node_id: str) -> list[subprocess.Popen]:
+    # 清理指定节点已退出的浏览器进程句柄,返回仍存活的进程列表。
+    with PROCESS_LOCK:
+        procs = [p for p in BROWSER_TABLE.get(node_id, []) if p.poll() is None]
+        if procs:
+            BROWSER_TABLE[node_id] = procs
+        else:
+            BROWSER_TABLE.pop(node_id, None)
+        return list(procs)
+
+
+def active_browser_node_ids() -> list[str]:
+    # 返回当前仍有存活浏览器进程的节点 ID 列表,供前端决定是否显示「停止浏览器」按钮。
+    with PROCESS_LOCK:
+        node_ids = list(BROWSER_TABLE.keys())
+    return [node_id for node_id in node_ids if prune_browser_processes(node_id)]
+
+
+def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    # 停止某节点的指纹浏览器:先结束全部浏览器进程组,再停止该节点对应的 SOCKS5 桥接。
+    node_id = str(payload.get("node_id") or "")
+    if not node_id:
+        raise ValueError("缺少节点 ID")
+
+    with PROCESS_LOCK:
+        procs = BROWSER_TABLE.pop(node_id, [])
+    killed = 0
+    for process in procs:
+        if process.poll() is None:
+            # 浏览器以 start_new_session 启动,终结整个进程组以带走全部子进程。
+            terminate_process(process)
+            killed += 1
+
+    # 同步停止该节点当前活跃的 SOCKS5 桥接(浏览器与代理成对出现,一起关闭)。
+    stopped_bridges: list[str] = []
+    with STATE_LOCK:
+        state = load_state()
+        sync_process_status(state)
+        save_state(state)
+        bridge = active_bridge_for_node(state, node_id)
+    if bridge and bridge.get("id"):
+        stop_bridge(str(bridge["id"]))
+        stopped_bridges.append(str(bridge["id"]))
+
+    return {
+        "ok": True,
+        "node_id": node_id,
+        "killed_browsers": killed,
+        "stopped_bridges": stopped_bridges,
+    }
+
+
+FP_CHROMIUM_RELEASES_API = "https://api.github.com/repos/adryfish/fingerprint-chromium/releases"
+
+
+def _macos_arch_token() -> str:
+    # 返回本机 CPU 架构标记,用于安装后校验内核二进制与主机是否兼容。
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "arm64"
+    return "x86_64"
+
+
+def _pick_macos_asset(releases: list[dict[str, Any]]) -> dict[str, str] | None:
+    # 从 GitHub releases 列表中挑选第一个 macOS dmg 资源。
+    # 注意:fingerprint-chromium 的 macOS 包命名为 ..._macos.dmg,文件名不含架构标记
+    # (目前只发布单一 arm64 包),因此这里按 "_macos.dmg" 结尾识别,不按架构 token 过滤。
+    # 并非每个版本都发布 macOS 包,所以需要遍历多个 release 兜底取最新可用者。
+    for release in releases:
+        if release.get("draft") or release.get("prerelease"):
+            continue
+        for asset in release.get("assets") or []:
+            name = str(asset.get("name") or "")
+            lowered = name.lower()
+            if lowered.endswith(".dmg") and "macos" in lowered:
+                url = asset.get("browser_download_url")
+                if url:
+                    return {"name": name, "url": str(url), "tag": str(release.get("tag_name") or "")}
+    return None
+
+
+def _verify_macos_binary_arch(app_path: Path) -> str | None:
+    # 用 file 命令读取内核二进制的架构(如 arm64 / x86_64),用于与主机架构做兼容性判断。
+    exe = _bundle_executable(app_path)
+    if not exe:
+        return None
+    probe = subprocess.run(["file", "-b", str(exe)], capture_output=True, text=True)
+    text = (probe.stdout or "").lower()
+    if "arm64" in text:
+        return "arm64"
+    if "x86_64" in text:
+        return "x86_64"
+    return None
+
+
+def _install_from_dmg(dmg_path: Path, dest_root: Path) -> Path:
+    # 挂载 dmg,复制其中的 Chromium.app 到目标目录,再卸载。全程使用 macOS 自带 hdiutil。
+    mount_point = dest_root / "_mnt"
+    if mount_point.exists():
+        subprocess.run(["hdiutil", "detach", str(mount_point), "-force"], capture_output=True)
+        shutil.rmtree(mount_point, ignore_errors=True)
+    mount_point.mkdir(parents=True, exist_ok=True)
+    attach = subprocess.run(
+        ["hdiutil", "attach", str(dmg_path), "-nobrowse", "-noverify", "-mountpoint", str(mount_point)],
+        capture_output=True,
+        text=True,
+    )
+    if attach.returncode != 0:
+        shutil.rmtree(mount_point, ignore_errors=True)
+        raise RuntimeError(f"挂载 dmg 失败:{attach.stderr.strip() or attach.stdout.strip()}")
+    try:
+        source_app = next(mount_point.glob("**/Chromium.app"), None)
+        if not source_app:
+            raise RuntimeError("dmg 中未找到 Chromium.app")
+        target_app = dest_root / "Chromium.app"
+        if target_app.exists():
+            shutil.rmtree(target_app, ignore_errors=True)
+        shutil.copytree(source_app, target_app, symlinks=True)
+    finally:
+        subprocess.run(["hdiutil", "detach", str(mount_point), "-force"], capture_output=True)
+        shutil.rmtree(mount_point, ignore_errors=True)
+    # 去除 Gatekeeper 隔离属性,避免首次启动被 macOS 拦截("已损坏/无法验证开发者")。
+    subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(target_app)], capture_output=True)
+    return target_app
+
+
+def download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
+    # 一键下载指纹内核:查询 GitHub Releases,取最新的 macOS dmg,下载并安装到工作目录。
+    existing = fingerprint_chromium_path()
+    if existing and not truthy(payload.get("force")):
+        return {"ok": True, "already_installed": True, "path": existing}
+
+    request = urllib.request.Request(
+        f"{FP_CHROMIUM_RELEASES_API}?per_page=20",
+        headers={"User-Agent": "ProxyBridge/0.1", "Accept": "application/vnd.github+json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            releases = json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception as error:
+        raise RuntimeError(f"获取指纹内核版本列表失败:{error}") from error
+
+    asset = _pick_macos_asset(releases if isinstance(releases, list) else [])
+    if not asset:
+        raise RuntimeError(
+            "未找到 macOS 指纹内核包(..._macos.dmg)。"
+            "该项目并非每个版本都发布 macOS 包,请稍后重试或手动下载。"
+        )
+
+    host_arch = _macos_arch_token()
+    dest_root = fingerprint_chromium_root()
+    dest_root.mkdir(parents=True, exist_ok=True)
+    dmg_path = dest_root / asset["name"]
+    try:
+        # 流式下载 dmg 到工作目录,再从中安装。
+        with urllib.request.urlopen(
+            urllib.request.Request(asset["url"], headers={"User-Agent": "ProxyBridge/0.1"}),
+            timeout=600,
+        ) as response, dmg_path.open("wb") as out:
+            shutil.copyfileobj(response, out)
+    except Exception as error:
+        dmg_path.unlink(missing_ok=True)
+        raise RuntimeError(f"下载指纹内核失败:{error}") from error
+
+    try:
+        target_app = _install_from_dmg(dmg_path, dest_root)
+    finally:
+        dmg_path.unlink(missing_ok=True)
+
+    # 安装后校验二进制架构:若与主机不一致,给出明确提示(arm64 内核在 Intel Mac 无法运行;
+    # 反之 Apple Silicon 可通过 Rosetta 兼容 x86_64,但仍提醒用户以免困惑)。
+    binary_arch = _verify_macos_binary_arch(target_app)
+    arch_warning = ""
+    if binary_arch and binary_arch != host_arch:
+        if host_arch == "x86_64" and binary_arch == "arm64":
+            arch_warning = "警告:下载到的是 arm64 内核,但本机是 Intel(x86_64),无法运行。"
+        elif host_arch == "arm64" and binary_arch == "x86_64":
+            arch_warning = "提示:下载到的是 x86_64 内核,将通过 Rosetta 在 Apple Silicon 上运行。"
+
+    resolved = fingerprint_chromium_path()
+    return {
+        "ok": True,
+        "already_installed": False,
+        "path": resolved or str(target_app),
+        "version": asset.get("tag"),
+        "host_arch": host_arch,
+        "binary_arch": binary_arch,
+        "arch_warning": arch_warning,
+        "asset": asset["name"],
     }
 
 
@@ -1883,6 +2189,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, test_node(payload))
             elif self.path == "/api/browser/launch":
                 json_response(self, launch_browser(payload))
+            elif self.path == "/api/browser/stop":
+                json_response(self, stop_browser(payload))
+            elif self.path == "/api/browser/download-kernel":
+                json_response(self, download_fingerprint_chromium(payload))
             elif self.path == "/api/clipboard":
                 json_response(self, copy_to_clipboard(str(payload.get("text") or "")))
             elif self.path == "/api/logs/clear":
@@ -1931,6 +2241,13 @@ class ProxyBridgeHTTPServer(ThreadingHTTPServer):
 
 def shutdown() -> None:
     SHUTTING_DOWN.set()
+    # 退出前一并结束所有指纹浏览器进程,避免残留窗口与孤儿进程。
+    with PROCESS_LOCK:
+        browser_procs = [p for procs in BROWSER_TABLE.values() for p in procs]
+        BROWSER_TABLE.clear()
+    for process in browser_procs:
+        if process.poll() is None:
+            terminate_process(process)
     with PROCESS_LOCK:
         bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
     traffic_by_bridge = {}

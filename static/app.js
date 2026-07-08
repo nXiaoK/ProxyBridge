@@ -1,6 +1,8 @@
 const appState = {
   cores: {},
   chrome: null,
+  fingerprint_chromium: null,
+  active_browsers: [],
   subscriptions: [],
   nodes: [],
   bridges: [],
@@ -138,6 +140,8 @@ async function loadStatus() {
   const status = await api("/api/status");
   appState.cores = status.cores || {};
   appState.chrome = status.chrome || null;
+  appState.fingerprint_chromium = status.fingerprint_chromium || null;
+  appState.active_browsers = status.active_browsers || [];
   appState.subscriptions = status.subscriptions || [];
   appState.nodes = status.nodes || [];
   appState.bridges = status.bridges || [];
@@ -160,9 +164,15 @@ function renderCores() {
   const coreStrip = $("#coreStrip");
   const singBox = appState.cores["sing-box"];
   const xray = appState.cores.xray;
+  const fpKernel = appState.fingerprint_chromium;
+  // 指纹内核状态:已安装显示 ready,缺失显示可点击的「下载指纹内核」按钮。
+  const fpPill = fpKernel
+    ? `<button class="pill core-pill ok" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}">指纹内核 ready</button>`
+    : `<button class="pill core-pill warn" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium">下载指纹内核</button>`;
   coreStrip.innerHTML = `
     <button class="pill core-pill ${singBox ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="sing-box" aria-label="查看 sing-box 运行日志" title="查看 sing-box 运行日志">sing-box ${singBox ? "ready" : "missing"}</button>
     <button class="pill core-pill ${xray ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="xray" aria-label="查看 xray 运行日志" title="查看 xray 运行日志">xray ${xray ? "ready" : "missing"}</button>
+    ${fpPill}
   `;
 }
 
@@ -318,6 +328,7 @@ function renderNodes() {
   rows.innerHTML = nodes
     .map((node) => {
       const bridge = bridgeForNode(node.id);
+      const browserActive = appState.active_browsers.includes(node.id);
       const transport = node.transport || "-";
       const security = node.security || "";
       const server = `${node.server}:${node.port}`;
@@ -342,7 +353,12 @@ function renderNodes() {
                   ? `<button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}">${icon("copy")}<span>复制</span></button>`
                   : `<button class="row-button primary-row" data-action="start" data-node="${escapeHtml(node.id)}">${icon("play")}<span>启动并复制</span></button>`
               }
-              <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="用独立 Chrome Profile 启动 ${escapeHtml(node.name)}" title="用独立 Chrome Profile 启动，并绑定该节点 SOCKS5">${icon("browser")}<span>浏览器</span></button>
+              <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="用独立指纹浏览器启动 ${escapeHtml(node.name)}" title="用独立指纹浏览器启动：伪造指纹 + 独立 Profile + 绑定该节点 SOCKS5">${icon("browser")}<span>浏览器</span></button>
+              ${
+                browserActive
+                  ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器和 SOCKS5" title="结束该节点的指纹浏览器进程，并停止其 SOCKS5">${icon("stop")}<span>停止浏览器</span></button>`
+                  : ""
+              }
             </div>
           </td>
         </tr>
@@ -600,7 +616,31 @@ async function testNode(nodeId) {
 async function launchBrowser(nodeId) {
   const result = await api("/api/browser/launch", { node_id: nodeId });
   await loadStatus();
-  showToast(`已启动浏览器：${result.proxy}`);
+  showToast(`已启动指纹浏览器：${result.region || ""} · ${result.proxy}`);
+  return result;
+}
+
+// 停止某节点的指纹浏览器进程,并一并停止其 SOCKS5。
+async function stopBrowser(nodeId) {
+  const result = await api("/api/browser/stop", { node_id: nodeId });
+  await loadStatus();
+  showToast("已停止浏览器和 SOCKS5");
+  return result;
+}
+
+// 一键下载并安装指纹内核。下载体积较大(约 150-250MB),提示用户耐心等待。
+async function downloadKernel() {
+  showToast("正在下载指纹内核，约 150-250MB，请耐心等待…");
+  const result = await api("/api/browser/download-kernel", {});
+  await loadStatus();
+  if (result.already_installed) {
+    showToast("指纹内核已安装");
+  } else if (result.arch_warning) {
+    // 架构不匹配(如 arm64 内核装到 Intel 机)时给出显著提示。
+    showToast(result.arch_warning, "error");
+  } else {
+    showToast(`指纹内核安装完成：${result.version || ""}`);
+  }
   return result;
 }
 
@@ -616,6 +656,10 @@ async function handleAction(event) {
       await testNode(button.dataset.node);
     } else if (action === "launch-browser") {
       await launchBrowser(button.dataset.node);
+    } else if (action === "stop-browser") {
+      await stopBrowser(button.dataset.node);
+    } else if (action === "download-kernel") {
+      await downloadKernel();
     } else if (action === "copy") {
       await copyText(button.dataset.text);
     } else if (action === "stop") {
