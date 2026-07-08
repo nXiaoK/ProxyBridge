@@ -33,6 +33,8 @@ DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
 REQUEST_LOG_LIMIT = 500
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
+CORE_LOG_TAIL_LIMIT = 12000
+CORE_LOG_ENTRY_LIMIT = 30
 PROCESS_TABLE: dict[str, subprocess.Popen] = {}
 LOG_PROXY_TABLE: dict[str, "Socks5LogProxy"] = {}
 TRAFFIC_TABLE: dict[str, dict[str, int]] = {}
@@ -1147,6 +1149,46 @@ def read_tail(path: Path, limit: int = 6000) -> str:
         return ""
 
 
+def core_log_payload(core: str) -> dict[str, Any]:
+    core = core.strip()
+    if core not in {"sing-box", "xray"}:
+        raise ValueError("核心只能是 sing-box 或 xray")
+
+    with STATE_LOCK:
+        state = load_state()
+        sync_process_status(state)
+        save_state(state)
+        bridges = [dict(bridge) for bridge in state.get("bridges", []) if bridge.get("core") == core]
+
+    entries = []
+    sorted_bridges = sorted(bridges, key=lambda item: safe_int(item.get("started_at"), 0), reverse=True)
+    for bridge in sorted_bridges[:CORE_LOG_ENTRY_LIMIT]:
+        bridge_id = str(bridge.get("id") or "")
+        if not bridge_id:
+            continue
+        log_path = RUNTIME_ROOT / f"{bridge_id}.log"
+        entries.append(
+            {
+                "id": bridge_id,
+                "node_id": bridge.get("node_id"),
+                "node_name": bridge.get("node_name") or bridge.get("node_id") or "未知节点",
+                "port": bridge.get("port"),
+                "status": bridge.get("status") or "-",
+                "started_at": bridge.get("started_at"),
+                "log_path": str(log_path),
+                "log": read_tail(log_path, CORE_LOG_TAIL_LIMIT),
+            }
+        )
+
+    return {
+        "core": core,
+        "core_path": core_paths().get(core),
+        "entries": entries,
+        "generated_at": now_ts(),
+        "tail_limit": CORE_LOG_TAIL_LIMIT,
+    }
+
+
 def stop_process(bridge_id: str) -> dict[str, int]:
     with PROCESS_LOCK:
         proxy = LOG_PROXY_TABLE.pop(bridge_id, None)
@@ -1679,16 +1721,25 @@ class AppHandler(BaseHTTPRequestHandler):
         return json.loads(data.decode("utf-8"))
 
     def do_GET(self) -> None:
-        if self.path == "/api/status":
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path == "/api/status":
             json_response(self, status_payload())
             return
-        if self.path.startswith("/api/log/"):
-            bridge_id = self.path.rsplit("/", 1)[-1]
+        if parsed.path == "/api/core/logs":
+            params = urllib.parse.parse_qs(parsed.query)
+            core = first(params, "core", default="")
+            try:
+                json_response(self, core_log_payload(core))
+            except Exception as exc:
+                error_response(self, exc, 400)
+            return
+        if parsed.path.startswith("/api/log/"):
+            bridge_id = parsed.path.rsplit("/", 1)[-1]
             path = RUNTIME_ROOT / f"{bridge_id}.log"
             json_response(self, {"log": read_tail(path)})
             return
-        if self.path.startswith("/api/config/"):
-            bridge_id = self.path.rsplit("/", 1)[-1]
+        if parsed.path.startswith("/api/config/"):
+            bridge_id = parsed.path.rsplit("/", 1)[-1]
             path = RUNTIME_ROOT / f"{bridge_id}.json"
             try:
                 with path.open("r", encoding="utf-8") as f:

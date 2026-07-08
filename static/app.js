@@ -18,6 +18,7 @@ const appState = {
 };
 
 const $ = (selector) => document.querySelector(selector);
+let lastCoreLogTrigger = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -32,6 +33,7 @@ function icon(name) {
   const paths = {
     play: '<path d="M8 5v14l11-7z"/>',
     check: '<path d="M20 6L9 17l-5-5"/>',
+    close: '<path d="M18 6 6 18"/><path d="M6 6l12 12"/>',
     copy: '<path d="M8 8h10v10H8z"/><path d="M6 16H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
     stop: '<path d="M7 7h10v10H7z"/>',
     refresh: '<path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4M18 3v4h-4M6 21v-4h4"/>',
@@ -156,8 +158,8 @@ function renderCores() {
   const singBox = appState.cores["sing-box"];
   const xray = appState.cores.xray;
   coreStrip.innerHTML = `
-    <span class="pill ${singBox ? "ok" : "warn"}">sing-box ${singBox ? "ready" : "missing"}</span>
-    <span class="pill ${xray ? "ok" : "warn"}">xray ${xray ? "ready" : "missing"}</span>
+    <button class="pill core-pill ${singBox ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="sing-box" aria-label="查看 sing-box 运行日志" title="查看 sing-box 运行日志">sing-box ${singBox ? "ready" : "missing"}</button>
+    <button class="pill core-pill ${xray ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="xray" aria-label="查看 xray 运行日志" title="查看 xray 运行日志">xray ${xray ? "ready" : "missing"}</button>
   `;
 }
 
@@ -485,6 +487,69 @@ function renderRequestLogs() {
     .join("");
 }
 
+function closeCoreLogModal() {
+  $("#coreLogModal").hidden = true;
+  if (lastCoreLogTrigger?.isConnected) {
+    lastCoreLogTrigger.focus();
+  }
+  lastCoreLogTrigger = null;
+}
+
+function renderCoreLogPayload(payload) {
+  const core = payload.core || "core";
+  const corePath = payload.core_path || "missing";
+  $("#coreLogTitle").textContent = `${core} 运行日志`;
+  $("#coreLogMeta").textContent = `${corePath} · ${payload.entries?.length || 0} 个日志片段`;
+
+  const body = $("#coreLogBody");
+  const entries = payload.entries || [];
+  if (!entries.length) {
+    body.innerHTML = `
+      <div class="core-log-empty">
+        <strong>暂无运行日志</strong>
+        <span>启动使用 ${escapeHtml(core)} 的节点后，这里会显示对应核心输出。</span>
+      </div>
+    `;
+    return;
+  }
+
+  body.innerHTML = entries
+    .map((entry) => {
+      const title = `${entry.node_name || "未知节点"} · ${entry.port || "-"} · ${entry.status || "-"}`;
+      const log = entry.log || "暂无日志输出";
+      return `
+        <article class="core-log-entry">
+          <header>
+            <div>
+              <strong>${escapeHtml(title)}</strong>
+              <span>${escapeHtml(formatTime(entry.started_at))}</span>
+            </div>
+            <span class="status ${escapeHtml(entry.status || "")}">${escapeHtml(entry.status || "-")}</span>
+          </header>
+          <pre>${escapeHtml(log)}</pre>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+async function showCoreLog(core) {
+  if (!core) return;
+  const modal = $("#coreLogModal");
+  modal.hidden = false;
+  modal.querySelector('[data-action="close-core-log"]')?.focus();
+  $("#coreLogTitle").textContent = `${core} 运行日志`;
+  $("#coreLogMeta").textContent = "加载中";
+  $("#coreLogBody").innerHTML = '<div class="core-log-loading">正在读取日志...</div>';
+  try {
+    const payload = await api(`/api/core/logs?core=${encodeURIComponent(core)}`);
+    renderCoreLogPayload(payload);
+  } catch (error) {
+    $("#coreLogMeta").textContent = "读取失败";
+    $("#coreLogBody").innerHTML = `<div class="core-log-empty error"><strong>日志读取失败</strong><span>${escapeHtml(error.message)}</span></div>`;
+  }
+}
+
 async function copyText(text) {
   try {
     const result = await api("/api/clipboard", { text });
@@ -559,6 +624,11 @@ async function handleAction(event) {
       renderLogFilters();
       renderRequestLogs();
       showToast("日志筛选已重置");
+    } else if (action === "show-core-log") {
+      lastCoreLogTrigger = button;
+      await showCoreLog(button.dataset.core);
+    } else if (action === "close-core-log") {
+      closeCoreLogModal();
     }
   } catch (error) {
     showToast(error.message, "error");
@@ -661,6 +731,16 @@ function bindEvents() {
   $("#logStatusFilter").addEventListener("change", (event) => {
     appState.logFilters.status = event.target.value;
     renderRequestLogs();
+  });
+  $("#coreLogModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeCoreLogModal();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !$("#coreLogModal").hidden) {
+      closeCoreLogModal();
+    }
   });
 }
 

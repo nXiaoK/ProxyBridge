@@ -94,6 +94,60 @@ class ParserTests(unittest.TestCase):
             app.RUNTIME_ROOT = old_runtime_root
             app.STATE_PATH = old_state_path
 
+    def test_core_log_payload_filters_by_core(self):
+        old_work_root = app.WORK_ROOT
+        old_runtime_root = app.RUNTIME_ROOT
+        old_state_path = app.STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.RUNTIME_ROOT = Path(temp_dir) / "runtime"
+                app.STATE_PATH = Path(temp_dir) / "state.json"
+                app.ensure_dirs()
+                app.STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "subscriptions": [],
+                            "nodes": [],
+                            "bridges": [
+                                {
+                                    "id": "bridge-sing",
+                                    "node_id": "node-sing",
+                                    "node_name": "Sing Node",
+                                    "core": "sing-box",
+                                    "status": "stopped",
+                                    "port": 21080,
+                                    "started_at": 10,
+                                },
+                                {
+                                    "id": "bridge-xray",
+                                    "node_id": "node-xray",
+                                    "node_name": "Xray Node",
+                                    "core": "xray",
+                                    "status": "stopped",
+                                    "port": 21081,
+                                    "started_at": 11,
+                                },
+                            ],
+                            "tests": {},
+                            "request_logs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                (app.RUNTIME_ROOT / "bridge-sing.log").write_text("sing-box log line", encoding="utf-8")
+                (app.RUNTIME_ROOT / "bridge-xray.log").write_text("xray log line", encoding="utf-8")
+
+                payload = app.core_log_payload("sing-box")
+                self.assertEqual(payload["core"], "sing-box")
+                self.assertEqual(len(payload["entries"]), 1)
+                self.assertEqual(payload["entries"][0]["node_name"], "Sing Node")
+                self.assertIn("sing-box log line", payload["entries"][0]["log"])
+        finally:
+            app.WORK_ROOT = old_work_root
+            app.RUNTIME_ROOT = old_runtime_root
+            app.STATE_PATH = old_state_path
+
     def test_start_bridge_cleans_process_table_when_core_exits_immediately(self):
         old_work_root = app.WORK_ROOT
         old_runtime_root = app.RUNTIME_ROOT

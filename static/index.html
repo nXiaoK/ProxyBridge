@@ -193,6 +193,21 @@
       </section>
     </main>
 
+    <div class="modal-backdrop" id="coreLogModal" hidden>
+      <section class="core-log-modal" role="dialog" aria-modal="true" aria-labelledby="coreLogTitle" tabindex="-1">
+        <header class="modal-head">
+          <div>
+            <h2 id="coreLogTitle">核心日志</h2>
+            <p id="coreLogMeta" class="modal-subtitle"></p>
+          </div>
+          <button class="icon-button" type="button" data-action="close-core-log" aria-label="关闭日志" title="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </header>
+        <div class="core-log-body" id="coreLogBody"></div>
+      </section>
+    </div>
+
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script>
       // Theme toggle
