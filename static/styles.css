@@ -157,6 +157,9 @@ body {
   text-rendering: optimizeLegibility;
   padding: 24px;
 }
+body.modal-open {
+  overflow: hidden;
+}
 
 h1,
 h2,
@@ -932,6 +935,7 @@ tbody .row-actions {
 }
 .core-log-modal {
   width: min(920px, 100%);
+  height: min(760px, calc(100dvh - 48px));
   max-height: min(760px, calc(100dvh - 48px));
   display: flex;
   flex-direction: column;
@@ -942,6 +946,7 @@ tbody .row-actions {
   box-shadow: var(--shadow-window);
 }
 .modal-head {
+  flex: 0 0 auto;
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -966,13 +971,18 @@ tbody .row-actions {
   color: var(--text-tertiary);
 }
 .core-log-body {
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 12px;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
 .core-log-entry {
+  flex: 0 0 auto;
   overflow: hidden;
   border: 0.5px solid var(--border-subtle);
   border-radius: var(--radius-md);
@@ -983,7 +993,7 @@ tbody .row-actions {
 }
 .core-log-entry header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
   padding: 9px 11px;
@@ -998,6 +1008,7 @@ tbody .row-actions {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
+  line-height: 1.35;
   color: var(--text-primary);
 }
 .core-log-entry header span:not(.status) {
@@ -1007,17 +1018,31 @@ tbody .row-actions {
   font-size: 10px;
   color: var(--text-tertiary);
 }
-.core-log-entry pre {
+.core-log-text,
+.core-log-placeholder {
+  display: block;
   margin: 0;
-  max-height: 260px;
-  overflow: auto;
+  min-height: 44px;
   padding: 11px;
+  border-top: 0.5px solid var(--separator);
+  background: var(--bg-input);
   font-family: var(--font-mono);
   font-size: 11px;
   line-height: 1.55;
+}
+.core-log-text {
+  max-height: 260px;
+  overflow: auto;
   color: var(--text-secondary);
   white-space: pre-wrap;
   word-break: break-word;
+}
+.core-log-placeholder {
+  color: var(--text-tertiary);
+}
+[data-theme="dark"] .core-log-text,
+[data-theme="dark"] .core-log-placeholder {
+  background: rgba(0, 0, 0, 0.18);
 }
 .core-log-loading,
 .core-log-empty {

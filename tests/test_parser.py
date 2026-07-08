@@ -120,6 +120,24 @@ class ParserTests(unittest.TestCase):
                                     "started_at": 10,
                                 },
                                 {
+                                    "id": "bridge-empty",
+                                    "node_id": "node-empty",
+                                    "node_name": "Empty History",
+                                    "core": "sing-box",
+                                    "status": "stopped",
+                                    "port": 21082,
+                                    "started_at": 11,
+                                },
+                                {
+                                    "id": "bridge-failed-empty",
+                                    "node_id": "node-failed-empty",
+                                    "node_name": "Failed Empty",
+                                    "core": "sing-box",
+                                    "status": "failed",
+                                    "port": 21083,
+                                    "started_at": 12,
+                                },
+                                {
                                     "id": "bridge-xray",
                                     "node_id": "node-xray",
                                     "node_name": "Xray Node",
@@ -140,9 +158,14 @@ class ParserTests(unittest.TestCase):
 
                 payload = app.core_log_payload("sing-box")
                 self.assertEqual(payload["core"], "sing-box")
-                self.assertEqual(len(payload["entries"]), 1)
-                self.assertEqual(payload["entries"][0]["node_name"], "Sing Node")
-                self.assertIn("sing-box log line", payload["entries"][0]["log"])
+                self.assertEqual(len(payload["entries"]), 2)
+                self.assertEqual(payload["hidden_empty_count"], 1)
+                entries_by_id = {entry["id"]: entry for entry in payload["entries"]}
+                self.assertIn("bridge-sing", entries_by_id)
+                self.assertIn("bridge-failed-empty", entries_by_id)
+                self.assertEqual(entries_by_id["bridge-sing"]["node_name"], "Sing Node")
+                self.assertIn("sing-box log line", entries_by_id["bridge-sing"]["log"])
+                self.assertFalse(entries_by_id["bridge-failed-empty"]["has_log"])
         finally:
             app.WORK_ROOT = old_work_root
             app.RUNTIME_ROOT = old_runtime_root

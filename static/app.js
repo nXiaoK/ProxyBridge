@@ -489,6 +489,7 @@ function renderRequestLogs() {
 
 function closeCoreLogModal() {
   $("#coreLogModal").hidden = true;
+  document.body.classList.remove("modal-open");
   if (lastCoreLogTrigger?.isConnected) {
     lastCoreLogTrigger.focus();
   }
@@ -498,16 +499,19 @@ function closeCoreLogModal() {
 function renderCoreLogPayload(payload) {
   const core = payload.core || "core";
   const corePath = payload.core_path || "missing";
+  const entries = payload.entries || [];
+  const metaParts = [`${entries.length} 个日志片段`];
+  if (payload.hidden_empty_count) metaParts.push(`已隐藏 ${payload.hidden_empty_count} 个空历史记录`);
+  if (payload.truncated_count) metaParts.push(`还有 ${payload.truncated_count} 个未显示`);
   $("#coreLogTitle").textContent = `${core} 运行日志`;
-  $("#coreLogMeta").textContent = `${corePath} · ${payload.entries?.length || 0} 个日志片段`;
+  $("#coreLogMeta").textContent = `${corePath} · ${metaParts.join(" · ")}`;
 
   const body = $("#coreLogBody");
-  const entries = payload.entries || [];
   if (!entries.length) {
     body.innerHTML = `
       <div class="core-log-empty">
         <strong>暂无运行日志</strong>
-        <span>启动使用 ${escapeHtml(core)} 的节点后，这里会显示对应核心输出。</span>
+        <span>启动使用 ${escapeHtml(core)} 的节点后，这里会显示对应核心输出；无输出的已停止历史记录不会占用列表。</span>
       </div>
     `;
     return;
@@ -515,18 +519,22 @@ function renderCoreLogPayload(payload) {
 
   body.innerHTML = entries
     .map((entry) => {
-      const title = `${entry.node_name || "未知节点"} · ${entry.port || "-"} · ${entry.status || "-"}`;
-      const log = entry.log || "暂无日志输出";
+      const status = entry.status || "-";
+      const title = `${entry.node_name || "未知节点"} · ${entry.port || "-"}`;
+      const log = String(entry.log || "").trim();
+      const logContent = log
+        ? `<pre class="core-log-text">${escapeHtml(log)}</pre>`
+        : '<div class="core-log-placeholder">暂无核心输出，保持运行后有新输出会显示在这里。</div>';
       return `
-        <article class="core-log-entry">
+        <article class="core-log-entry ${log ? "" : "is-empty"}">
           <header>
             <div>
               <strong>${escapeHtml(title)}</strong>
               <span>${escapeHtml(formatTime(entry.started_at))}</span>
             </div>
-            <span class="status ${escapeHtml(entry.status || "")}">${escapeHtml(entry.status || "-")}</span>
+            <span class="status ${escapeHtml(status)}">${escapeHtml(status)}</span>
           </header>
-          <pre>${escapeHtml(log)}</pre>
+          ${logContent}
         </article>
       `;
     })
@@ -537,6 +545,7 @@ async function showCoreLog(core) {
   if (!core) return;
   const modal = $("#coreLogModal");
   modal.hidden = false;
+  document.body.classList.add("modal-open");
   modal.querySelector('[data-action="close-core-log"]')?.focus();
   $("#coreLogTitle").textContent = `${core} 运行日志`;
   $("#coreLogMeta").textContent = "加载中";

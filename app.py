@@ -33,6 +33,7 @@ DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
 REQUEST_LOG_LIMIT = 500
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
+CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
 CORE_LOG_ENTRY_LIMIT = 30
 PROCESS_TABLE: dict[str, subprocess.Popen] = {}
@@ -1161,29 +1162,42 @@ def core_log_payload(core: str) -> dict[str, Any]:
         bridges = [dict(bridge) for bridge in state.get("bridges", []) if bridge.get("core") == core]
 
     entries = []
+    hidden_empty_count = 0
     sorted_bridges = sorted(bridges, key=lambda item: safe_int(item.get("started_at"), 0), reverse=True)
-    for bridge in sorted_bridges[:CORE_LOG_ENTRY_LIMIT]:
+    for bridge in sorted_bridges:
         bridge_id = str(bridge.get("id") or "")
         if not bridge_id:
             continue
         log_path = RUNTIME_ROOT / f"{bridge_id}.log"
+        log = read_tail(log_path, CORE_LOG_TAIL_LIMIT)
+        status = str(bridge.get("status") or "-")
+        if not log and status not in CORE_LOG_VISIBLE_STATUSES:
+            hidden_empty_count += 1
+            continue
         entries.append(
             {
                 "id": bridge_id,
                 "node_id": bridge.get("node_id"),
                 "node_name": bridge.get("node_name") or bridge.get("node_id") or "未知节点",
                 "port": bridge.get("port"),
-                "status": bridge.get("status") or "-",
+                "status": status,
                 "started_at": bridge.get("started_at"),
                 "log_path": str(log_path),
-                "log": read_tail(log_path, CORE_LOG_TAIL_LIMIT),
+                "log": log,
+                "has_log": bool(log),
             }
         )
 
+    visible_count = len(entries)
+    entries = entries[:CORE_LOG_ENTRY_LIMIT]
     return {
         "core": core,
         "core_path": core_paths().get(core),
         "entries": entries,
+        "total_count": len(bridges),
+        "visible_count": visible_count,
+        "hidden_empty_count": hidden_empty_count,
+        "truncated_count": max(0, visible_count - len(entries)),
         "generated_at": now_ts(),
         "tail_limit": CORE_LOG_TAIL_LIMIT,
     }
