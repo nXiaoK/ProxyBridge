@@ -54,6 +54,90 @@ class ParserTests(unittest.TestCase):
             if old_xray is not None:
                 os.environ["PROXY_BRIDGE_XRAY"] = old_xray
 
+    def test_launch_browser_uses_node_profile_and_proxy(self):
+        old_work_root = app.WORK_ROOT
+        old_runtime_root = app.RUNTIME_ROOT
+        old_state_path = app.STATE_PATH
+        old_chrome = os.environ.get("PROXY_BRIDGE_CHROME")
+        old_popen = app.subprocess.Popen
+        old_start_bridge = app.start_bridge
+
+        class FakePopen:
+            calls: list[tuple[list[str], dict[str, object]]] = []
+
+            def __init__(self, command: list[str], **kwargs: object) -> None:
+                self.pid = 4242
+                self.command = command
+                FakePopen.calls.append((command, kwargs))
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                chrome = root / "Google Chrome"
+                chrome.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                chrome.chmod(0o755)
+                os.environ["PROXY_BRIDGE_CHROME"] = str(chrome)
+                app.WORK_ROOT = root / "work"
+                app.RUNTIME_ROOT = app.WORK_ROOT / "runtime"
+                app.STATE_PATH = app.WORK_ROOT / "state.json"
+                app.ensure_dirs()
+                node_id = "node-browser"
+                app.STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "subscriptions": [],
+                            "nodes": [
+                                {
+                                    "id": node_id,
+                                    "name": "Browser Node",
+                                    "protocol": "vless",
+                                    "server": "example.com",
+                                    "port": 443,
+                                    "region": "HK",
+                                    "source": "test",
+                                    "raw": "",
+                                    "preferred_core": "sing-box",
+                                }
+                            ],
+                            "bridges": [],
+                            "tests": {},
+                            "request_logs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                app.subprocess.Popen = FakePopen
+                app.start_bridge = lambda payload: {
+                    "id": "bridge-browser",
+                    "node_id": node_id,
+                    "node_name": "Browser Node",
+                    "port": 25080,
+                    "socks_url": "socks5://127.0.0.1:25080",
+                    "status": "running",
+                }
+
+                result = app.launch_browser({"node_id": node_id})
+                self.assertEqual(result["proxy"], "socks5://127.0.0.1:25080")
+                self.assertEqual(result["pid"], 4242)
+                self.assertEqual(len(FakePopen.calls), 1)
+                command = FakePopen.calls[0][0]
+                self.assertEqual(command[0], str(chrome))
+                self.assertIn("--proxy-server=socks5://127.0.0.1:25080", command)
+                profile_arg = next(arg for arg in command if arg.startswith("--user-data-dir="))
+                profile_path = Path(profile_arg.split("=", 1)[1])
+                self.assertTrue(profile_path.is_dir())
+                self.assertEqual(profile_path.parent, app.browser_profiles_root())
+        finally:
+            app.WORK_ROOT = old_work_root
+            app.RUNTIME_ROOT = old_runtime_root
+            app.STATE_PATH = old_state_path
+            app.subprocess.Popen = old_popen
+            app.start_bridge = old_start_bridge
+            if old_chrome is None:
+                os.environ.pop("PROXY_BRIDGE_CHROME", None)
+            else:
+                os.environ["PROXY_BRIDGE_CHROME"] = old_chrome
+
     def test_load_state_keeps_running_bridges_enabled_for_restore(self):
         old_work_root = app.WORK_ROOT
         old_runtime_root = app.RUNTIME_ROOT

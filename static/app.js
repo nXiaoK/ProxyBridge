@@ -1,5 +1,6 @@
 const appState = {
   cores: {},
+  chrome: null,
   subscriptions: [],
   nodes: [],
   bridges: [],
@@ -37,6 +38,7 @@ function icon(name) {
     copy: '<path d="M8 8h10v10H8z"/><path d="M6 16H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
     stop: '<path d="M7 7h10v10H7z"/>',
     refresh: '<path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4M18 3v4h-4M6 21v-4h4"/>',
+    browser: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18"/><path d="M8 4v4"/>',
     trash: '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 15h10l1-15"/>',
     link: '<path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"/><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"/>',
     minus: '<path d="M5 12h14"/>',
@@ -135,6 +137,7 @@ function endpointParts(socksUrl, fallbackPort) {
 async function loadStatus() {
   const status = await api("/api/status");
   appState.cores = status.cores || {};
+  appState.chrome = status.chrome || null;
   appState.subscriptions = status.subscriptions || [];
   appState.nodes = status.nodes || [];
   appState.bridges = status.bridges || [];
@@ -339,6 +342,7 @@ function renderNodes() {
                   ? `<button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}">${icon("copy")}<span>复制</span></button>`
                   : `<button class="row-button primary-row" data-action="start" data-node="${escapeHtml(node.id)}">${icon("play")}<span>启动并复制</span></button>`
               }
+              <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="用独立 Chrome Profile 启动 ${escapeHtml(node.name)}" title="用独立 Chrome Profile 启动，并绑定该节点 SOCKS5">${icon("browser")}<span>浏览器</span></button>
             </div>
           </td>
         </tr>
@@ -593,6 +597,13 @@ async function testNode(nodeId) {
   return result;
 }
 
+async function launchBrowser(nodeId) {
+  const result = await api("/api/browser/launch", { node_id: nodeId });
+  await loadStatus();
+  showToast(`已启动浏览器：${result.proxy}`);
+  return result;
+}
+
 async function handleAction(event) {
   const button = event.target.closest("button[data-action]");
   if (!button) return;
@@ -603,6 +614,8 @@ async function handleAction(event) {
       await startNode(button.dataset.node);
     } else if (action === "test") {
       await testNode(button.dataset.node);
+    } else if (action === "launch-browser") {
+      await launchBrowser(button.dataset.node);
     } else if (action === "copy") {
       await copyText(button.dataset.text);
     } else if (action === "stop") {

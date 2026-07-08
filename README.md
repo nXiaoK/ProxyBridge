@@ -10,6 +10,7 @@
 - 为节点生成本地 `socks5://127.0.0.1:端口`。
 - 普通协议走 `sing-box`，`VLESS + XHTTP` 自动走 `xray` fallback。
 - 菜单栏 App 可内置 `sing-box` / `xray`，复制到其他 Apple Silicon Mac 后无需再单独安装代理核心。
+- 节点操作列可启动独立 Chrome Profile，并自动绑定该节点的本地 SOCKS5 代理。
 
 ## 运行要求
 
@@ -48,6 +49,7 @@ outputs/ProxyBridgeMenuBar.app
 - 左键点击 `PB`：打开内置控制台面板。
 - 右键点击 `PB`：打开快捷菜单。
 - 控制台里可以导入订阅、筛选节点、启动并复制 SOCKS5、停止端口。
+- 节点操作列的 `浏览器` 按钮会使用本机 Google Chrome 创建/复用该节点专属 Profile，并绑定该节点 SOCKS5。若节点还未启动 SOCKS5，会先自动启动。
 - 每个节点都有 `测试` / `重测`，会临时启动该节点并通过 SOCKS5 访问 `cp.cloudflare.com/generate_204`，显示真实可通信状态和延迟。
 - `测试可见节点` 会按当前筛选结果批量测试。
 - 控制台底部的 `连接日志` 会显示通过本地 SOCKS5 的 CONNECT 目标、客户端本地端口、使用节点、上下行流量、耗时和成功/失败状态。
@@ -61,6 +63,8 @@ outputs/ProxyBridgeMenuBar.app
 ```text
 ~/Library/Application Support/ProxyBridge
 ```
+
+浏览器 Profile 会保存在同一目录下的 `browser_profiles/`，因此 Cookies、LocalStorage、SessionStorage 等浏览器本地数据会按节点隔离并保留。该功能使用的是本机 Chrome 的多用户数据目录能力，不会伪造 Canvas、WebGL、AudioContext、字体、Client Hints 等浏览器指纹；如需合规的企业级反关联/设备指纹管理，需要使用专门的浏览器隔离产品或受控测试环境。
 
 如果 App 是从本项目的 `outputs/` 目录启动，首次运行会尝试迁移旧 Web 版的 `work/state.json`。
 

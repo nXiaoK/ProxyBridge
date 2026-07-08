@@ -69,6 +69,11 @@ def now_ts() -> int:
 def ensure_dirs() -> None:
     WORK_ROOT.mkdir(parents=True, exist_ok=True)
     RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
+    browser_profiles_root().mkdir(parents=True, exist_ok=True)
+
+
+def browser_profiles_root() -> Path:
+    return WORK_ROOT / "browser_profiles"
 
 
 def clean_name(value: str | None, fallback: str) -> str:
@@ -698,6 +703,23 @@ def core_paths() -> dict[str, str | None]:
     return {"sing-box": sing_box, "xray": xray}
 
 
+def chrome_path() -> str | None:
+    env_path = os.environ.get("PROXY_BRIDGE_CHROME")
+    candidates: list[Path] = []
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+    candidates.extend(
+        [
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return shutil.which("google-chrome") or shutil.which("chrome") or shutil.which("google-chrome-stable")
+
+
 def status_payload() -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
@@ -705,6 +727,7 @@ def status_payload() -> dict[str, Any]:
         save_state(state)
         return {
             "cores": core_paths(),
+            "chrome": chrome_path(),
             "subscriptions": state["subscriptions"],
             "nodes": [public_node(node) for node in state["nodes"]],
             "bridges": state["bridges"],
@@ -792,6 +815,19 @@ def find_node(state: dict[str, Any], node_id: str) -> dict[str, Any]:
     if not node:
         raise ValueError("节点不存在")
     return node
+
+
+def active_bridge_for_node(state: dict[str, Any], node_id: str) -> dict[str, Any] | None:
+    bridges = [bridge for bridge in state.get("bridges", []) if bridge.get("node_id") == node_id]
+    bridges.sort(key=lambda bridge: safe_int(bridge.get("started_at"), 0), reverse=True)
+    return next(
+        (
+            bridge
+            for bridge in bridges
+            if bridge.get("status") in ACTIVE_BRIDGE_STATUSES and safe_int(bridge.get("port"), 0) > 0
+        ),
+        None,
+    )
 
 
 def is_port_free(port: int) -> bool:
@@ -1140,6 +1176,61 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
         state["bridges"].append(bridge)
         save_state(state)
         return bridge
+
+
+def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    node_id = str(payload.get("node_id") or "")
+    if not node_id:
+        raise ValueError("缺少节点 ID")
+    chrome = chrome_path()
+    if not chrome:
+        raise RuntimeError("未找到 Google Chrome，请安装 Chrome 或设置 PROXY_BRIDGE_CHROME")
+
+    with STATE_LOCK:
+        state = load_state()
+        node = find_node(state, node_id)
+        sync_process_status(state)
+        save_state(state)
+        bridge = active_bridge_for_node(state, node_id)
+
+    if not bridge:
+        bridge = start_bridge({"node_id": node_id, "core": "auto"})
+
+    local_port = safe_int(bridge.get("port"), 0)
+    if local_port <= 0:
+        raise RuntimeError("当前节点没有可用的 SOCKS5 端口")
+
+    profile_path = browser_profiles_root() / stable_id(node_id)
+    profile_path.mkdir(parents=True, exist_ok=True)
+    proxy = f"socks5://127.0.0.1:{local_port}"
+    command = [
+        chrome,
+        f"--user-data-dir={profile_path}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        f"--proxy-server={proxy}",
+        "--new-window",
+        "about:blank",
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=str(APP_ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return {
+        "ok": True,
+        "pid": process.pid,
+        "node_id": node_id,
+        "node_name": node.get("name") or node_id,
+        "proxy": proxy,
+        "bridge_id": bridge.get("id"),
+        "profile_path": str(profile_path),
+        "chrome_path": chrome,
+        "isolation": "Chrome user-data-dir + SOCKS5 proxy",
+        "fingerprint_note": "本功能隔离 Profile 数据并绑定代理，但不会伪造 Canvas/WebGL/Audio 等浏览器指纹。",
+    }
 
 
 def read_tail(path: Path, limit: int = 6000) -> str:
@@ -1790,6 +1881,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, stop_all_bridges())
             elif self.path == "/api/nodes/test":
                 json_response(self, test_node(payload))
+            elif self.path == "/api/browser/launch":
+                json_response(self, launch_browser(payload))
             elif self.path == "/api/clipboard":
                 json_response(self, copy_to_clipboard(str(payload.get("text") or "")))
             elif self.path == "/api/logs/clear":
