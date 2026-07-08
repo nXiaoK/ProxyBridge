@@ -147,6 +147,9 @@ class ParserTests(unittest.TestCase):
                 self.command = command
                 FakePopen.calls.append((command, kwargs))
 
+            def poll(self) -> None:
+                return None
+
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
                 root = Path(temp_dir)
@@ -201,6 +204,8 @@ class ParserTests(unittest.TestCase):
                 result = app.launch_browser({"node_id": node_id})
                 self.assertEqual(result["proxy"], "socks5://127.0.0.1:25080")
                 self.assertEqual(result["pid"], 4242)
+                self.assertIn("instance_id", result)
+                instance_id = result["instance_id"]
                 self.assertEqual(len(FakePopen.calls), 1)
                 command = FakePopen.calls[0][0]
                 self.assertEqual(command[0], str(fp_kernel))
@@ -211,12 +216,12 @@ class ParserTests(unittest.TestCase):
                 self.assertIn("--webrtc-ip-handling-policy=disable_non_proxied_udp", command)
                 self.assertTrue(any(arg.startswith("--timezone=") for arg in command))
                 self.assertTrue(any(arg.startswith("--lang=") for arg in command))
-                # 同一节点两次启动应派生完全相同的指纹种子(环境可恢复)。
-                self.assertEqual(result["fingerprint_seed"], app.fingerprint_seed(node_id))
+                self.assertEqual(result["fingerprint_seed"], app.fingerprint_seed(f"{node_id}:{instance_id}"))
+                self.assertNotEqual(result["fingerprint_seed"], app.fingerprint_seed(node_id))
                 profile_arg = next(arg for arg in command if arg.startswith("--user-data-dir="))
                 profile_path = Path(profile_arg.split("=", 1)[1])
                 self.assertTrue(profile_path.is_dir())
-                self.assertEqual(profile_path.parent, app.browser_profiles_root())
+                self.assertEqual(profile_path.parent, app.browser_profiles_root() / app.stable_id(node_id))
                 self.assertEqual(command[-1], "https://ip.skk.moe/")
                 prefs_path = profile_path / "Default" / "Preferences"
                 prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
@@ -232,6 +237,16 @@ class ParserTests(unittest.TestCase):
                 self.assertEqual(search_provider["name"], "Google")
                 self.assertEqual(search_provider["search_url"], "https://www.google.com/search?q={searchTerms}")
                 self.assertTrue(search_provider["is_default"])
+
+                second = app.launch_browser({"node_id": node_id})
+                self.assertNotEqual(second["instance_id"], instance_id)
+                self.assertNotEqual(second["fingerprint_seed"], result["fingerprint_seed"])
+                self.assertNotEqual(second["profile_path"], result["profile_path"])
+                state = app.load_state()
+                instances = [item for item in state["browser_instances"] if item["node_id"] == node_id]
+                self.assertEqual(len(instances), 2)
+                self.assertTrue(all(item["status"] == "running" for item in instances))
+                self.assertEqual([item["name"] for item in instances], ["浏览器 1", "浏览器 2"])
         finally:
             app.WORK_ROOT = old_work_root
             app.RUNTIME_ROOT = old_runtime_root
@@ -246,6 +261,177 @@ class ParserTests(unittest.TestCase):
                 os.environ.pop("PROXY_BRIDGE_FP_CHROMIUM", None)
             else:
                 os.environ["PROXY_BRIDGE_FP_CHROMIUM"] = old_fp_kernel
+
+    def test_load_state_adds_legacy_browser_instance_for_existing_profile(self):
+        old_work_root = app.WORK_ROOT
+        old_runtime_root = app.RUNTIME_ROOT
+        old_state_path = app.STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.RUNTIME_ROOT = Path(temp_dir) / "runtime"
+                app.STATE_PATH = Path(temp_dir) / "state.json"
+                app.ensure_dirs()
+                node_id = "node-legacy-browser"
+                legacy_profile = app.browser_profiles_root() / app.stable_id(node_id)
+                (legacy_profile / "Default").mkdir(parents=True)
+                app.STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "subscriptions": [],
+                            "nodes": [
+                                {
+                                    "id": node_id,
+                                    "name": "Legacy Browser Node",
+                                    "protocol": "socks",
+                                    "server": "127.0.0.1",
+                                    "port": 1,
+                                    "region": "本地",
+                                    "source": "test",
+                                    "raw": "",
+                                    "settings": {},
+                                    "tags": [],
+                                    "transport": "tcp",
+                                    "security": "",
+                                    "preferred_core": "sing-box",
+                                }
+                            ],
+                            "bridges": [],
+                            "tests": {},
+                            "request_logs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                state = app.load_state()
+                legacy = state["browser_instances"][0]
+                self.assertTrue(legacy["legacy"])
+                self.assertEqual(legacy["node_id"], node_id)
+                self.assertEqual(legacy["profile_path"], str(legacy_profile))
+                self.assertEqual(legacy["fingerprint_seed"], app.fingerprint_seed(node_id))
+                self.assertEqual(legacy["status"], "stopped")
+        finally:
+            app.WORK_ROOT = old_work_root
+            app.RUNTIME_ROOT = old_runtime_root
+            app.STATE_PATH = old_state_path
+
+    def test_stop_single_browser_instance_keeps_sibling_and_socks_bridge(self):
+        old_work_root = app.WORK_ROOT
+        old_runtime_root = app.RUNTIME_ROOT
+        old_state_path = app.STATE_PATH
+        old_browser_table = {key: list(value) for key, value in app.BROWSER_TABLE.items()}
+        old_process_table = dict(app.PROCESS_TABLE)
+        old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
+        old_browser_process_table = dict(getattr(app, "BROWSER_PROCESS_TABLE", {}))
+        old_terminate_process = app.terminate_process
+        old_wait_for_port = app.wait_for_port
+
+        class FakeProcess:
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
+
+            def poll(self) -> None:
+                return None
+
+        killed_pids: list[int] = []
+
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.RUNTIME_ROOT = Path(temp_dir) / "runtime"
+                app.STATE_PATH = Path(temp_dir) / "state.json"
+                app.ensure_dirs()
+                node_id = "node-single-instance-stop"
+                bridge_id = "bridge-single-instance-stop"
+                first_id = "browser-first"
+                second_id = "browser-second"
+                app.STATE_PATH.write_text(
+                    json.dumps(
+                        {
+                            "subscriptions": [],
+                            "nodes": [],
+                            "bridges": [
+                                {
+                                    "id": bridge_id,
+                                    "node_id": node_id,
+                                    "node_name": "Single Stop Node",
+                                    "core": "sing-box",
+                                    "status": "running",
+                                    "enabled": True,
+                                    "port": 25480,
+                                    "pid": 5454,
+                                    "started_at": 10,
+                                }
+                            ],
+                            "browser_instances": [
+                                {
+                                    "id": first_id,
+                                    "node_id": node_id,
+                                    "name": "浏览器 1",
+                                    "status": "running",
+                                    "profile_path": str(app.browser_profiles_root() / app.stable_id(node_id) / first_id),
+                                    "fingerprint_seed": app.fingerprint_seed(f"{node_id}:{first_id}"),
+                                    "pid": 6463,
+                                    "launch_count": 1,
+                                    "legacy": False,
+                                },
+                                {
+                                    "id": second_id,
+                                    "node_id": node_id,
+                                    "name": "浏览器 2",
+                                    "status": "running",
+                                    "profile_path": str(app.browser_profiles_root() / app.stable_id(node_id) / second_id),
+                                    "fingerprint_seed": app.fingerprint_seed(f"{node_id}:{second_id}"),
+                                    "pid": 6464,
+                                    "launch_count": 1,
+                                    "legacy": False,
+                                },
+                            ],
+                            "tests": {},
+                            "request_logs": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                app.PROCESS_TABLE.clear()
+                app.PROCESS_TABLE[bridge_id] = FakeProcess(5454)
+                app.LOG_PROXY_TABLE.clear()
+                if hasattr(app, "BROWSER_PROCESS_TABLE"):
+                    app.BROWSER_PROCESS_TABLE.clear()
+                    app.BROWSER_PROCESS_TABLE[first_id] = FakeProcess(6463)
+                    app.BROWSER_PROCESS_TABLE[second_id] = FakeProcess(6464)
+                app.terminate_process = lambda process: killed_pids.append(process.pid)
+                app.wait_for_port = lambda port, timeout=2.0: True
+
+                result = app.stop_browser({"instance_id": first_id})
+                state = app.load_state()
+                instances = {item["id"]: item for item in state["browser_instances"]}
+                bridge = state["bridges"][0]
+
+                self.assertEqual(result["killed_browsers"], 1)
+                self.assertEqual(killed_pids, [6463])
+                self.assertEqual(instances[first_id]["status"], "stopped")
+                self.assertIsNone(instances[first_id]["pid"])
+                self.assertEqual(instances[second_id]["status"], "running")
+                self.assertEqual(instances[second_id]["pid"], 6464)
+                self.assertEqual(bridge["status"], "running")
+                self.assertTrue(bridge["enabled"])
+        finally:
+            app.WORK_ROOT = old_work_root
+            app.RUNTIME_ROOT = old_runtime_root
+            app.STATE_PATH = old_state_path
+            app.terminate_process = old_terminate_process
+            app.wait_for_port = old_wait_for_port
+            app.BROWSER_TABLE.clear()
+            app.BROWSER_TABLE.update(old_browser_table)
+            app.PROCESS_TABLE.clear()
+            app.PROCESS_TABLE.update(old_process_table)
+            app.LOG_PROXY_TABLE.clear()
+            app.LOG_PROXY_TABLE.update(old_log_proxy_table)
+            if hasattr(app, "BROWSER_PROCESS_TABLE"):
+                app.BROWSER_PROCESS_TABLE.clear()
+                app.BROWSER_PROCESS_TABLE.update(old_browser_process_table)
 
     def test_stop_browser_keeps_active_socks_bridge_running(self):
         old_work_root = app.WORK_ROOT

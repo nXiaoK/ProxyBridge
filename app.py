@@ -41,13 +41,14 @@ REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
 HTTP_PROXY_HEADER_LIMIT = 65536
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
+ACTIVE_BROWSER_STATUSES = {"running", "starting"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
 CORE_LOG_ENTRY_LIMIT = 30
 PROCESS_TABLE: dict[str, subprocess.Popen] = {}
-# 记录每个节点已启动的指纹浏览器进程(可能因单例复用产生多个短命进程,故用列表);
-# 用于「停止浏览器」时结束进程组,并据此在前端显示停止按钮。
+# 兼容旧的节点级浏览器进程表;新的多开浏览器以 BROWSER_PROCESS_TABLE 按实例记录。
 BROWSER_TABLE: dict[str, list[subprocess.Popen]] = {}
+BROWSER_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
 LOG_PROXY_TABLE: dict[str, "Socks5LogProxy"] = {}
 TRAFFIC_TABLE: dict[str, dict[str, int]] = {}
 STATE_LOCK = threading.RLock()
@@ -329,6 +330,170 @@ def ensure_google_search_extension() -> Path:
         json.dump(GOOGLE_SEARCH_EXTENSION_MANIFEST, f, ensure_ascii=False, indent=2)
     tmp.replace(manifest_path)
     return extension_dir
+
+
+def browser_node_profile_root(node_id: str) -> Path:
+    return browser_profiles_root() / stable_id(node_id)
+
+
+def legacy_browser_instance_id(node_id: str) -> str:
+    return stable_id("browser-instance", "legacy", node_id)
+
+
+def new_browser_instance_id(node_id: str) -> str:
+    return stable_id("browser-instance", node_id, str(time.time_ns()))
+
+
+def browser_instance_seed(node_id: str, instance_id: str, legacy: bool = False) -> int:
+    return fingerprint_seed(node_id if legacy else f"{node_id}:{instance_id}")
+
+
+def browser_instance_profile_path(node_id: str, instance_id: str, legacy: bool = False) -> Path:
+    if legacy:
+        return browser_node_profile_root(node_id)
+    return browser_node_profile_root(node_id) / instance_id
+
+
+def is_legacy_browser_profile(profile_path: Path) -> bool:
+    # 旧版本把 Default 目录直接放在节点目录下;新版本的 Default 位于实例子目录内。
+    return (profile_path / "Default").exists() or (profile_path / "Local State").exists()
+
+
+def browser_instances_for_node(state: dict[str, Any], node_id: str) -> list[dict[str, Any]]:
+    return [item for item in state.get("browser_instances", []) if str(item.get("node_id") or "") == node_id]
+
+
+def next_browser_instance_name(state: dict[str, Any], node_id: str) -> str:
+    numbers: list[int] = []
+    count = 0
+    for item in browser_instances_for_node(state, node_id):
+        if item.get("legacy"):
+            continue
+        count += 1
+        match = re.fullmatch(r"浏览器\s+(\d+)", str(item.get("name") or "").strip())
+        if match:
+            numbers.append(safe_int(match.group(1), 0))
+    return f"浏览器 {max(numbers, default=count) + 1}"
+
+
+def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[str, Any]:
+    existing_ids = {str(item.get("id") or "") for item in state.get("browser_instances", [])}
+    instance_id = new_browser_instance_id(node_id)
+    while instance_id in existing_ids:
+        instance_id = new_browser_instance_id(node_id)
+    profile_path = browser_instance_profile_path(node_id, instance_id)
+    return {
+        "id": instance_id,
+        "node_id": node_id,
+        "name": next_browser_instance_name(state, node_id),
+        "status": "stopped",
+        "profile_path": str(profile_path),
+        "fingerprint_seed": browser_instance_seed(node_id, instance_id),
+        "created_at": now_ts(),
+        "last_started_at": None,
+        "last_stopped_at": None,
+        "pid": None,
+        "bridge_id": None,
+        "proxy": "",
+        "launch_count": 0,
+        "legacy": False,
+    }
+
+
+def find_browser_instance(state: dict[str, Any], instance_id: str) -> dict[str, Any]:
+    for instance in state.get("browser_instances", []):
+        if str(instance.get("id") or "") == instance_id:
+            return instance
+    raise ValueError("找不到浏览器记录")
+
+
+def normalize_browser_instances(state: dict[str, Any]) -> None:
+    instances = state.get("browser_instances")
+    if not isinstance(instances, list):
+        instances = []
+    normalized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    next_numbers: dict[str, int] = {}
+    for raw in instances:
+        if not isinstance(raw, dict):
+            continue
+        node_id = str(raw.get("node_id") or "")
+        if not node_id:
+            continue
+        legacy = bool(raw.get("legacy"))
+        instance_id = str(raw.get("id") or "") or (
+            legacy_browser_instance_id(node_id) if legacy else new_browser_instance_id(node_id)
+        )
+        if instance_id in seen:
+            continue
+        seen.add(instance_id)
+        record = dict(raw)
+        if not record.get("name"):
+            if legacy:
+                record["name"] = "默认浏览器"
+            else:
+                number = next_numbers.get(node_id, 1)
+                record["name"] = f"浏览器 {number}"
+                next_numbers[node_id] = number + 1
+        status = str(record.get("status") or "stopped")
+        if status not in ACTIVE_BROWSER_STATUSES | {"stopped", "failed"}:
+            status = "stopped"
+        record.update(
+            {
+                "id": instance_id,
+                "node_id": node_id,
+                "status": status,
+                "profile_path": str(
+                    record.get("profile_path") or browser_instance_profile_path(node_id, instance_id, legacy)
+                ),
+                "fingerprint_seed": safe_int(
+                    record.get("fingerprint_seed"), browser_instance_seed(node_id, instance_id, legacy)
+                ),
+                "created_at": safe_int(record.get("created_at"), now_ts()),
+                "last_started_at": safe_int(record.get("last_started_at"), 0) or None,
+                "last_stopped_at": safe_int(record.get("last_stopped_at"), 0) or None,
+                "pid": safe_int(record.get("pid"), 0) or None,
+                "bridge_id": record.get("bridge_id"),
+                "proxy": str(record.get("proxy") or ""),
+                "launch_count": safe_int(record.get("launch_count"), 0),
+                "legacy": legacy,
+            }
+        )
+        normalized.append(record)
+    state["browser_instances"] = normalized
+    ensure_legacy_browser_instances(state)
+
+
+def ensure_legacy_browser_instances(state: dict[str, Any]) -> None:
+    instances = state.setdefault("browser_instances", [])
+    existing_ids = {str(item.get("id") or "") for item in instances}
+    for node in state.get("nodes", []):
+        node_id = str(node.get("id") or "")
+        if not node_id:
+            continue
+        profile_path = browser_node_profile_root(node_id)
+        instance_id = legacy_browser_instance_id(node_id)
+        if instance_id in existing_ids or not is_legacy_browser_profile(profile_path):
+            continue
+        instances.append(
+            {
+                "id": instance_id,
+                "node_id": node_id,
+                "name": "默认浏览器",
+                "status": "stopped",
+                "profile_path": str(profile_path),
+                "fingerprint_seed": browser_instance_seed(node_id, instance_id, legacy=True),
+                "created_at": now_ts(),
+                "last_started_at": None,
+                "last_stopped_at": None,
+                "pid": None,
+                "bridge_id": None,
+                "proxy": "",
+                "launch_count": 0,
+                "legacy": True,
+            }
+        )
+        existing_ids.add(instance_id)
 
 
 def guess_transport(params: dict[str, str], fallback: str = "") -> str:
@@ -720,7 +885,7 @@ def parse_subscription_payload(payload: str, source: str = "手动导入") -> li
 
 
 def empty_state() -> dict[str, Any]:
-    return {"subscriptions": [], "nodes": [], "bridges": [], "tests": {}, "request_logs": []}
+    return {"subscriptions": [], "nodes": [], "bridges": [], "browser_instances": [], "tests": {}, "request_logs": []}
 
 
 def load_state(reset_running: bool = False) -> dict[str, Any]:
@@ -735,6 +900,7 @@ def load_state(reset_running: bool = False) -> dict[str, Any]:
     state.setdefault("subscriptions", [])
     state.setdefault("nodes", [])
     state.setdefault("bridges", [])
+    state.setdefault("browser_instances", [])
     state.setdefault("tests", {})
     state.setdefault("request_logs", [])
     for bridge in state["bridges"]:
@@ -753,6 +919,12 @@ def load_state(reset_running: bool = False) -> dict[str, Any]:
             if bridge.get("status") in ACTIVE_BRIDGE_STATUSES:
                 bridge["status"] = "stopped"
                 bridge["pid"] = None
+    normalize_browser_instances(state)
+    if reset_running:
+        for instance in state["browser_instances"]:
+            if instance.get("status") in ACTIVE_BROWSER_STATUSES:
+                instance["status"] = "stopped"
+                instance["pid"] = None
     return state
 
 
@@ -1185,13 +1357,16 @@ def fingerprint_chromium_path(force_refresh: bool = False) -> str | None:
 def status_payload() -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
-        if sync_process_status(state):
+        changed = sync_process_status(state)
+        changed |= sync_browser_instance_status(state)
+        if changed:
             save_state(state)
         return {
             "cores": core_paths(),
             "chrome": chrome_path(),
             "fingerprint_chromium": fingerprint_chromium_path(),
-            "active_browsers": active_browser_node_ids(),
+            "active_browsers": active_browser_node_ids_from_state(state),
+            "browser_instances": state.get("browser_instances", []),
             "subscriptions": state["subscriptions"],
             "nodes": [public_node(node) for node in state["nodes"]],
             "bridges": state["bridges"],
@@ -1663,8 +1838,7 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
 
 def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
-    if not node_id:
-        raise ValueError("缺少节点 ID")
+    requested_instance_id = str(payload.get("instance_id") or "")
     # 方案 B:使用打过补丁的指纹内核(fingerprint-chromium),从底层伪造 Canvas/WebGL/Audio/
     # 字体/屏幕/硬件并发/设备内存/Client Hints 等全部指纹维度;若内核缺失则明确提示去下载。
     fp_chromium = fingerprint_chromium_path()
@@ -1676,8 +1850,23 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
 
     with STATE_LOCK:
         state = load_state()
+        instance: dict[str, Any] | None = None
+        if requested_instance_id:
+            instance = find_browser_instance(state, requested_instance_id)
+            if not node_id:
+                node_id = str(instance.get("node_id") or "")
+        if not node_id:
+            raise ValueError("缺少节点 ID")
         node = find_node(state, node_id)
-        if sync_process_status(state):
+        changed = sync_process_status(state)
+        changed |= sync_browser_instance_status(state)
+        if instance is None:
+            instance = create_browser_instance_record(state, node_id)
+            state["browser_instances"].append(instance)
+            changed = True
+        elif str(instance.get("node_id") or "") != node_id:
+            raise ValueError("浏览器记录与节点不匹配")
+        if changed:
             save_state(state)
         bridge = active_bridge_for_node(state, node_id)
 
@@ -1688,7 +1877,9 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     if local_port <= 0:
         raise RuntimeError("当前节点没有可用的本地代理端口")
 
-    profile_path = browser_profiles_root() / stable_id(node_id)
+    instance_id = str(instance["id"])
+    legacy = bool(instance.get("legacy"))
+    profile_path = Path(str(instance.get("profile_path") or browser_instance_profile_path(node_id, instance_id, legacy)))
     first_profile_launch = not profile_path.exists()
     profile_path.mkdir(parents=True, exist_ok=True)
     configure_browser_profile_defaults(profile_path)
@@ -1696,7 +1887,7 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     proxy = f"socks5://127.0.0.1:{local_port}"
 
     # 每个节点派生固定指纹种子,并按地区匹配时区/语言,使指纹与代理出口地区一致。
-    seed = fingerprint_seed(node_id)
+    seed = safe_int(instance.get("fingerprint_seed"), browser_instance_seed(node_id, instance_id, legacy))
     region = node.get("region") or node_region(node.get("name") or "", node.get("server") or "")
     timezone, language, accept_language = region_locale(region)
 
@@ -1732,11 +1923,35 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         procs = [p for p in BROWSER_TABLE.get(node_id, []) if p.poll() is None]
         procs.append(process)
         BROWSER_TABLE[node_id] = procs
+        BROWSER_PROCESS_TABLE[instance_id] = process
+    with STATE_LOCK:
+        state = load_state()
+        try:
+            saved_instance = find_browser_instance(state, instance_id)
+        except ValueError:
+            saved_instance = dict(instance)
+            state["browser_instances"].append(saved_instance)
+        saved_instance.update(
+            {
+                "status": "running",
+                "profile_path": str(profile_path),
+                "fingerprint_seed": seed,
+                "pid": process.pid,
+                "bridge_id": bridge.get("id"),
+                "proxy": proxy,
+                "last_started_at": now_ts(),
+                "last_stopped_at": None,
+                "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
+            }
+        )
+        save_state(state)
     return {
         "ok": True,
         "pid": process.pid,
         "node_id": node_id,
         "node_name": node.get("name") or node_id,
+        "instance_id": instance_id,
+        "browser_name": instance.get("name") or "浏览器",
         "proxy": proxy,
         "bridge_id": bridge.get("id"),
         "profile_path": str(profile_path),
@@ -1765,34 +1980,109 @@ def prune_browser_processes(node_id: str) -> list[subprocess.Popen]:
 
 
 def active_browser_node_ids() -> list[str]:
-    # 返回当前仍有存活浏览器进程的节点 ID 列表,供前端决定是否显示「停止浏览器」按钮。
+    with STATE_LOCK:
+        state = load_state()
+        if sync_browser_instance_status(state):
+            save_state(state)
+    return active_browser_node_ids_from_state(state)
+
+
+def active_browser_node_ids_from_state(state: dict[str, Any]) -> list[str]:
+    node_ids: list[str] = []
+    for instance in state.get("browser_instances", []):
+        node_id = str(instance.get("node_id") or "")
+        if node_id and instance.get("status") in ACTIVE_BROWSER_STATUSES:
+            node_ids.append(node_id)
     with PROCESS_LOCK:
-        node_ids = list(BROWSER_TABLE.keys())
-    return [node_id for node_id in node_ids if prune_browser_processes(node_id)]
+        fallback_node_ids = list(BROWSER_TABLE.keys())
+    for node_id in fallback_node_ids:
+        if prune_browser_processes(node_id):
+            node_ids.append(node_id)
+    return list(dict.fromkeys(node_ids))
 
 
-def stop_browser_processes_for_node(node_id: str) -> int:
+def remove_browser_process_from_node_tables(process: subprocess.Popen) -> None:
+    for node_id, procs in list(BROWSER_TABLE.items()):
+        remaining = [item for item in procs if item is not process]
+        if remaining:
+            BROWSER_TABLE[node_id] = remaining
+        else:
+            BROWSER_TABLE.pop(node_id, None)
+
+
+def stop_browser_instance_process(instance_id: str) -> int:
+    with PROCESS_LOCK:
+        process = BROWSER_PROCESS_TABLE.pop(instance_id, None)
+        if process is not None:
+            remove_browser_process_from_node_tables(process)
+    if process is not None and process.poll() is None:
+        # 浏览器以 start_new_session 启动,终结整个进程组以带走全部子进程。
+        terminate_process(process)
+        return 1
+    return 0
+
+
+def stop_untracked_browser_processes_for_node(node_id: str) -> int:
     with PROCESS_LOCK:
         procs = BROWSER_TABLE.pop(node_id, [])
     killed = 0
     for process in procs:
         if process.poll() is None:
-            # 浏览器以 start_new_session 启动,终结整个进程组以带走全部子进程。
             terminate_process(process)
             killed += 1
+    return killed
+
+
+def stop_browser_instances(state: dict[str, Any], instance_ids: list[str]) -> int:
+    killed = 0
+    stopped_at = now_ts()
+    for instance_id in dict.fromkeys(instance_ids):
+        try:
+            instance = find_browser_instance(state, instance_id)
+        except ValueError:
+            continue
+        killed += stop_browser_instance_process(instance_id)
+        if instance.get("status") != "stopped" or instance.get("pid"):
+            instance.update({"status": "stopped", "pid": None, "last_stopped_at": stopped_at})
+    return killed
+
+
+def stop_browser_processes_for_node(node_id: str, state: dict[str, Any] | None = None) -> int:
+    if state is None:
+        with STATE_LOCK:
+            state = load_state()
+            killed = stop_browser_processes_for_node(node_id, state)
+            save_state(state)
+            return killed
+    instance_ids = [
+        str(instance.get("id") or "")
+        for instance in state.get("browser_instances", [])
+        if str(instance.get("node_id") or "") == node_id
+    ]
+    killed = stop_browser_instances(state, instance_ids)
+    killed += stop_untracked_browser_processes_for_node(node_id)
     return killed
 
 
 def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
     # 停止某节点的指纹浏览器:只结束浏览器进程组,保留该节点已启用的本地代理端口。
     node_id = str(payload.get("node_id") or "")
-    if not node_id:
-        raise ValueError("缺少节点 ID")
-
-    killed = stop_browser_processes_for_node(node_id)
+    instance_id = str(payload.get("instance_id") or "")
+    with STATE_LOCK:
+        state = load_state()
+        if instance_id:
+            instance = find_browser_instance(state, instance_id)
+            node_id = str(instance.get("node_id") or "")
+            killed = stop_browser_instances(state, [instance_id])
+        else:
+            if not node_id:
+                raise ValueError("缺少节点 ID")
+            killed = stop_browser_processes_for_node(node_id, state)
+        save_state(state)
     return {
         "ok": True,
         "node_id": node_id,
+        "instance_id": instance_id or None,
         "killed_browsers": killed,
         "stopped_bridges": [],
     }
@@ -2721,7 +3011,7 @@ def stop_bridge(bridge_id: str) -> dict[str, Any]:
             if bridge.get("id") == bridge_id:
                 bridge_node_id = str(bridge.get("node_id") or "")
                 break
-        killed_browsers = stop_browser_processes_for_node(bridge_node_id) if bridge_node_id else 0
+        killed_browsers = stop_browser_processes_for_node(bridge_node_id, state) if bridge_node_id else 0
         traffic = stop_process(bridge_id)
         for bridge in state["bridges"]:
             if bridge.get("id") == bridge_id:
@@ -2737,15 +3027,20 @@ def stop_bridge(bridge_id: str) -> dict[str, Any]:
 
 def stop_all_bridges() -> dict[str, Any]:
     with STATE_LOCK:
+        state = load_state()
+        browser_node_ids = {
+            str(instance.get("node_id") or "")
+            for instance in state.get("browser_instances", [])
+            if str(instance.get("node_id") or "")
+        }
         with PROCESS_LOCK:
-            browser_node_ids = list(BROWSER_TABLE.keys())
-        killed_browsers = sum(stop_browser_processes_for_node(node_id) for node_id in browser_node_ids)
+            browser_node_ids.update(BROWSER_TABLE.keys())
+        killed_browsers = sum(stop_browser_processes_for_node(node_id, state) for node_id in browser_node_ids)
         with PROCESS_LOCK:
             bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
         traffic_by_bridge = {}
         for bridge_id in bridge_ids:
             traffic_by_bridge[bridge_id] = stop_process(bridge_id)
-        state = load_state()
         for bridge in state["bridges"]:
             bridge["status"] = "stopped"
             bridge["enabled"] = False
@@ -2793,6 +3088,29 @@ def sync_process_status(state: dict[str, Any]) -> bool:
             if bridge_id:
                 traffic = stop_process(str(bridge_id))
             changed |= apply_updates(bridge, {"status": "stopped", "pid": None, **traffic})
+    return changed
+
+
+def sync_browser_instance_status(state: dict[str, Any]) -> bool:
+    changed = False
+    stopped_at = now_ts()
+    for instance in state.get("browser_instances", []):
+        instance_id = str(instance.get("id") or "")
+        if not instance_id:
+            continue
+        with PROCESS_LOCK:
+            process = BROWSER_PROCESS_TABLE.get(instance_id)
+        if process and process.poll() is None:
+            changed |= apply_updates(instance, {"status": "running", "pid": process.pid})
+        elif instance.get("status") in ACTIVE_BROWSER_STATUSES:
+            if process is not None:
+                with PROCESS_LOCK:
+                    BROWSER_PROCESS_TABLE.pop(instance_id, None)
+                    remove_browser_process_from_node_tables(process)
+            changed |= apply_updates(
+                instance,
+                {"status": "stopped", "pid": None, "last_stopped_at": stopped_at},
+            )
     return changed
 
 
@@ -2972,9 +3290,16 @@ def shutdown() -> None:
     SHUTTING_DOWN.set()
     # 退出前一并结束所有指纹浏览器进程,避免残留窗口与孤儿进程。
     with PROCESS_LOCK:
-        browser_procs = [p for procs in BROWSER_TABLE.values() for p in procs]
+        browser_procs = list(BROWSER_PROCESS_TABLE.values())
+        browser_procs.extend(p for procs in BROWSER_TABLE.values() for p in procs)
         BROWSER_TABLE.clear()
+        BROWSER_PROCESS_TABLE.clear()
+    seen_browser_pids: set[int] = set()
     for process in browser_procs:
+        pid = safe_int(getattr(process, "pid", None), 0)
+        if pid in seen_browser_pids:
+            continue
+        seen_browser_pids.add(pid)
         if process.poll() is None:
             terminate_process(process)
     with PROCESS_LOCK:

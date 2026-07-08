@@ -1382,6 +1382,81 @@ tbody .row-actions .row-button {
 .core-log-empty span { font-size: 12px; }
 .core-log-empty.error strong { color: var(--danger); }
 
+.browser-record-modal {
+  width: min(760px, 100%);
+  height: min(680px, calc(100dvh - 48px));
+}
+.browser-record-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 12px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.browser-record-entry {
+  flex: 0 0 auto;
+  overflow: hidden;
+  border: 0.5px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+}
+.browser-record-entry.is-running {
+  border-color: color-mix(in oklab, var(--success) 36%, var(--border-subtle));
+}
+.browser-record-entry header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border-bottom: 0.5px solid var(--separator);
+}
+.browser-record-entry header > div {
+  min-width: 0;
+}
+.browser-record-entry strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  line-height: 1.35;
+}
+.browser-record-entry header span:not(.status) {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+.browser-record-grid {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 7px 10px;
+  padding: 11px 12px;
+  border-bottom: 0.5px solid var(--separator);
+}
+.browser-record-grid span {
+  color: var(--text-tertiary);
+  font-size: 11px;
+}
+.browser-record-grid code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.browser-record-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding: 9px 12px;
+}
+
 /* ============================================================
    Scrollbars (slim, macOS style)
    ============================================================ */

@@ -3,6 +3,7 @@ const appState = {
   chrome: null,
   fingerprint_chromium: null,
   active_browsers: [],
+  browser_instances: [],
   subscriptions: [],
   nodes: [],
   bridges: [],
@@ -24,10 +25,12 @@ const appState = {
     search: "",
     level: "all",
   },
+  browserRecordNodeId: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
+let lastBrowserRecordTrigger = null;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
 const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system"];
@@ -84,6 +87,7 @@ function icon(name) {
     link: '<path d="M10 13a5 5 0 0 0 7.1 0l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1"/><path d="M14 11a5 5 0 0 0-7.1 0l-2 2A5 5 0 0 0 12 20.1l1.1-1.1"/>',
     minus: '<path d="M5 12h14"/>',
     activity: '<path d="M22 12h-4l-3 8L9 4l-3 8H2"/>',
+    list: '<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
   };
   return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.play}</svg>`;
 }
@@ -160,6 +164,37 @@ function runningBridges() {
   return appState.bridges.filter((bridge) => ["running", "starting"].includes(bridge.status));
 }
 
+function nodeById(nodeId) {
+  return appState.nodes.find((node) => node.id === nodeId);
+}
+
+function browserInstancesForNode(nodeId) {
+  const rank = { running: 0, starting: 1, stopped: 2, failed: 3 };
+  return (appState.browser_instances || [])
+    .filter((instance) => instance.node_id === nodeId)
+    .slice()
+    .sort((a, b) => {
+      const statusDiff = (rank[a.status] ?? 9) - (rank[b.status] ?? 9);
+      if (statusDiff) return statusDiff;
+      if (!!a.legacy !== !!b.legacy) return a.legacy ? -1 : 1;
+      return Number(a.created_at || 0) - Number(b.created_at || 0);
+    });
+}
+
+function runningBrowserInstancesForNode(nodeId) {
+  return browserInstancesForNode(nodeId).filter((instance) => ["running", "starting"].includes(instance.status));
+}
+
+function browserStatusLabel(status) {
+  const labels = {
+    running: "运行中",
+    starting: "启动中",
+    stopped: "已停止",
+    failed: "失败",
+  };
+  return labels[status] || status || "-";
+}
+
 function endpointParts(socksUrl, fallbackPort) {
   try {
     const url = new URL(socksUrl);
@@ -181,6 +216,7 @@ async function loadStatus() {
   appState.chrome = status.chrome || null;
   appState.fingerprint_chromium = status.fingerprint_chromium || null;
   appState.active_browsers = status.active_browsers || [];
+  appState.browser_instances = status.browser_instances || [];
   appState.subscriptions = status.subscriptions || [];
   appState.nodes = status.nodes || [];
   appState.bridges = status.bridges || [];
@@ -200,6 +236,9 @@ function render() {
   renderLogFilters();
   renderRequestLogs();
   renderSystemLogs();
+  if (appState.browserRecordNodeId && !$("#browserRecordModal").hidden) {
+    renderBrowserRecords(appState.browserRecordNodeId);
+  }
 }
 
 function renderCores() {
@@ -373,10 +412,13 @@ function renderNodes() {
   rows.innerHTML = nodes
     .map((node) => {
       const bridge = bridgeForNode(node.id);
-      const browserActive = appState.active_browsers.includes(node.id);
+      const browserInstances = browserInstancesForNode(node.id);
+      const runningBrowserCount = runningBrowserInstancesForNode(node.id).length;
+      const browserActive = runningBrowserCount > 0 || appState.active_browsers.includes(node.id);
       const transport = node.transport || "-";
       const security = node.security || "";
       const server = `${node.server}:${node.port}`;
+      const recordLabel = browserInstances.length ? `浏览器记录 ${browserInstances.length}` : "浏览器记录";
       return `
         <tr class="${bridge ? "is-running" : ""}">
           <td>
@@ -399,10 +441,11 @@ function renderNodes() {
                     <button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.http_url || bridge.socks_url)}">${icon("copy")}<span>HTTP</span></button>`
                   : `<button class="row-button primary-row" data-action="start" data-node="${escapeHtml(node.id)}">${icon("play")}<span>启动并复制</span></button>`
               }
-              <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="用独立指纹浏览器启动 ${escapeHtml(node.name)}" title="用独立指纹浏览器启动：伪造指纹 + 独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
+              <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开不同指纹浏览器 ${escapeHtml(node.name)}" title="新开不同指纹浏览器：独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
+              <button class="row-button" data-action="browser-records" data-node="${escapeHtml(node.id)}" aria-label="查看 ${escapeHtml(node.name)} 的浏览器记录" title="浏览器记录">${icon("list")}<span>${escapeHtml(recordLabel)}</span></button>
               ${
                 browserActive
-                  ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器</span></button>`
+                  ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
                   : ""
               }
             </div>
@@ -605,9 +648,15 @@ function renderSystemLogs() {
     .join("");
 }
 
+function syncModalOpenState() {
+  const coreOpen = $("#coreLogModal") && !$("#coreLogModal").hidden;
+  const browserOpen = $("#browserRecordModal") && !$("#browserRecordModal").hidden;
+  document.body.classList.toggle("modal-open", coreOpen || browserOpen);
+}
+
 function closeCoreLogModal() {
   $("#coreLogModal").hidden = true;
-  document.body.classList.remove("modal-open");
+  syncModalOpenState();
   if (lastCoreLogTrigger?.isConnected) {
     lastCoreLogTrigger.focus();
   }
@@ -663,7 +712,7 @@ async function showCoreLog(core) {
   if (!core) return;
   const modal = $("#coreLogModal");
   modal.hidden = false;
-  document.body.classList.add("modal-open");
+  syncModalOpenState();
   modal.querySelector('[data-action="close-core-log"]')?.focus();
   $("#coreLogTitle").textContent = `${core} 运行日志`;
   $("#coreLogMeta").textContent = "加载中";
@@ -675,6 +724,81 @@ async function showCoreLog(core) {
     $("#coreLogMeta").textContent = "读取失败";
     $("#coreLogBody").innerHTML = `<div class="core-log-empty error"><strong>日志读取失败</strong><span>${escapeHtml(error.message)}</span></div>`;
   }
+}
+
+function closeBrowserRecordModal() {
+  $("#browserRecordModal").hidden = true;
+  appState.browserRecordNodeId = null;
+  syncModalOpenState();
+  if (lastBrowserRecordTrigger?.isConnected) {
+    lastBrowserRecordTrigger.focus();
+  }
+  lastBrowserRecordTrigger = null;
+}
+
+function compactPath(value) {
+  const parts = String(value || "").split("/").filter(Boolean);
+  return parts.length > 3 ? `.../${parts.slice(-3).join("/")}` : value || "-";
+}
+
+function renderBrowserRecords(nodeId) {
+  const node = nodeById(nodeId);
+  const instances = browserInstancesForNode(nodeId);
+  const runningCount = instances.filter((instance) => ["running", "starting"].includes(instance.status)).length;
+  $("#browserRecordTitle").textContent = `${node?.name || "节点"} 浏览器记录`;
+  $("#browserRecordMeta").textContent = `${instances.length} 个记录 · ${runningCount} 个运行中`;
+  const body = $("#browserRecordBody");
+  if (!instances.length) {
+    body.innerHTML = `
+      <div class="core-log-empty">
+        <strong>暂无浏览器记录</strong>
+        <span>${escapeHtml(node?.name || nodeId || "-")}</span>
+      </div>
+    `;
+    return;
+  }
+  body.innerHTML = instances
+    .map((instance) => {
+      const running = ["running", "starting"].includes(instance.status);
+      const profilePath = instance.profile_path || "";
+      const action = running ? "stop-browser-instance" : "launch-browser-instance";
+      const actionLabel = running ? "停止" : "启动";
+      const actionIcon = running ? "stop" : "browser";
+      return `
+        <article class="browser-record-entry ${running ? "is-running" : ""}">
+          <header>
+            <div>
+              <strong>${escapeHtml(instance.name || "浏览器")}</strong>
+              <span>${instance.legacy ? "默认浏览器" : "独立指纹"} · ${escapeHtml(formatTime(instance.created_at))}</span>
+            </div>
+            <span class="status ${escapeHtml(instance.status || "stopped")}">${escapeHtml(browserStatusLabel(instance.status))}</span>
+          </header>
+          <div class="browser-record-grid">
+            <span>指纹</span><code>${escapeHtml(instance.fingerprint_seed || "-")}</code>
+            <span>Profile</span><code title="${escapeHtml(profilePath)}">${escapeHtml(compactPath(profilePath))}</code>
+            <span>上次启动</span><code>${escapeHtml(formatTime(instance.last_started_at))}</code>
+            <span>PID</span><code>${escapeHtml(instance.pid || "-")}</code>
+          </div>
+          <div class="browser-record-actions">
+            <button class="row-button ${running ? "danger" : ""}" type="button" data-action="${action}" data-node="${escapeHtml(nodeId)}" data-instance="${escapeHtml(instance.id)}" aria-label="${actionLabel} ${escapeHtml(instance.name || "浏览器")}">
+              ${icon(actionIcon)}<span>${actionLabel}</span>
+            </button>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function showBrowserRecords(nodeId, trigger = null) {
+  if (!nodeId) return;
+  appState.browserRecordNodeId = nodeId;
+  lastBrowserRecordTrigger = trigger;
+  const modal = $("#browserRecordModal");
+  modal.hidden = false;
+  syncModalOpenState();
+  renderBrowserRecords(nodeId);
+  modal.querySelector('[data-action="close-browser-records"]')?.focus();
 }
 
 async function copyText(text) {
@@ -711,16 +835,18 @@ async function testNode(nodeId) {
   return result;
 }
 
-async function launchBrowser(nodeId) {
-  const result = await api("/api/browser/launch", { node_id: nodeId });
+async function launchBrowser(nodeId, instanceId = "") {
+  const payload = instanceId ? { node_id: nodeId, instance_id: instanceId } : { node_id: nodeId };
+  const result = await api("/api/browser/launch", payload);
   await loadStatus();
-  showToast(`已启动指纹浏览器：${result.region || ""} · ${result.proxy}`);
+  showToast(`已启动${result.browser_name ? ` ${result.browser_name}` : "指纹浏览器"}：${result.proxy}`);
   return result;
 }
 
 // 停止某节点的指纹浏览器进程,保留其本地代理。
-async function stopBrowser(nodeId) {
-  const result = await api("/api/browser/stop", { node_id: nodeId });
+async function stopBrowser(nodeId, instanceId = "") {
+  const payload = instanceId ? { instance_id: instanceId } : { node_id: nodeId };
+  const result = await api("/api/browser/stop", payload);
   await loadStatus();
   showToast("已停止浏览器，SOCKS5 端口保持运行");
   return result;
@@ -748,8 +874,8 @@ async function handleAction(event) {
   const action = button.dataset.action;
   button.disabled = true;
   // 点击后立即进入加载态:隐藏图标、显示旋转 spinner,给用户即时反馈。
-  // close-core-log / copy 这类瞬时操作不需要转圈。
-  const spins = !["close-core-log", "copy"].includes(action);
+  // close / copy 这类瞬时操作不需要转圈。
+  const spins = !["close-core-log", "close-browser-records", "copy", "browser-records"].includes(action);
   if (spins) button.classList.add("is-busy");
   try {
     if (action === "start") {
@@ -758,8 +884,14 @@ async function handleAction(event) {
       await testNode(button.dataset.node);
     } else if (action === "launch-browser") {
       await launchBrowser(button.dataset.node);
+    } else if (action === "launch-browser-instance") {
+      await launchBrowser(button.dataset.node, button.dataset.instance);
     } else if (action === "stop-browser") {
       await stopBrowser(button.dataset.node);
+    } else if (action === "stop-browser-instance") {
+      await stopBrowser(button.dataset.node, button.dataset.instance);
+    } else if (action === "browser-records") {
+      showBrowserRecords(button.dataset.node, button);
     } else if (action === "download-kernel") {
       await downloadKernel();
     } else if (action === "copy") {
@@ -801,6 +933,8 @@ async function handleAction(event) {
       await showCoreLog(button.dataset.core);
     } else if (action === "close-core-log") {
       closeCoreLogModal();
+    } else if (action === "close-browser-records") {
+      closeBrowserRecordModal();
     }
   } catch (error) {
     showToast(error.message, "error");
@@ -934,9 +1068,16 @@ function bindEvents() {
       closeCoreLogModal();
     }
   });
+  $("#browserRecordModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeBrowserRecordModal();
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !$("#coreLogModal").hidden) {
       closeCoreLogModal();
+    } else if (event.key === "Escape" && !$("#browserRecordModal").hidden) {
+      closeBrowserRecordModal();
     }
   });
 }
