@@ -670,6 +670,10 @@ async function handleAction(event) {
   if (!button) return;
   const action = button.dataset.action;
   button.disabled = true;
+  // 点击后立即进入加载态:隐藏图标、显示旋转 spinner,给用户即时反馈。
+  // close-core-log / copy 这类瞬时操作不需要转圈。
+  const spins = !["close-core-log", "copy"].includes(action);
+  if (spins) button.classList.add("is-busy");
   try {
     if (action === "start") {
       await startNode(button.dataset.node);
@@ -721,6 +725,7 @@ async function handleAction(event) {
     showToast(error.message, "error");
   } finally {
     button.disabled = false;
+    button.classList.remove("is-busy");
   }
 }
 
@@ -753,20 +758,32 @@ function bindEvents() {
   });
   $("#importForm").addEventListener("submit", handleImport);
   document.addEventListener("click", handleAction);
-  $("#refreshStatus").addEventListener("click", async () => {
+  $("#refreshStatus").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.classList.add("is-busy");
+    button.disabled = true;
     try {
       await loadStatus();
       showToast("状态已刷新");
     } catch (error) {
       showToast(error.message, "error");
+    } finally {
+      button.classList.remove("is-busy");
+      button.disabled = false;
     }
   });
-  $("#refreshList").addEventListener("click", async () => {
+  $("#refreshList").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    button.classList.add("is-busy");
+    button.disabled = true;
     try {
       await loadStatus();
       showToast("列表已刷新");
     } catch (error) {
       showToast(error.message, "error");
+    } finally {
+      button.classList.remove("is-busy");
+      button.disabled = false;
     }
   });
   $("#stopAll").addEventListener("click", async () => {

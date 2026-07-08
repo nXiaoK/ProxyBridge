@@ -280,6 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        installMainMenu()
         configureStatusItem()
         migrateWorkspaceStateIfNeeded()
         startBackend()
@@ -287,6 +288,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.refreshNow()
         }
+    }
+
+    // 安装标准主菜单。菜单栏 App(.accessory)默认没有主菜单,导致控制台窗口里
+    // 的输入框收不到 Cmd+C/V/X/A —— 这些快捷键依赖「编辑」菜单项携带的
+    // key equivalent 才能沿响应链派发到 WKWebView。这里补上一个 App 菜单
+    // (提供 Cmd+Q 退出)和一个标准「编辑」菜单,让复制/粘贴等快捷键恢复正常。
+    private func installMainMenu() {
+        let mainMenu = NSMenu()
+
+        // App 菜单:仅保留退出项,满足 Cmd+Q 习惯。
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "退出 Proxy Bridge", action: #selector(quitApp), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+
+        // 编辑菜单:标准的撤销/重做/剪切/复制/粘贴/全选,均带系统快捷键。
+        // action 设为 nil 让其沿响应链自动寻找第一响应者(即当前聚焦的文本框)。
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+
+        NSApp.mainMenu = mainMenu
     }
 
     func applicationWillTerminate(_ notification: Notification) {
