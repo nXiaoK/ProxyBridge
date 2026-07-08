@@ -1192,6 +1192,34 @@ tbody .row-actions .row-button {
 .log-status.closed { background: var(--bg-hover); color: var(--text-tertiary); }
 .log-metrics { font-family: var(--font-mono); font-size: 11px; color: var(--text-secondary); display: flex; gap: 8px; }
 
+/* 系统日志:级别徽标 + 分类 / 消息列样式 */
+.system-log-table td:nth-child(2) { width: 1%; white-space: nowrap; }
+.system-log-table td:nth-child(3) { width: 1%; white-space: nowrap; }
+.log-level {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 550;
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+.log-level.info { background: var(--accent-soft); color: var(--accent); }
+.log-level.warn { background: color-mix(in oklab, var(--warning) 18%, transparent); color: var(--warning); }
+.log-level.error { background: color-mix(in oklab, var(--danger) 15%, transparent); color: var(--danger); }
+.log-category {
+  font-size: 11px;
+  color: var(--text-secondary);
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: var(--bg-hover);
+}
+.log-message {
+  font-size: 12px;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
 /* ============================================================
    Toast
    ============================================================ */

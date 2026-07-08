@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import collections
 import hashlib
 import json
 import mimetypes
@@ -33,6 +34,7 @@ STATE_PATH = WORK_ROOT / "state.json"
 DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
 REQUEST_LOG_LIMIT = 500
+SYSTEM_LOG_LIMIT = 1000
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
@@ -50,6 +52,46 @@ SHUTTING_DOWN = threading.Event()
 PATH_CACHE_LOCK = threading.RLock()
 FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
 FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
+
+# 系统日志:App 自身运行事件的内存环形缓冲区,用于在控制台「系统日志」视图里
+# 排查软件使用中的问题(启动、订阅导入、SOCKS5 启停、测试、报错等)。
+# 与「连接日志」(per-connection)、「核心日志」(sing-box/xray 输出)是三条独立的日志线。
+SYSTEM_LOGS: "collections.deque[dict[str, Any]]" = collections.deque(maxlen=SYSTEM_LOG_LIMIT)
+SYSTEM_LOG_LOCK = threading.RLock()
+
+
+def log_event(message: str, level: str = "info", category: str = "") -> None:
+    """记录一条系统日志事件:写入内存环形缓冲区,同时打印到 stdout。
+
+    stdout 会被原生 App 重定向到 menubar-backend.log,因此事件既能在控制台
+    实时查看,也会持久化到磁盘日志文件。level 取 info/warn/error。
+    """
+    entry = {
+        "ts": time.time(),
+        "level": level if level in {"info", "warn", "error"} else "info",
+        "category": category,
+        "message": str(message),
+    }
+    with SYSTEM_LOG_LOCK:
+        SYSTEM_LOGS.append(entry)
+    # 同步打印到标准输出,格式化为「时间 LEVEL [分类] 消息」便于在日志文件里检索。
+    stamp = time.strftime("%H:%M:%S", time.localtime(entry["ts"]))
+    tag = f"[{category}] " if category else ""
+    print(f"{stamp} {entry['level'].upper():5} {tag}{message}", flush=True)
+
+
+def system_log_entries() -> list[dict[str, Any]]:
+    """返回系统日志快照(最新的在前),供前端展示。"""
+    with SYSTEM_LOG_LOCK:
+        return list(reversed(SYSTEM_LOGS))
+
+
+def clear_system_logs() -> dict[str, Any]:
+    """清空系统日志缓冲区。"""
+    with SYSTEM_LOG_LOCK:
+        SYSTEM_LOGS.clear()
+    log_event("系统日志已清空", category="系统")
+    return {"ok": True}
 
 
 @dataclass
@@ -855,6 +897,7 @@ def status_payload() -> dict[str, Any]:
             "bridges": state["bridges"],
             "tests": state.get("tests", {}),
             "request_logs": state.get("request_logs", [])[:200],
+            "system_logs": system_log_entries()[:300],
             "version": "0.1.0",
         }
 
@@ -1690,7 +1733,7 @@ def restore_enabled_bridges() -> None:
                     state = load_state()
                     state["bridges"] = [b for b in state.get("bridges", []) if b.get("id") != previous_id]
                     save_state(state)
-            print(f"Restored SOCKS5 {restored.get('socks_url')} for {restored.get('node_name')}", flush=True)
+            log_event(f"已恢复 SOCKS5:{restored.get('node_name')} → {restored.get('socks_url')}", category="SOCKS5")
         except Exception as exc:
             with STATE_LOCK:
                 state = load_state()
@@ -1703,7 +1746,7 @@ def restore_enabled_bridges() -> None:
                         bridge["pid"] = None
                         bridge["error"] = str(exc)
                 save_state(state)
-            print(f"Failed to restore SOCKS5 for {previous.get('node_name') or node_id}: {exc}", flush=True)
+            log_event(f"恢复 SOCKS5 失败:{previous.get('node_name') or node_id}:{exc}", level="error", category="SOCKS5")
 
 
 def read_exact(sock: socket.socket, length: int) -> bytes:
@@ -2054,6 +2097,7 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
         result = {
             **probe,
             "node_id": node_id,
+            "node_name": node.get("name", ""),
             "core": core,
             "tested_at": now_ts(),
         }
@@ -2061,6 +2105,7 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
         result = {
             "ok": False,
             "node_id": node_id,
+            "node_name": node.get("name", ""),
             "core": core,
             "latency_ms": None,
             "status_code": None,
@@ -2171,6 +2216,8 @@ def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 2
 
 
 def error_response(handler: BaseHTTPRequestHandler, exc: Exception, status: int = 400) -> None:
+    # 统一记录所有 API 错误到系统日志,便于事后排查失败的操作。
+    log_event(f"{handler.command} {handler.path} 失败:{exc}", level="error", category="接口")
     json_response(handler, {"error": str(exc)}, status)
 
 
@@ -2199,6 +2246,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, core_log_payload(core))
             except Exception as exc:
                 error_response(self, exc, 400)
+            return
+        if parsed.path == "/api/system/logs":
+            json_response(self, {"system_logs": system_log_entries()})
             return
         if parsed.path.startswith("/api/log/"):
             bridge_id = parsed.path.rsplit("/", 1)[-1]
@@ -2230,29 +2280,54 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             payload = self.read_json()
             if self.path == "/api/subscriptions/import":
-                json_response(self, import_subscription(payload))
+                result = import_subscription(payload)
+                sub = result.get("subscription", {}) if isinstance(result, dict) else {}
+                log_event(f"导入订阅「{sub.get('name', '')}」共 {sub.get('node_count', 0)} 个节点", category="订阅")
+                json_response(self, result)
             elif self.path == "/api/subscriptions/refresh":
                 json_response(self, refresh_subscription(str(payload.get("id") or "")))
+                log_event("刷新订阅完成", category="订阅")
             elif self.path == "/api/subscriptions/delete":
                 json_response(self, delete_subscription(str(payload.get("id") or "")))
+                log_event("删除订阅", category="订阅")
             elif self.path == "/api/bridges/start":
-                json_response(self, start_bridge(payload))
+                result = start_bridge(payload)
+                log_event(f"启动 SOCKS5:{result.get('node_name', '')} → {result.get('socks_url', '')}", category="SOCKS5")
+                json_response(self, result)
             elif self.path == "/api/bridges/stop":
                 json_response(self, stop_bridge(str(payload.get("id") or "")))
+                log_event("停止 SOCKS5", category="SOCKS5")
             elif self.path == "/api/bridges/stop-all":
                 json_response(self, stop_all_bridges())
+                log_event("停止全部 SOCKS5", category="SOCKS5")
             elif self.path == "/api/nodes/test":
-                json_response(self, test_node(payload))
+                result = test_node(payload)
+                ok = result.get("ok")
+                latency = result.get("latency_ms")
+                node_name = result.get("node_name", "")
+                if ok:
+                    log_event(f"测试节点「{node_name}」通信正常 {latency} ms", category="测试")
+                else:
+                    log_event(f"测试节点「{node_name}」失败:{result.get('message', '')}", level="warn", category="测试")
+                json_response(self, result)
             elif self.path == "/api/browser/launch":
-                json_response(self, launch_browser(payload))
+                result = launch_browser(payload)
+                log_event(f"启动指纹浏览器:{result.get('region', '')} → {result.get('proxy', '')}", category="浏览器")
+                json_response(self, result)
             elif self.path == "/api/browser/stop":
                 json_response(self, stop_browser(payload))
+                log_event("停止指纹浏览器", category="浏览器")
             elif self.path == "/api/browser/download-kernel":
-                json_response(self, download_fingerprint_chromium(payload))
+                result = download_fingerprint_chromium(payload)
+                log_event(f"指纹内核下载/安装:{result.get('version') or '完成'}", category="浏览器")
+                json_response(self, result)
             elif self.path == "/api/clipboard":
                 json_response(self, copy_to_clipboard(str(payload.get("text") or "")))
             elif self.path == "/api/logs/clear":
                 json_response(self, clear_request_logs())
+                log_event("连接日志已清空", category="系统")
+            elif self.path == "/api/system/logs/clear":
+                json_response(self, clear_system_logs())
             else:
                 error_response(self, ValueError("未知 API"), 404)
         except (urllib.error.URLError, TimeoutError) as exc:
@@ -2348,7 +2423,7 @@ def main() -> None:
     start_parent_monitor()
     restore_enabled_bridges()
     server = ProxyBridgeHTTPServer(("127.0.0.1", port), AppHandler)
-    print(f"Proxy Bridge running at http://127.0.0.1:{port}")
+    log_event(f"Proxy Bridge 已启动,监听 http://127.0.0.1:{port}", category="系统")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

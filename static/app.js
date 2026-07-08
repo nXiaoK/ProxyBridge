@@ -8,6 +8,7 @@ const appState = {
   bridges: [],
   tests: {},
   requestLogs: [],
+  systemLogs: [],
   activeView: "nodes",
   filters: {
     protocol: "all",
@@ -19,13 +20,17 @@ const appState = {
     node: "all",
     status: "all",
   },
+  systemLogFilters: {
+    search: "",
+    level: "all",
+  },
 };
 
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
-const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs"];
+const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system"];
 
 // 切换当前视图:高亮对应侧边栏项、显示对应内容区,并记住上次选择。
 function setActiveView(view) {
@@ -54,6 +59,7 @@ function renderNav() {
   setNavCount("navCountSubs", appState.subscriptions.length);
   setNavCount("navCountBridges", runningBridges().length);
   setNavCount("navCountLogs", (appState.requestLogs || []).length);
+  setNavCount("navCountSystem", (appState.systemLogs || []).length);
 }
 
 function escapeHtml(value) {
@@ -180,6 +186,7 @@ async function loadStatus() {
   appState.bridges = status.bridges || [];
   appState.tests = status.tests || {};
   appState.requestLogs = status.request_logs || [];
+  appState.systemLogs = status.system_logs || [];
   render();
 }
 
@@ -192,6 +199,7 @@ function render() {
   renderBridges();
   renderLogFilters();
   renderRequestLogs();
+  renderSystemLogs();
 }
 
 function renderCores() {
@@ -528,6 +536,60 @@ function renderRequestLogs() {
     .join("");
 }
 
+// 系统日志级别的中文标签。
+function systemLevelLabel(level) {
+  const labels = { info: "信息", warn: "警告", error: "错误" };
+  return labels[level] || level || "信息";
+}
+
+// 按当前筛选(级别 + 关键词)过滤系统日志。
+function filteredSystemLogs() {
+  const search = appState.systemLogFilters.search.trim().toLowerCase();
+  const level = appState.systemLogFilters.level;
+  return (appState.systemLogs || []).filter((entry) => {
+    if (level !== "all" && entry.level !== level) return false;
+    if (!search) return true;
+    return [entry.message, entry.category, entry.level, systemLevelLabel(entry.level)]
+      .some((value) => String(value || "").toLowerCase().includes(search));
+  });
+}
+
+// 渲染系统日志表格,并同步筛选控件的当前值与计数。
+function renderSystemLogs() {
+  const rows = $("#systemLogRows");
+  const empty = $("#emptySystemLogs");
+  if (!rows) return;
+  // 回填筛选控件的值(轮询刷新时保持用户选择)。
+  $("#systemSearchInput").value = appState.systemLogFilters.search;
+  $("#systemLevelFilter").value = ["all", "info", "warn", "error"].includes(appState.systemLogFilters.level)
+    ? appState.systemLogFilters.level
+    : "all";
+
+  const all = appState.systemLogs || [];
+  const logs = filteredSystemLogs();
+  $("#systemCount").textContent = all.length === logs.length ? `${logs.length} 条` : `${logs.length} / ${all.length} 条`;
+  if (!logs.length) {
+    rows.innerHTML = "";
+    empty.textContent = all.length ? "没有匹配的系统日志" : "暂无系统日志";
+    empty.classList.add("visible");
+    return;
+  }
+  empty.classList.remove("visible");
+  rows.innerHTML = logs
+    .map((entry) => {
+      const level = entry.level || "info";
+      return `
+        <tr>
+          <td><span class="mono">${escapeHtml(formatLogTime(entry.ts))}</span></td>
+          <td><span class="log-level ${escapeHtml(level)}">${escapeHtml(systemLevelLabel(level))}</span></td>
+          <td><span class="log-category">${escapeHtml(entry.category || "-")}</span></td>
+          <td><span class="log-message">${escapeHtml(entry.message || "")}</span></td>
+        </tr>
+      `;
+    })
+    .join("");
+}
+
 function closeCoreLogModal() {
   $("#coreLogModal").hidden = true;
   document.body.classList.remove("modal-open");
@@ -708,6 +770,10 @@ async function handleAction(event) {
       await api("/api/logs/clear", {});
       await loadStatus();
       showToast("连接日志已清空");
+    } else if (action === "clear-system-logs") {
+      await api("/api/system/logs/clear", {});
+      await loadStatus();
+      showToast("系统日志已清空");
     } else if (action === "reset-log-filters") {
       appState.logFilters.search = "";
       appState.logFilters.node = "all";
@@ -839,6 +905,14 @@ function bindEvents() {
   $("#logStatusFilter").addEventListener("change", (event) => {
     appState.logFilters.status = event.target.value;
     renderRequestLogs();
+  });
+  $("#systemSearchInput").addEventListener("input", (event) => {
+    appState.systemLogFilters.search = event.target.value;
+    renderSystemLogs();
+  });
+  $("#systemLevelFilter").addEventListener("change", (event) => {
+    appState.systemLogFilters.level = event.target.value;
+    renderSystemLogs();
   });
   $("#coreLogModal").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) {

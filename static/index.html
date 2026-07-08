@@ -60,6 +60,11 @@
             <span class="nav-label">连接日志</span>
             <span class="nav-count" id="navCountLogs">0</span>
           </button>
+          <button class="nav-item" type="button" data-view="system">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+            <span class="nav-label">系统日志</span>
+            <span class="nav-count" id="navCountSystem">0</span>
+          </button>
         </nav>
 
         <!-- 侧边栏底部:代理核心 / 指纹内核状态 + 主题切换 -->
@@ -240,6 +245,52 @@
                 <tbody id="logRows"></tbody>
               </table>
               <div class="empty-state visible" id="emptyLogs">暂无连接日志</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ---------- 系统日志视图 ---------- -->
+        <section class="view" data-view="system" aria-labelledby="systemTitle" hidden>
+          <header class="view-toolbar">
+            <div class="view-heading">
+              <h1 id="systemTitle">系统日志</h1>
+              <span class="countline" id="systemCount">0 条</span>
+            </div>
+            <div class="toolbar-controls">
+              <div class="search-field">
+                <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+                <input id="systemSearchInput" type="search" autocomplete="off" placeholder="消息 / 分类" aria-label="搜索系统日志">
+              </div>
+              <label class="field-inline">
+                <span>级别</span>
+                <select id="systemLevelFilter">
+                  <option value="all">全部级别</option>
+                  <option value="info">信息</option>
+                  <option value="warn">警告</option>
+                  <option value="error">错误</option>
+                </select>
+              </label>
+              <button class="toolbar-button danger" id="clearSystemLogs" type="button" data-action="clear-system-logs">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 15h10l1-15"/></svg>
+                <span>清空</span>
+              </button>
+            </div>
+          </header>
+          <div class="view-body">
+            <p class="view-hint">记录软件运行中的关键事件(启动、订阅、SOCKS5 启停、测试、报错等),用于排查使用问题。</p>
+            <div class="log-table-shell">
+              <table class="log-table system-log-table">
+                <thead>
+                  <tr>
+                    <th>时间</th>
+                    <th>级别</th>
+                    <th>分类</th>
+                    <th>消息</th>
+                  </tr>
+                </thead>
+                <tbody id="systemLogRows"></tbody>
+              </table>
+              <div class="empty-state visible" id="emptySystemLogs">暂无系统日志</div>
             </div>
           </div>
         </section>
