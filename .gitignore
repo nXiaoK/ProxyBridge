@@ -1,0 +1,19 @@
+.DS_Store
+*/.DS_Store
+
+__pycache__/
+*.py[cod]
+
+# Local runtime state can contain subscription URLs, node UUIDs, passwords,
+# generated proxy configs, and request logs.
+work/
+
+# Build outputs and distributable archives are produced locally.
+outputs/
+
+# Swift compiler caches and temporary build tools.
+.build/
+DerivedData/
+
+# Generated iconset intermediates. The build script regenerates icons.
+macos/ProxyBridgeMenuBar/AppIcon.iconset/
