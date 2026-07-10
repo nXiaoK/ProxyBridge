@@ -687,6 +687,65 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertNotIn(instance_id, app.BROWSER_PROCESS_TABLE)
         self.assertNotIn(process, app.BROWSER_TABLE.get(node_id, []))
 
+    def test_terminate_process_waits_for_exit_after_force_kill(self) -> None:
+        events: list[object] = []
+
+        class ForceKilledProcess:
+            def __init__(self) -> None:
+                self.pid = 4821
+                self.wait_calls = 0
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, *, timeout: int) -> int:
+                self.wait_calls += 1
+                events.append(("wait", timeout))
+                if self.wait_calls == 1:
+                    raise app.subprocess.TimeoutExpired(str(self.pid), timeout)
+                return 0
+
+        process = ForceKilledProcess()
+
+        def kill_process_group(_pid: int, sig: int) -> None:
+            events.append(sig)
+
+        with mock.patch.object(app.os, "killpg", side_effect=kill_process_group):
+            app.terminate_process(process)
+
+        self.assertEqual(
+            events,
+            [app.signal.SIGTERM, ("wait", 3), app.signal.SIGKILL, ("wait", 3)],
+        )
+
+    def test_stop_browser_instance_keeps_handle_when_force_kill_wait_fails(self) -> None:
+        node_id = "node-browser-force-kill-retry"
+        instance_id = "browser-force-kill-retry"
+
+        class StubbornProcess:
+            def __init__(self) -> None:
+                self.pid = 4822
+                self.wait_timeouts: list[int] = []
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, *, timeout: int) -> int:
+                self.wait_timeouts.append(timeout)
+                raise app.subprocess.TimeoutExpired(str(self.pid), timeout)
+
+        process = StubbornProcess()
+        app.BROWSER_PROCESS_TABLE[instance_id] = process
+        app.BROWSER_TABLE[node_id] = [process]
+
+        with mock.patch.object(app.os, "killpg"):
+            with self.assertRaises(app.subprocess.TimeoutExpired):
+                app.stop_browser_instance_process(instance_id)
+
+        self.assertEqual(process.wait_timeouts, [3, 3])
+        self.assertIs(app.BROWSER_PROCESS_TABLE.get(instance_id), process)
+        self.assertEqual(app.BROWSER_TABLE.get(node_id), [process])
+
     def test_stop_browser_instance_keeps_handle_until_termination_succeeds(self) -> None:
         node_id = "node-browser-stop-retry"
         instance_id = "browser-stop-retry"

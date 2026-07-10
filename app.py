@@ -1800,6 +1800,7 @@ def terminate_process(process: subprocess.Popen) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except Exception:
             process.kill()
+        process.wait(timeout=3)
 
 
 def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
