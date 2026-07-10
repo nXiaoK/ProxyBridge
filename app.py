@@ -2556,6 +2556,9 @@ class Socks5LogProxy:
         self._stop = threading.Event()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
+        self._client_lock = threading.RLock()
+        self._client_sockets: set[socket.socket] = set()
+        self._client_threads: set[threading.Thread] = set()
 
     def start(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2569,13 +2572,46 @@ class Socks5LogProxy:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._server:
+        server = self._server
+        accept_thread = self._thread
+        if server:
             try:
-                self._server.close()
+                server.close()
             except OSError:
                 pass
-        if self._thread and self._thread.is_alive() and self._thread is not threading.current_thread():
-            self._thread.join(timeout=1.0)
+        with self._client_lock:
+            clients = list(self._client_sockets)
+        for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
+        current = threading.current_thread()
+        if accept_thread and accept_thread.is_alive() and accept_thread is not current:
+            accept_thread.join(timeout=1.0)
+        deadline = time.monotonic() + 3.0
+        while True:
+            with self._client_lock:
+                handlers = [
+                    thread
+                    for thread in self._client_threads
+                    if thread is not current and thread.is_alive()
+                ]
+            if not handlers:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            for thread in handlers:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._client_lock:
+            lingering = [thread for thread in self._client_threads if thread.is_alive()]
+        if (accept_thread and accept_thread.is_alive()) or lingering:
+            raise RuntimeError("本地代理连接未能及时停止")
         self._server = None
         self._thread = None
 
@@ -2591,7 +2627,34 @@ class Socks5LogProxy:
                 continue
             except OSError:
                 break
-            threading.Thread(target=self._handle_client, args=(client, address), daemon=True).start()
+            thread = threading.Thread(
+                target=self._run_client_handler,
+                args=(client, address),
+                daemon=True,
+            )
+            with self._client_lock:
+                if self._stop.is_set():
+                    client.close()
+                    break
+                self._client_sockets.add(client)
+                self._client_threads.add(thread)
+            try:
+                thread.start()
+            except BaseException:
+                with self._client_lock:
+                    self._client_sockets.discard(client)
+                    self._client_threads.discard(thread)
+                client.close()
+                raise
+
+    def _run_client_handler(self, client: socket.socket, address: tuple[str, int]) -> None:
+        thread = threading.current_thread()
+        try:
+            self._handle_client(client, address)
+        finally:
+            with self._client_lock:
+                self._client_sockets.discard(client)
+                self._client_threads.discard(thread)
 
     def _handle_client(self, client: socket.socket, address: tuple[str, int]) -> None:
         try:

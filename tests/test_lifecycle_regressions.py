@@ -1102,6 +1102,86 @@ class LifecycleRegressionTests(unittest.TestCase):
     def test_core_log_payload_waits_for_shutdown(self) -> None:
         self._assert_sync_payload_waits_for_shutdown("core-log")
 
+    def test_shutdown_waits_for_proxy_clients_before_persisting_traffic(self) -> None:
+        node_id = "node-final-traffic"
+        bridge_id = "bridge-final-traffic"
+        bridge = self._bridge(bridge_id, node_id, 4830, 24520)
+        self._write_state(node_id, bridges=[bridge])
+        app.PROCESS_TABLE[bridge_id] = FakeProcess(4830)
+        app.BRIDGE_NODE_TABLE[bridge_id] = node_id
+        app.init_bridge_traffic(bridge_id)
+
+        entered = threading.Event()
+        release = threading.Event()
+        stop_done = threading.Event()
+        errors: list[BaseException] = []
+
+        class FakeClient:
+            def shutdown(self, _how: int) -> None:
+                return None
+
+            def close(self) -> None:
+                return None
+
+        class FakeServer:
+            def __init__(self) -> None:
+                self.accepted = False
+                self.closed = threading.Event()
+
+            def accept(self) -> tuple[FakeClient, tuple[str, int]]:
+                if not self.accepted:
+                    self.accepted = True
+                    return FakeClient(), ("127.0.0.1", 50000)
+                self.closed.wait(timeout=2)
+                raise OSError("closed")
+
+            def close(self) -> None:
+                self.closed.set()
+
+        proxy = app.Socks5LogProxy(
+            bridge_id=bridge_id,
+            node_id=node_id,
+            node_name="Lifecycle Node",
+            listen_port=24520,
+            upstream_port=25520,
+        )
+        proxy._server = FakeServer()
+
+        def handler(_client: FakeClient, _address: tuple[str, int]) -> None:
+            entered.set()
+            release.wait(timeout=2)
+            app.add_bridge_traffic(bridge_id, "download_bytes", 19)
+
+        with mock.patch.object(proxy, "_handle_client", side_effect=handler):
+            proxy._thread = threading.Thread(target=proxy._serve, daemon=True)
+            proxy._thread.start()
+            self.assertTrue(entered.wait(timeout=1))
+            app.LOG_PROXY_TABLE[bridge_id] = proxy
+
+            def run_shutdown() -> None:
+                try:
+                    with mock.patch.object(app, "terminate_process", return_value=None):
+                        app.shutdown()
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    stop_done.set()
+
+            worker = threading.Thread(target=run_shutdown)
+            worker.start()
+            try:
+                self.assertFalse(stop_done.wait(timeout=0.1))
+            finally:
+                release.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        saved = app.load_state()["bridges"][0]
+        self.assertEqual(saved["download_bytes"], 19)
+        self.assertEqual(saved["total_bytes"], 19)
+        self.assertEqual(app.TRAFFIC_TABLE, {})
+
     def test_shutdown_persists_successful_traffic_and_retries_failed_bridge(self) -> None:
         node_id = "node-shutdown-bridge-retry"
         successful_id = "bridge-shutdown-success"
