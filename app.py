@@ -2727,6 +2727,8 @@ class Socks5LogProxy:
                 raise RuntimeError("HTTP 代理请求提前关闭")
             data.extend(chunk)
         header, body_prefix = bytes(data).split(b"\r\n\r\n", 1)
+        if len(header) + 4 > HTTP_PROXY_HEADER_LIMIT:
+            raise RuntimeError("HTTP 代理请求头过大")
         return header + b"\r\n\r\n", body_prefix
 
     def _parse_http_request(self, header_bytes: bytes) -> dict[str, Any]:
@@ -2781,13 +2783,14 @@ class Socks5LogProxy:
         has_host = False
         for name, value in request["headers"]:
             lowered = str(name).lower()
-            if lowered in {"proxy-authorization", "proxy-connection"}:
+            if lowered in {"connection", "keep-alive", "proxy-authorization", "proxy-connection"}:
                 continue
             if lowered == "host":
                 has_host = True
             lines.append(f"{name}: {value}\r\n")
         if not has_host:
             lines.append(f"Host: {self._format_host_header(host, port)}\r\n")
+        lines.append("Connection: close\r\n")
         lines.append("\r\n")
         return "".join(lines).encode("iso-8859-1", errors="replace")
 
@@ -2879,7 +2882,9 @@ class Socks5LogProxy:
 
     def _relay(self, client: socket.socket, upstream: socket.socket) -> dict[str, int]:
         counters = {"upload": 0, "download": 0}
-        relay_done = threading.Event()
+        relay_aborted = threading.Event()
+        errors: list[Exception] = []
+        errors_lock = threading.Lock()
 
         def shutdown_pair() -> None:
             for sock in (client, upstream):
@@ -2888,23 +2893,32 @@ class Socks5LogProxy:
                 except OSError:
                     pass
 
+        def abort_relay() -> None:
+            relay_aborted.set()
+            shutdown_pair()
+
         def pump(src: socket.socket, dst: socket.socket, key: str) -> None:
             try:
                 src.settimeout(1.0)
-                while not relay_done.is_set() and not self._stop.is_set():
+                while not relay_aborted.is_set():
+                    if self._stop.is_set():
+                        abort_relay()
+                        return
                     try:
                         data = src.recv(65536)
                     except socket.timeout:
                         continue
                     if not data:
-                        break
+                        dst.shutdown(socket.SHUT_WR)
+                        return
                     dst.sendall(data)
                     self._record_transfer(counters, key, len(data))
             except OSError:
-                pass
-            finally:
-                relay_done.set()
-                shutdown_pair()
+                abort_relay()
+            except Exception as exc:
+                with errors_lock:
+                    errors.append(exc)
+                abort_relay()
 
         upload = threading.Thread(target=pump, args=(client, upstream, "upload"), daemon=True)
         download = threading.Thread(target=pump, args=(upstream, client, "download"), daemon=True)
@@ -2912,6 +2926,8 @@ class Socks5LogProxy:
         download.start()
         upload.join()
         download.join()
+        if errors:
+            raise errors[0]
         return counters
 
 

@@ -1238,7 +1238,7 @@ class ParserTests(unittest.TestCase):
             app.TRAFFIC_TABLE.clear()
             app.TRAFFIC_TABLE.update(old_traffic_table)
 
-    def test_relay_returns_when_one_side_closes_and_peer_stays_open(self):
+    def test_relay_preserves_response_after_client_half_closes(self):
         proxy = Socks5LogProxy(
             bridge_id="bridge-half-close",
             node_id="node-test",
@@ -1255,13 +1255,28 @@ class ParserTests(unittest.TestCase):
 
         relay_thread = threading.Thread(target=run_relay, daemon=True)
         relay_thread.start()
+        response = b"world"
+        transfer_error: Exception | None = None
         try:
+            client_peer.settimeout(2.0)
+            upstream_peer.settimeout(2.0)
             client_peer.sendall(b"hello")
+            client_peer.shutdown(socket.SHUT_WR)
             self.assertEqual(read_exact(upstream_peer, 5), b"hello")
-            client_peer.close()
-            relay_thread.join(timeout=0.5)
+            self.assertEqual(upstream_peer.recv(1), b"")
+            try:
+                upstream_peer.sendall(response)
+                upstream_peer.shutdown(socket.SHUT_WR)
+                received = read_exact(client_peer, len(response))
+            except (OSError, RuntimeError) as exc:
+                transfer_error = exc
+                received = b""
+
+            self.assertEqual(received, response, f"reverse transfer failed: {transfer_error!r}")
+            self.assertEqual(client_peer.recv(1), b"")
+            relay_thread.join(timeout=2.0)
             self.assertFalse(relay_thread.is_alive())
-            self.assertEqual(result["counters"]["upload"], 5)
+            self.assertEqual(result["counters"], {"upload": 5, "download": len(response)})
         finally:
             proxy._stop.set()
             for sock in (client_proxy, client_peer, upstream_proxy, upstream_peer):
