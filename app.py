@@ -4,6 +4,7 @@ from __future__ import annotations
 import atexit
 import base64
 import collections
+import concurrent.futures
 import hashlib
 import json
 import mimetypes
@@ -58,6 +59,9 @@ TRAFFIC_LOCK = threading.RLock()
 SHUTTING_DOWN = threading.Event()
 PATH_CACHE_LOCK = threading.RLock()
 CORE_INSTALL_LOCK = threading.RLock()
+BROWSER_LAUNCH_LOCK = threading.RLock()
+FINGERPRINT_INSTALL_LOCK = threading.RLock()
+SHUTDOWN_LOCK = threading.RLock()
 CORE_AUTO_INSTALL_STARTED = threading.Event()
 FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
 FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
@@ -1805,6 +1809,12 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         node = find_node(state, node_id)
+        changed = sync_process_status(state)
+        active_bridge = active_bridge_for_node(state, node_id)
+        if active_bridge:
+            if changed:
+                save_state(state)
+            return active_bridge
         core = node.get("preferred_core") if requested_core == "auto" else requested_core
         if core not in {"sing-box", "xray"}:
             raise ValueError("核心只能是 sing-box、xray 或 auto")
@@ -1882,6 +1892,11 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    with BROWSER_LAUNCH_LOCK:
+        return _launch_browser(payload)
+
+
+def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
     requested_instance_id = str(payload.get("instance_id") or "")
     # 方案 B:使用打过补丁的指纹内核(fingerprint-chromium),从底层伪造 Canvas/WebGL/Audio/
@@ -1911,6 +1926,10 @@ def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
             changed = True
         elif str(instance.get("node_id") or "") != node_id:
             raise ValueError("浏览器记录与节点不匹配")
+        elif instance.get("status") in ACTIVE_BROWSER_STATUSES:
+            if changed:
+                save_state(state)
+            raise ValueError("浏览器实例已在运行")
         if changed:
             save_state(state)
         bridge = active_bridge_for_node(state, node_id)
@@ -2208,6 +2227,11 @@ def _install_from_dmg(dmg_path: Path, dest_root: Path) -> Path:
 
 
 def download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
+    with FINGERPRINT_INSTALL_LOCK:
+        return _download_fingerprint_chromium(payload)
+
+
+def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
     # 一键下载指纹内核:查询 GitHub Releases,取最新的 macOS dmg,下载并安装到工作目录。
     existing = fingerprint_chromium_path()
     if existing and not truthy(payload.get("force")):
@@ -3401,33 +3425,47 @@ class ProxyBridgeHTTPServer(ThreadingHTTPServer):
 
 def shutdown() -> None:
     SHUTTING_DOWN.set()
-    # 退出前一并结束所有指纹浏览器进程,避免残留窗口与孤儿进程。
-    with PROCESS_LOCK:
-        browser_procs = list(BROWSER_PROCESS_TABLE.values())
-        browser_procs.extend(p for procs in BROWSER_TABLE.values() for p in procs)
-        BROWSER_TABLE.clear()
-        BROWSER_PROCESS_TABLE.clear()
-    seen_browser_pids: set[int] = set()
-    for process in browser_procs:
-        pid = safe_int(getattr(process, "pid", None), 0)
-        if pid in seen_browser_pids:
-            continue
-        seen_browser_pids.add(pid)
-        if process.poll() is None:
-            terminate_process(process)
-    with PROCESS_LOCK:
-        bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
-    traffic_by_bridge = {}
-    for bridge_id in bridge_ids:
-        traffic_by_bridge[bridge_id] = stop_process(bridge_id)
-    if traffic_by_bridge:
-        with STATE_LOCK:
-            state = load_state()
-            for bridge in state.get("bridges", []):
-                bridge_id = bridge.get("id")
-                if bridge_id in traffic_by_bridge:
-                    bridge.update(traffic_by_bridge[bridge_id])
-            save_state(state)
+    with SHUTDOWN_LOCK:
+        # 只在进程表锁内摘取句柄;外部进程的退出等待交给独立工作线程。
+        with PROCESS_LOCK:
+            browser_procs = list(BROWSER_PROCESS_TABLE.values())
+            browser_procs.extend(p for procs in BROWSER_TABLE.values() for p in procs)
+            BROWSER_TABLE.clear()
+            BROWSER_PROCESS_TABLE.clear()
+            bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
+
+        active_browser_procs: list[subprocess.Popen] = []
+        seen_browser_processes: set[tuple[str, int]] = set()
+        for process in browser_procs:
+            pid = safe_int(getattr(process, "pid", None), 0)
+            identity = ("pid", pid) if pid > 0 else ("object", id(process))
+            if identity in seen_browser_processes:
+                continue
+            seen_browser_processes.add(identity)
+            if process.poll() is None:
+                active_browser_procs.append(process)
+
+        traffic_by_bridge: dict[str, dict[str, int]] = {}
+        worker_count = len(active_browser_procs) + len(bridge_ids)
+        if worker_count:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                browser_futures = [executor.submit(terminate_process, process) for process in active_browser_procs]
+                bridge_futures = {
+                    bridge_id: executor.submit(stop_process, bridge_id) for bridge_id in bridge_ids
+                }
+                for future in browser_futures:
+                    future.result()
+                for bridge_id, future in bridge_futures.items():
+                    traffic_by_bridge[bridge_id] = future.result()
+
+        if traffic_by_bridge:
+            with STATE_LOCK:
+                state = load_state()
+                for bridge in state.get("bridges", []):
+                    bridge_id = bridge.get("id")
+                    if bridge_id in traffic_by_bridge:
+                        bridge.update(traffic_by_bridge[bridge_id])
+                save_state(state)
 
 
 def handle_shutdown_signal(signum: int, _frame: Any) -> None:
