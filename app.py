@@ -70,18 +70,18 @@ SYSTEM_LOG_LOCK = threading.RLock()
 
 
 def _is_loopback_host(value: str) -> bool:
-    if not value or value != value.strip() or any(char in value for char in "\r\n\t"):
+    match = re.fullmatch(
+        r"(?:127\.0\.0\.1|localhost|\[::1\])(?::([0-9]+))?",
+        value,
+        re.IGNORECASE,
+    )
+    if match is None:
         return False
-    try:
-        parsed = urllib.parse.urlsplit(f"//{value}")
-        parsed.port
-    except ValueError:
-        return False
-    if parsed.username is not None or parsed.password is not None:
-        return False
-    if parsed.path or parsed.query or parsed.fragment:
-        return False
-    return parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+    port = match.group(1)
+    if port is None:
+        return True
+    normalized_port = port.lstrip("0") or "0"
+    return len(normalized_port) <= 5 and int(normalized_port) <= 65535
 
 
 def log_event(message: str, level: str = "info", category: str = "") -> None:
@@ -3214,9 +3214,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error(status)
             return
         if self.command == "HEAD":
+            data = json.dumps({"error": message}, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", "0")
+            self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             return
         json_response(self, {"error": message}, status)

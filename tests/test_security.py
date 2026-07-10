@@ -121,7 +121,15 @@ class SecurityTests(unittest.TestCase):
         for value in ("127.0.0.1", "127.0.0.1:8787", "localhost:8787", "[::1]:8787"):
             with self.subTest(value=value):
                 self.assertTrue(app._is_loopback_host(value))
-        for value in ("", "evil.example", "127.0.0.1.evil.example", "evil@127.0.0.1", "[::2]:8787"):
+        for value in (
+            "",
+            "evil.example",
+            "127.0.0.1.evil.example",
+            "evil@127.0.0.1",
+            "[::2]:8787",
+            "[::1].evil",
+            "[::1]evil:80",
+        ):
             with self.subTest(value=value):
                 self.assertFalse(app._is_loopback_host(value))
 
@@ -139,6 +147,7 @@ class SecurityTests(unittest.TestCase):
         for headers in (
             {"Host": "evil.example"},
             {"Host": "127.0.0.1:8787", "Origin": "https://evil.example"},
+            {"Host": "127.0.0.1:8787", "Origin": "http://[::1].evil"},
             {"Host": "127.0.0.1:8787", "Sec-Fetch-Site": "cross-site"},
             {},
         ):
@@ -219,6 +228,18 @@ class SecurityTests(unittest.TestCase):
                     self.assertEqual(response_body, b"")
                 elif path.startswith("/api/"):
                     self.assertIn("error", json.loads(response_body))
+
+    def test_api_head_error_declares_unsent_json_entity_length(self):
+        handler = make_handler("HEAD", "/api/status", {"Host": "evil.example"})
+
+        handler.do_HEAD()
+
+        status, headers, response_body = response_parts(handler)
+        expected_body = json.dumps({"error": "不可信请求来源"}, ensure_ascii=False).encode("utf-8")
+        self.assertEqual(status, 403)
+        self.assertEqual(headers.get_content_type(), "application/json")
+        self.assertEqual(int(headers["Content-Length"]), len(expected_body))
+        self.assertEqual(response_body, b"")
 
     def test_invalid_content_length_returns_json_error(self):
         for content_length in ("-1", "invalid"):
