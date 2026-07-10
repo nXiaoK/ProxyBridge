@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import io
 import json
 import tempfile
@@ -45,6 +46,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         self._old_browser_process_table = dict(app.BROWSER_PROCESS_TABLE)
         self._old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
         self._old_traffic_table = {key: dict(value) for key, value in app.TRAFFIC_TABLE.items()}
+        self._old_test_process_table = dict(app.TEST_PROCESS_TABLE)
         self._old_fingerprint_cache = dict(app.FINGERPRINT_CHROMIUM_CACHE)
         self._was_shutting_down = app.SHUTTING_DOWN.is_set()
         shutdown_signal_claimed = getattr(app, "SHUTDOWN_SIGNAL_CLAIMED", None)
@@ -62,6 +64,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.BROWSER_PROCESS_TABLE.clear()
         app.LOG_PROXY_TABLE.clear()
         app.TRAFFIC_TABLE.clear()
+        app.TEST_PROCESS_TABLE.clear()
         app.SHUTTING_DOWN.clear()
         if shutdown_signal_claimed is not None:
             shutdown_signal_claimed.clear()
@@ -84,6 +87,8 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.LOG_PROXY_TABLE.update(self._old_log_proxy_table)
         app.TRAFFIC_TABLE.clear()
         app.TRAFFIC_TABLE.update(self._old_traffic_table)
+        app.TEST_PROCESS_TABLE.clear()
+        app.TEST_PROCESS_TABLE.update(self._old_test_process_table)
         app.FINGERPRINT_CHROMIUM_CACHE.clear()
         app.FINGERPRINT_CHROMIUM_CACHE.update(self._old_fingerprint_cache)
         app.SHUTTING_DOWN.clear()
@@ -1239,6 +1244,426 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertNotIn(bridge_id, app.LOG_PROXY_TABLE)
         self.assertNotIn(bridge_id, app.BRIDGE_NODE_TABLE)
         self.assertEqual(app.TRAFFIC_TABLE, {})
+
+    def test_stop_bridge_retains_live_traffic_until_state_save_succeeds(self) -> None:
+        node_id = "node-stop-save-retry"
+        bridge_id = "bridge-stop-save-retry"
+        bridge = self._bridge(bridge_id, node_id, 4831, 24521)
+        self._write_state(node_id, bridges=[bridge])
+        self._activate_bridge(bridge, 40, 60)
+        state_tmp_path = app.STATE_PATH.with_suffix(".tmp")
+        original_path_open = Path.open
+
+        def disk_full_on_state_tmp(path: Path, *args: object, **kwargs: object):
+            mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
+            if path == state_tmp_path and "w" in mode:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return original_path_open(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(app, "terminate_process", return_value=None),
+            mock.patch.object(app, "stop_browser_processes_for_node", return_value=0),
+            mock.patch.object(Path, "open", new=disk_full_on_state_tmp),
+        ):
+            with self.assertRaises(OSError) as caught:
+                app.stop_bridge(bridge_id)
+
+        self.assertEqual(caught.exception.errno, errno.ENOSPC)
+        self.assertEqual(
+            app.bridge_traffic_snapshot(bridge_id),
+            {"upload_bytes": 40, "download_bytes": 60, "total_bytes": 100},
+        )
+        self.assertEqual(app.load_state()["bridges"][0]["status"], "running")
+
+        with (
+            mock.patch.object(app, "terminate_process", return_value=None),
+            mock.patch.object(app, "stop_browser_processes_for_node", return_value=0),
+        ):
+            app.stop_bridge(bridge_id)
+
+        saved = app.load_state()["bridges"][0]
+        self.assertEqual(saved["status"], "stopped")
+        self.assertEqual(
+            (saved["upload_bytes"], saved["download_bytes"], saved["total_bytes"]),
+            (40, 60, 100),
+        )
+        self.assertNotIn(bridge_id, app.TRAFFIC_TABLE)
+
+    def test_stop_all_retains_successful_traffic_when_another_stop_fails(self) -> None:
+        node_id = "node-stop-all-partial"
+        bridge_ids = ["bridge-stop-all-a", "bridge-stop-all-b"]
+        bridges = [
+            self._bridge(bridge_ids[0], node_id, 4832, 24522),
+            self._bridge(bridge_ids[1], node_id, 4833, 24523),
+        ]
+        self._write_state(node_id, bridges=bridges)
+        self._activate_bridge(bridges[0], 40, 60)
+        self._activate_bridge(bridges[1], 30, 20)
+        runtime_order = list(set(app.PROCESS_TABLE) | set(app.LOG_PROXY_TABLE))
+        successful_id, failed_id = runtime_order
+        failed_process = app.PROCESS_TABLE[failed_id]
+        attempts: list[int] = []
+
+        def partially_failing_terminate(process: FakeProcess) -> None:
+            attempts.append(process.pid)
+            if process is failed_process:
+                raise RuntimeError("partial Bridge termination failure")
+
+        with mock.patch.object(app, "terminate_process", side_effect=partially_failing_terminate):
+            with self.assertRaisesRegex(RuntimeError, "partial Bridge termination failure"):
+                app.stop_all_bridges()
+
+        self.assertNotIn(successful_id, app.TRAFFIC_TABLE)
+        self.assertIn(failed_id, app.TRAFFIC_TABLE)
+        first_state = {item["id"]: item for item in app.load_state()["bridges"]}
+        self.assertEqual(first_state[successful_id]["status"], "stopped")
+        self.assertEqual(first_state[successful_id]["total_bytes"], 100 if successful_id == bridge_ids[0] else 50)
+        self.assertEqual(first_state[failed_id]["status"], "running")
+
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            app.shutdown()
+
+        final_state = {item["id"]: item for item in app.load_state()["bridges"]}
+        expected_totals = {bridge_ids[0]: 100, bridge_ids[1]: 50}
+        for bridge_id in bridge_ids:
+            self.assertEqual(final_state[bridge_id]["status"], "stopped")
+            self.assertEqual(final_state[bridge_id]["total_bytes"], expected_totals[bridge_id])
+        self.assertEqual(app.TRAFFIC_TABLE, {})
+
+    def test_stop_all_retries_traffic_only_entry_after_state_save_failure(self) -> None:
+        node_id = "node-stop-all-save-retry"
+        bridge_id = "bridge-stop-all-save-retry"
+        bridge = self._bridge(bridge_id, node_id, 4842, 24532)
+        self._write_state(node_id, bridges=[bridge])
+        self._activate_bridge(bridge, 40, 60)
+        state_tmp_path = app.STATE_PATH.with_suffix(".tmp")
+        original_path_open = Path.open
+
+        def disk_full_on_state_tmp(path: Path, *args: object, **kwargs: object):
+            mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
+            if path == state_tmp_path and "w" in mode:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return original_path_open(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(app, "terminate_process", return_value=None),
+            mock.patch.object(Path, "open", new=disk_full_on_state_tmp),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No space left on device") as caught:
+                app.stop_all_bridges()
+
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertEqual(app.load_state()["bridges"][0]["status"], "running")
+        self.assertNotIn(bridge_id, app.PROCESS_TABLE)
+        self.assertNotIn(bridge_id, app.LOG_PROXY_TABLE)
+        self.assertEqual(app.bridge_traffic_snapshot(bridge_id)["total_bytes"], 100)
+
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            app.stop_all_bridges()
+        saved = app.load_state()["bridges"][0]
+        self.assertEqual(saved["status"], "stopped")
+        self.assertEqual(saved["total_bytes"], 100)
+        self.assertNotIn(bridge_id, app.TRAFFIC_TABLE)
+
+    def test_status_drains_stale_proxy_before_taking_state_lock(self) -> None:
+        node_id = "node-status-drain"
+        bridge_id = "bridge-status-drain"
+        log_id = "request-status-drain"
+        bridge = self._bridge(bridge_id, node_id, 4834, 24524)
+        self._write_state(node_id, bridges=[bridge])
+
+        class ExitedProcess(FakeProcess):
+            def poll(self) -> int:
+                return 1
+
+        handler_acquired_state = threading.Event()
+
+        class StateLockDrainProxy:
+            def is_alive(self) -> bool:
+                return True
+
+            def stop(self) -> None:
+                def finish_handler() -> None:
+                    app.append_request_log(
+                        {
+                            "id": log_id,
+                            "bridge_id": bridge_id,
+                            "status": "completed",
+                            "upload_bytes": 0,
+                            "download_bytes": 7,
+                        }
+                    )
+                    app.add_bridge_traffic(bridge_id, "download_bytes", 7)
+                    handler_acquired_state.set()
+
+                handler = threading.Thread(target=finish_handler)
+                handler.start()
+                if not handler_acquired_state.wait(timeout=0.3):
+                    raise RuntimeError("proxy handler blocked on STATE_LOCK")
+                handler.join(timeout=1)
+
+        app.PROCESS_TABLE[bridge_id] = ExitedProcess(4834)
+        app.BRIDGE_NODE_TABLE[bridge_id] = node_id
+        app.LOG_PROXY_TABLE[bridge_id] = StateLockDrainProxy()
+        app.init_bridge_traffic(bridge_id, 40, 60)
+
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            status = app.status_payload()
+
+        saved_bridge = {item["id"]: item for item in status["bridges"]}[bridge_id]
+        self.assertTrue(handler_acquired_state.is_set())
+        self.assertEqual(saved_bridge["status"], "stopped")
+        self.assertEqual(saved_bridge["total_bytes"], 107)
+        self.assertEqual(status["request_logs"][0]["id"], log_id)
+        self.assertNotIn(bridge_id, app.LOG_PROXY_TABLE)
+        self.assertNotIn(bridge_id, app.TRAFFIC_TABLE)
+
+    def test_status_retains_stale_traffic_when_state_save_fails(self) -> None:
+        node_id = "node-status-save-retry"
+        bridge_id = "bridge-status-save-retry"
+        bridge = self._bridge(bridge_id, node_id, 4835, 24525)
+        self._write_state(node_id, bridges=[bridge])
+
+        class ExitedProcess(FakeProcess):
+            def poll(self) -> int:
+                return 1
+
+        app.PROCESS_TABLE[bridge_id] = ExitedProcess(4835)
+        app.BRIDGE_NODE_TABLE[bridge_id] = node_id
+        app.LOG_PROXY_TABLE[bridge_id] = FakeProxy()
+        app.init_bridge_traffic(bridge_id, 40, 60)
+        state_tmp_path = app.STATE_PATH.with_suffix(".tmp")
+        original_path_open = Path.open
+
+        def disk_full_on_state_tmp(path: Path, *args: object, **kwargs: object):
+            mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
+            if path == state_tmp_path and "w" in mode:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return original_path_open(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(app, "terminate_process", return_value=None),
+            mock.patch.object(Path, "open", new=disk_full_on_state_tmp),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "No space left on device") as caught:
+                app.status_payload()
+
+        self.assertIsInstance(caught.exception.__cause__, OSError)
+        self.assertEqual(getattr(caught.exception.__cause__, "errno", None), errno.ENOSPC)
+        self.assertEqual(app.bridge_traffic_snapshot(bridge_id)["total_bytes"], 100)
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            status = app.status_payload()
+        saved_bridge = {item["id"]: item for item in status["bridges"]}[bridge_id]
+        self.assertEqual(saved_bridge["status"], "stopped")
+        self.assertEqual(saved_bridge["total_bytes"], 100)
+        self.assertNotIn(bridge_id, app.TRAFFIC_TABLE)
+
+    def test_status_commits_successful_stale_cleanup_before_reporting_failure(self) -> None:
+        node_id = "node-status-partial-cleanup"
+        successful_id = "bridge-status-partial-success"
+        failed_id = "bridge-status-partial-failure"
+        bridges = [
+            self._bridge(successful_id, node_id, 4838, 24528),
+            self._bridge(failed_id, node_id, 4839, 24529),
+        ]
+        self._write_state(node_id, bridges=bridges)
+
+        class ExitedProcess(FakeProcess):
+            def poll(self) -> int:
+                return 1
+
+        class FailingProxy(FakeProxy):
+            def stop(self) -> None:
+                raise RuntimeError("stale proxy drain failed")
+
+        app.PROCESS_TABLE.update(
+            {
+                successful_id: ExitedProcess(4838),
+                failed_id: ExitedProcess(4839),
+            }
+        )
+        app.BRIDGE_NODE_TABLE.update({successful_id: node_id, failed_id: node_id})
+        app.LOG_PROXY_TABLE.update({successful_id: FakeProxy(), failed_id: FailingProxy()})
+        app.init_bridge_traffic(successful_id, 40, 60)
+        app.init_bridge_traffic(failed_id, 30, 20)
+
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "stale proxy drain failed"):
+                app.status_payload()
+
+        first_state = {item["id"]: item for item in app.load_state()["bridges"]}
+        self.assertEqual(first_state[successful_id]["status"], "stopped")
+        self.assertEqual(first_state[successful_id]["total_bytes"], 100)
+        self.assertNotIn(successful_id, app.TRAFFIC_TABLE)
+        self.assertEqual(first_state[failed_id]["status"], "running")
+        self.assertEqual(app.bridge_traffic_snapshot(failed_id)["total_bytes"], 50)
+
+        app.LOG_PROXY_TABLE[failed_id] = FakeProxy()
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            status = app.status_payload()
+        final_state = {item["id"]: item for item in status["bridges"]}
+        self.assertEqual(final_state[failed_id]["status"], "stopped")
+        self.assertEqual(final_state[failed_id]["total_bytes"], 50)
+        self.assertEqual(app.TRAFFIC_TABLE, {})
+
+    def test_status_does_not_publish_stopped_before_stale_runtime_is_drained(self) -> None:
+        node_id = "node-status-exit-after-snapshot"
+        bridge_id = "bridge-status-exit-after-snapshot"
+        bridge = self._bridge(bridge_id, node_id, 4840, 24530)
+        self._write_state(node_id, bridges=[bridge])
+
+        class JustExitedProcess(FakeProcess):
+            def poll(self) -> int:
+                return 1
+
+        process = JustExitedProcess(4840)
+        proxy = FakeProxy()
+        app.PROCESS_TABLE[bridge_id] = process
+        app.BRIDGE_NODE_TABLE[bridge_id] = node_id
+        app.LOG_PROXY_TABLE[bridge_id] = proxy
+        app.init_bridge_traffic(bridge_id, 40, 60)
+
+        with mock.patch.object(app, "bridge_runtime_is_active", return_value=True):
+            first_status = app.status_payload()
+
+        first_bridge = {item["id"]: item for item in first_status["bridges"]}[bridge_id]
+        self.assertEqual(first_bridge["status"], "running")
+        self.assertIs(app.PROCESS_TABLE.get(bridge_id), process)
+        self.assertIs(app.LOG_PROXY_TABLE.get(bridge_id), proxy)
+        self.assertEqual(app.bridge_traffic_snapshot(bridge_id)["total_bytes"], 100)
+
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            second_status = app.status_payload()
+        second_bridge = {item["id"]: item for item in second_status["bridges"]}[bridge_id]
+        self.assertEqual(second_bridge["status"], "stopped")
+        self.assertEqual(second_bridge["total_bytes"], 100)
+        self.assertNotIn(bridge_id, app.PROCESS_TABLE)
+        self.assertNotIn(bridge_id, app.LOG_PROXY_TABLE)
+        self.assertNotIn(bridge_id, app.TRAFFIC_TABLE)
+
+    def test_status_does_not_wait_for_bound_proxy_port_under_state_lock(self) -> None:
+        node_id = "node-status-no-port-wait"
+        bridge_id = "bridge-status-no-port-wait"
+        bridge = self._bridge(bridge_id, node_id, 4841, 24531)
+        self._write_state(node_id, bridges=[bridge])
+        self._activate_bridge(bridge, 40, 60)
+
+        with mock.patch.object(
+            app,
+            "wait_for_port",
+            side_effect=AssertionError("status waited for a socket while STATE_LOCK was held"),
+        ):
+            status = app.status_payload()
+
+        saved_bridge = {item["id"]: item for item in status["bridges"]}[bridge_id]
+        self.assertEqual(saved_bridge["status"], "running")
+        self.assertEqual(saved_bridge["total_bytes"], 100)
+
+    def test_shutdown_owns_registered_node_test_while_probe_is_blocked(self) -> None:
+        node_id = "node-test-shutdown-owner"
+        self._write_state(node_id)
+        probe_entered = threading.Event()
+        release_probe = threading.Event()
+        terminate_entered = threading.Event()
+        terminate_calls: list[int] = []
+        test_errors: list[BaseException] = []
+        shutdown_errors: list[BaseException] = []
+
+        class TestProcess(FakeProcess):
+            pass
+
+        process = TestProcess(4836)
+
+        def blocking_probe(_port: int) -> dict[str, object]:
+            probe_entered.set()
+            if not release_probe.wait(timeout=3):
+                raise AssertionError("node probe was never released")
+            return {
+                "ok": True,
+                "latency_ms": 1,
+                "target": "example.test:80/",
+                "status_code": 204,
+                "message": "通信正常",
+            }
+
+        def terminate(item: FakeProcess) -> None:
+            terminate_calls.append(item.pid)
+            terminate_entered.set()
+
+        def run_test() -> None:
+            try:
+                app.test_node({"node_id": node_id, "core": "auto"})
+            except BaseException as error:
+                test_errors.append(error)
+
+        def run_shutdown() -> None:
+            try:
+                app.shutdown()
+            except BaseException as error:
+                shutdown_errors.append(error)
+
+        with (
+            mock.patch.object(app, "generate_config", return_value={"test": True}),
+            mock.patch.object(app, "core_command", return_value=["fake-core"]),
+            mock.patch.object(app, "next_free_port", return_value=24526),
+            mock.patch.object(app, "wait_for_port", return_value=True),
+            mock.patch.object(app.subprocess, "Popen", return_value=process),
+            mock.patch.object(app, "socks5_http_probe", side_effect=blocking_probe),
+            mock.patch.object(app, "terminate_process", side_effect=terminate),
+        ):
+            test_thread = threading.Thread(target=run_test)
+            test_thread.start()
+            self.assertTrue(probe_entered.wait(timeout=1))
+            test_process_table = getattr(app, "TEST_PROCESS_TABLE", {})
+            self.assertEqual(list(test_process_table.values()), [process])
+
+            shutdown_thread = threading.Thread(target=run_shutdown)
+            shutdown_thread.start()
+            self.assertTrue(terminate_entered.wait(timeout=1))
+            shutdown_thread.join(timeout=1)
+            self.assertFalse(shutdown_thread.is_alive())
+            release_probe.set()
+            test_thread.join(timeout=2)
+
+        self.assertFalse(test_thread.is_alive())
+        self.assertEqual(test_errors, [])
+        self.assertEqual(shutdown_errors, [])
+        self.assertEqual(terminate_calls, [4836])
+        self.assertEqual(getattr(app, "TEST_PROCESS_TABLE", {}), {})
+        self.assertNotIn(node_id, app.load_state()["tests"])
+
+    def test_shutdown_retains_node_test_process_when_termination_fails(self) -> None:
+        test_process_table = getattr(app, "TEST_PROCESS_TABLE", None)
+        self.assertIsNotNone(test_process_table)
+        assert test_process_table is not None
+        process = FakeProcess(4837)
+        test_process_table["test-retry"] = process
+        attempts = 0
+
+        def flaky_terminate(item: FakeProcess) -> None:
+            nonlocal attempts
+            self.assertIs(item, process)
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("node test terminate failed")
+
+        with mock.patch.object(app, "terminate_process", side_effect=flaky_terminate):
+            with self.assertRaisesRegex(RuntimeError, "node test terminate failed"):
+                app.shutdown()
+            self.assertIs(test_process_table.get("test-retry"), process)
+            app.shutdown()
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(test_process_table, {})
+
+    def test_node_rejects_new_process_after_shutdown_begins(self) -> None:
+        node_id = "node-test-after-shutdown"
+        self._write_state(node_id)
+        app.shutdown()
+        with mock.patch.object(app.subprocess, "Popen") as popen:
+            with self.assertRaisesRegex(RuntimeError, "正在退出"):
+                app.test_node({"node_id": node_id, "core": "auto"})
+        popen.assert_not_called()
 
     def test_shutdown_waits_for_proxy_clients_before_persisting_traffic(self) -> None:
         node_id = "node-final-traffic"

@@ -362,6 +362,12 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
             webView.reload()
         }
     }
+
+    func invalidateAndClose() {
+        webView.stopLoading()
+        webView.load(URLRequest(url: URL(string: "about:blank")!))
+        close()
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -392,6 +398,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let processOutputFinalizationTimeout: TimeInterval = 0.75
     private let processOutputCloseConfirmationTimeout: TimeInterval = 0.1
     private let processOutputLimit = 1_048_576
+
+    private var backendIsReady: Bool {
+        guard api != nil,
+              let process = backendProcess,
+              process.isRunning,
+              expectedBackendTerminationProcess !== process,
+              !terminationRequested() else {
+            return false
+        }
+        return true
+    }
 
     private var appSupportURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -454,6 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         refreshTimer?.invalidate()
         refreshTimer = nil
+        invalidateConsole()
 
         let helperDeadline = monotonicDeadline(after: helperShutdownTimeout)
         let helperGraceDeadline = monotonicDeadline(after: helperTerminationGraceTimeout)
@@ -512,16 +530,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
         if NSApp.currentEvent?.type == .rightMouseUp {
             statusItem.popUpMenu(statusMenu)
-        } else {
+        } else if backendIsReady {
             showConsole()
+        } else {
+            rebuildMenu()
+            statusItem.popUpMenu(statusMenu)
         }
     }
 
     @objc private func showConsole() {
+        guard backendIsReady else {
+            rebuildMenu()
+            statusItem.popUpMenu(statusMenu)
+            return
+        }
         if consoleWindowController == nil {
             consoleWindowController = ConsoleWindowController(backendURL: URL(string: "http://127.0.0.1:\(backendPort)")!)
         }
         consoleWindowController?.showAndReloadIfNeeded()
+    }
+
+    private func invalidateConsole() {
+        consoleWindowController?.invalidateAndClose()
+        consoleWindowController = nil
     }
 
     private func resourceBridgeScript() -> URL? {
@@ -1039,6 +1070,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func startBackend(pythonExecutable: URL) {
         guard !terminationRequested() else { return }
+        invalidateConsole()
         api = nil
         latestStatus = nil
         startupStatus = "正在启动后端"
@@ -1214,6 +1246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func failBackendStartup(process: Process, message: String) {
         guard backendProcess === process else { return }
+        invalidateConsole()
         api = nil
         latestStatus = nil
         expectedBackendTerminationProcess = process
@@ -1261,6 +1294,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @discardableResult
     private func clearBackendState(for process: Process, matching logHandle: FileHandle?) -> Bool {
         guard backendProcess === process else { return false }
+        invalidateConsole()
         backendProcess = nil
         api = nil
         latestStatus = nil
@@ -1341,7 +1375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        let backendReady = api != nil
+        let backendReady = backendIsReady
         let consoleItem = actionItem("打开控制台", #selector(showConsole))
         consoleItem.isEnabled = backendReady
         menu.addItem(consoleItem)

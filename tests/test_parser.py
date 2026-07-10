@@ -1279,6 +1279,8 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(result["counters"], {"upload": 5, "download": len(response)})
         finally:
             proxy._stop.set()
+            with app.TRAFFIC_LOCK:
+                app.TRAFFIC_TABLE.pop("bridge-half-close", None)
             for sock in (client_proxy, client_peer, upstream_proxy, upstream_peer):
                 try:
                     sock.close()
