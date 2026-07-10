@@ -33,7 +33,7 @@
 - Consumes: `parse_link(raw, source) -> Node | None`、`sing_box_config(node, local_port) -> dict`、`load_state() -> dict`。
 - Produces: `referenced_node_ids(subscriptions: list[dict[str, Any]]) -> set[str]`；合法且类型规范的状态字典；不会破坏共享节点引用的导入、刷新与删除行为。
 
-- [ ] **Step 1: 写入状态与 gRPC 的失败回归测试**
+- [x] **Step 1: 写入状态与 gRPC 的失败回归测试**
 
 在新测试文件中用 `tempfile.TemporaryDirectory()` 临时替换 `WORK_ROOT`、`RUNTIME_ROOT` 和 `STATE_PATH`，并分别覆盖：
 
@@ -77,13 +77,13 @@ def test_vless_grpc_service_name_reaches_sing_box_config(self):
     self.assertEqual(config["outbounds"][0]["transport"]["service_name"], "orders")
 ```
 
-- [ ] **Step 2: 运行新测试并确认按目标缺陷失败**
+- [x] **Step 2: 运行新测试并确认按目标缺陷失败**
 
 Run: `python3 -m unittest tests.test_state_and_parsing -v`
 
 Expected: 刷新后仍出现 `A`、删除后节点数为 `0`、手动导入 ID 相同、异常形状抛出异常、gRPC `service_name` 为空。
 
-- [ ] **Step 3: 在同一状态事务内维护引用并规范输入**
+- [x] **Step 3: 在同一状态事务内维护引用并规范输入**
 
 实施以下最小逻辑：
 
@@ -104,7 +104,7 @@ def referenced_node_ids(subscriptions: list[dict[str, Any]]) -> set[str]:
 - 删除订阅时只删除不再被其他订阅引用的节点。
 - 订阅 ID 使用 `time.time_ns()` 并包含原始内容摘要，避免同秒碰撞，不改变已有 ID。
 
-- [ ] **Step 4: 运行局部与全量 Python 测试**
+- [x] **Step 4: 运行局部与全量 Python 测试**
 
 Run: `python3 -m unittest tests.test_state_and_parsing -v`
 
@@ -114,7 +114,7 @@ Run: `python3 -m unittest discover -s tests -v`
 
 Expected: 原有与新增测试全部通过；端口测试在受限沙箱内仍可明确显示 SKIP。
 
-- [ ] **Step 5: 提交状态修复**
+- [x] **Step 5: 提交状态修复**
 
 ```bash
 git add app.py tests/test_state_and_parsing.py
@@ -133,7 +133,7 @@ git commit -m "fix: preserve subscription state invariants"
 - Consumes: `_safe_extract_tar(archive_path, dest)`、`AppHandler.headers`、`AppHandler.read_json()`。
 - Produces: `_is_loopback_host(value: str) -> bool`、`AppHandler.is_trusted_request() -> bool`；只接受本地 Host/Origin 与 JSON 变更请求的 API。
 
-- [ ] **Step 1: 写入解压和请求来源失败测试**
+- [x] **Step 1: 写入解压和请求来源失败测试**
 
 测试必须用真实 tar 和真实 `email.message.Message`/`io.BytesIO`，覆盖：
 
@@ -160,13 +160,13 @@ def test_read_json_rejects_non_json_and_oversized_body(self):
     # application/json 正常；text/plain 和超过 API_JSON_BODY_LIMIT 的长度分别拒绝。
 ```
 
-- [ ] **Step 2: 运行测试并确认当前 tar 越界和来源校验缺失**
+- [x] **Step 2: 运行测试并确认当前 tar 越界和来源校验缺失**
 
 Run: `python3 -m unittest tests.test_security -v`
 
 Expected: tar 测试发现目标目录外文件；`AppHandler.is_trusted_request` 不存在；`read_json` 接受未限制长度。
 
-- [ ] **Step 3: 实施兼容 Python 3.10 的最小安全边界**
+- [x] **Step 3: 实施兼容 Python 3.10 的最小安全边界**
 
 - `_safe_extract_tar()` 拒绝符号链接、硬链接、块/字符设备和 FIFO，只允许普通文件与目录，再执行路径包含检查和解压。
 - 增加 `API_JSON_BODY_LIMIT = 1_048_576`。
@@ -174,7 +174,7 @@ Expected: tar 测试发现目标目录外文件；`AppHandler.is_trusted_request
 - `do_GET()`、`do_HEAD()`、`do_POST()` 在访问 API 或静态内容前拒绝不可信请求；`do_POST()` 仅接受 `application/json`。
 - `read_json()` 验证 `Content-Length` 为 `0..API_JSON_BODY_LIMIT`。
 
-- [ ] **Step 4: 运行安全测试、全部 Python 测试和语法检查**
+- [x] **Step 4: 运行安全测试、全部 Python 测试和语法检查**
 
 Run: `python3 -m unittest tests.test_security -v`
 
@@ -184,7 +184,7 @@ Run: `PYTHONPYCACHEPREFIX=/tmp/proxybridge-pycache python3 -m py_compile app.py 
 
 Expected: exit 0。
 
-- [ ] **Step 5: 提交安全修复**
+- [x] **Step 5: 提交安全修复**
 
 ```bash
 git add app.py tests/test_security.py
@@ -203,7 +203,7 @@ git commit -m "fix: harden archives and local api requests"
 - Consumes: `Socks5LogProxy._relay(client, upstream) -> dict[str, int]`、`_build_http_forward_head(...) -> bytes`。
 - Produces: 正确传播单向 EOF 的双向 relay；明确向上游发送 `Connection: close` 的单请求 HTTP 转发。
 
-- [ ] **Step 1: 先写会暴露响应截断与 keep-alive 的测试**
+- [x] **Step 1: 先写会暴露响应截断与 keep-alive 的测试**
 
 ```python
 def test_relay_preserves_response_after_client_half_closes(self):
@@ -221,20 +221,20 @@ def test_http_forward_forces_upstream_connection_close(self):
 
 把现有“任一侧关闭即立即全关闭”的测试改为上述正确半关闭语义，而不是继续固化错误行为。
 
-- [ ] **Step 2: 运行代理回归测试并观察失败**
+- [x] **Step 2: 运行代理回归测试并观察失败**
 
 Run: `python3 -m unittest tests.test_proxy_regressions -v`
 
 Expected: response 为空或不完整；转发头仍含 `Connection: keep-alive`。
 
-- [ ] **Step 3: 最小修改 relay 和请求头**
+- [x] **Step 3: 最小修改 relay 和请求头**
 
 - 正常 EOF 只对目标 socket 调用 `shutdown(SHUT_WR)`，不设置全局完成事件。
 - OSError、显式 `_stop` 或不可恢复异常才全关闭两端；双方 pump 都结束后返回计数。
 - HTTP 普通请求过滤 `Connection`、`Proxy-Connection`、`Keep-Alive` 和 `Proxy-Authorization`，统一添加 `Connection: close`，确保一次解析对应一次上游连接。
 - 在拆分请求头后再次检查实际长度，堵住单次 `recv()` 越过限制的边界。
 
-- [ ] **Step 4: 运行局部测试和受允许的真实 socket 测试**
+- [x] **Step 4: 运行局部测试和受允许的真实 socket 测试**
 
 Run: `python3 -m unittest tests.test_proxy_regressions -v`
 
@@ -244,7 +244,7 @@ Run outside restricted port sandbox when approved: `python3 -m unittest discover
 
 Expected: 包括 SOCKS5、HTTP CONNECT、HTTP absolute-form 在内的全部测试 PASS，无 SKIP。
 
-- [ ] **Step 5: 提交代理语义修复**
+- [x] **Step 5: 提交代理语义修复**
 
 ```bash
 git add app.py tests/test_proxy_regressions.py tests/test_parser.py
@@ -265,7 +265,7 @@ git commit -m "fix: preserve proxy half-close semantics"
 - Consumes: `start_bridge(payload) -> dict`、`launch_browser(payload) -> dict`、`download_fingerprint_chromium(payload) -> dict`、`shutdown()`。
 - Produces: 每节点最多一个活动 Bridge；每实例最多一个活动浏览器进程；指纹内核安装单飞；并发清理所有独立进程组。
 
-- [ ] **Step 1: 写入重复启动与并发清理失败测试**
+- [x] **Step 1: 写入重复启动与并发清理失败测试**
 
 用现有 FakeProcess/FakePopen 模式，但断言真实生命周期结果：
 
@@ -290,20 +290,20 @@ def test_shutdown_stops_independent_processes_concurrently(self):
     # terminate_process 替身用 Barrier 证明多个清理任务同时进入，而不是逐个等待。
 ```
 
-- [ ] **Step 2: 运行生命周期测试并确认重复创建与串行清理**
+- [x] **Step 2: 运行生命周期测试并确认重复创建与串行清理**
 
 Run: `python3 -m unittest tests.test_lifecycle_regressions -v`
 
 Expected: 第二个 Bridge/浏览器被创建；安装临界区并发数大于 1；关闭任务无法同时到达 Barrier。
 
-- [ ] **Step 3: 加入最小锁和幂等检查**
+- [x] **Step 3: 加入最小锁和幂等检查**
 
 - `start_bridge()` 在 `STATE_LOCK` 内同步进程状态后，如果该节点已有活动 Bridge，直接返回它。
 - 用 `BROWSER_LAUNCH_LOCK` 包住一次完整浏览器启动；同步实例状态后，活动实例返回明确错误，避免覆盖 `BROWSER_PROCESS_TABLE[instance_id]`。
 - 用 `FINGERPRINT_INSTALL_LOCK` 包住“检查已有安装→下载→安装→刷新缓存”全过程，等待者进锁后重新检查。
 - `shutdown()` 同时启动浏览器终止和 Bridge `stop_process()` 工作线程，收集 traffic 后一次写回状态；保持重复调用幂等。
 
-- [ ] **Step 4: 运行生命周期与全量测试**
+- [x] **Step 4: 运行生命周期与全量测试**
 
 Run: `python3 -m unittest tests.test_lifecycle_regressions -v`
 
@@ -313,7 +313,7 @@ Run: `python3 -m unittest discover -s tests -v`
 
 Expected: PASS（受限环境的端口用例除外）。
 
-- [ ] **Step 5: 提交运行时生命周期修复**
+- [x] **Step 5: 提交运行时生命周期修复**
 
 ```bash
 git add app.py tests/test_lifecycle_regressions.py
@@ -332,7 +332,7 @@ git commit -m "fix: serialize runtime lifecycle operations"
 - Consumes: `/api/status`、`/api/clipboard`、`/api/browser/download-kernel`。
 - Produces: 只提交最新状态请求；筛选 UI 与内部状态一致；复制只有实际成功才提示；内核下载在 DOM 重绘后仍保持单飞。
 
-- [ ] **Step 1: 在隔离后端上复现四个前端问题**
+- [x] **Step 1: 在隔离后端上复现四个前端问题**
 
 启动：`PROXY_BRIDGE_WORKDIR=/tmp/proxybridge-review PROXY_BRIDGE_PORT=18788 python3 app.py`。
 
@@ -345,7 +345,7 @@ git commit -m "fix: serialize runtime lifecycle operations"
 
 Expected: 四个场景均复现当前错误。
 
-- [ ] **Step 2: 实施最小前端状态修复**
+- [x] **Step 2: 实施最小前端状态修复**
 
 ```javascript
 let latestStatusRequest = 0;
@@ -365,7 +365,7 @@ async function loadStatus() {
 - `downloadKernel()` 复用 `kernelDownloadPromise`；`renderCores()` 根据该 Promise 给重建按钮加 `disabled` 与 `is-busy`。
 - 删除只写不读的 `appState.chrome`、`appState.activeView`，以及行为等价为空操作的 `syncModalOpenState()`、调用点和 `body.modal-open` 重复 CSS；保留后端公开的 `status.chrome` 字段。
 
-- [ ] **Step 3: 重复隔离场景并运行静态检查**
+- [x] **Step 3: 重复隔离场景并运行静态检查**
 
 Run: `node --check static/app.js`
 
@@ -373,7 +373,7 @@ Expected: exit 0。
 
 重复 Step 1；Expected: 筛选回退到全部并显示节点、旧响应不覆盖新状态、复制失败显示错误、内核下载只提交一次。
 
-- [ ] **Step 4: 提交前端修复**
+- [x] **Step 4: 提交前端修复**
 
 ```bash
 git add static/app.js static/styles.css
@@ -391,27 +391,27 @@ git commit -m "fix: stabilize web console state"
 - Consumes: `BridgeAPI.getStatus`、Swift `Process`、Python `/api/status`。
 - Produces: 仅在后端实际响应后启用菜单；后端意外退出时清除伪状态；退出时取消 bootstrap helper；重复 node ID 不再触发字典 fatal error。
 
-- [ ] **Step 1: 复现菜单栏崩溃和伪就绪**
+- [x] **Step 1: 复现菜单栏崩溃和伪就绪**
 
 - 用两个相同 `nodeId` 的 `Bridge` 值执行现有 `Dictionary(uniqueKeysWithValues:)`，确认触发 duplicate-key fatal error。
 - 在 18787 端口先启动占位监听，再启动菜单栏 App；确认 Python bind 失败后 `api != nil` 仍使菜单项可用。
 - 用限速 helper 替代下载命令，在安装中退出，确认现有退出路径不登记也不停止 helper。
 
-- [ ] **Step 2: 先让启动状态取决于真实健康检查**
+- [x] **Step 2: 先让启动状态取决于真实健康检查**
 
 - `startBackend()` 创建局部 `candidateAPI`，成功 `process.run()` 后保持 `self.api == nil`。
 - 新增 `waitForBackendReady(candidateAPI:process:attemptsRemaining:)`，每 200ms 调用 `/api/status`；仅在响应成功且 `backendProcess === process`、`process.isRunning` 时赋值 `api` 和 `latestStatus`。
 - 在重试耗尽或进程退出时清空 `api/backendProcess/latestStatus`、关闭对应日志并显示具体错误。
 - 给 backend `Process` 设置常驻 termination handler，按对象身份忽略旧进程回调；App 正在退出时不弹出新错误。
 
-- [ ] **Step 3: 登记 bootstrap helper 并防御重复 Bridge**
+- [x] **Step 3: 登记 bootstrap helper 并防御重复 Bridge**
 
 - 用 `NSLock` 保护 `helperProcesses` 和 `isTerminating`；`runProcess()` 在 `process.run()` 前后登记/移除 helper。
 - `applicationWillTerminate()` 先设置退出标志，终止 helper，等待 bootstrap 工作组完成清理，再终止后端；后端并发清理完成的上限与 Swift 等待窗口保持一致。
 - 启动安装前删除仅匹配 `python-runtime-install-*` 和 `python-runtime-staged-*` 的旧临时目录。
 - 把 `Dictionary(uniqueKeysWithValues:)` 改为 `reduce(into:)`；旧状态有重复节点时按后端数组顺序保留最后一条活动 Bridge，不再 fatal。
 
-- [ ] **Step 4: 类型检查并重复端口冲突/退出场景**
+- [x] **Step 4: 类型检查并重复端口冲突/退出场景**
 
 Run: `xcrun swiftc -frontend -parse macos/ProxyBridgeMenuBar/main.swift`
 
@@ -427,7 +427,7 @@ Expected: exit 0；若本机 SDK 与 compiler build 不匹配，记录完整版�
 
 重复 Step 1；Expected: 重复 node 不崩溃、端口冲突不启用菜单、退出后无 helper 残留。
 
-- [ ] **Step 5: 提交菜单栏生命周期修复**
+- [x] **Step 5: 提交菜单栏生命周期修复**
 
 ```bash
 git add macos/ProxyBridgeMenuBar/main.swift
@@ -443,7 +443,7 @@ git commit -m "fix: harden menubar process lifecycle"
 - Consumes: Tasks 1–6 的全部提交。
 - Produces: 可重复的最终验证证据和剩余风险清单。
 
-- [ ] **Step 1: 运行所有离线质量门**
+- [x] **Step 1: 运行所有离线质量门**
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -458,21 +458,21 @@ git diff --check
 
 Expected: 所有命令成功；受限沙箱导致的端口 SKIP 单独在下一步消除。
 
-- [ ] **Step 2: 在获批的非网络沙箱环境运行真实端口测试**
+- [x] **Step 2: 在获批的非网络沙箱环境运行真实端口测试**
 
 Run: `python3 -m unittest discover -s tests -v`
 
 Expected: 全部测试 PASS，`test_socks5_log_proxy_records_connect`、`test_http_connect_proxy_records_connect`、`test_http_proxy_rewrites_absolute_form_request` 不再 SKIP。
 
-- [ ] **Step 3: 运行隔离 UI 冒烟测试**
+- [x] **Step 3: 运行隔离 UI 冒烟测试**
 
 使用 `/tmp/proxybridge-review` 和非默认端口启动后端，确认导入、筛选、启动按钮错误处理、日志模态框和浏览器记录模态框；不下载真实核心、不读写用户状态。
 
-- [ ] **Step 4: 请求独立代码复审**
+- [x] **Step 4: 请求独立代码复审**
 
 复审者逐项核对设计说明、计划、diff、测试输出，重点检查：状态引用集合、tar 成员类型、半关闭线程退出、锁顺序、Swift 回调身份、前端旧响应抑制及是否存在无关重构。
 
-- [ ] **Step 5: 记录不在稳健修复范围内的剩余风险**
+- [x] **Step 5: 记录不在稳健修复范围内的剩余风险**
 
 明确记录：动态 `latest` Python 运行时和代理核心仍依赖上游 HTTPS/release 账户信任；若要加入固定版本、SHA-256 或签名 manifest，需要独立发布策略设计与更新流程，不能作为本轮临时常量写入。
 
