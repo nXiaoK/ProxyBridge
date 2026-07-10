@@ -476,7 +476,7 @@ Expected: 全部测试 PASS，`test_socks5_log_proxy_records_connect`、`test_ht
 
 明确记录：动态 `latest` Python 运行时和代理核心仍依赖上游 HTTPS/release 账户信任；若要加入固定版本、SHA-256 或签名 manifest，需要独立发布策略设计与更新流程，不能作为本轮临时常量写入。
 
-- [ ] **Step 6: 最终状态检查**
+- [x] **Step 6: 最终状态检查**
 
 Run: `git status --short --branch`
 
