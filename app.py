@@ -40,6 +40,7 @@ DEFAULT_BROWSER_START_URL = "https://ip.skk.moe/"
 REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
 HTTP_PROXY_HEADER_LIMIT = 65536
+API_JSON_BODY_LIMIT = 1_048_576
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
 ACTIVE_BROWSER_STATUSES = {"running", "starting"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
@@ -66,6 +67,21 @@ FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checke
 # 与「连接日志」(per-connection)、「核心日志」(sing-box/xray 输出)是三条独立的日志线。
 SYSTEM_LOGS: "collections.deque[dict[str, Any]]" = collections.deque(maxlen=SYSTEM_LOG_LIMIT)
 SYSTEM_LOG_LOCK = threading.RLock()
+
+
+def _is_loopback_host(value: str) -> bool:
+    if not value or value != value.strip() or any(char in value for char in "\r\n\t"):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(f"//{value}")
+        parsed.port
+    except ValueError:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return False
+    if parsed.path or parsed.query or parsed.fragment:
+        return False
+    return parsed.hostname in {"127.0.0.1", "localhost", "::1"}
 
 
 def log_event(message: str, level: str = "info", category: str = "") -> None:
@@ -1153,6 +1169,8 @@ def _safe_extract_tar(archive_path: Path, dest: Path) -> None:
     root = dest.resolve()
     with tarfile.open(archive_path) as archive:
         for member in archive.getmembers():
+            if not (member.isfile() or member.isdir()):
+                raise RuntimeError("压缩包包含非法类型")
             target = (dest / member.name).resolve()
             if target != root and root not in target.parents:
                 raise RuntimeError("压缩包包含非法路径")
@@ -3170,14 +3188,56 @@ class AppHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
 
+    def is_trusted_request(self) -> bool:
+        if not _is_loopback_host(self.headers.get("Host") or ""):
+            return False
+        if (self.headers.get("Sec-Fetch-Site") or "").strip().lower() == "cross-site":
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        if not origin or origin != origin.strip() or any(char in origin for char in "\r\n\t"):
+            return False
+        try:
+            parsed = urllib.parse.urlsplit(origin)
+        except ValueError:
+            return False
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return False
+        if parsed.path or parsed.query or parsed.fragment:
+            return False
+        return _is_loopback_host(parsed.netloc)
+
+    def _send_request_error(self, status: int, message: str) -> None:
+        path = urllib.parse.urlsplit(self.path).path
+        if not path.startswith("/api/"):
+            self.send_error(status)
+            return
+        if self.command == "HEAD":
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        json_response(self, {"error": message}, status)
+
     def read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length") or "0")
-        if not length:
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length is not None else 0
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Content-Length 无效") from exc
+        if length < 0 or length > API_JSON_BODY_LIMIT:
+            raise ValueError(f"Content-Length 必须在 0..{API_JSON_BODY_LIMIT} 之间")
+        if length == 0:
             return {}
         data = self.rfile.read(length)
         return json.loads(data.decode("utf-8"))
 
     def do_GET(self) -> None:
+        if not self.is_trusted_request():
+            self._send_request_error(403, "不可信请求来源")
+            return
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/api/status":
             json_response(self, status_payload())
@@ -3211,6 +3271,9 @@ class AppHandler(BaseHTTPRequestHandler):
         self.serve_static()
 
     def do_HEAD(self) -> None:
+        if not self.is_trusted_request():
+            self._send_request_error(403, "不可信请求来源")
+            return
         if self.path == "/api/status":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -3220,6 +3283,12 @@ class AppHandler(BaseHTTPRequestHandler):
         self.serve_static(head_only=True)
 
     def do_POST(self) -> None:
+        if not self.is_trusted_request():
+            self._send_request_error(403, "不可信请求来源")
+            return
+        if self.headers.get_content_type() != "application/json":
+            self._send_request_error(415, "仅支持 application/json")
+            return
         try:
             payload = self.read_json()
             if self.path == "/api/subscriptions/import":
