@@ -310,6 +310,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var backendLogHandle: FileHandle?
     private var consoleWindowController: ConsoleWindowController?
     private let pythonReleaseAPI = URL(string: "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest")!
+    private let processLifecycleLock = NSLock()
+    private var helperProcesses: [Process] = []
+    private var isTerminating = false
+    private let bootstrapGroup = DispatchGroup()
+    private let processTerminationTimeout: TimeInterval = 4
+    private let backendReadinessAttempts = 30
 
     private var appSupportURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -365,17 +371,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        processLifecycleLock.lock()
+        isTerminating = true
+        let helpers = helperProcesses
+        processLifecycleLock.unlock()
+
         refreshTimer?.invalidate()
         refreshTimer = nil
+
+        for helper in helpers where helper.isRunning {
+            helper.terminate()
+        }
+        _ = bootstrapGroup.wait(timeout: .now() + processTerminationTimeout)
+        for helper in helpers where helper.isRunning {
+            kill(helper.processIdentifier, SIGKILL)
+            helper.waitUntilExit()
+        }
+
         if let process = backendProcess, process.isRunning {
             let semaphore = DispatchSemaphore(value: 0)
-            process.terminationHandler = { _ in semaphore.signal() }
+            DispatchQueue.global(qos: .utility).async {
+                process.waitUntilExit()
+                semaphore.signal()
+            }
             process.terminate()
-            if semaphore.wait(timeout: .now() + 4) == .timedOut, process.isRunning {
+            if semaphore.wait(timeout: .now() + processTerminationTimeout) == .timedOut, process.isRunning {
                 kill(process.processIdentifier, SIGKILL)
                 process.waitUntilExit()
             }
         }
+        api = nil
+        latestStatus = nil
         backendProcess = nil
         try? backendLogHandle?.close()
         backendLogHandle = nil
@@ -417,26 +443,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func bootstrapBackend() {
         updateStartupStatus("正在准备 Python 运行时")
+        let group = bootstrapGroup
+        group.enter()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer { group.leave() }
             guard let self else { return }
+            guard !self.terminationRequested() else { return }
             do {
                 let pythonExecutable = try self.resolvePythonExecutable()
                 DispatchQueue.main.async { [weak self] in
-                    self?.startBackend(pythonExecutable: pythonExecutable)
+                    guard let self, !self.terminationRequested() else { return }
+                    self.startBackend(pythonExecutable: pythonExecutable)
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
-                    self?.startupStatus = nil
-                    self?.lastError = "Python 运行时准备失败：\(error.localizedDescription)"
-                    self?.rebuildMenu()
+                    guard let self, !self.terminationRequested() else { return }
+                    self.startupStatus = nil
+                    self.lastError = "Python 运行时准备失败：\(error.localizedDescription)"
+                    self.rebuildMenu()
                 }
             }
         }
     }
 
+    private func terminationRequested() -> Bool {
+        processLifecycleLock.lock()
+        defer { processLifecycleLock.unlock() }
+        return isTerminating
+    }
+
     private func updateStartupStatus(_ message: String?) {
+        guard !terminationRequested() else { return }
         let apply = { [weak self] in
-            guard let self else { return }
+            guard let self, !self.terminationRequested() else { return }
             self.startupStatus = message
             if message != nil {
                 self.lastError = nil
@@ -517,6 +556,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateStartupStatus("正在下载 Python 运行时")
 
         let fileManager = FileManager.default
+        removeStalePythonRuntimeInstallations(fileManager: fileManager)
         let tempRoot = appSupportURL.appendingPathComponent("python-runtime-install-\(UUID().uuidString)", isDirectory: true)
         let extractRoot = tempRoot.appendingPathComponent("extract", isDirectory: true)
         let stagedRuntime = appSupportURL.appendingPathComponent("python-runtime-staged-\(UUID().uuidString)", isDirectory: true)
@@ -557,6 +597,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         updateStartupStatus("Python 运行时已安装")
         return installedPython
+    }
+
+    private func removeStalePythonRuntimeInstallations(fileManager: FileManager) {
+        guard let children = try? fileManager.contentsOfDirectory(
+            at: appSupportURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return
+        }
+        for child in children {
+            let name = child.lastPathComponent
+            guard name.hasPrefix("python-runtime-install-") ||
+                  name.hasPrefix("python-runtime-staged-") else {
+                continue
+            }
+            try? fileManager.removeItem(at: child)
+        }
     }
 
     private func latestPythonRuntimeAsset() throws -> GitHubAsset {
@@ -714,6 +772,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func runProcess(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> CommandResult {
         let process = Process()
+        defer {
+            processLifecycleLock.lock()
+            helperProcesses.removeAll { $0 === process }
+            processLifecycleLock.unlock()
+        }
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         let pipe = Pipe()
@@ -722,7 +785,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let semaphore = DispatchSemaphore(value: 0)
         process.terminationHandler = { _ in semaphore.signal() }
-        try process.run()
+        processLifecycleLock.lock()
+        guard !isTerminating else {
+            processLifecycleLock.unlock()
+            throw ProxyBridgeError.message("应用正在退出")
+        }
+        helperProcesses.append(process)
+        do {
+            try process.run()
+        } catch {
+            processLifecycleLock.unlock()
+            throw error
+        }
+        processLifecycleLock.unlock()
 
         if semaphore.wait(timeout: .now() + timeout) == .timedOut {
             process.terminate()
@@ -747,16 +822,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startBackend(pythonExecutable: URL) {
+        guard !terminationRequested() else { return }
+        api = nil
+        latestStatus = nil
+        startupStatus = "正在启动后端"
+        lastError = nil
+        rebuildMenu()
+
         do {
             try FileManager.default.createDirectory(at: appSupportURL, withIntermediateDirectories: true)
             guard let script = resourceBridgeScript() else {
                 lastError = "找不到 app.py 后端脚本"
                 startupStatus = nil
                 api = nil
+                latestStatus = nil
                 rebuildMenu()
                 return
             }
-            api = BridgeAPI(port: backendPort)
+            let candidateAPI = BridgeAPI(port: backendPort)
 
             let process = Process()
             process.executableURL = pythonExecutable
@@ -776,6 +859,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             logHandle.seekToEndOfFile()
             process.standardOutput = logHandle
             process.standardError = logHandle
+            process.terminationHandler = { [weak self] terminatedProcess in
+                self?.backendDidTerminate(terminatedProcess, logHandle: logHandle)
+            }
             do {
                 try process.run()
             } catch {
@@ -784,14 +870,112 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             backendLogHandle = logHandle
             backendProcess = process
-            startupStatus = nil
-            lastError = nil
+            waitForBackendReady(
+                candidateAPI: candidateAPI,
+                process: process,
+                attemptsRemaining: backendReadinessAttempts
+            )
         } catch {
             startupStatus = nil
             api = nil
-            lastError = error.localizedDescription
+            latestStatus = nil
+            backendProcess = nil
+            try? backendLogHandle?.close()
+            backendLogHandle = nil
+            guard !terminationRequested() else { return }
+            lastError = "后端启动失败：\(error.localizedDescription)"
             rebuildMenu()
         }
+    }
+
+    private func waitForBackendReady(candidateAPI: BridgeAPI, process: Process, attemptsRemaining: Int) {
+        guard backendProcess === process else { return }
+        guard process.isRunning else {
+            failBackendStartup(
+                process: process,
+                message: "后端进程在就绪前退出（状态码 \(process.terminationStatus)）"
+            )
+            return
+        }
+
+        candidateAPI.getStatus { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self, self.backendProcess === process else { return }
+                guard process.isRunning else {
+                    self.failBackendStartup(
+                        process: process,
+                        message: "后端进程在就绪前退出（状态码 \(process.terminationStatus)）"
+                    )
+                    return
+                }
+
+                switch result {
+                case .success(let status):
+                    self.api = candidateAPI
+                    self.latestStatus = status
+                    self.startupStatus = nil
+                    self.lastError = nil
+                    self.rebuildMenu()
+                case .failure(let error):
+                    guard attemptsRemaining > 1 else {
+                        self.failBackendStartup(
+                            process: process,
+                            message: "后端启动失败：/api/status 未就绪（\(error.localizedDescription)）"
+                        )
+                        return
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                        self?.waitForBackendReady(
+                            candidateAPI: candidateAPI,
+                            process: process,
+                            attemptsRemaining: attemptsRemaining - 1
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func backendDidTerminate(_ process: Process, logHandle: FileHandle) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self,
+                  self.clearBackendState(for: process, matching: logHandle) else {
+                return
+            }
+            guard !self.terminationRequested() else { return }
+            self.startupStatus = nil
+            self.lastError = "后端进程意外退出（状态码 \(process.terminationStatus)）"
+            self.rebuildMenu()
+        }
+    }
+
+    private func failBackendStartup(process: Process, message: String) {
+        guard clearBackendState(for: process, matching: backendLogHandle) else { return }
+        if process.isRunning {
+            process.terminate()
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
+            }
+        }
+        guard !terminationRequested() else { return }
+        startupStatus = nil
+        lastError = message
+        rebuildMenu()
+    }
+
+    @discardableResult
+    private func clearBackendState(for process: Process, matching logHandle: FileHandle?) -> Bool {
+        guard backendProcess === process else { return false }
+        backendProcess = nil
+        api = nil
+        latestStatus = nil
+        if let logHandle, backendLogHandle === logHandle {
+            backendLogHandle = nil
+            try? logHandle.close()
+        }
+        return true
     }
 
     private func migrateWorkspaceStateIfNeeded() {
@@ -811,20 +995,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshNow() {
-        guard api != nil else {
+        guard let currentAPI = api,
+              let process = backendProcess,
+              process.isRunning else {
             rebuildMenu()
             return
         }
-        api.getStatus { [weak self] result in
+        currentAPI.getStatus { [weak self] result in
             DispatchQueue.main.async {
+                guard let self,
+                      self.api === currentAPI,
+                      self.backendProcess === process,
+                      process.isRunning else {
+                    return
+                }
                 switch result {
                 case .success(let status):
-                    self?.latestStatus = status
-                    self?.lastError = nil
+                    self.latestStatus = status
+                    self.lastError = nil
                 case .failure(let error):
-                    self?.lastError = error.localizedDescription
+                    self.lastError = error.localizedDescription
                 }
-                self?.rebuildMenu()
+                self.rebuildMenu()
             }
         }
     }
@@ -946,7 +1138,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return parent
         }
 
-        let runningByNode = Dictionary(uniqueKeysWithValues: bridges.map { ($0.nodeId, $0) })
+        let runningByNode = bridges.reduce(into: [String: Bridge]()) { result, bridge in
+            result[bridge.nodeId] = bridge
+        }
         let grouped = Dictionary(grouping: nodes) { $0.region }
         for region in grouped.keys.sorted(by: { $0.localizedStandardCompare($1) == .orderedAscending }) {
             let regionMenu = NSMenu()
@@ -1039,33 +1233,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func importSubscription(name: String, url: String, raw: String) {
-        api.importSubscription(name: name, url: url, raw: raw) { [weak self] result in
+        guard let currentAPI = api,
+              let process = backendProcess,
+              process.isRunning else {
+            return
+        }
+        currentAPI.importSubscription(name: name, url: url, raw: raw) { [weak self] result in
             DispatchQueue.main.async {
+                guard let self,
+                      self.api === currentAPI,
+                      self.backendProcess === process,
+                      process.isRunning else {
+                    return
+                }
                 switch result {
                 case .success(let status):
-                    self?.latestStatus = status
-                    self?.lastError = nil
-                    self?.showNotification("订阅已导入", detail: "当前共有 \(status.nodes.count) 个节点")
+                    self.latestStatus = status
+                    self.lastError = nil
+                    self.showNotification("订阅已导入", detail: "当前共有 \(status.nodes.count) 个节点")
                 case .failure(let error):
-                    self?.showError(error.localizedDescription)
+                    self.showError(error.localizedDescription)
                 }
-                self?.rebuildMenu()
+                self.rebuildMenu()
             }
         }
     }
 
     @objc private func refreshSubscription(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String else { return }
-        api.refreshSubscription(id: id) { [weak self] result in
+        guard let id = sender.representedObject as? String,
+              let currentAPI = api,
+              let process = backendProcess,
+              process.isRunning else {
+            return
+        }
+        currentAPI.refreshSubscription(id: id) { [weak self] result in
             DispatchQueue.main.async {
+                guard let self,
+                      self.api === currentAPI,
+                      self.backendProcess === process,
+                      process.isRunning else {
+                    return
+                }
                 switch result {
                 case .success(let status):
-                    self?.latestStatus = status
-                    self?.showNotification("订阅已刷新", detail: "当前共有 \(status.nodes.count) 个节点")
+                    self.latestStatus = status
+                    self.showNotification("订阅已刷新", detail: "当前共有 \(status.nodes.count) 个节点")
                 case .failure(let error):
-                    self?.showError(error.localizedDescription)
+                    self.showError(error.localizedDescription)
                 }
-                self?.rebuildMenu()
+                self.rebuildMenu()
             }
         }
     }
@@ -1123,6 +1339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showError(_ message: String) {
+        guard !terminationRequested() else { return }
         lastError = message
         let alert = NSAlert()
         alert.messageText = "Proxy Bridge"
