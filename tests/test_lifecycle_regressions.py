@@ -47,6 +47,10 @@ class LifecycleRegressionTests(unittest.TestCase):
         self._old_traffic_table = {key: dict(value) for key, value in app.TRAFFIC_TABLE.items()}
         self._old_fingerprint_cache = dict(app.FINGERPRINT_CHROMIUM_CACHE)
         self._was_shutting_down = app.SHUTTING_DOWN.is_set()
+        shutdown_signal_claimed = getattr(app, "SHUTDOWN_SIGNAL_CLAIMED", None)
+        self._was_shutdown_signal_claimed = bool(
+            shutdown_signal_claimed is not None and shutdown_signal_claimed.is_set()
+        )
 
         root = Path(self._temp_dir.name)
         app.WORK_ROOT = root / "work"
@@ -59,6 +63,8 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.LOG_PROXY_TABLE.clear()
         app.TRAFFIC_TABLE.clear()
         app.SHUTTING_DOWN.clear()
+        if shutdown_signal_claimed is not None:
+            shutdown_signal_claimed.clear()
         app.invalidate_fingerprint_chromium_cache()
         app.ensure_dirs()
 
@@ -83,6 +89,11 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.SHUTTING_DOWN.clear()
         if self._was_shutting_down:
             app.SHUTTING_DOWN.set()
+        shutdown_signal_claimed = getattr(app, "SHUTDOWN_SIGNAL_CLAIMED", None)
+        if shutdown_signal_claimed is not None:
+            shutdown_signal_claimed.clear()
+            if self._was_shutdown_signal_claimed:
+                shutdown_signal_claimed.set()
         self._temp_dir.cleanup()
 
     def _node(self, node_id: str) -> dict[str, object]:
@@ -1511,6 +1522,37 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(traffic[bridge_ids[0]], (11, 22, 33))
         self.assertEqual(traffic[bridge_ids[1]], (33, 44, 77))
         self.assertEqual(second_state["bridges"], first_state["bridges"])
+
+    def test_shutdown_signal_is_single_flight_during_recursive_delivery(self) -> None:
+        shutdown_calls = 0
+
+        def recursive_shutdown() -> None:
+            nonlocal shutdown_calls
+            shutdown_calls += 1
+            if shutdown_calls == 1:
+                app.handle_shutdown_signal(app.signal.SIGINT, None)
+
+        with mock.patch.object(app, "shutdown", side_effect=recursive_shutdown):
+            with self.assertRaises(SystemExit) as caught:
+                app.handle_shutdown_signal(app.signal.SIGTERM, None)
+
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(shutdown_calls, 1)
+        claimed = getattr(app, "SHUTDOWN_SIGNAL_CLAIMED", threading.Event())
+        self.assertTrue(claimed.is_set())
+
+    def test_shutdown_signal_claim_persists_when_first_shutdown_raises(self) -> None:
+        failure = RuntimeError("shutdown persistence failed")
+        with mock.patch.object(app, "shutdown", side_effect=failure) as shutdown_mock:
+            with self.assertRaises(RuntimeError) as caught:
+                app.handle_shutdown_signal(app.signal.SIGTERM, None)
+            self.assertIs(caught.exception, failure)
+            try:
+                app.handle_shutdown_signal(app.signal.SIGINT, None)
+            except RuntimeError as error:
+                self.fail(f"second signal restarted shutdown: {error}")
+
+        self.assertEqual(shutdown_mock.call_count, 1)
 
 
 if __name__ == "__main__":

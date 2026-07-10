@@ -61,6 +61,8 @@ STATE_LOCK = threading.RLock()
 PROCESS_LOCK = threading.RLock()
 TRAFFIC_LOCK = threading.RLock()
 SHUTTING_DOWN = threading.Event()
+SHUTDOWN_SIGNAL_CLAIMED = threading.Event()
+SHUTDOWN_SIGNAL_CLAIM_LOCK = threading.Lock()
 PATH_CACHE_LOCK = threading.RLock()
 CORE_INSTALL_LOCK = threading.RLock()
 BROWSER_LAUNCH_LOCK = threading.RLock()
@@ -3737,6 +3739,16 @@ def shutdown() -> None:
 
 
 def handle_shutdown_signal(signum: int, _frame: Any) -> None:
+    if SHUTDOWN_SIGNAL_CLAIMED.is_set():
+        return
+    if not SHUTDOWN_SIGNAL_CLAIM_LOCK.acquire(blocking=False):
+        return
+    try:
+        if SHUTDOWN_SIGNAL_CLAIMED.is_set():
+            return
+        SHUTDOWN_SIGNAL_CLAIMED.set()
+    finally:
+        SHUTDOWN_SIGNAL_CLAIM_LOCK.release()
     shutdown()
     raise SystemExit(0)
 
