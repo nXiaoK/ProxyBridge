@@ -48,6 +48,7 @@ CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
 CORE_LOG_ENTRY_LIMIT = 30
 PROCESS_TABLE: dict[str, subprocess.Popen] = {}
+BRIDGE_NODE_TABLE: dict[str, str] = {}
 # 兼容旧的节点级浏览器进程表;新的多开浏览器以 BROWSER_PROCESS_TABLE 按实例记录。
 BROWSER_TABLE: dict[str, list[subprocess.Popen]] = {}
 BROWSER_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
@@ -1837,8 +1838,8 @@ def _start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
         with PROCESS_LOCK:
             residual_bridge_ids = [
                 bridge_id
-                for bridge_id, proxy in LOG_PROXY_TABLE.items()
-                if str(getattr(proxy, "node_id", "") or "") == node_id
+                for bridge_id, owner_node_id in BRIDGE_NODE_TABLE.items()
+                if owner_node_id == node_id
             ]
         if residual_bridge_ids:
             raise RuntimeError("该节点仍有未清理的本地代理资源，无法重复启动")
@@ -1868,6 +1869,7 @@ def _start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
             log_file.close()
         with PROCESS_LOCK:
             PROCESS_TABLE[bridge_id] = process
+            BRIDGE_NODE_TABLE[bridge_id] = node_id
         try:
             core_started = wait_for_port(core_port, timeout=2.5)
             if process.poll() is not None:
@@ -2448,15 +2450,24 @@ def stop_process(bridge_id: str, *, pop_traffic: bool = True) -> dict[str, int]:
     with PROCESS_LOCK:
         proxy = LOG_PROXY_TABLE.get(bridge_id)
         process = PROCESS_TABLE.get(bridge_id)
+        owner_node_id = BRIDGE_NODE_TABLE.get(bridge_id)
     if proxy:
         proxy.stop()
+        with PROCESS_LOCK:
+            if LOG_PROXY_TABLE.get(bridge_id) is proxy:
+                LOG_PROXY_TABLE.pop(bridge_id, None)
     if process:
         terminate_process(process)
+        with PROCESS_LOCK:
+            if PROCESS_TABLE.get(bridge_id) is process:
+                PROCESS_TABLE.pop(bridge_id, None)
     with PROCESS_LOCK:
-        if proxy is not None and LOG_PROXY_TABLE.get(bridge_id) is proxy:
-            LOG_PROXY_TABLE.pop(bridge_id, None)
-        if process is not None and PROCESS_TABLE.get(bridge_id) is process:
-            PROCESS_TABLE.pop(bridge_id, None)
+        if (
+            bridge_id not in PROCESS_TABLE
+            and bridge_id not in LOG_PROXY_TABLE
+            and BRIDGE_NODE_TABLE.get(bridge_id) == owner_node_id
+        ):
+            BRIDGE_NODE_TABLE.pop(bridge_id, None)
     if pop_traffic:
         return pop_bridge_traffic(bridge_id)
     return bridge_traffic_snapshot(bridge_id)

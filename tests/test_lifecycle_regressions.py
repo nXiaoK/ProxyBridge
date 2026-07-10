@@ -40,6 +40,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         self._old_runtime_root = app.RUNTIME_ROOT
         self._old_state_path = app.STATE_PATH
         self._old_process_table = dict(app.PROCESS_TABLE)
+        self._old_bridge_node_table = dict(app.BRIDGE_NODE_TABLE)
         self._old_browser_table = {key: list(value) for key, value in app.BROWSER_TABLE.items()}
         self._old_browser_process_table = dict(app.BROWSER_PROCESS_TABLE)
         self._old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
@@ -52,6 +53,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.RUNTIME_ROOT = app.WORK_ROOT / "runtime"
         app.STATE_PATH = app.WORK_ROOT / "state.json"
         app.PROCESS_TABLE.clear()
+        app.BRIDGE_NODE_TABLE.clear()
         app.BROWSER_TABLE.clear()
         app.BROWSER_PROCESS_TABLE.clear()
         app.LOG_PROXY_TABLE.clear()
@@ -66,6 +68,8 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.STATE_PATH = self._old_state_path
         app.PROCESS_TABLE.clear()
         app.PROCESS_TABLE.update(self._old_process_table)
+        app.BRIDGE_NODE_TABLE.clear()
+        app.BRIDGE_NODE_TABLE.update(self._old_bridge_node_table)
         app.BROWSER_TABLE.clear()
         app.BROWSER_TABLE.update(self._old_browser_table)
         app.BROWSER_PROCESS_TABLE.clear()
@@ -158,6 +162,7 @@ class LifecycleRegressionTests(unittest.TestCase):
     def _activate_bridge(self, bridge: dict[str, object], upload: int = 0, download: int = 0) -> None:
         bridge_id = str(bridge["id"])
         app.PROCESS_TABLE[bridge_id] = FakeProcess(int(bridge["pid"]))
+        app.BRIDGE_NODE_TABLE[bridge_id] = str(bridge["node_id"])
         app.LOG_PROXY_TABLE[bridge_id] = FakeProxy()
         app.init_bridge_traffic(bridge_id, upload, download)
 
@@ -423,6 +428,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(terminated_pids, [4700])
         self.assertTrue(TrackingProxy.instances[0].stopped)
         self.assertEqual(app.PROCESS_TABLE, {})
+        self.assertEqual(app.BRIDGE_NODE_TABLE, {})
         self.assertEqual(app.LOG_PROXY_TABLE, {})
         self.assertEqual(app.TRAFFIC_TABLE, {})
 
@@ -485,7 +491,9 @@ class LifecycleRegressionTests(unittest.TestCase):
             self.assertEqual(terminate_attempts, [process.pid])
             self.assertEqual(proxy.stop_calls, 1)
             self.assertIn(process, app.PROCESS_TABLE.values())
-            self.assertIn(proxy, app.LOG_PROXY_TABLE.values())
+            self.assertNotIn(proxy, app.LOG_PROXY_TABLE.values())
+            self.assertEqual(set(app.BRIDGE_NODE_TABLE), set(app.PROCESS_TABLE))
+            self.assertEqual(list(app.BRIDGE_NODE_TABLE.values()), [node_id])
             self.assertTrue(app.TRAFFIC_TABLE)
 
             with self.assertRaisesRegex(RuntimeError, "未清理|残留"):
@@ -498,8 +506,51 @@ class LifecycleRegressionTests(unittest.TestCase):
 
         self.assertEqual(retried_pids, [process.pid])
         self.assertEqual(app.PROCESS_TABLE, {})
+        self.assertEqual(app.BRIDGE_NODE_TABLE, {})
         self.assertEqual(app.LOG_PROXY_TABLE, {})
         self.assertEqual(app.TRAFFIC_TABLE, {})
+
+    def test_process_only_bridge_residual_blocks_duplicate_start(self) -> None:
+        node_id = "node-process-only-residual"
+        self._write_state(node_id)
+        ports = iter([24510, 25510, 24511, 25511])
+        terminate_attempts: list[int] = []
+
+        class FakePopen:
+            calls: list["FakePopen"] = []
+
+            def __init__(self, _command: list[str], **_kwargs: object) -> None:
+                self.pid = 4820 + len(self.calls)
+                self.calls.append(self)
+
+            def poll(self) -> None:
+                return None
+
+        def fail_first_termination(process: FakePopen) -> None:
+            terminate_attempts.append(process.pid)
+            if len(terminate_attempts) == 1:
+                raise RuntimeError("core cleanup failed")
+
+        with (
+            mock.patch.object(app, "generate_config", return_value={"test": True}),
+            mock.patch.object(app, "core_command", return_value=["fake-core"]),
+            mock.patch.object(app, "next_free_port", side_effect=lambda _preferred=None: next(ports)),
+            mock.patch.object(app, "wait_for_port", return_value=False),
+            mock.patch.object(app.subprocess, "Popen", FakePopen),
+            mock.patch.object(app, "terminate_process", side_effect=fail_first_termination),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "内部端口启动超时"):
+                app.start_bridge({"node_id": node_id, "core": "auto"})
+            with self.assertRaisesRegex(RuntimeError, "未清理|残留"):
+                app.start_bridge({"node_id": node_id, "core": "auto"})
+
+        self.assertEqual(len(FakePopen.calls), 1)
+        self.assertEqual(len(app.PROCESS_TABLE), 1)
+
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            app.shutdown()
+        self.assertEqual(app.PROCESS_TABLE, {})
+        self.assertEqual(app.BRIDGE_NODE_TABLE, {})
 
     def test_running_browser_instance_cannot_be_launched_twice(self) -> None:
         node_id = "node-browser-single-flight"
@@ -1094,9 +1145,11 @@ class LifecycleRegressionTests(unittest.TestCase):
             self.assertEqual(first_state[failed_id]["total_bytes"], 0)
             self.assertNotIn(successful_id, app.PROCESS_TABLE)
             self.assertNotIn(successful_id, app.LOG_PROXY_TABLE)
+            self.assertNotIn(successful_id, app.BRIDGE_NODE_TABLE)
             self.assertNotIn(successful_id, app.TRAFFIC_TABLE)
             self.assertIn(failed_id, app.PROCESS_TABLE)
-            self.assertIn(failed_id, app.LOG_PROXY_TABLE)
+            self.assertNotIn(failed_id, app.LOG_PROXY_TABLE)
+            self.assertEqual(app.BRIDGE_NODE_TABLE.get(failed_id), node_id)
             self.assertEqual(app.TRAFFIC_TABLE[failed_id]["total_bytes"], 77)
             self.assertEqual(app.BROWSER_PROCESS_TABLE, {})
             self.assertRegex(str(caught.exception), "关闭.*失败")
@@ -1128,6 +1181,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         )
         self.assertEqual(attempts[4542], 2)
         self.assertEqual(app.PROCESS_TABLE, {})
+        self.assertEqual(app.BRIDGE_NODE_TABLE, {})
         self.assertEqual(app.LOG_PROXY_TABLE, {})
         self.assertEqual(app.TRAFFIC_TABLE, {})
 
