@@ -687,6 +687,46 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertNotIn(instance_id, app.BROWSER_PROCESS_TABLE)
         self.assertNotIn(process, app.BROWSER_TABLE.get(node_id, []))
 
+    def test_stop_browser_instance_keeps_handle_until_termination_succeeds(self) -> None:
+        node_id = "node-browser-stop-retry"
+        instance_id = "browser-stop-retry"
+        process = FakeProcess(4801)
+        app.BROWSER_PROCESS_TABLE[instance_id] = process
+        app.BROWSER_TABLE[node_id] = [process]
+
+        with mock.patch.object(app, "terminate_process", side_effect=RuntimeError("terminate failed")):
+            with self.assertRaisesRegex(RuntimeError, "terminate failed"):
+                app.stop_browser_instance_process(instance_id)
+
+        self.assertIs(app.BROWSER_PROCESS_TABLE.get(instance_id), process)
+        self.assertEqual(app.BROWSER_TABLE.get(node_id), [process])
+
+        retried: list[int] = []
+        with mock.patch.object(app, "terminate_process", side_effect=lambda item: retried.append(item.pid)):
+            self.assertEqual(app.stop_browser_instance_process(instance_id), 1)
+        self.assertEqual(retried, [4801])
+        self.assertNotIn(instance_id, app.BROWSER_PROCESS_TABLE)
+        self.assertNotIn(node_id, app.BROWSER_TABLE)
+
+    def test_stop_untracked_browsers_removes_only_successful_processes(self) -> None:
+        node_id = "node-browser-batch-retry"
+        failed = FakeProcess(4811)
+        successful = FakeProcess(4812)
+        app.BROWSER_TABLE[node_id] = [failed, successful]
+        attempted: list[int] = []
+
+        def terminate(item: FakeProcess) -> None:
+            attempted.append(item.pid)
+            if item is failed:
+                raise RuntimeError("batch terminate failed")
+
+        with mock.patch.object(app, "terminate_process", side_effect=terminate):
+            with self.assertRaisesRegex(RuntimeError, "batch terminate failed"):
+                app.stop_untracked_browser_processes_for_node(node_id)
+
+        self.assertEqual(attempted, [4811, 4812])
+        self.assertEqual(app.BROWSER_TABLE[node_id], [failed])
+
     def test_start_bridge_and_shutdown_share_lifecycle_barrier(self) -> None:
         node_id = "node-bridge-shutdown-barrier"
         self._write_state(node_id)

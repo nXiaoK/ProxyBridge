@@ -2127,26 +2127,47 @@ def remove_browser_process_from_node_tables(process: subprocess.Popen) -> None:
             BROWSER_TABLE.pop(node_id, None)
 
 
+def remove_registered_browser_process(
+    process: subprocess.Popen,
+    instance_id: str | None = None,
+) -> None:
+    with PROCESS_LOCK:
+        if instance_id and BROWSER_PROCESS_TABLE.get(instance_id) is process:
+            BROWSER_PROCESS_TABLE.pop(instance_id, None)
+        remove_browser_process_from_node_tables(process)
+
+
 def stop_browser_instance_process(instance_id: str) -> int:
     with PROCESS_LOCK:
-        process = BROWSER_PROCESS_TABLE.pop(instance_id, None)
-        if process is not None:
-            remove_browser_process_from_node_tables(process)
-    if process is not None and process.poll() is None:
+        process = BROWSER_PROCESS_TABLE.get(instance_id)
+    if process is None:
+        return 0
+    killed = 0
+    if process.poll() is None:
         # 浏览器以 start_new_session 启动,终结整个进程组以带走全部子进程。
         terminate_process(process)
-        return 1
-    return 0
+        killed = 1
+    remove_registered_browser_process(process, instance_id)
+    return killed
 
 
 def stop_untracked_browser_processes_for_node(node_id: str) -> int:
     with PROCESS_LOCK:
-        procs = BROWSER_TABLE.pop(node_id, [])
+        procs = list(BROWSER_TABLE.get(node_id, []))
     killed = 0
+    failures: list[BaseException] = []
     for process in procs:
-        if process.poll() is None:
-            terminate_process(process)
-            killed += 1
+        try:
+            if process.poll() is None:
+                terminate_process(process)
+                killed += 1
+        except BaseException as error:
+            failures.append(error)
+            continue
+        remove_registered_browser_process(process)
+    if failures:
+        details = "; ".join(str(error) for error in failures)
+        raise RuntimeError(f"停止部分浏览器失败（{len(failures)} 项）: {details}") from failures[0]
     return killed
 
 
