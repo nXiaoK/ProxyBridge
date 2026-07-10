@@ -574,6 +574,7 @@ def parse_vless(raw: str, source: str) -> Node | None:
         "path": params.get("path", ""),
         "host": params.get("host", ""),
         "mode": params.get("mode", ""),
+        "service_name": params.get("servicename") or params.get("service_name") or params.get("service-name") or "",
         "allow_insecure": truthy(params.get("allowinsecure") or params.get("insecure")),
     }
     settings.update({f"query_{key}": value for key, value in params.items()})
@@ -823,6 +824,7 @@ def clash_proxy_to_node(proxy: dict[str, Any], source: str) -> Node | None:
     }
     reality_opts = proxy.get("reality-opts") or {}
     ws_opts = proxy.get("ws-opts") or {}
+    grpc_opts = proxy.get("grpc-opts") or {}
     if isinstance(reality_opts, dict):
         settings["public_key"] = reality_opts.get("public-key") or reality_opts.get("publicKey") or ""
         settings["short_id"] = reality_opts.get("short-id") or reality_opts.get("shortId") or ""
@@ -832,6 +834,15 @@ def clash_proxy_to_node(proxy: dict[str, Any], source: str) -> Node | None:
         headers = ws_opts.get("headers") or {}
         if isinstance(headers, dict):
             settings["host"] = headers.get("Host") or headers.get("host") or ""
+    if isinstance(grpc_opts, dict):
+        normalized_grpc_opts = {str(key).lower(): value for key, value in grpc_opts.items()}
+        settings["service_name"] = (
+            normalized_grpc_opts.get("grpc-service-name")
+            or normalized_grpc_opts.get("servicename")
+            or normalized_grpc_opts.get("service_name")
+            or normalized_grpc_opts.get("service-name")
+            or ""
+        )
 
     security = guess_security({k: str(v) for k, v in settings.items()}, settings.get("tls"))
     raw = json.dumps(proxy, sort_keys=True, ensure_ascii=False)
@@ -897,12 +908,13 @@ def load_state(reset_running: bool = False) -> dict[str, Any]:
             state = json.load(f)
     except Exception:
         return empty_state()
-    state.setdefault("subscriptions", [])
-    state.setdefault("nodes", [])
-    state.setdefault("bridges", [])
-    state.setdefault("browser_instances", [])
-    state.setdefault("tests", {})
-    state.setdefault("request_logs", [])
+    if not isinstance(state, dict):
+        state = {}
+    for field_name in ("subscriptions", "nodes", "bridges", "browser_instances", "request_logs"):
+        value = state.get(field_name)
+        state[field_name] = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    if not isinstance(state.get("tests"), dict):
+        state["tests"] = {}
     for bridge in state["bridges"]:
         if "enabled" not in bridge:
             bridge["enabled"] = bridge.get("status") in ACTIVE_BRIDGE_STATUSES
@@ -1391,6 +1403,16 @@ def fetch_subscription(url: str) -> str:
         return data.decode(charset, errors="replace")
 
 
+def referenced_node_ids(subscriptions: list[dict[str, Any]]) -> set[str]:
+    return {
+        str(node_id)
+        for subscription in subscriptions
+        if isinstance(subscription, dict)
+        for node_id in subscription.get("node_ids") or []
+        if node_id
+    }
+
+
 def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
     name = clean_name(str(payload.get("name") or ""), "未命名订阅")
     url = str(payload.get("url") or "").strip()
@@ -1401,7 +1423,8 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("需要订阅 URL 或原始订阅内容")
 
     nodes = parse_subscription_payload(raw, name)
-    subscription_id = stable_id(name, url, str(now_ts()))
+    raw_digest = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+    subscription_id = stable_id(name, url, str(time.time_ns()), raw_digest)
     imported_at = now_ts()
     node_dicts = [asdict(node) for node in nodes]
     node_ids = [node.id for node in nodes]
@@ -1415,9 +1438,13 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
     }
     with STATE_LOCK:
         state = load_state()
+        replaced_subscriptions = [s for s in state["subscriptions"] if url and s.get("url") == url]
+        replaced_node_ids = referenced_node_ids(replaced_subscriptions)
         state["subscriptions"] = [s for s in state["subscriptions"] if s.get("url") != url or not url]
+        retained_node_ids = referenced_node_ids(state["subscriptions"])
+        remove_ids = replaced_node_ids - retained_node_ids
         state["subscriptions"].append(subscription)
-        existing = {node["id"]: node for node in state["nodes"]}
+        existing = {node["id"]: node for node in state["nodes"] if node.get("id") not in remove_ids}
         for node in node_dicts:
             existing[node["id"]] = node
         state["nodes"] = list(existing.values())
@@ -1443,8 +1470,8 @@ def delete_subscription(subscription_id: str) -> dict[str, Any]:
         subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
         if not subscription:
             raise ValueError("订阅不存在")
-        remove_ids = set(subscription.get("node_ids") or [])
         state["subscriptions"] = [s for s in state["subscriptions"] if s.get("id") != subscription_id]
+        remove_ids = set(subscription.get("node_ids") or []) - referenced_node_ids(state["subscriptions"])
         state["nodes"] = [n for n in state["nodes"] if n.get("id") not in remove_ids]
         save_state(state)
     return {"ok": True}
