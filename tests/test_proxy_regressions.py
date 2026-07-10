@@ -74,6 +74,11 @@ class ProxyRegressionTests(unittest.TestCase):
                 except OSError:
                     pass
             relay_thread.join(timeout=2.0)
+            with app.TRAFFIC_LOCK:
+                app.TRAFFIC_TABLE.pop(proxy.bridge_id, None)
+
+        with app.TRAFFIC_LOCK:
+            self.assertNotIn(proxy.bridge_id, app.TRAFFIC_TABLE)
 
     def test_http_forward_forces_upstream_connection_close(self):
         proxy = self._proxy("bridge-http-close")
