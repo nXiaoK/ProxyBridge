@@ -1798,11 +1798,18 @@ def terminate_process(process: subprocess.Popen) -> None:
 
 
 def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
-    if SHUTTING_DOWN.is_set():
-        raise RuntimeError("程序正在退出，不能启动新的本地代理")
+    with SHUTDOWN_LOCK:
+        if SHUTTING_DOWN.is_set():
+            raise RuntimeError("程序正在退出，不能启动新的本地代理")
+        return _start_bridge(payload)
+
+
+def _start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
     requested_port = safe_int(payload.get("port"), 0) or None
     requested_core = str(payload.get("core") or "auto")
+    if requested_core not in {"auto", "sing-box", "xray"}:
+        raise ValueError("核心只能是 sing-box、xray 或 auto")
     preserve_traffic = bool(payload.get("restore"))
     initial_upload = safe_int(payload.get("upload_bytes"), 0) if preserve_traffic else 0
     initial_download = safe_int(payload.get("download_bytes"), 0) if preserve_traffic else 0
@@ -1812,6 +1819,12 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
         changed = sync_process_status(state)
         active_bridge = active_bridge_for_node(state, node_id)
         if active_bridge:
+            active_core = str(active_bridge.get("core") or "")
+            active_port = safe_int(active_bridge.get("port"), 0)
+            if requested_core != "auto" and requested_core != active_core:
+                raise ValueError(f"活动本地代理核心为 {active_core}，与请求的 {requested_core} 冲突")
+            if requested_port is not None and requested_port != active_port:
+                raise ValueError(f"活动本地代理端口为 {active_port}，与请求的 {requested_port} 冲突")
             if changed:
                 save_state(state)
             return active_bridge
@@ -1892,8 +1905,11 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
-    with BROWSER_LAUNCH_LOCK:
-        return _launch_browser(payload)
+    with SHUTDOWN_LOCK:
+        if SHUTTING_DOWN.is_set():
+            raise RuntimeError("程序正在退出，不能启动新的浏览器")
+        with BROWSER_LAUNCH_LOCK:
+            return _launch_browser(payload)
 
 
 def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1982,33 +1998,47 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    # 记录浏览器进程,便于后续「停止浏览器」结束整个进程组;同时清理已退出的旧句柄。
-    with PROCESS_LOCK:
-        procs = [p for p in BROWSER_TABLE.get(node_id, []) if p.poll() is None]
-        procs.append(process)
-        BROWSER_TABLE[node_id] = procs
-        BROWSER_PROCESS_TABLE[instance_id] = process
-    with STATE_LOCK:
-        state = load_state()
+    try:
+        # 记录浏览器进程,便于后续「停止浏览器」结束整个进程组;同时清理已退出的旧句柄。
+        with PROCESS_LOCK:
+            procs = [p for p in BROWSER_TABLE.get(node_id, []) if p.poll() is None]
+            procs.append(process)
+            BROWSER_TABLE[node_id] = procs
+            BROWSER_PROCESS_TABLE[instance_id] = process
+        with STATE_LOCK:
+            state = load_state()
+            try:
+                saved_instance = find_browser_instance(state, instance_id)
+            except ValueError:
+                saved_instance = dict(instance)
+                state["browser_instances"].append(saved_instance)
+            saved_instance.update(
+                {
+                    "status": "running",
+                    "profile_path": str(profile_path),
+                    "fingerprint_seed": seed,
+                    "pid": process.pid,
+                    "bridge_id": bridge.get("id"),
+                    "proxy": proxy,
+                    "last_started_at": now_ts(),
+                    "last_stopped_at": None,
+                    "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
+                }
+            )
+            save_state(state)
+    except BaseException:
         try:
-            saved_instance = find_browser_instance(state, instance_id)
-        except ValueError:
-            saved_instance = dict(instance)
-            state["browser_instances"].append(saved_instance)
-        saved_instance.update(
-            {
-                "status": "running",
-                "profile_path": str(profile_path),
-                "fingerprint_seed": seed,
-                "pid": process.pid,
-                "bridge_id": bridge.get("id"),
-                "proxy": proxy,
-                "last_started_at": now_ts(),
-                "last_stopped_at": None,
-                "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
-            }
-        )
-        save_state(state)
+            with PROCESS_LOCK:
+                if BROWSER_PROCESS_TABLE.get(instance_id) is process:
+                    BROWSER_PROCESS_TABLE.pop(instance_id, None)
+                remove_browser_process_from_node_tables(process)
+        except BaseException:
+            pass
+        try:
+            terminate_process(process)
+        except BaseException:
+            pass
+        raise
     return {
         "ok": True,
         "pid": process.pid,
@@ -2359,15 +2389,22 @@ def core_log_payload(core: str) -> dict[str, Any]:
     }
 
 
-def stop_process(bridge_id: str) -> dict[str, int]:
+def stop_process(bridge_id: str, *, pop_traffic: bool = True) -> dict[str, int]:
     with PROCESS_LOCK:
-        proxy = LOG_PROXY_TABLE.pop(bridge_id, None)
-        process = PROCESS_TABLE.pop(bridge_id, None)
+        proxy = LOG_PROXY_TABLE.get(bridge_id)
+        process = PROCESS_TABLE.get(bridge_id)
     if proxy:
         proxy.stop()
     if process:
         terminate_process(process)
-    return pop_bridge_traffic(bridge_id)
+    with PROCESS_LOCK:
+        if proxy is not None and LOG_PROXY_TABLE.get(bridge_id) is proxy:
+            LOG_PROXY_TABLE.pop(bridge_id, None)
+        if process is not None and PROCESS_TABLE.get(bridge_id) is process:
+            PROCESS_TABLE.pop(bridge_id, None)
+    if pop_traffic:
+        return pop_bridge_traffic(bridge_id)
+    return bridge_traffic_snapshot(bridge_id)
 
 
 def restore_enabled_bridges() -> None:
@@ -3424,17 +3461,17 @@ class ProxyBridgeHTTPServer(ThreadingHTTPServer):
 
 
 def shutdown() -> None:
-    SHUTTING_DOWN.set()
     with SHUTDOWN_LOCK:
-        # 只在进程表锁内摘取句柄;外部进程的退出等待交给独立工作线程。
+        SHUTTING_DOWN.set()
+        # 只在进程表锁内快照句柄;外部进程的退出等待交给独立工作线程。
         with PROCESS_LOCK:
             browser_procs = list(BROWSER_PROCESS_TABLE.values())
             browser_procs.extend(p for procs in BROWSER_TABLE.values() for p in procs)
-            BROWSER_TABLE.clear()
-            BROWSER_PROCESS_TABLE.clear()
-            bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
+            bridge_ids = set(PROCESS_TABLE) | set(LOG_PROXY_TABLE)
+        with TRAFFIC_LOCK:
+            bridge_ids.update(TRAFFIC_TABLE)
 
-        active_browser_procs: list[subprocess.Popen] = []
+        unique_browser_procs: list[tuple[tuple[str, int], subprocess.Popen]] = []
         seen_browser_processes: set[tuple[str, int]] = set()
         for process in browser_procs:
             pid = safe_int(getattr(process, "pid", None), 0)
@@ -3442,30 +3479,74 @@ def shutdown() -> None:
             if identity in seen_browser_processes:
                 continue
             seen_browser_processes.add(identity)
-            if process.poll() is None:
-                active_browser_procs.append(process)
+            unique_browser_procs.append((identity, process))
 
         traffic_by_bridge: dict[str, dict[str, int]] = {}
-        worker_count = len(active_browser_procs) + len(bridge_ids)
+        failures: list[tuple[str, BaseException]] = []
+        worker_count = len(unique_browser_procs) + len(bridge_ids)
         if worker_count:
             with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                browser_futures = [executor.submit(terminate_process, process) for process in active_browser_procs]
+                browser_futures = [
+                    (identity, process, executor.submit(terminate_process, process))
+                    for identity, process in unique_browser_procs
+                ]
                 bridge_futures = {
-                    bridge_id: executor.submit(stop_process, bridge_id) for bridge_id in bridge_ids
+                    bridge_id: executor.submit(stop_process, bridge_id, pop_traffic=False)
+                    for bridge_id in sorted(bridge_ids)
                 }
-                for future in browser_futures:
-                    future.result()
+                for identity, process, future in browser_futures:
+                    try:
+                        future.result()
+                    except BaseException as error:
+                        failures.append((f"浏览器 PID {safe_int(getattr(process, 'pid', None), 0)}", error))
+                        continue
+                    with PROCESS_LOCK:
+                        for instance_id, current in list(BROWSER_PROCESS_TABLE.items()):
+                            current_pid = safe_int(getattr(current, "pid", None), 0)
+                            current_identity = (
+                                ("pid", current_pid) if current_pid > 0 else ("object", id(current))
+                            )
+                            if current_identity == identity:
+                                BROWSER_PROCESS_TABLE.pop(instance_id, None)
+                        for node_id, processes in list(BROWSER_TABLE.items()):
+                            remaining = []
+                            for current in processes:
+                                current_pid = safe_int(getattr(current, "pid", None), 0)
+                                current_identity = (
+                                    ("pid", current_pid) if current_pid > 0 else ("object", id(current))
+                                )
+                                if current_identity != identity:
+                                    remaining.append(current)
+                            if remaining:
+                                BROWSER_TABLE[node_id] = remaining
+                            else:
+                                BROWSER_TABLE.pop(node_id, None)
                 for bridge_id, future in bridge_futures.items():
-                    traffic_by_bridge[bridge_id] = future.result()
+                    try:
+                        traffic_by_bridge[bridge_id] = future.result()
+                    except BaseException as error:
+                        failures.append((f"Bridge {bridge_id}", error))
 
         if traffic_by_bridge:
-            with STATE_LOCK:
-                state = load_state()
-                for bridge in state.get("bridges", []):
-                    bridge_id = bridge.get("id")
-                    if bridge_id in traffic_by_bridge:
-                        bridge.update(traffic_by_bridge[bridge_id])
-                save_state(state)
+            try:
+                with STATE_LOCK:
+                    state = load_state()
+                    for bridge in state.get("bridges", []):
+                        bridge_id = bridge.get("id")
+                        if bridge_id in traffic_by_bridge:
+                            bridge.update(traffic_by_bridge[bridge_id])
+                    save_state(state)
+            except BaseException as error:
+                failures.append(("状态保存", error))
+            else:
+                with TRAFFIC_LOCK:
+                    for bridge_id, traffic in traffic_by_bridge.items():
+                        if TRAFFIC_TABLE.get(bridge_id) == traffic:
+                            TRAFFIC_TABLE.pop(bridge_id, None)
+
+        if failures:
+            details = "; ".join(f"{label}: {error}" for label, error in failures)
+            raise RuntimeError(f"关闭部分进程失败（{len(failures)} 项）: {details}") from failures[0][1]
 
 
 def handle_shutdown_signal(signum: int, _frame: Any) -> None:
