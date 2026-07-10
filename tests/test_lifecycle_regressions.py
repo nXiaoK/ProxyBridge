@@ -1632,6 +1632,101 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(getattr(app, "TEST_PROCESS_TABLE", {}), {})
         self.assertNotIn(node_id, app.load_state()["tests"])
 
+    def test_node_result_save_is_serialized_with_shutdown_start(self) -> None:
+        node_id = "node-test-save-shutdown-race"
+        self._write_state(node_id)
+        process = FakeProcess(4843)
+        final_state_acquire_entered = threading.Event()
+        release_final_state_acquire = threading.Event()
+        shutdown_done = threading.Event()
+        test_errors: list[BaseException] = []
+        shutdown_errors: list[BaseException] = []
+        saved_after_shutdown = False
+        original_state_lock = app.STATE_LOCK
+        original_save_state = app.save_state
+
+        class GateLock:
+            def __init__(self, delegate: threading.RLock) -> None:
+                self.delegate = delegate
+                self.target_acquisitions = 0
+
+            def __enter__(self) -> "GateLock":
+                if threading.current_thread().name == "node-test-save-worker":
+                    self.target_acquisitions += 1
+                    if self.target_acquisitions == 2:
+                        final_state_acquire_entered.set()
+                        if not release_final_state_acquire.wait(timeout=2):
+                            raise AssertionError("final node-test state acquisition was never released")
+                self.delegate.acquire()
+                return self
+
+            def __exit__(self, _exc_type: object, _exc: object, _traceback: object) -> None:
+                self.delegate.release()
+
+        def observed_save_state(state: dict[str, object]) -> None:
+            nonlocal saved_after_shutdown
+            tests = state.get("tests")
+            if isinstance(tests, dict) and node_id in tests and app.SHUTTING_DOWN.is_set():
+                saved_after_shutdown = True
+            original_save_state(state)
+
+        def run_test() -> None:
+            try:
+                app.test_node({"node_id": node_id, "core": "auto"})
+            except BaseException as error:
+                test_errors.append(error)
+
+        def run_shutdown() -> None:
+            try:
+                app.shutdown()
+            except BaseException as error:
+                shutdown_errors.append(error)
+            finally:
+                shutdown_done.set()
+
+        gate_lock = GateLock(original_state_lock)
+        app.STATE_LOCK = gate_lock
+        try:
+            with (
+                mock.patch.object(app, "generate_config", return_value={"test": True}),
+                mock.patch.object(app, "core_command", return_value=["fake-core"]),
+                mock.patch.object(app, "next_free_port", return_value=24533),
+                mock.patch.object(app, "wait_for_port", return_value=True),
+                mock.patch.object(app.subprocess, "Popen", return_value=process),
+                mock.patch.object(
+                    app,
+                    "socks5_http_probe",
+                    return_value={
+                        "ok": True,
+                        "latency_ms": 1,
+                        "target": "example.test:80/",
+                        "status_code": 204,
+                        "message": "通信正常",
+                    },
+                ),
+                mock.patch.object(app, "terminate_process", return_value=None),
+                mock.patch.object(app, "save_state", side_effect=observed_save_state),
+            ):
+                test_thread = threading.Thread(target=run_test, name="node-test-save-worker")
+                test_thread.start()
+                self.assertTrue(final_state_acquire_entered.wait(timeout=1))
+                shutdown_thread = threading.Thread(target=run_shutdown, name="node-test-save-shutdown")
+                shutdown_thread.start()
+                shutdown_completed_before_release = shutdown_done.wait(timeout=0.2)
+                release_final_state_acquire.set()
+                test_thread.join(timeout=2)
+                shutdown_thread.join(timeout=2)
+        finally:
+            release_final_state_acquire.set()
+            app.STATE_LOCK = original_state_lock
+
+        self.assertFalse(test_thread.is_alive())
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertEqual(test_errors, [])
+        self.assertEqual(shutdown_errors, [])
+        self.assertFalse(saved_after_shutdown)
+        self.assertFalse(shutdown_completed_before_release)
+
     def test_shutdown_retains_node_test_process_when_termination_fails(self) -> None:
         test_process_table = getattr(app, "TEST_PROCESS_TABLE", None)
         self.assertIsNotNone(test_process_table)

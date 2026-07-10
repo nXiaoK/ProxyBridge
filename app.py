@@ -3335,12 +3335,13 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
                             if TEST_PROCESS_TABLE.get(test_id) is process:
                                 TEST_PROCESS_TABLE.pop(test_id, None)
 
-    if SHUTTING_DOWN.is_set():
-        return result
-    with STATE_LOCK:
-        state = load_state()
-        state.setdefault("tests", {})[node_id] = result
-        save_state(state)
+    with SHUTDOWN_LOCK:
+        if SHUTTING_DOWN.is_set():
+            return result
+        with STATE_LOCK:
+            state = load_state()
+            state.setdefault("tests", {})[node_id] = result
+            save_state(state)
     return result
 
 
