@@ -157,9 +157,6 @@ body {
   text-rendering: optimizeLegibility;
   overflow: hidden;
 }
-body.modal-open {
-  overflow: hidden;
-}
 
 h1, h2, h3 {
   margin: 0;

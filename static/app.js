@@ -1,6 +1,5 @@
 const appState = {
   cores: {},
-  chrome: null,
   fingerprint_chromium: null,
   active_browsers: [],
   browser_instances: [],
@@ -10,7 +9,6 @@ const appState = {
   tests: {},
   requestLogs: [],
   systemLogs: [],
-  activeView: "nodes",
   filters: {
     protocol: "all",
     region: "all",
@@ -31,6 +29,8 @@ const appState = {
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
 let lastBrowserRecordTrigger = null;
+let latestStatusRequest = 0;
+let kernelDownloadPromise = null;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
 const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system"];
@@ -38,7 +38,6 @@ const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system"];
 // 切换当前视图:高亮对应侧边栏项、显示对应内容区,并记住上次选择。
 function setActiveView(view) {
   if (!VIEW_IDS.includes(view)) view = "nodes";
-  appState.activeView = view;
   try { localStorage.setItem("pb-view", view); } catch (e) {}
   document.querySelectorAll(".nav-item").forEach((item) => {
     item.setAttribute("aria-current", item.dataset.view === view ? "true" : "false");
@@ -211,9 +210,10 @@ function endpointParts(socksUrl, fallbackPort) {
 }
 
 async function loadStatus() {
+  const requestId = ++latestStatusRequest;
   const status = await api("/api/status");
+  if (requestId !== latestStatusRequest) return false;
   appState.cores = status.cores || {};
-  appState.chrome = status.chrome || null;
   appState.fingerprint_chromium = status.fingerprint_chromium || null;
   appState.active_browsers = status.active_browsers || [];
   appState.browser_instances = status.browser_instances || [];
@@ -224,6 +224,7 @@ async function loadStatus() {
   appState.requestLogs = status.request_logs || [];
   appState.systemLogs = status.system_logs || [];
   render();
+  return true;
 }
 
 function render() {
@@ -246,10 +247,12 @@ function renderCores() {
   const singBox = appState.cores["sing-box"];
   const xray = appState.cores.xray;
   const fpKernel = appState.fingerprint_chromium;
+  const kernelBusyClass = kernelDownloadPromise ? " is-busy" : "";
+  const kernelBusyAttributes = kernelDownloadPromise ? ' disabled aria-busy="true"' : "";
   // 指纹内核状态:已安装显示 ready,缺失显示可点击的「下载指纹内核」按钮。
   const fpPill = fpKernel
-    ? `<button class="pill core-pill ok" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}">指纹内核 ready</button>`
-    : `<button class="pill core-pill warn" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium">下载指纹内核</button>`;
+    ? `<button class="pill core-pill ok${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}"${kernelBusyAttributes}>指纹内核 ready</button>`
+    : `<button class="pill core-pill warn${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium"${kernelBusyAttributes}>下载指纹内核</button>`;
   coreStrip.innerHTML = `
     <button class="pill core-pill ${singBox ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="sing-box" aria-label="查看 sing-box 运行日志" title="查看 sing-box 运行日志">sing-box ${singBox ? "ready" : "missing"}</button>
     <button class="pill core-pill ${xray ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="xray" aria-label="查看 xray 运行日志" title="查看 xray 运行日志">xray ${xray ? "ready" : "missing"}</button>
@@ -297,13 +300,14 @@ function setSelectOptions(select, values, current, allLabel) {
     .map((value) => `<option value="${escapeHtml(value)}">${value === "all" ? allLabel : escapeHtml(value)}</option>`)
     .join("");
   select.value = normalized.includes(current) ? current : "all";
+  return select.value;
 }
 
 function renderFilters() {
   const protocols = [...new Set(appState.nodes.map((node) => node.protocol))];
   const regions = [...new Set(appState.nodes.map((node) => node.region))];
-  setSelectOptions($("#protocolFilter"), protocols, appState.filters.protocol, "全部协议");
-  setSelectOptions($("#regionFilter"), regions, appState.filters.region, "全部地区");
+  appState.filters.protocol = setSelectOptions($("#protocolFilter"), protocols, appState.filters.protocol, "全部协议");
+  appState.filters.region = setSelectOptions($("#regionFilter"), regions, appState.filters.region, "全部地区");
   $("#searchInput").value = appState.filters.search;
 }
 
@@ -648,15 +652,8 @@ function renderSystemLogs() {
     .join("");
 }
 
-function syncModalOpenState() {
-  const coreOpen = $("#coreLogModal") && !$("#coreLogModal").hidden;
-  const browserOpen = $("#browserRecordModal") && !$("#browserRecordModal").hidden;
-  document.body.classList.toggle("modal-open", coreOpen || browserOpen);
-}
-
 function closeCoreLogModal() {
   $("#coreLogModal").hidden = true;
-  syncModalOpenState();
   if (lastCoreLogTrigger?.isConnected) {
     lastCoreLogTrigger.focus();
   }
@@ -712,7 +709,6 @@ async function showCoreLog(core) {
   if (!core) return;
   const modal = $("#coreLogModal");
   modal.hidden = false;
-  syncModalOpenState();
   modal.querySelector('[data-action="close-core-log"]')?.focus();
   $("#coreLogTitle").textContent = `${core} 运行日志`;
   $("#coreLogMeta").textContent = "加载中";
@@ -729,7 +725,6 @@ async function showCoreLog(core) {
 function closeBrowserRecordModal() {
   $("#browserRecordModal").hidden = true;
   appState.browserRecordNodeId = null;
-  syncModalOpenState();
   if (lastBrowserRecordTrigger?.isConnected) {
     lastBrowserRecordTrigger.focus();
   }
@@ -796,26 +791,28 @@ function showBrowserRecords(nodeId, trigger = null) {
   lastBrowserRecordTrigger = trigger;
   const modal = $("#browserRecordModal");
   modal.hidden = false;
-  syncModalOpenState();
   renderBrowserRecords(nodeId);
   modal.querySelector('[data-action="close-browser-records"]')?.focus();
 }
 
 async function copyText(text) {
+  let copied = false;
   try {
     const result = await api("/api/clipboard", { text });
-    if (!result.ok && navigator.clipboard) {
+    copied = result.ok === true;
+  } catch {}
+
+  if (!copied) {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error();
       await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch {
+      throw new Error("当前环境无法复制到剪贴板");
     }
-    showToast(`已复制 ${text}`);
-  } catch (error) {
-    if (navigator.clipboard) {
-      await navigator.clipboard.writeText(text);
-      showToast(`已复制 ${text}`);
-      return;
-    }
-    showToast(error.message, "error");
   }
+
+  showToast(`已复制 ${text}`);
 }
 
 async function startNode(nodeId) {
@@ -853,19 +850,28 @@ async function stopBrowser(nodeId, instanceId = "") {
 }
 
 // 一键下载并安装指纹内核。下载体积较大(约 150-250MB),提示用户耐心等待。
-async function downloadKernel() {
+function downloadKernel() {
+  if (kernelDownloadPromise) return kernelDownloadPromise;
+
   showToast("正在下载指纹内核，约 150-250MB，请耐心等待…");
-  const result = await api("/api/browser/download-kernel", {});
-  await loadStatus();
-  if (result.already_installed) {
-    showToast("指纹内核已安装");
-  } else if (result.arch_warning) {
-    // 架构不匹配(如 arm64 内核装到 Intel 机)时给出显著提示。
-    showToast(result.arch_warning, "error");
-  } else {
-    showToast(`指纹内核安装完成：${result.version || ""}`);
-  }
-  return result;
+  kernelDownloadPromise = (async () => {
+    const result = await api("/api/browser/download-kernel", {});
+    await loadStatus();
+    if (result.already_installed) {
+      showToast("指纹内核已安装");
+    } else if (result.arch_warning) {
+      // 架构不匹配(如 arm64 内核装到 Intel 机)时给出显著提示。
+      showToast(result.arch_warning, "error");
+    } else {
+      showToast(`指纹内核安装完成：${result.version || ""}`);
+    }
+    return result;
+  })().finally(() => {
+    kernelDownloadPromise = null;
+    renderCores();
+  });
+  renderCores();
+  return kernelDownloadPromise;
 }
 
 async function handleAction(event) {
