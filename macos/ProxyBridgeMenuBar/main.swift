@@ -129,6 +129,39 @@ struct CommandResult {
     let output: String
 }
 
+private final class BoundedProcessOutput {
+    private let lock = NSLock()
+    private let limit: Int
+    private var data = Data()
+    private var truncated = false
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        let remaining = max(0, limit - data.count)
+        if remaining > 0 {
+            data.append(contentsOf: chunk.prefix(remaining))
+        }
+        if chunk.count > remaining {
+            truncated = true
+        }
+    }
+
+    func string() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        var value = String(decoding: data, as: UTF8.self)
+        if truncated {
+            value += "\n…输出已截断（超过 \(limit) 字节）"
+        }
+        return value
+    }
+}
+
 enum ProxyBridgeError: LocalizedError {
     case message(String)
 
@@ -141,6 +174,7 @@ enum ProxyBridgeError: LocalizedError {
 }
 
 final class BridgeAPI {
+    private static let instanceHeader = "X-ProxyBridge-Instance"
     let baseURL: URL
 
     init(port: Int) {
@@ -149,6 +183,21 @@ final class BridgeAPI {
 
     func getStatus(completion: @escaping (Result<StatusPayload, Error>) -> Void) {
         request(path: "/api/status", method: "GET", body: nil, completion: completion)
+    }
+
+    func getStatus(
+        expectedInstanceToken: String,
+        timeout: TimeInterval,
+        completion: @escaping (Result<StatusPayload, Error>) -> Void
+    ) {
+        request(
+            path: "/api/status",
+            method: "GET",
+            body: nil,
+            timeout: timeout,
+            expectedInstanceToken: expectedInstanceToken,
+            completion: completion
+        )
     }
 
     func importSubscription(name: String, url: String, raw: String, completion: @escaping (Result<StatusPayload, Error>) -> Void) {
@@ -200,11 +249,18 @@ final class BridgeAPI {
         }
     }
 
-    private func request<T: Decodable>(path: String, method: String, body: [String: Any]?, completion: @escaping (Result<T, Error>) -> Void) {
+    private func request<T: Decodable>(
+        path: String,
+        method: String,
+        body: [String: Any]?,
+        timeout: TimeInterval = 25,
+        expectedInstanceToken: String? = nil,
+        completion: @escaping (Result<T, Error>) -> Void
+    ) {
         let cleanPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
         var request = URLRequest(url: baseURL.appendingPathComponent(cleanPath))
         request.httpMethod = method
-        request.timeoutInterval = 25
+        request.timeoutInterval = timeout
         if let body {
             request.addValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -218,6 +274,17 @@ final class BridgeAPI {
             guard let data else {
                 completion(.failure(NSError(domain: "ProxyBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "没有收到后端响应"])))
                 return
+            }
+            if let expectedInstanceToken {
+                guard let http = response as? HTTPURLResponse,
+                      http.value(forHTTPHeaderField: Self.instanceHeader) == expectedInstanceToken else {
+                    completion(.failure(NSError(
+                        domain: "ProxyBridge",
+                        code: -2,
+                        userInfo: [NSLocalizedDescriptionKey: "后端实例校验失败"]
+                    )))
+                    return
+                }
             }
             if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                 if let apiError = try? JSONDecoder().decode(APIError.self, from: data) {
@@ -314,8 +381,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var helperProcesses: [Process] = []
     private var isTerminating = false
     private let bootstrapGroup = DispatchGroup()
-    private let processTerminationTimeout: TimeInterval = 4
-    private let backendReadinessAttempts = 30
+    private var expectedBackendTerminationProcess: Process?
+    private let helperTerminationGraceTimeout: TimeInterval = 2
+    private let helperShutdownTimeout: TimeInterval = 4
+    private let backendTerminationTimeout: TimeInterval = 12
+    private let forceKillConfirmationTimeout: TimeInterval = 1
+    private let backendReadinessTimeout: TimeInterval = 6
+    private let backendReadinessRequestTimeout: TimeInterval = 0.75
+    private let backendReadinessPollInterval: TimeInterval = 0.2
+    private let processOutputFinalizationTimeout: TimeInterval = 0.75
+    private let processOutputCloseConfirmationTimeout: TimeInterval = 0.1
+    private let processOutputLimit = 1_048_576
 
     private var appSupportURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -379,29 +455,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshTimer?.invalidate()
         refreshTimer = nil
 
+        let helperDeadline = monotonicDeadline(after: helperShutdownTimeout)
+        let helperGraceDeadline = monotonicDeadline(after: helperTerminationGraceTimeout)
         for helper in helpers where helper.isRunning {
-            helper.terminate()
+            if !sendSignal(SIGTERM, to: helper) {
+                NSLog("ProxyBridge: helper SIGTERM failed for PID %d", helper.processIdentifier)
+            }
         }
-        _ = bootstrapGroup.wait(timeout: .now() + processTerminationTimeout)
+        _ = waitForBootstrapCleanup(until: helperGraceDeadline)
         for helper in helpers where helper.isRunning {
-            kill(helper.processIdentifier, SIGKILL)
-            helper.waitUntilExit()
+            if !sendSignal(SIGKILL, to: helper) {
+                NSLog("ProxyBridge: helper SIGKILL failed for PID %d", helper.processIdentifier)
+            }
+        }
+        _ = waitForBootstrapCleanup(until: helperDeadline)
+        for helper in helpers where helper.isRunning {
+            if !waitForProcessExit(helper, until: helperDeadline) {
+                NSLog("ProxyBridge: helper PID %d did not exit before shutdown deadline", helper.processIdentifier)
+            }
         }
 
         if let process = backendProcess, process.isRunning {
-            let semaphore = DispatchSemaphore(value: 0)
-            DispatchQueue.global(qos: .utility).async {
-                process.waitUntilExit()
-                semaphore.signal()
+            if !sendSignal(SIGTERM, to: process) {
+                NSLog("ProxyBridge: backend SIGTERM failed for PID %d", process.processIdentifier)
             }
-            process.terminate()
-            if semaphore.wait(timeout: .now() + processTerminationTimeout) == .timedOut, process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-                process.waitUntilExit()
+            let backendDeadline = monotonicDeadline(after: backendTerminationTimeout)
+            if !waitForProcessExit(process, until: backendDeadline), process.isRunning {
+                if !sendSignal(SIGKILL, to: process) {
+                    NSLog("ProxyBridge: backend SIGKILL failed for PID %d", process.processIdentifier)
+                }
+                let forceDeadline = monotonicDeadline(after: forceKillConfirmationTimeout)
+                if !waitForProcessExit(process, until: forceDeadline) {
+                    NSLog("ProxyBridge: backend PID %d did not exit after SIGKILL", process.processIdentifier)
+                }
             }
         }
         api = nil
         latestStatus = nil
+        expectedBackendTerminationProcess = nil
         backendProcess = nil
         try? backendLogHandle?.close()
         backendLogHandle = nil
@@ -470,6 +561,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         processLifecycleLock.lock()
         defer { processLifecycleLock.unlock() }
         return isTerminating
+    }
+
+    private func ensureNotTerminating() throws {
+        if terminationRequested() {
+            throw ProxyBridgeError.message("应用正在退出")
+        }
+    }
+
+    private func monotonicDeadline(after interval: TimeInterval) -> UInt64 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let nanoseconds = UInt64(max(0, interval) * 1_000_000_000)
+        if UInt64.max - now < nanoseconds {
+            return UInt64.max
+        }
+        return now + nanoseconds
+    }
+
+    private func remainingTime(until deadline: UInt64) -> TimeInterval {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard deadline > now else { return 0 }
+        return TimeInterval(deadline - now) / 1_000_000_000
+    }
+
+    private func waitForProcessExit(_ process: Process, until deadline: UInt64) -> Bool {
+        while process.isRunning {
+            let remaining = remainingTime(until: deadline)
+            guard remaining > 0 else { return false }
+            Thread.sleep(forTimeInterval: min(0.02, remaining))
+        }
+        return true
+    }
+
+    @discardableResult
+    private func sendSignal(_ signal: Int32, to process: Process) -> Bool {
+        guard process.isRunning else { return true }
+        if kill(process.processIdentifier, signal) == 0 {
+            return true
+        }
+        return errno == ESRCH
+    }
+
+    private func waitForBootstrapCleanup(until deadline: UInt64) -> Bool {
+        let remaining = remainingTime(until: deadline)
+        return bootstrapGroup.wait(timeout: .now() + remaining) == .success
+    }
+
+    private func deregisterHelper(_ process: Process) {
+        processLifecycleLock.lock()
+        helperProcesses.removeAll { $0 === process }
+        processLifecycleLock.unlock()
+    }
+
+    private func startProcessOutputDrain(
+        pipe: Pipe,
+        output: BoundedProcessOutput
+    ) -> DispatchSemaphore {
+        let finished = DispatchSemaphore(value: 0)
+        let readHandle = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async {
+            defer { finished.signal() }
+            while true {
+                do {
+                    guard let chunk = try readHandle.read(upToCount: 64 * 1024),
+                          !chunk.isEmpty else {
+                        return
+                    }
+                    output.append(chunk)
+                } catch {
+                    return
+                }
+            }
+        }
+        return finished
+    }
+
+    private func finishProcessOutputDrain(
+        pipe: Pipe,
+        output: BoundedProcessOutput,
+        finished: DispatchSemaphore
+    ) -> String {
+        let deadline = monotonicDeadline(after: processOutputFinalizationTimeout)
+        let timedOut = finished.wait(timeout: .now() + remainingTime(until: deadline)) == .timedOut
+        try? pipe.fileHandleForReading.close()
+        if timedOut {
+            _ = finished.wait(timeout: .now() + processOutputCloseConfirmationTimeout)
+        }
+        return output.string()
+    }
+
+    private func closeProcessOutputDrain(pipe: Pipe, finished: DispatchSemaphore) {
+        try? pipe.fileHandleForReading.close()
+        _ = finished.wait(timeout: .now() + processOutputCloseConfirmationTimeout)
     }
 
     private func updateStartupStatus(_ message: String?) {
@@ -551,8 +734,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func installPythonRuntime() throws -> URL {
+        try ensureNotTerminating()
         updateStartupStatus("正在查询 Python 运行时版本")
         let asset = try latestPythonRuntimeAsset()
+        try ensureNotTerminating()
         updateStartupStatus("正在下载 Python 运行时")
 
         let fileManager = FileManager.default
@@ -568,6 +753,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try fileManager.createDirectory(at: extractRoot, withIntermediateDirectories: true)
         let archiveURL = tempRoot.appendingPathComponent(asset.name)
         try downloadPythonArchive(asset: asset, to: archiveURL)
+        try ensureNotTerminating()
 
         updateStartupStatus("正在安装 Python 运行时")
         let extractResult = try runProcess("/usr/bin/tar", ["-xzf", archiveURL.path, "-C", extractRoot.path], timeout: 180)
@@ -578,11 +764,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let extractedPython = findPythonExecutable(in: extractRoot) else {
             throw ProxyBridgeError.message("下载的 Python 运行时中没有找到 python3")
         }
+        try ensureNotTerminating()
 
         let pythonHome = extractedPython.deletingLastPathComponent().deletingLastPathComponent()
         try fileManager.createDirectory(at: stagedRuntime, withIntermediateDirectories: true)
         try fileManager.moveItem(at: pythonHome, to: stagedRuntime.appendingPathComponent("python", isDirectory: true))
 
+        try ensureNotTerminating()
         if fileManager.fileExists(atPath: pythonRuntimeURL.path) {
             try fileManager.removeItem(at: pythonRuntimeURL)
         }
@@ -772,45 +960,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func runProcess(_ executable: String, _ arguments: [String], timeout: TimeInterval) throws -> CommandResult {
         let process = Process()
-        defer {
-            processLifecycleLock.lock()
-            helperProcesses.removeAll { $0 === process }
-            processLifecycleLock.unlock()
-        }
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        let output = BoundedProcessOutput(limit: processOutputLimit)
 
-        let semaphore = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in semaphore.signal() }
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        process.terminationHandler = { [weak self] terminatedProcess in
+            exitSemaphore.signal()
+            self?.deregisterHelper(terminatedProcess)
+        }
         processLifecycleLock.lock()
         guard !isTerminating else {
             processLifecycleLock.unlock()
+            try? pipe.fileHandleForReading.close()
+            try? pipe.fileHandleForWriting.close()
             throw ProxyBridgeError.message("应用正在退出")
         }
         helperProcesses.append(process)
         do {
             try process.run()
         } catch {
+            helperProcesses.removeAll { $0 === process }
             processLifecycleLock.unlock()
+            try? pipe.fileHandleForReading.close()
+            try? pipe.fileHandleForWriting.close()
             throw error
         }
         processLifecycleLock.unlock()
 
-        if semaphore.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-                process.waitUntilExit()
+        let drainFinished = startProcessOutputDrain(pipe: pipe, output: output)
+        try? pipe.fileHandleForWriting.close()
+        let executionDeadline = monotonicDeadline(after: timeout)
+        if exitSemaphore.wait(timeout: .now() + remainingTime(until: executionDeadline)) == .timedOut {
+            if !sendSignal(SIGTERM, to: process) {
+                NSLog("ProxyBridge: helper SIGTERM failed for PID %d", process.processIdentifier)
             }
+            let terminateDeadline = monotonicDeadline(after: forceKillConfirmationTimeout)
+            if !waitForProcessExit(process, until: terminateDeadline), process.isRunning {
+                guard sendSignal(SIGKILL, to: process) else {
+                    closeProcessOutputDrain(pipe: pipe, finished: drainFinished)
+                    throw ProxyBridgeError.message(
+                        "\(URL(fileURLWithPath: executable).lastPathComponent) 执行超时且无法发送 SIGKILL"
+                    )
+                }
+                let forceDeadline = monotonicDeadline(after: forceKillConfirmationTimeout)
+                guard waitForProcessExit(process, until: forceDeadline) else {
+                    closeProcessOutputDrain(pipe: pipe, finished: drainFinished)
+                    throw ProxyBridgeError.message(
+                        "\(URL(fileURLWithPath: executable).lastPathComponent) 执行超时且无法确认退出"
+                    )
+                }
+            }
+            _ = finishProcessOutputDrain(pipe: pipe, output: output, finished: drainFinished)
             throw ProxyBridgeError.message("\(URL(fileURLWithPath: executable).lastPathComponent) 执行超时")
         }
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        return CommandResult(status: process.terminationStatus, output: output)
+        let exitConfirmationDeadline = monotonicDeadline(after: forceKillConfirmationTimeout)
+        guard waitForProcessExit(process, until: exitConfirmationDeadline) else {
+            closeProcessOutputDrain(pipe: pipe, finished: drainFinished)
+            throw ProxyBridgeError.message(
+                "\(URL(fileURLWithPath: executable).lastPathComponent) 已通知退出但无法确认"
+            )
+        }
+        let capturedOutput = finishProcessOutputDrain(pipe: pipe, output: output, finished: drainFinished)
+        return CommandResult(status: process.terminationStatus, output: capturedOutput)
     }
 
     private func trimmedOutput(_ output: String) -> String {
@@ -840,6 +1056,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             let candidateAPI = BridgeAPI(port: backendPort)
+            let instanceToken = UUID().uuidString
 
             let process = Process()
             process.executableURL = pythonExecutable
@@ -851,6 +1068,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             env["PROXY_BRIDGE_PORT"] = "\(backendPort)"
             env["PROXY_BRIDGE_WORKDIR"] = appSupportURL.path
             env["PROXY_BRIDGE_PARENT_PID"] = "\(ProcessInfo.processInfo.processIdentifier)"
+            env["PROXY_BRIDGE_INSTANCE_TOKEN"] = instanceToken
             process.environment = env
 
             let logURL = appSupportURL.appendingPathComponent("menubar-backend.log")
@@ -870,10 +1088,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             backendLogHandle = logHandle
             backendProcess = process
+            let readinessDeadline = monotonicDeadline(after: backendReadinessTimeout)
+            DispatchQueue.main.asyncAfter(deadline: .now() + backendReadinessTimeout) { [weak self] in
+                guard let self,
+                      self.backendProcess === process,
+                      self.api == nil,
+                      self.expectedBackendTerminationProcess !== process else {
+                    return
+                }
+                self.failBackendStartup(
+                    process: process,
+                    message: "后端启动失败：/api/status 在 6 秒内未就绪"
+                )
+            }
             waitForBackendReady(
                 candidateAPI: candidateAPI,
                 process: process,
-                attemptsRemaining: backendReadinessAttempts
+                instanceToken: instanceToken,
+                deadline: readinessDeadline
             )
         } catch {
             startupStatus = nil
@@ -888,8 +1120,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func waitForBackendReady(candidateAPI: BridgeAPI, process: Process, attemptsRemaining: Int) {
-        guard backendProcess === process else { return }
+    private func waitForBackendReady(
+        candidateAPI: BridgeAPI,
+        process: Process,
+        instanceToken: String,
+        deadline: UInt64
+    ) {
+        guard backendProcess === process,
+              expectedBackendTerminationProcess !== process else {
+            return
+        }
         guard process.isRunning else {
             failBackendStartup(
                 process: process,
@@ -897,14 +1137,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             return
         }
+        let remaining = remainingTime(until: deadline)
+        guard remaining > 0 else {
+            failBackendStartup(process: process, message: "后端启动失败：/api/status 在 6 秒内未就绪")
+            return
+        }
 
-        candidateAPI.getStatus { [weak self] result in
+        candidateAPI.getStatus(
+            expectedInstanceToken: instanceToken,
+            timeout: min(backendReadinessRequestTimeout, remaining)
+        ) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.backendProcess === process else { return }
+                guard let self,
+                      self.backendProcess === process,
+                      self.expectedBackendTerminationProcess !== process else {
+                    return
+                }
                 guard process.isRunning else {
                     self.failBackendStartup(
                         process: process,
                         message: "后端进程在就绪前退出（状态码 \(process.terminationStatus)）"
+                    )
+                    return
+                }
+                guard self.remainingTime(until: deadline) > 0 else {
+                    self.failBackendStartup(
+                        process: process,
+                        message: "后端启动失败：/api/status 在 6 秒内未就绪"
                     )
                     return
                 }
@@ -916,19 +1175,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.startupStatus = nil
                     self.lastError = nil
                     self.rebuildMenu()
-                case .failure(let error):
-                    guard attemptsRemaining > 1 else {
-                        self.failBackendStartup(
-                            process: process,
-                            message: "后端启动失败：/api/status 未就绪（\(error.localizedDescription)）"
-                        )
-                        return
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                case .failure:
+                    DispatchQueue.main.asyncAfter(deadline: .now() + self.backendReadinessPollInterval) { [weak self] in
                         self?.waitForBackendReady(
                             candidateAPI: candidateAPI,
                             process: process,
-                            attemptsRemaining: attemptsRemaining - 1
+                            instanceToken: instanceToken,
+                            deadline: deadline
                         )
                     }
                 }
@@ -938,31 +1191,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func backendDidTerminate(_ process: Process, logHandle: FileHandle) {
         DispatchQueue.main.async { [weak self] in
-            guard let self,
-                  self.clearBackendState(for: process, matching: logHandle) else {
+            guard let self else { return }
+            let expectedStartupFailure = self.expectedBackendTerminationProcess === process
+            let exitedBeforeReadiness = self.api == nil
+            guard self.clearBackendState(for: process, matching: logHandle) else {
                 return
             }
             guard !self.terminationRequested() else { return }
             self.startupStatus = nil
-            self.lastError = "后端进程意外退出（状态码 \(process.terminationStatus)）"
+            if expectedStartupFailure {
+                self.rebuildMenu()
+                return
+            }
+            if exitedBeforeReadiness {
+                self.lastError = "后端进程在就绪前退出（状态码 \(process.terminationStatus)）"
+            } else {
+                self.lastError = "后端进程意外退出（状态码 \(process.terminationStatus)）"
+            }
             self.rebuildMenu()
         }
     }
 
     private func failBackendStartup(process: Process, message: String) {
-        guard clearBackendState(for: process, matching: backendLogHandle) else { return }
+        guard backendProcess === process else { return }
+        api = nil
+        latestStatus = nil
+        expectedBackendTerminationProcess = process
+        if !terminationRequested() {
+            startupStatus = nil
+            lastError = message
+            rebuildMenu()
+        }
         if process.isRunning {
-            process.terminate()
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
-                if process.isRunning {
-                    kill(process.processIdentifier, SIGKILL)
+            if !sendSignal(SIGTERM, to: process) {
+                if !terminationRequested() {
+                    lastError = "\(message)；无法发送 SIGTERM"
+                    rebuildMenu()
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + backendTerminationTimeout) { [weak self] in
+                guard let self,
+                      self.backendProcess === process,
+                      self.expectedBackendTerminationProcess === process,
+                      process.isRunning else {
+                    return
+                }
+                guard self.sendSignal(SIGKILL, to: process) else {
+                    if !self.terminationRequested() {
+                        self.lastError = "\(message)；无法发送 SIGKILL"
+                        self.rebuildMenu()
+                    }
+                    return
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + self.forceKillConfirmationTimeout) { [weak self] in
+                    guard let self,
+                          self.backendProcess === process,
+                          self.expectedBackendTerminationProcess === process,
+                          process.isRunning,
+                          !self.terminationRequested() else {
+                        return
+                    }
+                    self.lastError = "\(message)；无法确认后端退出"
+                    self.rebuildMenu()
                 }
             }
         }
-        guard !terminationRequested() else { return }
-        startupStatus = nil
-        lastError = message
-        rebuildMenu()
     }
 
     @discardableResult
@@ -971,6 +1264,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         backendProcess = nil
         api = nil
         latestStatus = nil
+        if expectedBackendTerminationProcess === process {
+            expectedBackendTerminationProcess = nil
+        }
         if let logHandle, backendLogHandle === logHandle {
             backendLogHandle = nil
             try? logHandle.close()

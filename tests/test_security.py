@@ -1,10 +1,12 @@
 import io
 import json
+import os
 import tarfile
 import tempfile
 import unittest
 from email.message import Message
 from pathlib import Path
+from unittest import mock
 
 import app
 
@@ -40,6 +42,41 @@ def response_parts(handler: app.AppHandler) -> tuple[int, Message, bytes]:
 
 
 class SecurityTests(unittest.TestCase):
+    def test_json_response_echoes_valid_backend_instance_token(self):
+        handler = make_handler("GET", "/api/status", {"Host": "127.0.0.1:8787"})
+
+        with mock.patch.dict(
+            os.environ,
+            {"PROXY_BRIDGE_INSTANCE_TOKEN": "01234567-89AB-CDEF-0123-456789ABCDEF"},
+        ):
+            app.json_response(handler, {"ok": True})
+
+        _status, headers, _body = response_parts(handler)
+        self.assertEqual(
+            headers["X-ProxyBridge-Instance"],
+            "01234567-89AB-CDEF-0123-456789ABCDEF",
+        )
+
+    def test_json_response_omits_invalid_backend_instance_tokens(self):
+        invalid_tokens = (
+            "",
+            "contains space",
+            "bad\r\nInjected: yes",
+            "x" * 129,
+            "令牌",
+        )
+        for token in invalid_tokens:
+            with self.subTest(token=token):
+                handler = make_handler("GET", "/api/status", {"Host": "127.0.0.1:8787"})
+                with mock.patch.dict(
+                    os.environ,
+                    {"PROXY_BRIDGE_INSTANCE_TOKEN": token},
+                ):
+                    app.json_response(handler, {"ok": True})
+
+                _status, headers, _body = response_parts(handler)
+                self.assertIsNone(headers["X-ProxyBridge-Instance"])
+
     def test_tar_rejects_symlink_pivot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

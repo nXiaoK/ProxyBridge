@@ -42,6 +42,9 @@ REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
 HTTP_PROXY_HEADER_LIMIT = 65536
 API_JSON_BODY_LIMIT = 1_048_576
+BACKEND_INSTANCE_HEADER = "X-ProxyBridge-Instance"
+BACKEND_INSTANCE_TOKEN_MAX_LENGTH = 128
+BACKEND_INSTANCE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
 ACTIVE_BROWSER_STATUSES = {"running", "starting"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
@@ -87,6 +90,15 @@ def _is_loopback_host(value: str) -> bool:
         return True
     normalized_port = port.lstrip("0") or "0"
     return len(normalized_port) <= 5 and int(normalized_port) <= 65535
+
+
+def backend_instance_token() -> str | None:
+    token = os.environ.get("PROXY_BRIDGE_INSTANCE_TOKEN", "")
+    if not 1 <= len(token) <= BACKEND_INSTANCE_TOKEN_MAX_LENGTH:
+        return None
+    if BACKEND_INSTANCE_TOKEN_PATTERN.fullmatch(token) is None:
+        return None
+    return token
 
 
 def log_event(message: str, level: str = "info", category: str = "") -> None:
@@ -3406,8 +3418,15 @@ def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 2
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
+    send_backend_instance_header(handler)
     handler.end_headers()
     handler.wfile.write(data)
+
+
+def send_backend_instance_header(handler: BaseHTTPRequestHandler) -> None:
+    token = backend_instance_token()
+    if token is not None:
+        handler.send_header(BACKEND_INSTANCE_HEADER, token)
 
 
 def error_response(handler: BaseHTTPRequestHandler, exc: Exception, status: int = 400) -> None:
@@ -3452,6 +3471,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            send_backend_instance_header(self)
             self.end_headers()
             return
         json_response(self, {"error": message}, status)
@@ -3513,6 +3533,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", "0")
+            send_backend_instance_header(self)
             self.end_headers()
             return
         self.serve_static(head_only=True)
