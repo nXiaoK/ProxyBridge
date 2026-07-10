@@ -1102,6 +1102,133 @@ class LifecycleRegressionTests(unittest.TestCase):
     def test_core_log_payload_waits_for_shutdown(self) -> None:
         self._assert_sync_payload_waits_for_shutdown("core-log")
 
+    def test_stop_bridge_drains_proxy_handler_without_holding_state_lock(self) -> None:
+        node_id = "node-public-stop-drain"
+        bridge_id = "bridge-public-stop-drain"
+        log_id = "request-public-stop-drain"
+        bridge = self._bridge(bridge_id, node_id, 4829, 24519)
+        self._write_state(node_id, bridges=[bridge])
+        app.PROCESS_TABLE[bridge_id] = FakeProcess(4829)
+        app.BRIDGE_NODE_TABLE[bridge_id] = node_id
+        app.init_bridge_traffic(bridge_id)
+
+        entered = threading.Event()
+        drain_entered = threading.Event()
+        release = threading.Event()
+        handler_done = threading.Event()
+        stop_done = threading.Event()
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        class FakeClient:
+            def shutdown(self, _how: int) -> None:
+                drain_entered.set()
+
+            def close(self) -> None:
+                return None
+
+        class FakeServer:
+            def __init__(self) -> None:
+                self.accepted = False
+                self.closed = threading.Event()
+
+            def accept(self) -> tuple[FakeClient, tuple[str, int]]:
+                if not self.accepted:
+                    self.accepted = True
+                    return FakeClient(), ("127.0.0.1", 50001)
+                self.closed.wait(timeout=5)
+                raise OSError("closed")
+
+            def close(self) -> None:
+                self.closed.set()
+
+        proxy = app.Socks5LogProxy(
+            bridge_id=bridge_id,
+            node_id=node_id,
+            node_name="Lifecycle Node",
+            listen_port=24519,
+            upstream_port=25519,
+        )
+        proxy._server = FakeServer()
+
+        def handler(_client: FakeClient, _address: tuple[str, int]) -> None:
+            entered.set()
+            try:
+                if not release.wait(timeout=5):
+                    raise AssertionError("公共停止未进入代理排空")
+                app.append_request_log(
+                    {
+                        "id": log_id,
+                        "bridge_id": bridge_id,
+                        "status": "open",
+                        "upload_bytes": 0,
+                        "download_bytes": 0,
+                    }
+                )
+                app.update_request_log(
+                    log_id,
+                    {"status": "completed", "download_bytes": 23},
+                )
+                app.add_bridge_traffic(bridge_id, "download_bytes", 23)
+            finally:
+                handler_done.set()
+
+        with mock.patch.object(proxy, "_handle_client", side_effect=handler):
+            proxy._thread = threading.Thread(target=proxy._serve, daemon=True)
+            proxy._thread.start()
+            self.assertTrue(entered.wait(timeout=1))
+            app.LOG_PROXY_TABLE[bridge_id] = proxy
+
+            def run_stop() -> None:
+                try:
+                    with mock.patch.object(app, "terminate_process", return_value=None):
+                        results.append(app.stop_bridge(bridge_id))
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    stop_done.set()
+
+            worker = threading.Thread(target=run_stop)
+            worker.start()
+            try:
+                self.assertTrue(drain_entered.wait(timeout=1))
+                self.assertFalse(stop_done.is_set())
+                release.set()
+                worker.join(timeout=5)
+                self.assertFalse(worker.is_alive())
+                self.assertTrue(handler_done.wait(timeout=1))
+                self.assertEqual(errors, [])
+            finally:
+                release.set()
+                worker.join(timeout=5)
+                handler_done.wait(timeout=1)
+                if app.LOG_PROXY_TABLE.get(bridge_id) is proxy:
+                    proxy.stop()
+
+        self.assertEqual(results, [{"ok": True, "killed_browsers": 0}])
+        saved = app.load_state()
+        saved_bridge = saved["bridges"][0]
+        self.assertEqual(saved_bridge["status"], "stopped")
+        self.assertFalse(saved_bridge["enabled"])
+        self.assertEqual(saved_bridge["download_bytes"], 23)
+        self.assertEqual(saved_bridge["total_bytes"], 23)
+        self.assertEqual(
+            saved["request_logs"],
+            [
+                {
+                    "id": log_id,
+                    "bridge_id": bridge_id,
+                    "status": "completed",
+                    "upload_bytes": 0,
+                    "download_bytes": 23,
+                }
+            ],
+        )
+        self.assertNotIn(bridge_id, app.PROCESS_TABLE)
+        self.assertNotIn(bridge_id, app.LOG_PROXY_TABLE)
+        self.assertNotIn(bridge_id, app.BRIDGE_NODE_TABLE)
+        self.assertEqual(app.TRAFFIC_TABLE, {})
+
     def test_shutdown_waits_for_proxy_clients_before_persisting_traffic(self) -> None:
         node_id = "node-final-traffic"
         bridge_id = "bridge-final-traffic"
@@ -1112,13 +1239,14 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.init_bridge_traffic(bridge_id)
 
         entered = threading.Event()
+        drain_entered = threading.Event()
         release = threading.Event()
         stop_done = threading.Event()
         errors: list[BaseException] = []
 
         class FakeClient:
             def shutdown(self, _how: int) -> None:
-                return None
+                drain_entered.set()
 
             def close(self) -> None:
                 return None
@@ -1149,7 +1277,7 @@ class LifecycleRegressionTests(unittest.TestCase):
 
         def handler(_client: FakeClient, _address: tuple[str, int]) -> None:
             entered.set()
-            release.wait(timeout=2)
+            release.wait(timeout=5)
             app.add_bridge_traffic(bridge_id, "download_bytes", 19)
 
         with mock.patch.object(proxy, "_handle_client", side_effect=handler):
@@ -1170,7 +1298,8 @@ class LifecycleRegressionTests(unittest.TestCase):
             worker = threading.Thread(target=run_shutdown)
             worker.start()
             try:
-                self.assertFalse(stop_done.wait(timeout=0.1))
+                self.assertTrue(drain_entered.wait(timeout=1))
+                self.assertFalse(stop_done.is_set())
             finally:
                 release.set()
             worker.join(timeout=2)

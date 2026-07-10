@@ -3263,20 +3263,22 @@ def _stop_bridge(bridge_id: str) -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         bridge_node_id = ""
-        persisted_traffic = traffic_defaults()
         for bridge in state["bridges"]:
             if bridge.get("id") == bridge_id:
                 bridge_node_id = str(bridge.get("node_id") or "")
-                persisted_traffic = traffic_defaults(bridge.get("upload_bytes"), bridge.get("download_bytes"))
                 break
-        killed_browsers = stop_browser_processes_for_node(bridge_node_id, state) if bridge_node_id else 0
-        with TRAFFIC_LOCK:
-            has_live_traffic = bridge_id in TRAFFIC_TABLE
-        traffic = stop_process(bridge_id)
-        if not has_live_traffic:
-            traffic = persisted_traffic
+
+    killed_browsers = stop_browser_processes_for_node(bridge_node_id) if bridge_node_id else 0
+    with TRAFFIC_LOCK:
+        has_live_traffic = bridge_id in TRAFFIC_TABLE
+    traffic = stop_process(bridge_id)
+
+    with STATE_LOCK:
+        state = load_state()
         for bridge in state["bridges"]:
             if bridge.get("id") == bridge_id:
+                if not has_live_traffic:
+                    traffic = traffic_defaults(bridge.get("upload_bytes"), bridge.get("download_bytes"))
                 bridge["status"] = "stopped"
                 bridge["enabled"] = False
                 bridge["pid"] = None
@@ -3300,16 +3302,20 @@ def _stop_all_bridges() -> dict[str, Any]:
             for instance in state.get("browser_instances", [])
             if str(instance.get("node_id") or "")
         }
-        with PROCESS_LOCK:
-            browser_node_ids.update(BROWSER_TABLE.keys())
-        killed_browsers = sum(stop_browser_processes_for_node(node_id, state) for node_id in browser_node_ids)
-        with PROCESS_LOCK:
-            bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
-        with TRAFFIC_LOCK:
-            live_traffic_ids = set(TRAFFIC_TABLE)
-        traffic_by_bridge = {}
-        for bridge_id in bridge_ids:
-            traffic_by_bridge[bridge_id] = stop_process(bridge_id)
+
+    with PROCESS_LOCK:
+        browser_node_ids.update(BROWSER_TABLE.keys())
+    killed_browsers = sum(stop_browser_processes_for_node(node_id) for node_id in browser_node_ids)
+    with PROCESS_LOCK:
+        bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
+    with TRAFFIC_LOCK:
+        live_traffic_ids = set(TRAFFIC_TABLE)
+    traffic_by_bridge = {}
+    for bridge_id in bridge_ids:
+        traffic_by_bridge[bridge_id] = stop_process(bridge_id)
+
+    with STATE_LOCK:
+        state = load_state()
         for bridge in state["bridges"]:
             bridge["status"] = "stopped"
             bridge["enabled"] = False
