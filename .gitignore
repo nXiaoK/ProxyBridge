@@ -18,5 +18,8 @@ DerivedData/
 # Isolated Codex development worktrees.
 .worktrees/
 
+# Superpowers task briefs, review packages, and progress ledgers.
+.superpowers/
+
 # Generated iconset intermediates. The build script regenerates icons.
 macos/ProxyBridgeMenuBar/AppIcon.iconset/
