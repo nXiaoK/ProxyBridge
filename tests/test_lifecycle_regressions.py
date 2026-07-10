@@ -161,6 +161,150 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.LOG_PROXY_TABLE[bridge_id] = FakeProxy()
         app.init_bridge_traffic(bridge_id, upload, download)
 
+    def _assert_public_stop_waits_for_shutdown(self, action: str) -> None:
+        node_id = f"node-shutdown-{action}-single-flight"
+        bridge_id = f"bridge-shutdown-{action}-single-flight"
+        bridge_pid = 4600
+        bridge = self._bridge(bridge_id, node_id, bridge_pid, 24400)
+        browser_instance_id = f"browser-shutdown-{action}-single-flight"
+        browser_instances: list[dict[str, object]] = []
+        if action == "browser":
+            browser_instance = self._browser_instance(node_id, browser_instance_id)
+            browser_instance.update({"status": "running", "pid": 4601})
+            browser_instances.append(browser_instance)
+        self._write_state(node_id, bridges=[bridge], browser_instances=browser_instances)
+
+        if action == "browser":
+            app.init_bridge_traffic(bridge_id, 77, 88)
+            browser_process = FakeProcess(4601)
+            app.BROWSER_PROCESS_TABLE[browser_instance_id] = browser_process
+            app.BROWSER_TABLE[node_id] = [browser_process]
+        else:
+            self._activate_bridge(bridge, 77, 88)
+
+        terminate_barrier = threading.Barrier(2)
+        first_terminate_entered = threading.Event()
+        duplicate_terminate_entered = threading.Event()
+        public_started = threading.Event()
+        terminate_lock = threading.Lock()
+        terminate_pids: list[int] = []
+        shutdown_errors: list[BaseException] = []
+        public_errors: list[BaseException] = []
+
+        def controlled_terminate(process: FakeProcess) -> None:
+            with terminate_lock:
+                terminate_pids.append(process.pid)
+                call_number = len(terminate_pids)
+            if call_number == 1:
+                first_terminate_entered.set()
+            else:
+                duplicate_terminate_entered.set()
+            try:
+                terminate_barrier.wait(timeout=0.5)
+            except threading.BrokenBarrierError:
+                pass
+
+        def shutdown_worker() -> None:
+            try:
+                app.shutdown()
+            except BaseException as error:
+                shutdown_errors.append(error)
+
+        def public_worker() -> None:
+            public_started.set()
+            try:
+                if action == "bridge":
+                    app.stop_bridge(bridge_id)
+                elif action == "all":
+                    app.stop_all_bridges()
+                else:
+                    app.stop_browser({"instance_id": browser_instance_id})
+            except BaseException as error:
+                public_errors.append(error)
+
+        with mock.patch.object(app, "terminate_process", side_effect=controlled_terminate):
+            shutdown_thread = threading.Thread(target=shutdown_worker)
+            shutdown_thread.start()
+            self.assertTrue(first_terminate_entered.wait(timeout=2))
+            public_thread = threading.Thread(target=public_worker)
+            public_thread.start()
+            self.assertTrue(public_started.wait(timeout=2))
+            shutdown_thread.join(timeout=2)
+            public_thread.join(timeout=2)
+
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertFalse(public_thread.is_alive())
+        self.assertEqual(shutdown_errors, [])
+        self.assertEqual(public_errors, [])
+        self.assertFalse(duplicate_terminate_entered.is_set())
+        self.assertEqual(len(terminate_pids), 1)
+        saved_bridge = app.load_state()["bridges"][0]
+        self.assertEqual(
+            (saved_bridge["upload_bytes"], saved_bridge["download_bytes"], saved_bridge["total_bytes"]),
+            (77, 88, 165),
+        )
+
+    def _assert_sync_payload_waits_for_shutdown(self, payload_name: str) -> None:
+        node_id = f"node-shutdown-{payload_name}-gate"
+        bridge_id = f"bridge-shutdown-{payload_name}-gate"
+        bridge = self._bridge(bridge_id, node_id, 4610, 24410)
+        self._write_state(node_id, bridges=[bridge])
+        self._activate_bridge(bridge, 12, 34)
+        terminate_entered = threading.Event()
+        release_terminate = threading.Event()
+        sync_entered = threading.Event()
+        payload_started = threading.Event()
+        shutdown_errors: list[BaseException] = []
+        payload_errors: list[BaseException] = []
+        original_sync = app.sync_process_status
+
+        def controlled_terminate(_process: FakeProcess) -> None:
+            terminate_entered.set()
+            if not release_terminate.wait(timeout=2):
+                raise AssertionError("shutdown 终止未获准继续")
+
+        def observed_sync(state: dict[str, object]) -> bool:
+            sync_entered.set()
+            return original_sync(state)
+
+        def shutdown_worker() -> None:
+            try:
+                app.shutdown()
+            except BaseException as error:
+                shutdown_errors.append(error)
+
+        def payload_worker() -> None:
+            payload_started.set()
+            try:
+                if payload_name == "status":
+                    app.status_payload()
+                else:
+                    app.core_log_payload("sing-box")
+            except BaseException as error:
+                payload_errors.append(error)
+
+        with (
+            mock.patch.object(app, "terminate_process", side_effect=controlled_terminate),
+            mock.patch.object(app, "sync_process_status", side_effect=observed_sync),
+            mock.patch.object(app, "wait_for_port", return_value=True),
+        ):
+            shutdown_thread = threading.Thread(target=shutdown_worker)
+            shutdown_thread.start()
+            self.assertTrue(terminate_entered.wait(timeout=2))
+            payload_thread = threading.Thread(target=payload_worker)
+            payload_thread.start()
+            self.assertTrue(payload_started.wait(timeout=2))
+            sync_entered_before_release = sync_entered.wait(timeout=0.2)
+            release_terminate.set()
+            shutdown_thread.join(timeout=2)
+            payload_thread.join(timeout=2)
+
+        self.assertFalse(shutdown_thread.is_alive())
+        self.assertFalse(payload_thread.is_alive())
+        self.assertEqual(shutdown_errors, [])
+        self.assertEqual(payload_errors, [])
+        self.assertFalse(sync_entered_before_release)
+
     def test_start_bridge_returns_existing_active_bridge(self) -> None:
         node_id = "node-bridge-single-flight"
         self._write_state(node_id)
@@ -227,6 +371,135 @@ class LifecycleRegressionTests(unittest.TestCase):
 
         self.assertEqual(reused["id"], bridge["id"])
         self.assertEqual(list(app.PROCESS_TABLE), [bridge["id"]])
+
+    def test_start_bridge_rolls_back_runtime_when_final_save_fails(self) -> None:
+        node_id = "node-bridge-save-rollback"
+        self._write_state(node_id)
+        ports = iter([24420, 25420])
+        persistence_error = RuntimeError("Bridge 最终保存失败")
+        terminated_pids: list[int] = []
+
+        class FakePopen:
+            calls: list["FakePopen"] = []
+
+            def __init__(self, _command: list[str], **_kwargs: object) -> None:
+                self.pid = 4700
+                self.calls.append(self)
+
+            def poll(self) -> None:
+                return None
+
+        class TrackingProxy:
+            instances: list["TrackingProxy"] = []
+
+            def __init__(self, **kwargs: object) -> None:
+                self.node_id = str(kwargs["node_id"])
+                self.stopped = False
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                self.stopped = True
+
+            def is_alive(self) -> bool:
+                return not self.stopped
+
+        with (
+            mock.patch.object(app, "generate_config", return_value={"test": True}),
+            mock.patch.object(app, "core_command", return_value=["fake-core"]),
+            mock.patch.object(app, "next_free_port", side_effect=lambda _preferred=None: next(ports)),
+            mock.patch.object(app, "wait_for_port", return_value=True),
+            mock.patch.object(app.subprocess, "Popen", FakePopen),
+            mock.patch.object(app, "Socks5LogProxy", TrackingProxy),
+            mock.patch.object(app, "terminate_process", side_effect=lambda process: terminated_pids.append(process.pid)),
+            mock.patch.object(app, "save_state", side_effect=persistence_error),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                app.start_bridge({"node_id": node_id, "core": "auto"})
+
+        self.assertIs(caught.exception, persistence_error)
+        self.assertEqual(terminated_pids, [4700])
+        self.assertTrue(TrackingProxy.instances[0].stopped)
+        self.assertEqual(app.PROCESS_TABLE, {})
+        self.assertEqual(app.LOG_PROXY_TABLE, {})
+        self.assertEqual(app.TRAFFIC_TABLE, {})
+
+    def test_start_bridge_keeps_failed_cleanup_registered_and_blocks_duplicate_start(self) -> None:
+        node_id = "node-bridge-save-terminate-failure"
+        self._write_state(node_id)
+        ports = iter([24421, 25421, 24422, 25422])
+        persistence_error = RuntimeError("Bridge 保存失败且终止失败")
+        terminate_attempts: list[int] = []
+
+        class FakePopen:
+            calls: list["FakePopen"] = []
+
+            def __init__(self, _command: list[str], **_kwargs: object) -> None:
+                self.pid = 4710 + len(self.calls)
+                self.calls.append(self)
+
+            def poll(self) -> None:
+                return None
+
+        class TrackingProxy:
+            instances: list["TrackingProxy"] = []
+
+            def __init__(self, **kwargs: object) -> None:
+                self.node_id = str(kwargs["node_id"])
+                self.stop_calls = 0
+                self.instances.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+            def is_alive(self) -> bool:
+                return self.stop_calls == 0
+
+        def failing_terminate(process: FakePopen) -> None:
+            terminate_attempts.append(process.pid)
+            raise RuntimeError("Bridge 回滚终止失败")
+
+        with (
+            mock.patch.object(app, "generate_config", return_value={"test": True}),
+            mock.patch.object(app, "core_command", return_value=["fake-core"]),
+            mock.patch.object(app, "next_free_port", side_effect=lambda _preferred=None: next(ports)),
+            mock.patch.object(app, "wait_for_port", return_value=True),
+            mock.patch.object(app.subprocess, "Popen", FakePopen),
+            mock.patch.object(app, "Socks5LogProxy", TrackingProxy),
+        ):
+            with (
+                mock.patch.object(app, "terminate_process", side_effect=failing_terminate),
+                mock.patch.object(app, "save_state", side_effect=persistence_error),
+            ):
+                with self.assertRaises(RuntimeError) as caught:
+                    app.start_bridge({"node_id": node_id, "core": "auto"})
+
+            process = FakePopen.calls[0]
+            proxy = TrackingProxy.instances[0]
+            self.assertIs(caught.exception, persistence_error)
+            self.assertEqual(terminate_attempts, [process.pid])
+            self.assertEqual(proxy.stop_calls, 1)
+            self.assertIn(process, app.PROCESS_TABLE.values())
+            self.assertIn(proxy, app.LOG_PROXY_TABLE.values())
+            self.assertTrue(app.TRAFFIC_TABLE)
+
+            with self.assertRaisesRegex(RuntimeError, "未清理|残留"):
+                app.start_bridge({"node_id": node_id, "core": "auto"})
+            self.assertEqual(len(FakePopen.calls), 1)
+
+        retried_pids: list[int] = []
+        with mock.patch.object(app, "terminate_process", side_effect=lambda process: retried_pids.append(process.pid)):
+            app.shutdown()
+
+        self.assertEqual(retried_pids, [process.pid])
+        self.assertEqual(app.PROCESS_TABLE, {})
+        self.assertEqual(app.LOG_PROXY_TABLE, {})
+        self.assertEqual(app.TRAFFIC_TABLE, {})
 
     def test_running_browser_instance_cannot_be_launched_twice(self) -> None:
         node_id = "node-browser-single-flight"
@@ -343,15 +616,14 @@ class LifecycleRegressionTests(unittest.TestCase):
             def poll(self) -> None:
                 return None
 
-        def failing_cleanup(process: FakePopen) -> None:
+        def successful_cleanup(process: FakePopen) -> None:
             process.terminated = True
-            raise RuntimeError("回滚清理失败")
 
         with (
             mock.patch.object(app, "fingerprint_chromium_path", return_value="/fake/Chromium"),
             mock.patch.object(app, "wait_for_port", return_value=True),
             mock.patch.object(app.subprocess, "Popen", FakePopen),
-            mock.patch.object(app, "terminate_process", side_effect=failing_cleanup),
+            mock.patch.object(app, "terminate_process", side_effect=successful_cleanup),
             mock.patch.object(app, "save_state", side_effect=persistence_error),
         ):
             with self.assertRaises(RuntimeError) as caught:
@@ -366,6 +638,54 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(saved_instance["status"], "stopped")
         self.assertIsNone(saved_instance["pid"])
         self.assertEqual(saved_instance["launch_count"], 0)
+
+    def test_launch_browser_keeps_process_registered_when_save_and_terminate_fail(self) -> None:
+        node_id = "node-browser-save-terminate-failure"
+        bridge = self._bridge("bridge-browser-save-terminate-failure", node_id, 4362, 24292)
+        instance_id = "browser-save-terminate-failure"
+        instance = self._browser_instance(node_id, instance_id)
+        self._write_state(node_id, bridges=[bridge], browser_instances=[instance])
+        self._activate_bridge(bridge)
+        persistence_error = RuntimeError("浏览器最终保存失败")
+        terminate_attempts: list[int] = []
+
+        class FakePopen:
+            created: list["FakePopen"] = []
+
+            def __init__(self, _command: list[str], **_kwargs: object) -> None:
+                self.pid = 4363
+                self.created.append(self)
+
+            def poll(self) -> None:
+                return None
+
+        def failing_terminate(process: FakePopen) -> None:
+            terminate_attempts.append(process.pid)
+            raise RuntimeError("浏览器回滚终止失败")
+
+        with (
+            mock.patch.object(app, "fingerprint_chromium_path", return_value="/fake/Chromium"),
+            mock.patch.object(app, "wait_for_port", return_value=True),
+            mock.patch.object(app.subprocess, "Popen", FakePopen),
+            mock.patch.object(app, "terminate_process", side_effect=failing_terminate),
+            mock.patch.object(app, "save_state", side_effect=persistence_error),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                app.launch_browser({"node_id": node_id, "instance_id": instance_id})
+
+        process = FakePopen.created[0]
+        self.assertIs(caught.exception, persistence_error)
+        self.assertEqual(terminate_attempts, [process.pid])
+        self.assertIs(app.BROWSER_PROCESS_TABLE.get(instance_id), process)
+        self.assertIn(process, app.BROWSER_TABLE[node_id])
+
+        retried_pids: list[int] = []
+        with mock.patch.object(app, "terminate_process", side_effect=lambda item: retried_pids.append(item.pid)):
+            app.shutdown()
+
+        self.assertIn(process.pid, retried_pids)
+        self.assertNotIn(instance_id, app.BROWSER_PROCESS_TABLE)
+        self.assertNotIn(process, app.BROWSER_TABLE.get(node_id, []))
 
     def test_start_bridge_and_shutdown_share_lifecycle_barrier(self) -> None:
         node_id = "node-bridge-shutdown-barrier"
@@ -617,6 +937,21 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(counters["max_active"], 1)
         self.assertEqual(sorted(result["already_installed"] for result in results), [False, True])
 
+    def test_shutdown_serializes_stop_bridge(self) -> None:
+        self._assert_public_stop_waits_for_shutdown("bridge")
+
+    def test_shutdown_serializes_stop_all_bridges(self) -> None:
+        self._assert_public_stop_waits_for_shutdown("all")
+
+    def test_shutdown_serializes_stop_browser(self) -> None:
+        self._assert_public_stop_waits_for_shutdown("browser")
+
+    def test_status_payload_waits_for_shutdown(self) -> None:
+        self._assert_sync_payload_waits_for_shutdown("status")
+
+    def test_core_log_payload_waits_for_shutdown(self) -> None:
+        self._assert_sync_payload_waits_for_shutdown("core-log")
+
     def test_shutdown_persists_successful_traffic_and_retries_failed_bridge(self) -> None:
         node_id = "node-shutdown-bridge-retry"
         successful_id = "bridge-shutdown-success"
@@ -666,6 +1001,20 @@ class LifecycleRegressionTests(unittest.TestCase):
             self.assertEqual(app.TRAFFIC_TABLE[failed_id]["total_bytes"], 77)
             self.assertEqual(app.BROWSER_PROCESS_TABLE, {})
             self.assertRegex(str(caught.exception), "关闭.*失败")
+
+            status = app.status_payload()
+            status_bridges = {bridge["id"]: bridge for bridge in status["bridges"]}
+            self.assertEqual(status_bridges[successful_id]["status"], "stopped")
+            self.assertIsNone(status_bridges[successful_id]["pid"])
+            self.assertTrue(status_bridges[successful_id]["enabled"])
+            self.assertEqual(
+                (
+                    status_bridges[successful_id]["upload_bytes"],
+                    status_bridges[successful_id]["download_bytes"],
+                    status_bridges[successful_id]["total_bytes"],
+                ),
+                (11, 22, 33),
+            )
 
             app.shutdown()
 

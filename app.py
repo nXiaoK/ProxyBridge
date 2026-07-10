@@ -1389,6 +1389,11 @@ def fingerprint_chromium_path(force_refresh: bool = False) -> str | None:
 
 
 def status_payload() -> dict[str, Any]:
+    with SHUTDOWN_LOCK:
+        return _status_payload()
+
+
+def _status_payload() -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         changed = sync_process_status(state)
@@ -1828,6 +1833,14 @@ def _start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
             if changed:
                 save_state(state)
             return active_bridge
+        with PROCESS_LOCK:
+            residual_bridge_ids = [
+                bridge_id
+                for bridge_id, proxy in LOG_PROXY_TABLE.items()
+                if str(getattr(proxy, "node_id", "") or "") == node_id
+            ]
+        if residual_bridge_ids:
+            raise RuntimeError("该节点仍有未清理的本地代理资源，无法重复启动")
         core = node.get("preferred_core") if requested_core == "auto" else requested_core
         if core not in {"sing-box", "xray"}:
             raise ValueError("核心只能是 sing-box、xray 或 auto")
@@ -1854,54 +1867,55 @@ def _start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
             log_file.close()
         with PROCESS_LOCK:
             PROCESS_TABLE[bridge_id] = process
-        core_started = wait_for_port(core_port, timeout=2.5)
-        if process.poll() is not None:
-            error = read_tail(log_path)
-            stop_process(bridge_id)
-            raise RuntimeError(error or f"{core} 启动失败")
-        if not core_started:
-            stop_process(bridge_id)
-            raise RuntimeError("核心内部端口启动超时")
-        proxy = Socks5LogProxy(
-            bridge_id=bridge_id,
-            node_id=node_id,
-            node_name=str(node.get("name") or ""),
-            listen_port=local_port,
-            upstream_port=core_port,
-        )
         try:
+            core_started = wait_for_port(core_port, timeout=2.5)
+            if process.poll() is not None:
+                error = read_tail(log_path)
+                raise RuntimeError(error or f"{core} 启动失败")
+            if not core_started:
+                raise RuntimeError("核心内部端口启动超时")
+            proxy = Socks5LogProxy(
+                bridge_id=bridge_id,
+                node_id=node_id,
+                node_name=str(node.get("name") or ""),
+                listen_port=local_port,
+                upstream_port=core_port,
+            )
             proxy.start()
-        except Exception:
-            stop_process(bridge_id)
+            with PROCESS_LOCK:
+                LOG_PROXY_TABLE[bridge_id] = proxy
+            started = wait_for_port(local_port, timeout=1.0)
+            traffic = init_bridge_traffic(bridge_id, initial_upload, initial_download)
+            bridge = {
+                "id": bridge_id,
+                "node_id": node_id,
+                "node_name": node.get("name"),
+                "protocol": node.get("protocol"),
+                "region": node.get("region"),
+                "core": core,
+                "port": local_port,
+                "core_port": core_port,
+                "socks_url": f"socks5://127.0.0.1:{local_port}",
+                "http_url": f"http://127.0.0.1:{local_port}",
+                "supported_proxy_protocols": ["socks5", "http", "https-connect"],
+                "status": "running" if started else "starting",
+                "enabled": True,
+                "pid": process.pid,
+                "started_at": now_ts(),
+                "config_path": str(config_path),
+                "log_path": str(log_path),
+                **traffic,
+            }
+            state["bridges"] = [b for b in state["bridges"] if b.get("id") != bridge_id]
+            state["bridges"].append(bridge)
+            save_state(state)
+            return bridge
+        except BaseException:
+            try:
+                stop_process(bridge_id)
+            except BaseException:
+                pass
             raise
-        with PROCESS_LOCK:
-            LOG_PROXY_TABLE[bridge_id] = proxy
-        started = wait_for_port(local_port, timeout=1.0)
-        traffic = init_bridge_traffic(bridge_id, initial_upload, initial_download)
-        bridge = {
-            "id": bridge_id,
-            "node_id": node_id,
-            "node_name": node.get("name"),
-            "protocol": node.get("protocol"),
-            "region": node.get("region"),
-            "core": core,
-            "port": local_port,
-            "core_port": core_port,
-            "socks_url": f"socks5://127.0.0.1:{local_port}",
-            "http_url": f"http://127.0.0.1:{local_port}",
-            "supported_proxy_protocols": ["socks5", "http", "https-connect"],
-            "status": "running" if started else "starting",
-            "enabled": True,
-            "pid": process.pid,
-            "started_at": now_ts(),
-            "config_path": str(config_path),
-            "log_path": str(log_path),
-            **traffic,
-        }
-        state["bridges"] = [b for b in state["bridges"] if b.get("id") != bridge_id]
-        state["bridges"].append(bridge)
-        save_state(state)
-        return bridge
 
 
 def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2027,17 +2041,21 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
             )
             save_state(state)
     except BaseException:
-        try:
-            with PROCESS_LOCK:
-                if BROWSER_PROCESS_TABLE.get(instance_id) is process:
-                    BROWSER_PROCESS_TABLE.pop(instance_id, None)
-                remove_browser_process_from_node_tables(process)
-        except BaseException:
-            pass
+        terminated = False
         try:
             terminate_process(process)
         except BaseException:
             pass
+        else:
+            terminated = True
+        if terminated:
+            try:
+                with PROCESS_LOCK:
+                    if BROWSER_PROCESS_TABLE.get(instance_id) is process:
+                        BROWSER_PROCESS_TABLE.pop(instance_id, None)
+                    remove_browser_process_from_node_tables(process)
+            except BaseException:
+                pass
         raise
     return {
         "ok": True,
@@ -2074,6 +2092,11 @@ def prune_browser_processes(node_id: str) -> list[subprocess.Popen]:
 
 
 def active_browser_node_ids() -> list[str]:
+    with SHUTDOWN_LOCK:
+        return _active_browser_node_ids()
+
+
+def _active_browser_node_ids() -> list[str]:
     with STATE_LOCK:
         state = load_state()
         if sync_browser_instance_status(state):
@@ -2159,6 +2182,11 @@ def stop_browser_processes_for_node(node_id: str, state: dict[str, Any] | None =
 
 
 def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    with SHUTDOWN_LOCK:
+        return _stop_browser(payload)
+
+
+def _stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
     # 停止某节点的指纹浏览器:只结束浏览器进程组,保留该节点已启用的本地代理端口。
     node_id = str(payload.get("node_id") or "")
     instance_id = str(payload.get("instance_id") or "")
@@ -2337,6 +2365,11 @@ def read_tail(path: Path, limit: int = 6000) -> str:
 
 
 def core_log_payload(core: str) -> dict[str, Any]:
+    with SHUTDOWN_LOCK:
+        return _core_log_payload(core)
+
+
+def _core_log_payload(core: str) -> dict[str, Any]:
     core = core.strip()
     if core not in {"sing-box", "xray"}:
         raise ValueError("核心只能是 sing-box 或 xray")
@@ -3126,15 +3159,26 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def stop_bridge(bridge_id: str) -> dict[str, Any]:
+    with SHUTDOWN_LOCK:
+        return _stop_bridge(bridge_id)
+
+
+def _stop_bridge(bridge_id: str) -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         bridge_node_id = ""
+        persisted_traffic = traffic_defaults()
         for bridge in state["bridges"]:
             if bridge.get("id") == bridge_id:
                 bridge_node_id = str(bridge.get("node_id") or "")
+                persisted_traffic = traffic_defaults(bridge.get("upload_bytes"), bridge.get("download_bytes"))
                 break
         killed_browsers = stop_browser_processes_for_node(bridge_node_id, state) if bridge_node_id else 0
+        with TRAFFIC_LOCK:
+            has_live_traffic = bridge_id in TRAFFIC_TABLE
         traffic = stop_process(bridge_id)
+        if not has_live_traffic:
+            traffic = persisted_traffic
         for bridge in state["bridges"]:
             if bridge.get("id") == bridge_id:
                 bridge["status"] = "stopped"
@@ -3148,6 +3192,11 @@ def stop_bridge(bridge_id: str) -> dict[str, Any]:
 
 
 def stop_all_bridges() -> dict[str, Any]:
+    with SHUTDOWN_LOCK:
+        return _stop_all_bridges()
+
+
+def _stop_all_bridges() -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         browser_node_ids = {
@@ -3160,6 +3209,8 @@ def stop_all_bridges() -> dict[str, Any]:
         killed_browsers = sum(stop_browser_processes_for_node(node_id, state) for node_id in browser_node_ids)
         with PROCESS_LOCK:
             bridge_ids = list(set(PROCESS_TABLE) | set(LOG_PROXY_TABLE))
+        with TRAFFIC_LOCK:
+            live_traffic_ids = set(TRAFFIC_TABLE)
         traffic_by_bridge = {}
         for bridge_id in bridge_ids:
             traffic_by_bridge[bridge_id] = stop_process(bridge_id)
@@ -3169,7 +3220,11 @@ def stop_all_bridges() -> dict[str, Any]:
             bridge["pid"] = None
             bridge["stopped_at"] = now_ts()
             if bridge.get("id") in traffic_by_bridge:
-                bridge.update(traffic_by_bridge[bridge.get("id")])
+                bridge_id = str(bridge.get("id") or "")
+                if bridge_id in live_traffic_ids:
+                    bridge.update(traffic_by_bridge[bridge_id])
+                else:
+                    bridge.update(traffic_defaults(bridge.get("upload_bytes"), bridge.get("download_bytes")))
             bridge.pop("error", None)
         save_state(state)
     return {"ok": True, "killed_browsers": killed_browsers}
@@ -3531,10 +3586,19 @@ def shutdown() -> None:
             try:
                 with STATE_LOCK:
                     state = load_state()
+                    stopped_at = now_ts()
                     for bridge in state.get("bridges", []):
                         bridge_id = bridge.get("id")
                         if bridge_id in traffic_by_bridge:
-                            bridge.update(traffic_by_bridge[bridge_id])
+                            bridge.update(
+                                {
+                                    **traffic_by_bridge[bridge_id],
+                                    "status": "stopped",
+                                    "pid": None,
+                                    "stopped_at": stopped_at,
+                                }
+                            )
+                            bridge.pop("error", None)
                     save_state(state)
             except BaseException as error:
                 failures.append(("状态保存", error))
