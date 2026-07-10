@@ -15,5 +15,8 @@ outputs/
 .build/
 DerivedData/
 
+# Isolated Codex development worktrees.
+.worktrees/
+
 # Generated iconset intermediates. The build script regenerates icons.
 macos/ProxyBridgeMenuBar/AppIcon.iconset/
