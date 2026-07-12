@@ -893,6 +893,110 @@ tbody tr.is-running td {
   background: color-mix(in oklab, var(--success) 7%, transparent);
 }
 
+/* 订阅分组头：整行可点击折叠/展开 */
+tbody tr.node-group-header td {
+  padding: 0;
+  border-bottom: 0.5px solid var(--separator);
+  background: color-mix(in oklab, var(--bg-elevated) 88%, var(--accent) 12%);
+  position: sticky;
+  top: 33px; /* 紧贴 thead 下方 */
+  z-index: 1;
+}
+tbody tr.node-group-header:hover td {
+  background: color-mix(in oklab, var(--bg-elevated) 72%, var(--accent) 18%);
+}
+tbody tr.node-group-header.is-collapsed td {
+  border-bottom: 0.5px solid var(--border-strong);
+}
+.node-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin: 0;
+  padding: 10px 14px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+}
+.node-group-toggle:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--accent) 55%, transparent);
+  outline-offset: -2px;
+}
+.node-group-chevron {
+  display: inline-flex;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  color: var(--text-tertiary);
+  transition: transform 0.15s ease;
+}
+.node-group-chevron svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.node-group-header:not(.is-collapsed) .node-group-chevron {
+  transform: rotate(90deg);
+}
+.node-group-avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  background: linear-gradient(135deg, #64d2ff, #0a84ff);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+tr.node-group-header[data-group-id^="source:"] .node-group-avatar {
+  background: linear-gradient(135deg, #a78bfa, #6366f1);
+}
+.node-group-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.node-group-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.node-group-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-group-kind {
+  flex-shrink: 0;
+  background: color-mix(in oklab, var(--accent) 14%, var(--bg-panel));
+  color: var(--text-secondary);
+}
+.node-group-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+tbody tr.node-row td:first-child {
+  padding-left: 42px; /* 与分组标题缩进对齐 */
+}
+
 .actions-col { width: 1%; white-space: nowrap; }
 tbody .row-actions {
   display: flex;

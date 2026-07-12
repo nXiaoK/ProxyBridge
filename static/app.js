@@ -13,8 +13,11 @@ const appState = {
   filters: {
     protocol: "all",
     region: "all",
+    subscription: "all",
     search: "",
   },
+  // groupId -> true 表示折叠；缺省为展开。
+  collapsedNodeGroups: loadCollapsedNodeGroups(),
   logFilters: {
     search: "",
     node: "all",
@@ -88,8 +91,49 @@ function icon(name) {
     minus: '<path d="M5 12h14"/>',
     activity: '<path d="M22 12h-4l-3 8L9 4l-3 8H2"/>',
     list: '<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
+    chevron: '<path d="M9 6l6 6-6 6"/>',
   };
   return `<svg viewBox="0 0 24 24" aria-hidden="true">${paths[name] || paths.play}</svg>`;
+}
+
+function loadCollapsedNodeGroups() {
+  try {
+    const raw = localStorage.getItem("pb-node-group-collapsed");
+    const parsed = raw ? JSON.parse(raw) : {};
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function saveCollapsedNodeGroups() {
+  try {
+    localStorage.setItem("pb-node-group-collapsed", JSON.stringify(appState.collapsedNodeGroups || {}));
+  } catch (e) {
+    /* ignore quota / private mode */
+  }
+}
+
+function isNodeGroupCollapsed(groupId) {
+  return Boolean(appState.collapsedNodeGroups && appState.collapsedNodeGroups[groupId]);
+}
+
+function setNodeGroupCollapsed(groupId, collapsed) {
+  if (!appState.collapsedNodeGroups) appState.collapsedNodeGroups = {};
+  if (collapsed) appState.collapsedNodeGroups[groupId] = true;
+  else delete appState.collapsedNodeGroups[groupId];
+  saveCollapsedNodeGroups();
+}
+
+/** node_id -> subscription record (first match wins). */
+function subscriptionIndexByNodeId() {
+  const map = new Map();
+  for (const sub of appState.subscriptions || []) {
+    for (const nodeId of sub.node_ids || []) {
+      if (nodeId && !map.has(nodeId)) map.set(nodeId, sub);
+    }
+  }
+  return map;
 }
 
 async function api(path, body = null) {
@@ -311,6 +355,25 @@ function renderFilters() {
   const regions = [...new Set(appState.nodes.map((node) => node.region))];
   appState.filters.protocol = setSelectOptions($("#protocolFilter"), protocols, appState.filters.protocol, "全部协议");
   appState.filters.region = setSelectOptions($("#regionFilter"), regions, appState.filters.region, "全部地区");
+
+  const subSelect = $("#subscriptionFilter");
+  if (subSelect) {
+    const options = [
+      '<option value="all">全部订阅</option>',
+      ...(appState.subscriptions || []).map(
+        (sub) =>
+          `<option value="${escapeHtml(sub.id)}">${escapeHtml(sub.name || "未命名订阅")} (${Number(sub.node_count || (sub.node_ids || []).length || 0)})</option>`
+      ),
+      '<option value="__other__">其他 / 未归组</option>',
+    ];
+    subSelect.innerHTML = options.join("");
+    const allowed = new Set(["all", "__other__", ...(appState.subscriptions || []).map((s) => s.id)]);
+    if (!allowed.has(appState.filters.subscription)) {
+      appState.filters.subscription = "all";
+    }
+    subSelect.value = appState.filters.subscription;
+  }
+
   $("#searchInput").value = appState.filters.search;
 }
 
@@ -389,21 +452,184 @@ function testSummary(nodeId) {
 
 function filteredNodes() {
   const search = appState.filters.search.trim().toLowerCase();
+  const subFilter = appState.filters.subscription || "all";
+  const byNode = subscriptionIndexByNodeId();
   return appState.nodes.filter((node) => {
     if (appState.filters.protocol !== "all" && node.protocol !== appState.filters.protocol) return false;
     if (appState.filters.region !== "all" && node.region !== appState.filters.region) return false;
+    if (subFilter !== "all") {
+      const sub = byNode.get(node.id);
+      if (subFilter === "__other__") {
+        if (sub) return false;
+      } else if (!sub || sub.id !== subFilter) {
+        return false;
+      }
+    }
     if (!search) return true;
-    return [node.name, node.server, node.source, node.protocol, node.region].some((value) =>
+    const subName = byNode.get(node.id)?.name || "";
+    return [node.name, node.server, node.source, node.protocol, node.region, subName].some((value) =>
       String(value || "").toLowerCase().includes(search)
     );
   });
+}
+
+/**
+ * 将可见节点按订阅分组：优先用 subscription.node_ids；
+ * 未挂在任何订阅下的节点按 source 归到「其他」分组。
+ */
+function groupNodesBySubscription(nodes) {
+  const byNode = subscriptionIndexByNodeId();
+  const groups = new Map();
+
+  for (const sub of appState.subscriptions || []) {
+    groups.set(`sub:${sub.id}`, {
+      id: `sub:${sub.id}`,
+      name: sub.name || "未命名订阅",
+      kind: "subscription",
+      subscription: sub,
+      nodes: [],
+    });
+  }
+
+  for (const node of nodes) {
+    const sub = byNode.get(node.id);
+    let group;
+    if (sub) {
+      const key = `sub:${sub.id}`;
+      group = groups.get(key);
+      if (!group) {
+        group = {
+          id: key,
+          name: sub.name || "未命名订阅",
+          kind: "subscription",
+          subscription: sub,
+          nodes: [],
+        };
+        groups.set(key, group);
+      }
+    } else {
+      const source = String(node.source || "").trim() || "其他节点";
+      const key = `source:${source}`;
+      group = groups.get(key);
+      if (!group) {
+        group = {
+          id: key,
+          name: source,
+          kind: "source",
+          subscription: null,
+          nodes: [],
+        };
+        groups.set(key, group);
+      }
+    }
+    group.nodes.push(node);
+  }
+
+  for (const group of groups.values()) {
+    group.nodes.sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh-CN"));
+  }
+
+  const ordered = [];
+  for (const sub of appState.subscriptions || []) {
+    const group = groups.get(`sub:${sub.id}`);
+    if (group && group.nodes.length) ordered.push(group);
+  }
+  const extras = [...groups.values()]
+    .filter((group) => group.kind === "source" && group.nodes.length)
+    .sort((a, b) => a.name.localeCompare(b.name, "zh-CN"));
+  ordered.push(...extras);
+  return ordered;
+}
+
+function renderNodeRow(node) {
+  const bridge = bridgeForNode(node.id);
+  const browserInstances = browserInstancesForNode(node.id);
+  const runningBrowserCount = runningBrowserInstancesForNode(node.id).length;
+  const browserActive = runningBrowserCount > 0 || appState.active_browsers.includes(node.id);
+  const transport = node.transport || "-";
+  const security = node.security || "";
+  const server = `${node.server}:${node.port}`;
+  const recordLabel = browserInstances.length ? `浏览器记录 ${browserInstances.length}` : "浏览器记录";
+  return `
+    <tr class="node-row ${bridge ? "is-running" : ""}" data-node-id="${escapeHtml(node.id)}">
+      <td>
+        <div class="name-cell">
+          <span class="node-name">${escapeHtml(node.name)}</span>
+        </div>
+      </td>
+      <td><span class="region-cell">${escapeHtml(node.region || "未分类")}</span></td>
+      <td><span class="tag protocol-tag">${escapeHtml(node.protocol)}</span></td>
+      <td><span class="transport-tag"><strong>${escapeHtml(transport)}</strong><em>${escapeHtml(security)}</em></span></td>
+      <td><span class="mono server-cell" title="${escapeHtml(server)}">${escapeHtml(server)}</span></td>
+      <td><span class="tag core-tag">${escapeHtml(node.preferred_core || "sing-box")}</span></td>
+      <td>${testSummary(node.id)}</td>
+      <td>
+        <div class="row-actions">
+          ${
+            bridge
+              ? `<button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}">${icon("copy")}<span>SOCKS</span></button>
+                <button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.http_url || bridge.socks_url)}">${icon("copy")}<span>HTTP</span></button>`
+              : `<button class="row-button primary-row" data-action="start" data-node="${escapeHtml(node.id)}">${icon("play")}<span>启动并复制</span></button>`
+          }
+          <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开不同指纹浏览器 ${escapeHtml(node.name)}" title="新开不同指纹浏览器：独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
+          <button class="row-button" data-action="browser-records" data-node="${escapeHtml(node.id)}" aria-label="查看 ${escapeHtml(node.name)} 的浏览器记录" title="浏览器记录">${icon("list")}<span>${escapeHtml(recordLabel)}</span></button>
+          ${
+            browserActive
+              ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
+              : ""
+          }
+        </div>
+      </td>
+    </tr>
+  `;
+}
+
+function renderNodeGroupHeader(group, { forceExpand = false } = {}) {
+  const collapsed = !forceExpand && isNodeGroupCollapsed(group.id);
+  const runningCount = group.nodes.filter((node) => bridgeForNode(node.id)).length;
+  const kindLabel = group.kind === "subscription" ? "订阅" : "来源";
+  const metaBits = [];
+  if (group.subscription?.url) metaBits.push("URL 订阅");
+  else if (group.kind === "source") metaBits.push("手动/未挂接");
+  const meta = metaBits.join(" · ");
+  return `
+    <tr class="node-group-header ${collapsed ? "is-collapsed" : ""}" data-group-id="${escapeHtml(group.id)}">
+      <td colspan="8">
+        <button
+          type="button"
+          class="node-group-toggle"
+          data-action="toggle-node-group"
+          data-group="${escapeHtml(group.id)}"
+          aria-expanded="${collapsed ? "false" : "true"}"
+          title="${collapsed ? "展开分组" : "折叠分组"}"
+        >
+          <span class="node-group-chevron" aria-hidden="true">${icon("chevron")}</span>
+          <span class="node-group-avatar" aria-hidden="true">${escapeHtml(initials(group.name))}</span>
+          <span class="node-group-text">
+            <span class="node-group-title-row">
+              <strong class="node-group-name">${escapeHtml(group.name)}</strong>
+              <span class="tag node-group-kind">${escapeHtml(kindLabel)}</span>
+            </span>
+            <span class="node-group-meta">
+              ${group.nodes.length} 个节点${runningCount ? ` · ${runningCount} 运行中` : ""}${meta ? ` · ${escapeHtml(meta)}` : ""}
+            </span>
+          </span>
+        </button>
+      </td>
+    </tr>
+  `;
 }
 
 function renderNodes() {
   const rows = $("#nodeRows");
   const empty = $("#emptyNodes");
   const nodes = filteredNodes();
-  $("#nodeCount").textContent = `${nodes.length} / ${appState.nodes.length} 个节点`;
+  const groups = groupNodesBySubscription(nodes);
+  const groupCount = groups.length;
+  $("#nodeCount").textContent =
+    groupCount > 1
+      ? `${nodes.length} / ${appState.nodes.length} 个节点 · ${groupCount} 组`
+      : `${nodes.length} / ${appState.nodes.length} 个节点`;
   empty.classList.toggle("visible", appState.nodes.length === 0);
   if (!nodes.length) {
     rows.innerHTML = "";
@@ -416,49 +642,16 @@ function renderNodes() {
     return;
   }
   empty.classList.remove("visible");
-  rows.innerHTML = nodes
-    .map((node) => {
-      const bridge = bridgeForNode(node.id);
-      const browserInstances = browserInstancesForNode(node.id);
-      const runningBrowserCount = runningBrowserInstancesForNode(node.id).length;
-      const browserActive = runningBrowserCount > 0 || appState.active_browsers.includes(node.id);
-      const transport = node.transport || "-";
-      const security = node.security || "";
-      const server = `${node.server}:${node.port}`;
-      const recordLabel = browserInstances.length ? `浏览器记录 ${browserInstances.length}` : "浏览器记录";
-      return `
-        <tr class="${bridge ? "is-running" : ""}">
-          <td>
-            <div class="name-cell">
-              <span class="node-name">${escapeHtml(node.name)}</span>
-              <span class="node-source">${escapeHtml(node.source || "-")}</span>
-            </div>
-          </td>
-          <td><span class="region-cell">${escapeHtml(node.region || "未分类")}</span></td>
-          <td><span class="tag protocol-tag">${escapeHtml(node.protocol)}</span></td>
-          <td><span class="transport-tag"><strong>${escapeHtml(transport)}</strong><em>${escapeHtml(security)}</em></span></td>
-          <td><span class="mono server-cell" title="${escapeHtml(server)}">${escapeHtml(server)}</span></td>
-          <td><span class="tag core-tag">${escapeHtml(node.preferred_core || "sing-box")}</span></td>
-          <td>${testSummary(node.id)}</td>
-          <td>
-            <div class="row-actions">
-              ${
-                bridge
-                  ? `<button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}">${icon("copy")}<span>SOCKS</span></button>
-                    <button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.http_url || bridge.socks_url)}">${icon("copy")}<span>HTTP</span></button>`
-                  : `<button class="row-button primary-row" data-action="start" data-node="${escapeHtml(node.id)}">${icon("play")}<span>启动并复制</span></button>`
-              }
-              <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开不同指纹浏览器 ${escapeHtml(node.name)}" title="新开不同指纹浏览器：独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
-              <button class="row-button" data-action="browser-records" data-node="${escapeHtml(node.id)}" aria-label="查看 ${escapeHtml(node.name)} 的浏览器记录" title="浏览器记录">${icon("list")}<span>${escapeHtml(recordLabel)}</span></button>
-              ${
-                browserActive
-                  ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
-                  : ""
-              }
-            </div>
-          </td>
-        </tr>
-      `;
+
+  // 搜索时强制展开全部分组，避免命中节点被藏在折叠里。
+  const forceExpand = Boolean(appState.filters.search.trim());
+  // 仅一组时仍显示分组头，便于识别订阅来源；折叠逻辑照常。
+  rows.innerHTML = groups
+    .map((group) => {
+      const collapsed = !forceExpand && isNodeGroupCollapsed(group.id);
+      const header = renderNodeGroupHeader(group, { forceExpand });
+      if (collapsed) return header;
+      return header + group.nodes.map((node) => renderNodeRow(node)).join("");
     })
     .join("");
 }
@@ -921,10 +1114,22 @@ async function handleAction(event) {
   button.disabled = true;
   // 点击后立即进入加载态:隐藏图标、显示旋转 spinner,给用户即时反馈。
   // close / copy 这类瞬时操作不需要转圈。
-  const spins = !["close-core-log", "close-browser-records", "copy", "browser-records"].includes(action);
+  const spins = ![
+    "close-core-log",
+    "close-browser-records",
+    "copy",
+    "browser-records",
+    "toggle-node-group",
+  ].includes(action);
   if (spins) button.classList.add("is-busy");
   try {
-    if (action === "start") {
+    if (action === "toggle-node-group") {
+      const groupId = button.dataset.group;
+      if (groupId) {
+        setNodeGroupCollapsed(groupId, !isNodeGroupCollapsed(groupId));
+        renderNodes();
+      }
+    } else if (action === "start") {
       await startNode(button.dataset.node);
     } else if (action === "test") {
       await testNode(button.dataset.node);
@@ -1089,6 +1294,13 @@ function bindEvents() {
     appState.filters.region = event.target.value;
     renderNodes();
   });
+  const subscriptionFilter = $("#subscriptionFilter");
+  if (subscriptionFilter) {
+    subscriptionFilter.addEventListener("change", (event) => {
+      appState.filters.subscription = event.target.value;
+      renderNodes();
+    });
+  }
   $("#searchInput").addEventListener("input", (event) => {
     appState.filters.search = event.target.value;
     renderNodes();
