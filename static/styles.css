@@ -1011,6 +1011,63 @@ tbody .row-actions .row-button {
   line-height: 1.5;
 }
 
+.pool-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 14px;
+  padding: 14px;
+  border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+  border: 0.5px solid var(--border-subtle);
+  box-shadow: var(--shadow-panel);
+}
+.pool-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.pool-card-head strong {
+  font-size: 14px;
+}
+.pool-link-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pool-link-row {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  border: 0.5px solid var(--border-subtle);
+}
+.pool-link-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.pool-link-url {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.pool-link-empty {
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.pool-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .bridge-card {
   display: flex;
   flex-direction: column;

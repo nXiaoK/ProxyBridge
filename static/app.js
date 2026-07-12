@@ -9,6 +9,7 @@ const appState = {
   tests: {},
   requestLogs: [],
   systemLogs: [],
+  pool: null,
   filters: {
     protocol: "all",
     region: "all",
@@ -223,6 +224,7 @@ async function loadStatus() {
   appState.tests = status.tests || {};
   appState.requestLogs = status.request_logs || [];
   appState.systemLogs = status.system_logs || [];
+  appState.pool = status.pool || null;
   render();
   return true;
 }
@@ -233,6 +235,7 @@ function render() {
   renderSubscriptions();
   renderFilters();
   renderNodes();
+  renderPool();
   renderBridges();
   renderLogFilters();
   renderRequestLogs();
@@ -457,6 +460,43 @@ function renderNodes() {
         </tr>
       `;
     })
+    .join("");
+}
+
+function renderPool() {
+  const pool = appState.pool || {};
+  const links = pool.links || {};
+  const countEl = $("#poolMemberCount");
+  if (countEl) {
+    const n = Number(pool.member_count || 0);
+    countEl.textContent = `${n} 个成员`;
+  }
+  const listBtn = $("#poolCopyListJson");
+  const txtBtn = $("#poolCopyProxiesTxt");
+  const getBtn = $("#poolCopyGet");
+  if (listBtn) listBtn.dataset.text = links.list_json || "";
+  if (txtBtn) txtBtn.dataset.text = links.proxies_txt || "";
+  if (getBtn) getBtn.dataset.text = links.get_random || "";
+
+  const rows = $("#poolLinkRows");
+  if (!rows) return;
+  const items = [
+    ["JSON 列表", links.list_json],
+    ["文本列表", links.proxies_txt],
+    ["随机获取", links.get_random],
+  ].filter(([, url]) => url);
+  if (!items.length) {
+    rows.innerHTML = `<div class="pool-link-empty">启动本地代理后，这里会显示可复制的代理池链接。</div>`;
+    return;
+  }
+  rows.innerHTML = items
+    .map(
+      ([label, url]) => `
+      <div class="pool-link-row">
+        <span class="pool-link-label">${escapeHtml(label)}</span>
+        <code class="pool-link-url" title="${escapeHtml(url)}">${escapeHtml(url)}</code>
+      </div>`
+    )
     .join("");
 }
 
@@ -902,6 +942,10 @@ async function handleAction(event) {
       await downloadKernel();
     } else if (action === "copy") {
       await copyText(button.dataset.text);
+    } else if (action === "rotate-pool-token") {
+      await api("/api/pool/token/rotate", {});
+      await loadStatus();
+      showToast("代理池密钥已轮换，旧链接立即失效");
     } else if (action === "stop") {
       const result = await api("/api/bridges/stop", { id: button.dataset.id });
       await loadStatus();

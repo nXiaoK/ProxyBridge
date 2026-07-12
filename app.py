@@ -6,11 +6,14 @@ import base64
 import collections
 import concurrent.futures
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
 import platform
+import random
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -50,6 +53,14 @@ ACTIVE_BROWSER_STATUSES = {"running", "starting"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
 CORE_LOG_ENTRY_LIMIT = 30
+POOL_TOKEN_MIN_LEN = 16
+POOL_TOKEN_MAX_LEN = 128
+# 字符集与 BACKEND_INSTANCE_TOKEN_PATTERN 对齐；长度策略刻意更严（min 16）。
+POOL_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
+# Only consumer paths `/pool/{token}/…` (or requestline with a space before them).
+# Do not match console routes like `/api/pool/token/rotate`.
+_POOL_PATH_REDACT = re.compile(r"(^|[\s\"'])(/pool/)([^/\s]+)(/[^\s]*)?")
+ALLOWED_PROXY_PROTOCOLS = frozenset({"socks5", "http"})
 PROCESS_TABLE: dict[str, subprocess.Popen] = {}
 BRIDGE_NODE_TABLE: dict[str, str] = {}
 # 兼容旧的节点级浏览器进程表;新的多开浏览器以 BROWSER_PROCESS_TABLE 按实例记录。
@@ -69,6 +80,8 @@ CORE_INSTALL_LOCK = threading.RLock()
 BROWSER_LAUNCH_LOCK = threading.RLock()
 FINGERPRINT_INSTALL_LOCK = threading.RLock()
 SHUTDOWN_LOCK = threading.RLock()
+POOL_RR_LOCK = threading.Lock()
+POOL_RR_COUNTER = 0
 CORE_AUTO_INSTALL_STARTED = threading.Event()
 FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
 FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
@@ -951,6 +964,8 @@ def load_state(reset_running: bool = False) -> dict[str, Any]:
         state[field_name] = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
     if not isinstance(state.get("tests"), dict):
         state["tests"] = {}
+    settings = state.get("settings")
+    state["settings"] = settings if isinstance(settings, dict) else {}
     for bridge in state["bridges"]:
         if "enabled" not in bridge:
             bridge["enabled"] = bridge.get("status") in ACTIVE_BRIDGE_STATUSES
@@ -1429,7 +1444,9 @@ def _status_payload() -> dict[str, Any]:
         state = load_state()
         changed = sync_process_status(state)
         changed |= sync_browser_instance_status(state)
-        if changed:
+        token, token_changed = ensure_pool_token(state)
+        members = pool_members(state, ready_only=False)
+        if changed or token_changed:
             save_state(state)
         return {
             "cores": core_paths(),
@@ -1443,8 +1460,277 @@ def _status_payload() -> dict[str, Any]:
             "tests": state.get("tests", {}),
             "request_logs": state.get("request_logs", [])[:200],
             "system_logs": system_log_entries()[:300],
+            "pool": {
+                "member_count": len(members),
+                "base_url": f"{console_base_url()}/pool/{token}",
+                "links": pool_links(token),
+            },
             "version": "0.1.0",
         }
+
+
+# ---------------------------------------------------------------------------
+# Proxy pool: derived view of active local bridges + tokenized discovery URLs
+# ---------------------------------------------------------------------------
+
+
+def new_pool_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
+def ensure_pool_token(state: dict[str, Any]) -> tuple[str, bool]:
+    """Return (token, changed). Caller must save_state if changed under STATE_LOCK."""
+    settings = state.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+        state["settings"] = settings
+    token = str(settings.get("pool_token") or "")
+    if not (POOL_TOKEN_MIN_LEN <= len(token) <= POOL_TOKEN_MAX_LEN) or POOL_TOKEN_PATTERN.fullmatch(token) is None:
+        token = new_pool_token()
+        settings["pool_token"] = token
+        return token, True
+    return token, False
+
+
+def pool_tokens_equal(provided: str, expected: str) -> bool:
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
+def console_base_url() -> str:
+    port = safe_int(os.environ.get("PROXY_BRIDGE_PORT"), DEFAULT_SERVER_PORT)
+    if port <= 0 or port > 65535:
+        port = DEFAULT_SERVER_PORT
+    # Always use 127.0.0.1 even if the user opens the console via localhost.
+    return f"http://127.0.0.1:{port}"
+
+
+def pool_links(token: str) -> dict[str, str]:
+    base = f"{console_base_url()}/pool/{token}"
+    return {
+        "list_json": f"{base}/list.json",
+        "proxies_txt": f"{base}/proxies.txt",
+        "get_random": f"{base}/get?strategy=random",
+        "get_round_robin": f"{base}/get?strategy=round_robin",
+        "get_random_socks5": f"{base}/get?strategy=random&protocol=socks5",
+        "get_random_http": f"{base}/get?strategy=random&protocol=http",
+    }
+
+
+def is_pool_member(bridge: dict[str, Any]) -> bool:
+    """List membership: discoverable active local proxy (may still be starting)."""
+    if bridge.get("status") not in ACTIVE_BRIDGE_STATUSES:
+        return False
+    port = safe_int(bridge.get("port"), 0)
+    return port > 0
+
+
+def is_pick_ready_member(bridge: dict[str, Any]) -> bool:
+    """Pick readiness: prefer actually serving endpoints."""
+    if not is_pool_member(bridge):
+        return False
+    if bridge.get("status") != "running":
+        return False
+    bridge_id = str(bridge.get("id") or "")
+    return bool(bridge_id and bridge_runtime_is_active(bridge_id))
+
+
+def public_pool_member(bridge: dict[str, Any]) -> dict[str, Any]:
+    port = safe_int(bridge.get("port"), 0)
+    socks = bridge.get("socks_url") or (f"socks5://127.0.0.1:{port}" if port else "")
+    http = bridge.get("http_url") or (f"http://127.0.0.1:{port}" if port else "")
+    return {
+        "id": bridge.get("id"),
+        "node_id": bridge.get("node_id"),
+        "node_name": bridge.get("node_name"),
+        "region": bridge.get("region") or "",
+        "node_protocol": bridge.get("protocol") or "",
+        "port": port,
+        "socks_url": socks,
+        "http_url": http,
+        "supported_proxy_protocols": bridge.get("supported_proxy_protocols")
+        or ["socks5", "http", "https-connect"],
+        "status": bridge.get("status"),
+    }
+
+
+def pool_members(
+    state: dict[str, Any],
+    *,
+    region: str | None = None,
+    q: str | None = None,
+    ready_only: bool = False,
+) -> list[dict[str, Any]]:
+    """Membership only. Does NOT take protocol (output preference is separate)."""
+    region_filter = (region or "").strip()
+    query = (q or "").strip().lower()
+    members: list[dict[str, Any]] = []
+    for bridge in state.get("bridges", []):
+        if not isinstance(bridge, dict):
+            continue
+        if ready_only:
+            if not is_pick_ready_member(bridge):
+                continue
+        elif not is_pool_member(bridge):
+            continue
+        if region_filter and str(bridge.get("region") or "") != region_filter:
+            continue
+        if query and query not in str(bridge.get("node_name") or "").lower():
+            continue
+        members.append(bridge)
+    members.sort(
+        key=lambda item: (
+            str(item.get("node_name") or "").lower(),
+            safe_int(item.get("port"), 0),
+            str(item.get("id") or ""),
+        )
+    )
+    return members
+
+
+def parse_protocol_param(raw: str | None) -> str | None:
+    if raw is None or raw == "":
+        return None
+    value = raw.strip().lower()
+    if value not in ALLOWED_PROXY_PROTOCOLS:
+        raise ValueError("protocol 只能是 socks5 或 http")
+    return value
+
+
+def select_proxy_url(member: dict[str, Any], protocol: str | None) -> str:
+    preferred = protocol or "socks5"
+    if preferred == "http":
+        return str(member.get("http_url") or "")
+    return str(member.get("socks_url") or "")
+
+
+def render_proxies_txt(members: list[dict[str, Any]], protocol: str | None) -> str:
+    lines: list[str] = []
+    for member in members:
+        if protocol is None:
+            socks = str(member.get("socks_url") or "")
+            http = str(member.get("http_url") or "")
+            if socks:
+                lines.append(socks)
+            if http:
+                lines.append(http)
+        else:
+            url = select_proxy_url(member, protocol)
+            if url:
+                lines.append(url)
+    return "".join(f"{line}\n" for line in lines)
+
+
+def pick_round_robin(members: list[dict[str, Any]]) -> dict[str, Any]:
+    global POOL_RR_COUNTER
+    if not members:
+        raise ValueError("代理池为空")
+    with POOL_RR_LOCK:
+        idx = POOL_RR_COUNTER % len(members)
+        POOL_RR_COUNTER += 1
+    return members[idx]
+
+
+def pick_pool_member(members: list[dict[str, Any]], strategy: str) -> dict[str, Any]:
+    if not members:
+        raise ValueError("代理池为空")
+    if strategy == "random":
+        return random.choice(members)
+    if strategy == "round_robin":
+        return pick_round_robin(members)
+    raise ValueError("strategy 只能是 random 或 round_robin")
+
+
+def pool_snapshot(
+    *,
+    ready_only: bool = False,
+    region: str | None = None,
+    q: str | None = None,
+) -> dict[str, Any]:
+    """Normative read path. Never call synchronize_process_state while holding only STATE_LOCK."""
+    with SHUTDOWN_LOCK:
+        synchronize_process_state()
+        with STATE_LOCK:
+            state = load_state()
+            changed = sync_process_status(state)
+            token, token_changed = ensure_pool_token(state)
+            members = pool_members(state, region=region, q=q, ready_only=ready_only)
+            if changed or token_changed:
+                save_state(state)
+            return {
+                "token": token,
+                "members": [public_pool_member(m) for m in members],
+                "updated_at": float(now_ts()),
+            }
+
+
+def pool_admin_payload() -> dict[str, Any]:
+    snapshot = pool_snapshot(ready_only=False)
+    token = str(snapshot["token"])
+    members = snapshot["members"]
+    return {
+        "member_count": len(members),
+        "base_url": f"{console_base_url()}/pool/{token}",
+        "links": pool_links(token),
+        "members": members,
+        "strategies": ["random", "round_robin"],
+        "formats": ["list.json", "proxies.txt", "get"],
+    }
+
+
+def rotate_pool_token() -> dict[str, Any]:
+    with SHUTDOWN_LOCK:
+        with STATE_LOCK:
+            state = load_state()
+            settings = state.get("settings")
+            if not isinstance(settings, dict):
+                settings = {}
+                state["settings"] = settings
+            token = new_pool_token()
+            settings["pool_token"] = token
+            save_state(state)
+            return {
+                "ok": True,
+                "base_url": f"{console_base_url()}/pool/{token}",
+                "links": pool_links(token),
+            }
+
+
+def _redact_pool_token_in_log_arg(value: Any) -> Any:
+    if not isinstance(value, str) or "/pool/" not in value:
+        return value
+    # Groups: prefix, "/pool/", token, optional rest → keep prefix + /pool/ + *** + rest
+    return _POOL_PATH_REDACT.sub(r"\1\2***\4", value)
+
+
+def parse_pool_path(path: str) -> tuple[str | None, str | None, str | None]:
+    """Return (token, action, error_kind).
+
+    error_kind is None on success; otherwise 'not_found' or 'forbidden'.
+    """
+    raw = urllib.parse.unquote(path or "")
+    if raw in {"/pool", "/pool/"}:
+        return None, None, "not_found"
+    if not raw.startswith("/pool/"):
+        return None, None, "not_found"
+    remainder = raw[len("/pool/") :]
+    # Preserve empty token segment for "/pool//list.json".
+    parts = remainder.split("/")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+    if len(parts) != 2:
+        if parts and parts[0] == "":
+            return None, None, "forbidden"
+        return None, None, "not_found"
+    token, action = parts[0], parts[1]
+    if token == "":
+        return None, None, "forbidden"
+    if POOL_TOKEN_PATTERN.fullmatch(token) is None:
+        return None, None, "forbidden"
+    if action not in {"list.json", "proxies.txt", "get"}:
+        return None, None, "not_found"
+    return token, action, None
 
 
 def fetch_subscription(url: str) -> str:
@@ -3523,14 +3809,38 @@ def copy_to_clipboard(text: str) -> dict[str, Any]:
     return {"ok": False, "text": text}
 
 
-def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
+def json_response(
+    handler: BaseHTTPRequestHandler,
+    payload: Any,
+    status: int = 200,
+    *,
+    head_only: bool = False,
+) -> None:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
     send_backend_instance_header(handler)
     handler.end_headers()
-    handler.wfile.write(data)
+    if not head_only:
+        handler.wfile.write(data)
+
+
+def text_response(
+    handler: BaseHTTPRequestHandler,
+    body: str,
+    status: int = 200,
+    *,
+    head_only: bool = False,
+) -> None:
+    data = body.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/plain; charset=utf-8")
+    handler.send_header("Content-Length", str(len(data)))
+    send_backend_instance_header(handler)
+    handler.end_headers()
+    if not head_only:
+        handler.wfile.write(data)
 
 
 def send_backend_instance_header(handler: BaseHTTPRequestHandler) -> None:
@@ -3541,7 +3851,9 @@ def send_backend_instance_header(handler: BaseHTTPRequestHandler) -> None:
 
 def error_response(handler: BaseHTTPRequestHandler, exc: Exception, status: int = 400) -> None:
     # 统一记录所有 API 错误到系统日志,便于事后排查失败的操作。
-    log_event(f"{handler.command} {handler.path} 失败:{exc}", level="error", category="接口")
+    # 脱敏 /pool/{token}/… 防止 token 写入 menubar-backend.log / 系统日志。
+    safe_path = _redact_pool_token_in_log_arg(handler.path)
+    log_event(f"{handler.command} {safe_path} 失败:{exc}", level="error", category="接口")
     json_response(handler, {"error": str(exc)}, status)
 
 
@@ -3549,7 +3861,8 @@ class AppHandler(BaseHTTPRequestHandler):
     server_version = "ProxyBridge/0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+        safe_args = tuple(_redact_pool_token_in_log_arg(a) for a in args)
+        sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), fmt % safe_args))
 
     def is_trusted_request(self) -> bool:
         if not _is_loopback_host(self.headers.get("Host") or ""):
@@ -3599,13 +3912,124 @@ class AppHandler(BaseHTTPRequestHandler):
         data = self.rfile.read(length)
         return json.loads(data.decode("utf-8"))
 
+    def handle_pool_request(self, parsed: urllib.parse.SplitResult, *, head_only: bool = False) -> None:
+        host = self.headers.get("Host") or ""
+        if not _is_loopback_host(host):
+            json_response(self, {"error": "无效的代理池凭证"}, 403, head_only=head_only)
+            return
+        token, action, error_kind = parse_pool_path(parsed.path)
+        if error_kind == "forbidden":
+            json_response(self, {"error": "无效的代理池凭证"}, 403, head_only=head_only)
+            return
+        if error_kind == "not_found" or token is None or action is None:
+            json_response(self, {"error": "未找到代理池资源"}, 404, head_only=head_only)
+            return
+
+        params = urllib.parse.parse_qs(parsed.query)
+        try:
+            protocol = parse_protocol_param(first(params, "protocol", default="") or None)
+            region = first(params, "region", default="").strip() or None
+            q = first(params, "q", default="").strip() or None
+            strategy = (first(params, "strategy", default="random") or "random").strip().lower()
+            response_format = (first(params, "format", default="json") or "json").strip().lower()
+            include_starting = truthy(first(params, "include_starting", default=""))
+            if action == "get":
+                if strategy not in {"random", "round_robin"}:
+                    raise ValueError("strategy 只能是 random 或 round_robin")
+                if response_format not in {"json", "text"}:
+                    raise ValueError("format 只能是 json 或 text")
+        except ValueError as exc:
+            error_response(self, exc, 400)
+            return
+
+        try:
+            with SHUTDOWN_LOCK:
+                synchronize_process_state()
+                with STATE_LOCK:
+                    state = load_state()
+                    changed = sync_process_status(state)
+                    expected_token, token_changed = ensure_pool_token(state)
+                    if changed or token_changed:
+                        save_state(state)
+                    if not pool_tokens_equal(token, expected_token):
+                        json_response(self, {"error": "无效的代理池凭证"}, 403, head_only=head_only)
+                        return
+
+                    if action == "list.json":
+                        members = [
+                            public_pool_member(m)
+                            for m in pool_members(state, region=region, q=q, ready_only=False)
+                        ]
+                        payload = {
+                            "count": len(members),
+                            "updated_at": float(now_ts()),
+                            "proxies": members,
+                        }
+                        if protocol is not None:
+                            payload["protocol"] = protocol
+                        json_response(self, payload, head_only=head_only)
+                        return
+
+                    if action == "proxies.txt":
+                        members = [
+                            public_pool_member(m)
+                            for m in pool_members(state, region=region, q=q, ready_only=False)
+                        ]
+                        body = render_proxies_txt(members, protocol)
+                        text_response(self, body, head_only=head_only)
+                        return
+
+                    # action == "get"
+                    ready_members = [
+                        public_pool_member(m)
+                        for m in pool_members(state, region=region, q=q, ready_only=True)
+                    ]
+                    candidates = ready_members
+                    if not candidates and include_starting:
+                        candidates = [
+                            public_pool_member(m)
+                            for m in pool_members(state, region=region, q=q, ready_only=False)
+                        ]
+                    if not candidates:
+                        if response_format == "text":
+                            text_response(self, "error: pool empty\n", 404, head_only=head_only)
+                        else:
+                            json_response(self, {"error": "代理池为空"}, 404, head_only=head_only)
+                        return
+                    picked = pick_pool_member(candidates, strategy)
+                    picked_url = select_proxy_url(picked, protocol)
+                    if response_format == "text":
+                        text_response(self, f"{picked_url}\n", head_only=head_only)
+                        return
+                    json_response(
+                        self,
+                        {
+                            "strategy": strategy,
+                            "protocol": protocol or "socks5",
+                            "picked_url": picked_url,
+                            "proxy": picked,
+                        },
+                        head_only=head_only,
+                    )
+        except Exception as exc:
+            error_response(self, exc, 400)
+
     def do_GET(self) -> None:
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path.startswith("/pool/") or parsed.path in {"/pool", "/pool/"}:
+            self.handle_pool_request(parsed, head_only=False)
+            return
         if not self.is_trusted_request():
             self._send_request_error(403, "不可信请求来源")
             return
-        parsed = urllib.parse.urlsplit(self.path)
         if parsed.path == "/api/status":
             json_response(self, status_payload())
+            return
+        if parsed.path == "/api/pool":
+            try:
+                json_response(self, pool_admin_payload())
+            except Exception as exc:
+                error_response(self, exc, 400)
             return
         if parsed.path == "/api/core/logs":
             params = urllib.parse.parse_qs(parsed.query)
@@ -3636,10 +4060,14 @@ class AppHandler(BaseHTTPRequestHandler):
         self.serve_static()
 
     def do_HEAD(self) -> None:
+        parsed = urllib.parse.urlsplit(self.path)
+        if parsed.path.startswith("/pool/") or parsed.path in {"/pool", "/pool/"}:
+            self.handle_pool_request(parsed, head_only=True)
+            return
         if not self.is_trusted_request():
             self._send_request_error(403, "不可信请求来源")
             return
-        if self.path == "/api/status":
+        if self.path == "/api/status" or parsed.path == "/api/status":
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", "0")
@@ -3706,6 +4134,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 log_event("连接日志已清空", category="系统")
             elif self.path == "/api/system/logs/clear":
                 json_response(self, clear_system_logs())
+            elif self.path == "/api/pool/token/rotate":
+                result = rotate_pool_token()
+                log_event("代理池 token 已轮换", category="代理")
+                json_response(self, result)
             else:
                 error_response(self, ValueError("未知 API"), 404)
         except (urllib.error.URLError, TimeoutError) as exc:

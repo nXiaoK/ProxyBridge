@@ -118,6 +118,27 @@ http://127.0.0.1:8787
 PROXY_BRIDGE_PORT=8790 python3 app.py
 ```
 
+## 代理池
+
+运行中的本地代理会自动进入**代理池**（`status` 为 `running` / `starting` 且端口有效）。控制台「本地代理」页可复制链接；也可在 `state.json` 的 `settings.pool_token` 中查看密钥。
+
+消费端只需 loopback + path token（无需控制台 Origin），例如：
+
+```bash
+# 假设 token 为 <token>，控制台端口 8787
+curl -sS "http://127.0.0.1:8787/pool/<token>/list.json"
+curl -sS "http://127.0.0.1:8787/pool/<token>/proxies.txt"
+curl -sS "http://127.0.0.1:8787/pool/<token>/get?strategy=random&protocol=socks5"
+```
+
+说明：
+
+- `list.json` / `proxies.txt` 返回**可发现**成员，可能短暂包含尚未就绪的 `starting` 端口。
+- `/get` 默认只返回**已就绪**端口（`running` 且本地代理进程活跃）；需要包含启动中成员时可加 `?include_starting=1`。
+- `proxies.txt` 默认每个成员输出 socks5 一行 + http 一行；可用 `?protocol=socks5` 或 `http` 收窄。
+- 轮换密钥后旧链接立即失效（控制台「轮换密钥」，或 `POST /api/pool/token/rotate`）。
+- 服务仍只监听 `127.0.0.1`；access log 会脱敏 path 中的 token。
+
 ## 数据位置
 
 Web 控制台模式：

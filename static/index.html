@@ -191,6 +191,20 @@
             </div>
           </header>
           <div class="view-body">
+            <section class="pool-card" id="poolCard" aria-label="代理池">
+              <div class="pool-card-head">
+                <strong>代理池</strong>
+                <span class="countline" id="poolMemberCount">0 个成员</span>
+              </div>
+              <p class="view-hint">自动包含所有运行中/启动中的本地 HTTP / SOCKS5 代理。列表链接可能短暂包含尚未就绪的节点；「随机获取」默认只返回已就绪端口。将链接粘贴到脚本或爬虫即可拉取。</p>
+              <div class="pool-link-rows" id="poolLinkRows"></div>
+              <div class="pool-card-actions">
+                <button type="button" class="toolbar-button" data-action="copy" id="poolCopyListJson" data-text="">复制 JSON 列表链接</button>
+                <button type="button" class="toolbar-button" data-action="copy" id="poolCopyProxiesTxt" data-text="">复制文本列表链接</button>
+                <button type="button" class="toolbar-button" data-action="copy" id="poolCopyGet" data-text="">复制随机获取链接</button>
+                <button type="button" class="toolbar-button danger" data-action="rotate-pool-token" id="poolRotateToken">轮换密钥</button>
+              </div>
+            </section>
             <div class="bridge-list" id="bridgeList"></div>
           </div>
         </section>
