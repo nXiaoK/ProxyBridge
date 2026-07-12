@@ -289,6 +289,7 @@
           <div class="view-body sync-body">
             <p class="view-hint">
               在多台 Mac 之间同步<strong>订阅 / 节点</strong>与<strong>已停止的指纹浏览器 Profile</strong>（Cookie、LocalStorage 等），实现换机接力。
+              删除订阅会清理关联节点的浏览器记录与本地 Profile，并在启用同步时<strong>自动上传</strong>（远端对应数据一并删除）。
               请先在本机关闭目标浏览器再上传；不要两边同时打开同一浏览器实例。
             </p>
             <form id="syncForm" class="sync-card">
@@ -316,6 +317,10 @@
                 <label class="sync-checkbox">
                   <input id="syncEnabled" name="enabled" type="checkbox">
                   <span>启用同步</span>
+                </label>
+                <label class="sync-checkbox">
+                  <input id="syncInsecureSsl" name="insecure_ssl" type="checkbox">
+                  <span>忽略 SSL 证书校验（过期/自签可用，有安全风险）</span>
                 </label>
               </div>
 

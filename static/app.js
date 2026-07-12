@@ -194,6 +194,8 @@ function applySyncSettingsToForm(settings, { force = false } = {}) {
   $("#syncEnabled").checked = Boolean(settings.enabled);
   $("#syncAutoUpload").checked = Boolean(settings.auto_upload_on_browser_stop);
   $("#syncCheckStartup").checked = Boolean(settings.check_on_startup);
+  const insecure = $("#syncInsecureSsl");
+  if (insecure) insecure.checked = Boolean(settings.insecure_ssl);
   $("#syncEncrypt").checked = Boolean(settings.encrypt);
   $("#syncEncryptPassword").value = "";
   $("#syncEncryptPassword").placeholder = settings.encrypt_password_set ? "已设置，留空不改" : "加密密码";
@@ -249,6 +251,7 @@ async function saveSyncSettings(event) {
     enabled: $("#syncEnabled").checked,
     auto_upload_on_browser_stop: $("#syncAutoUpload").checked,
     check_on_startup: $("#syncCheckStartup").checked,
+    insecure_ssl: Boolean($("#syncInsecureSsl")?.checked),
     encrypt: $("#syncEncrypt").checked,
   };
   const password = $("#syncPassword").value;
@@ -1162,6 +1165,35 @@ function showBrowserRecords(nodeId, trigger = null) {
   modal.querySelector('[data-action="close-browser-records"]')?.focus();
 }
 
+/** Open browser records after an optional WebDAV pull so profiles are up to date. */
+async function openBrowserRecordsWithSync(nodeId, trigger = null) {
+  if (!nodeId) return;
+  const sync = appState.sync || {};
+  if (sync.enabled && sync.url) {
+    try {
+      showToast("正在从远端同步浏览器数据…");
+      const result = await api("/api/sync/pull", {});
+      if (result.settings) appState.sync = result.settings;
+      await loadStatus();
+      if (result.skipped && result.reason === "already_latest") {
+        showToast("已是最新");
+      } else if (result.ok === false) {
+        showToast((result.errors || []).join("; ") || "同步有错误，显示本地记录", "error");
+      } else {
+        showToast("远端同步完成");
+      }
+    } catch (error) {
+      showToast(`同步失败，显示本地记录：${error.message}`, "error");
+      try {
+        await loadStatus();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+  showBrowserRecords(nodeId, trigger);
+}
+
 async function copyText(text) {
   let copied = false;
   try {
@@ -1276,7 +1308,7 @@ async function handleAction(event) {
     } else if (action === "stop-browser-instance") {
       await stopBrowser(button.dataset.node, button.dataset.instance);
     } else if (action === "browser-records") {
-      showBrowserRecords(button.dataset.node, button);
+      await openBrowserRecordsWithSync(button.dataset.node, button);
     } else if (action === "download-kernel") {
       await downloadKernel();
     } else if (action === "copy") {

@@ -167,6 +167,58 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertFalse(forced.get("skipped"))
         self.assertIn("inst1", forced.get("skipped_unchanged") or forced.get("downloaded_profiles") or [])
 
+    def test_push_deletes_remote_profile_for_removed_instance(self):
+        self.engine.push()
+        profile_url = self.engine.client_factory(self._load()["settings"]["webdav"]).url_for(
+            "ProxyBridge", "profiles", "inst1.tar.gz"
+        )
+        # Re-resolve via store: memory client base + path
+        store_client = self.store.client(self._load()["settings"]["webdav"])
+        purl = store_client.url_for("ProxyBridge", "profiles", "inst1.tar.gz")
+        self.assertIn(purl, self.store.files)
+
+        with self.lock:
+            state = self._load()
+            state["browser_instances"] = []
+            state["subscriptions"] = []
+            state["nodes"] = []
+            self._save(state)
+        self.engine.mark_local_change()
+        result = self.engine.push()
+        self.assertTrue(result["ok"])
+        self.assertIn("inst1", result.get("deleted_remote_profiles") or [])
+        self.assertNotIn(purl, self.store.files)
+        # Manifest should not list removed profile.
+        man = json.loads(self.store.files[store_client.url_for("ProxyBridge", "manifest.json")].decode("utf-8"))
+        self.assertNotIn("inst1", man.get("profile_hashes") or {})
+
+    def test_apply_remote_state_removes_local_only_subscription(self):
+        local = {
+            "subscriptions": [{"id": "sub1", "name": "keep"}, {"id": "sub-gone", "name": "delete-me"}],
+            "nodes": [{"id": "n1", "name": "A"}, {"id": "n-gone", "name": "B"}],
+            "browser_instances": [
+                {"id": "inst-keep", "node_id": "n1", "name": "B1", "status": "stopped", "legacy": False},
+                {"id": "inst-gone", "node_id": "n-gone", "name": "B2", "status": "stopped", "legacy": False},
+            ],
+        }
+        remote = {
+            "subscriptions": [{"id": "sub1", "name": "keep"}],
+            "nodes": [{"id": "n1", "name": "A"}],
+            "browser_instances": [
+                {"id": "inst-keep", "node_id": "n1", "name": "B1", "status": "stopped", "legacy": False},
+            ],
+        }
+        applied = webdav_sync.apply_remote_state(
+            local,
+            remote,
+            profile_path_builder=lambda n, i, legacy=False: Path(f"/tmp/{n}/{i}"),
+        )
+        self.assertEqual([s["id"] for s in local["subscriptions"]], ["sub1"])
+        self.assertEqual([n["id"] for n in local["nodes"]], ["n1"])
+        self.assertEqual([b["id"] for b in local["browser_instances"]], ["inst-keep"])
+        self.assertIn("sub-gone", applied["removed_subscription_ids"])
+        self.assertIn("inst-gone", applied["removed_browser_ids"])
+
     def test_remote_is_already_latest_helper(self):
         cfg = {
             "device_id": "dev-a",
@@ -190,11 +242,50 @@ class WebDAVSyncUnitTests(unittest.TestCase):
             webdav_sync.remote_is_already_latest(cfg2, {"updated_at": 250, "device_id": "other"})
         )
 
+    def test_exists_retries_get_when_head_404(self):
+        """Some WebDAV servers lie on HEAD; file may still be fetchable via GET."""
+
+        class FlakyHeadClient(webdav_sync.MemoryWebDAVClient):
+            def request(self, method, url, *, data=None, headers=None, allow_statuses=None):
+                if method == "HEAD":
+                    return 404, {}, b""
+                if method == "GET":
+                    if url in self.store.files:
+                        return 200, {}, self.store.files[url]
+                    return 404, {}, b""
+                return super().request(method, url, data=data, headers=headers, allow_statuses=allow_statuses)
+
+            def exists(self, url: str) -> bool:
+                # Exercise the real WebDAVClient.exists logic with a thin adapter.
+                status, _, _ = self.request("HEAD", url, allow_statuses={200, 204, 404, 405, 501})
+                if status in {200, 204}:
+                    return True
+                status, _, _ = self.request("GET", url, allow_statuses={200, 204, 404})
+                return status in {200, 204}
+
+        store = webdav_sync.MemoryWebDAV()
+        client = FlakyHeadClient(store, "https://dav.test/base")
+        url = client.url_for("ProxyBridge", "manifest.json")
+        self.assertFalse(client.exists(url))
+        store.files[url] = b'{"ok":true}'
+        self.assertTrue(client.exists(url))
+
     def test_public_settings_masks_secrets(self):
         pub = webdav_sync.public_webdav_settings(self._load()["settings"]["webdav"])
         self.assertTrue(pub["password_set"])
         self.assertNotIn("password", pub)
         self.assertNotIn("encrypt_password", pub)
+        self.assertIn("insecure_ssl", pub)
+
+    def test_insecure_ssl_client_builds(self):
+        client = webdav_sync.WebDAVClient(
+            "https://example.invalid/dav",
+            username="u",
+            password="p",
+            insecure_ssl=True,
+        )
+        self.assertTrue(client.insecure_ssl)
+        self.assertIsNotNone(client._opener)
 
     def test_apply_remote_state_lww(self):
         local = {

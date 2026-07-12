@@ -1861,18 +1861,106 @@ def refresh_subscription(subscription_id: str) -> dict[str, Any]:
     return import_subscription({"name": subscription.get("name"), "url": url})
 
 
+def _purge_browser_resources_for_nodes(state: dict[str, Any], node_ids: set[str]) -> dict[str, Any]:
+    """Stop browsers, drop records, and delete Profile dirs for the given node ids.
+
+    Caller must hold STATE_LOCK when mutating ``state``. Profile directory removal is
+    done here after process stop; returns summary for logging / auto-sync.
+    """
+    node_ids = {str(n) for n in node_ids if n}
+    if not node_ids:
+        return {"removed_instances": [], "killed_browsers": 0, "removed_profiles": 0}
+
+    instances = [
+        item
+        for item in state.get("browser_instances", [])
+        if isinstance(item, dict) and str(item.get("node_id") or "") in node_ids
+    ]
+    instance_ids = [str(item.get("id") or "") for item in instances if item.get("id")]
+    killed = stop_browser_instances(state, instance_ids) if instance_ids else 0
+    for node_id in node_ids:
+        try:
+            killed += stop_untracked_browser_processes_for_node(node_id)
+        except Exception:
+            pass
+
+    state["browser_instances"] = [
+        item
+        for item in state.get("browser_instances", [])
+        if not (isinstance(item, dict) and str(item.get("node_id") or "") in node_ids)
+    ]
+
+    removed_profiles = 0
+    for item in instances:
+        iid = str(item.get("id") or "")
+        node_id = str(item.get("node_id") or "")
+        legacy = bool(item.get("legacy"))
+        try:
+            path = browser_instance_profile_path(node_id, iid, legacy)
+            if path.exists():
+                shutil.rmtree(path, ignore_errors=True)
+                removed_profiles += 1
+            # Remove empty node-level profile root.
+            root = browser_node_profile_root(node_id)
+            if root.exists() and root.is_dir() and not any(root.iterdir()):
+                shutil.rmtree(root, ignore_errors=True)
+        except Exception:
+            pass
+
+    return {
+        "removed_instances": instance_ids,
+        "killed_browsers": killed,
+        "removed_profiles": removed_profiles,
+    }
+
+
 def delete_subscription(subscription_id: str) -> dict[str, Any]:
+    bridge_ids_to_stop: list[str] = []
+    remove_ids: set[str] = set()
+    purge_summary: dict[str, Any] = {"removed_instances": [], "killed_browsers": 0, "removed_profiles": 0}
     with STATE_LOCK:
         state = load_state()
         subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
         if not subscription:
             raise ValueError("订阅不存在")
         state["subscriptions"] = [s for s in state["subscriptions"] if s.get("id") != subscription_id]
-        remove_ids = set(subscription.get("node_ids") or []) - referenced_node_ids(state["subscriptions"])
+        remove_ids = {
+            str(n)
+            for n in (set(subscription.get("node_ids") or []) - referenced_node_ids(state["subscriptions"]))
+            if n
+        }
+        # Stop + drop fingerprint browsers / local Profile dirs for purged nodes.
+        purge_summary = _purge_browser_resources_for_nodes(state, remove_ids)
         state["nodes"] = [n for n in state["nodes"] if n.get("id") not in remove_ids]
+        # Collect bridges that belong to removed nodes (stop outside lock).
+        for bridge in state.get("bridges", []):
+            if not isinstance(bridge, dict):
+                continue
+            if str(bridge.get("node_id") or "") in remove_ids and (
+                bridge.get("status") in ACTIVE_BRIDGE_STATUSES or bridge.get("enabled")
+            ):
+                bid = str(bridge.get("id") or "")
+                if bid:
+                    bridge_ids_to_stop.append(bid)
         save_state(state)
+
+    for bridge_id in bridge_ids_to_stop:
+        try:
+            stop_bridge(bridge_id)
+        except Exception:
+            pass
+
     mark_sync_local_change()
-    return {"ok": True}
+    # WebDAV enabled → push deletion (subscriptions + remote Profile packages).
+    try:
+        get_sync_engine().maybe_auto_push(reason="删除订阅")
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "removed_node_ids": sorted(remove_ids),
+        **purge_summary,
+    }
 
 
 def find_node(state: dict[str, Any], node_id: str) -> dict[str, Any]:

@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import shutil
+import ssl
 import subprocess
 import tarfile
 import tempfile
@@ -85,6 +86,8 @@ def default_webdav_settings() -> dict[str, Any]:
         "enabled": False,
         "auto_upload_on_browser_stop": False,
         "check_on_startup": False,
+        # When True, HTTPS WebDAV skips certificate verification (expired/self-signed).
+        "insecure_ssl": False,
         "encrypt": False,
         "encrypt_password": "",
         "device_id": new_device_id(),
@@ -111,6 +114,7 @@ def normalize_webdav_settings(raw: Any) -> dict[str, Any]:
     base["enabled"] = bool(base.get("enabled"))
     base["auto_upload_on_browser_stop"] = bool(base.get("auto_upload_on_browser_stop"))
     base["check_on_startup"] = bool(base.get("check_on_startup"))
+    base["insecure_ssl"] = bool(base.get("insecure_ssl"))
     base["encrypt"] = bool(base.get("encrypt"))
     base["encrypt_password"] = str(base.get("encrypt_password") or "")
     device_id = str(base.get("device_id") or "").strip()
@@ -143,6 +147,7 @@ def public_webdav_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "enabled": cfg["enabled"],
         "auto_upload_on_browser_stop": cfg["auto_upload_on_browser_stop"],
         "check_on_startup": cfg["check_on_startup"],
+        "insecure_ssl": cfg["insecure_ssl"],
         "encrypt": cfg["encrypt"],
         "encrypt_password_set": bool(cfg["encrypt_password"]),
         "device_id": cfg["device_id"],
@@ -360,7 +365,15 @@ def build_sync_state(state: dict[str, Any], *, device_id: str, profile_hashes: d
 class WebDAVClient:
     """Minimal WebDAV client (Basic auth) using urllib."""
 
-    def __init__(self, base_url: str, username: str = "", password: str = "", timeout: float = 60.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        username: str = "",
+        password: str = "",
+        timeout: float = 60.0,
+        *,
+        insecure_ssl: bool = False,
+    ) -> None:
         raw = (base_url or "").strip()
         if not raw:
             raise ValueError("WebDAV URL 不能为空")
@@ -373,7 +386,13 @@ class WebDAVClient:
         self.username = username or ""
         self.password = password or ""
         self.timeout = timeout
-        self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler())
+        self.insecure_ssl = bool(insecure_ssl)
+        if self.insecure_ssl:
+            # Allow expired / self-signed certificates (user opt-in).
+            ctx = ssl._create_unverified_context()
+            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+        else:
+            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler())
 
     def _auth_header(self) -> str | None:
         if not self.username and not self.password:
@@ -435,20 +454,46 @@ class WebDAVClient:
             allow_statuses={200, 201, 204},
         )
 
+    def delete(self, url: str) -> bool:
+        """Delete a remote resource. Returns True if deleted or already absent."""
+        status, _, _ = self.request(
+            "DELETE",
+            url,
+            allow_statuses={200, 204, 404},
+        )
+        return status in {200, 204, 404}
+
     def get_bytes(self, url: str) -> bytes:
         _status, _headers, body = self.request("GET", url, allow_statuses={200})
         return body
 
     def exists(self, url: str) -> bool:
+        """Return whether a remote resource exists.
+
+        Many WebDAV providers (坚果云/部分 Nextcloud 配置) 对 HEAD 实现不完整：
+        文件存在时仍可能返回 404/405/501。因此 HEAD 非 200 时必须再试 GET，
+        避免误报「远端还没有同步数据」。
+        """
         try:
-            status, _, _ = self.request("HEAD", url, allow_statuses={200, 404})
-            return status == 200
+            status, _, _ = self.request(
+                "HEAD",
+                url,
+                allow_statuses={200, 204, 301, 302, 307, 308, 404, 405, 501},
+            )
+            if status in {200, 204}:
+                return True
+            # Non-authoritative negative: fall through to GET.
         except RuntimeError:
-            try:
-                status, _, _ = self.request("GET", url, allow_statuses={200, 404})
-                return status == 200
-            except RuntimeError:
-                return False
+            pass
+        try:
+            status, _, _ = self.request(
+                "GET",
+                url,
+                allow_statuses={200, 204, 301, 302, 307, 308, 404},
+            )
+            return status in {200, 204}
+        except RuntimeError:
+            return False
 
     def test_connection(self) -> dict[str, Any]:
         # PROPFIND depth 0 on base
@@ -503,7 +548,12 @@ class SyncEngine:
         self._bg_lock = threading.Lock()
 
     def _default_client(self, cfg: dict[str, Any]) -> WebDAVClient:
-        return WebDAVClient(cfg["url"], cfg.get("username") or "", cfg.get("password") or "")
+        return WebDAVClient(
+            cfg["url"],
+            cfg.get("username") or "",
+            cfg.get("password") or "",
+            insecure_ssl=bool(cfg.get("insecure_ssl")),
+        )
 
     def get_settings(self, state: dict[str, Any] | None = None) -> dict[str, Any]:
         if state is None:
@@ -538,6 +588,7 @@ class SyncEngine:
                 "enabled",
                 "auto_upload_on_browser_stop",
                 "check_on_startup",
+                "insecure_ssl",
                 "encrypt",
             ):
                 if key in payload:
@@ -626,6 +677,11 @@ class SyncEngine:
         return result
 
     def push(self, *, instance_ids: list[str] | None = None) -> dict[str, Any]:
+        """Upload local subscriptions/nodes/browsers and reconcile remote Profile deletions.
+
+        ``instance_ids`` limits which profiles are re-packed/uploaded (auto single-instance
+        upload). State + remote orphan deletion always reflect the full local truth.
+        """
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
@@ -633,6 +689,11 @@ class SyncEngine:
             if not cfg.get("enabled") and not cfg.get("url"):
                 raise ValueError("请先启用并配置 WebDAV")
 
+            local_instance_ids = {
+                str(item.get("id") or "")
+                for item in state.get("browser_instances", [])
+                if isinstance(item, dict) and item.get("id")
+            }
             instances = self._collect_pushable_profiles(state)
             if instance_ids is not None:
                 wanted = set(instance_ids)
@@ -652,24 +713,25 @@ class SyncEngine:
         urls = self._remote_urls(client, cfg)
         self._ensure_remote_layout(client, urls)
 
-        # Read remote manifest for hash skip (v1.1).
         remote_hashes: dict[str, str] = {}
-        remote_manifest: dict[str, Any] = {}
         try:
             if client.exists(urls["manifest"]):
                 raw_manifest = self._decode_blob(client.get_bytes(urls["manifest"]), cfg)
                 remote_manifest = json.loads(raw_manifest.decode("utf-8"))
-                if isinstance(remote_manifest.get("profile_hashes"), dict):
+                if isinstance(remote_manifest, dict) and isinstance(remote_manifest.get("profile_hashes"), dict):
                     remote_hashes = {
                         str(k): str(v) for k, v in remote_manifest["profile_hashes"].items() if k and v
                     }
         except Exception:
-            remote_manifest = {}
             remote_hashes = {}
 
-        profile_hashes: dict[str, str] = dict(remote_hashes)
+        # Rebuild from local only so deletions propagate; seed with still-local remote hashes.
+        profile_hashes: dict[str, str] = {
+            iid: digest for iid, digest in remote_hashes.items() if iid in local_instance_ids
+        }
         uploaded: list[str] = []
         skipped_unchanged: list[str] = []
+        deleted_remote: list[str] = []
         errors: list[str] = []
 
         for instance in instances:
@@ -692,9 +754,25 @@ class SyncEngine:
             except Exception as exc:
                 errors.append(f"{instance_id}: {exc}")
 
+        # Delete remote packages for instances removed locally.
+        for rid in list(remote_hashes.keys()):
+            if rid in local_instance_ids:
+                continue
+            try:
+                client.delete(client.url_for(cfg["remote_root"], PROFILES_DIR_NAME, f"{rid}.tar.gz"))
+                deleted_remote.append(rid)
+            except Exception as exc:
+                errors.append(f"删除远端 Profile {rid}: {exc}")
+
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
+            local_ids_now = {
+                str(item.get("id") or "")
+                for item in state.get("browser_instances", [])
+                if isinstance(item, dict) and item.get("id")
+            }
+            profile_hashes = {k: v for k, v in profile_hashes.items() if k in local_ids_now}
             sync_state = build_sync_state(state, device_id=str(cfg["device_id"]), profile_hashes=profile_hashes)
             sync_bytes = json.dumps(sync_state, ensure_ascii=False, indent=2).encode("utf-8")
             manifest = {
@@ -730,7 +808,7 @@ class SyncEngine:
             cfg["last_error"] = "; ".join(errors) if errors else ""
             cfg["last_status"] = (
                 f"已上传：{len(uploaded)} 个 Profile，跳过未变 {len(skipped_unchanged)}，"
-                f"跳过运行中 {len(skipped_running)}"
+                f"删除远端 {len(deleted_remote)}，跳过运行中 {len(skipped_running)}"
             )
             state["settings"]["webdav"] = cfg
             self.save_state(state)
@@ -741,6 +819,7 @@ class SyncEngine:
             "uploaded_profiles": uploaded,
             "skipped_unchanged": skipped_unchanged,
             "skipped_running": skipped_running,
+            "deleted_remote_profiles": deleted_remote,
             "errors": errors,
             "manifest": manifest,
             "settings": public_webdav_settings(cfg),
@@ -757,9 +836,19 @@ class SyncEngine:
         client = self.client_factory(cfg)
         urls = self._remote_urls(client, cfg)
         if not client.exists(urls["manifest"]):
-            raise RuntimeError("远端还没有同步数据，请先在另一台电脑上上传")
+            raise RuntimeError(
+                "远端还没有同步数据（找不到 manifest.json）。"
+                f"请确认：1) 源电脑已成功「上传到远端」；"
+                f"2) 两台电脑的 WebDAV URL / 远端目录一致；"
+                f"当前检查路径：{urls['manifest']}"
+            )
 
-        raw_manifest = self._decode_blob(client.get_bytes(urls["manifest"]), cfg)
+        try:
+            raw_manifest = self._decode_blob(client.get_bytes(urls["manifest"]), cfg)
+        except Exception as exc:
+            raise RuntimeError(
+                f"读取远端 manifest 失败：{exc}；路径：{urls['manifest']}"
+            ) from exc
         manifest = json.loads(raw_manifest.decode("utf-8"))
         if not isinstance(manifest, dict):
             raise RuntimeError("远端 manifest.json 格式无效")
@@ -882,22 +971,51 @@ class SyncEngine:
             except Exception as exc:
                 errors.append(f"{instance_id}: {exc}")
 
+        purged_profiles: list[str] = []
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
             applied = apply_remote_state(state, remote_state, profile_path_builder=self.browser_instance_profile_path)
+            # Drop local browser profiles for records deleted on the remote side.
+            for record in applied.get("removed_browsers") or []:
+                if not isinstance(record, dict):
+                    continue
+                iid = str(record.get("id") or "")
+                if iid and (
+                    record.get("status") in {"running", "starting"} or self.browser_runtime_is_active(iid)
+                ):
+                    skipped_running.append(iid)
+                    continue
+                try:
+                    path = self.browser_instance_profile_path(
+                        str(record.get("node_id") or ""),
+                        iid,
+                        bool(record.get("legacy")),
+                    )
+                    if path.exists():
+                        shutil.rmtree(path, ignore_errors=True)
+                        purged_profiles.append(iid)
+                    # Legacy node-level profile dir when empty of instances.
+                    node_root = path.parent if not record.get("legacy") else path
+                    if node_root.exists() and node_root.is_dir() and not any(node_root.iterdir()):
+                        shutil.rmtree(node_root, ignore_errors=True)
+                except Exception as exc:
+                    errors.append(f"清理本地 Profile {iid}: {exc}")
+
             now = int(time.time())
             cfg["last_pull_at"] = now
             cfg["last_remote_updated_at"] = remote_updated or None
-            # Prefer manifest sha; if missing, hash the decoded state body we just applied.
             applied_sha = str(manifest.get("state_sha256") or "").strip()
             if not applied_sha:
                 applied_sha = sha256_bytes(raw_state)
             cfg["last_applied_state_sha256"] = applied_sha
             cfg["last_error"] = "; ".join(errors) if errors else ""
+            removed_subs = len(applied.get("removed_subscription_ids") or [])
             cfg["last_status"] = (
                 f"已拉取：订阅 {applied['subscriptions']}，节点 {applied['nodes']}，"
-                f"浏览器记录 {applied['browser_instances']}，Profile {len(downloaded)}"
+                f"浏览器记录 {applied['browser_instances']}，Profile {len(downloaded)}，"
+                f"删除本地 Profile {len(purged_profiles)}"
+                + (f"，移除订阅 {removed_subs}" if removed_subs else "")
             )
             if conflict_warning:
                 cfg["last_status"] += f"；{conflict_warning}"
@@ -911,6 +1029,7 @@ class SyncEngine:
             "downloaded_profiles": downloaded,
             "skipped_running": skipped_running,
             "skipped_unchanged": skipped_unchanged,
+            "purged_local_profiles": purged_profiles,
             "errors": errors,
             "conflict_warning": conflict_warning,
             "manifest": manifest,
@@ -932,6 +1051,7 @@ class SyncEngine:
                 "has_remote": False,
                 "remote_newer": False,
                 "already_latest": False,
+                "manifest_url": urls["manifest"],
                 "settings": public_webdav_settings(cfg),
             }
         raw = self._decode_blob(client.get_bytes(urls["manifest"]), cfg)
@@ -993,6 +1113,30 @@ class SyncEngine:
 
         threading.Thread(target=worker, name="webdav-auto-upload", daemon=True).start()
 
+    def maybe_auto_push(self, *, reason: str = "") -> None:
+        """Fire-and-forget full push when WebDAV is enabled (e.g. after subscription delete)."""
+        if not self._bg_lock.acquire(blocking=False):
+            # Another sync is running; still mark dirty via last_local_change already done.
+            self.log("自动同步跳过：已有同步任务进行中", level="warn", category="同步")
+            return
+
+        def worker() -> None:
+            try:
+                with self.state_lock:
+                    state = self.load_state()
+                    cfg = self.get_settings(state)
+                    if not cfg.get("enabled") or not cfg.get("url"):
+                        return
+                label = f"（{reason}）" if reason else ""
+                self.log(f"自动上传到 WebDAV{label}", category="同步")
+                self.push()
+            except Exception as exc:
+                self.log(f"自动上传失败: {exc}", level="warn", category="同步")
+            finally:
+                self._bg_lock.release()
+
+        threading.Thread(target=worker, name="webdav-auto-push", daemon=True).start()
+
     def maybe_check_on_startup(self) -> None:
         def worker() -> None:
             try:
@@ -1020,42 +1164,39 @@ def apply_remote_state(
     remote_state: dict[str, Any],
     *,
     profile_path_builder: Callable[..., Path],
-) -> dict[str, int]:
-    """Merge remote subscriptions/nodes/browser_instances into local_state (LWW remote wins)."""
+) -> dict[str, Any]:
+    """Apply remote subscriptions/nodes/browser_instances as LWW source of truth.
+
+    Local-only subscriptions/nodes/browser records are **removed** so deletions
+    on the source machine propagate after pull.
+    """
     remote_subs = [item for item in remote_state.get("subscriptions") or [] if isinstance(item, dict)]
     remote_nodes = [item for item in remote_state.get("nodes") or [] if isinstance(item, dict)]
     remote_browsers = [item for item in remote_state.get("browser_instances") or [] if isinstance(item, dict)]
 
-    # Subscriptions: index by id, remote overwrites.
-    sub_by_id = {
-        str(item.get("id") or ""): dict(item)
-        for item in local_state.get("subscriptions") or []
-        if isinstance(item, dict) and item.get("id")
-    }
-    for item in remote_subs:
-        sid = str(item.get("id") or "")
-        if not sid:
-            continue
-        sub_by_id[sid] = dict(item)
-    local_state["subscriptions"] = list(sub_by_id.values())
-
-    node_by_id = {
-        str(item.get("id") or ""): dict(item)
-        for item in local_state.get("nodes") or []
-        if isinstance(item, dict) and item.get("id")
-    }
-    for item in remote_nodes:
-        nid = str(item.get("id") or "")
-        if not nid:
-            continue
-        node_by_id[nid] = dict(item)
-    local_state["nodes"] = list(node_by_id.values())
-
-    browser_by_id = {
+    old_browser_by_id = {
         str(item.get("id") or ""): dict(item)
         for item in local_state.get("browser_instances") or []
         if isinstance(item, dict) and item.get("id")
     }
+    old_browser_ids = set(old_browser_by_id.keys())
+    old_node_ids = {
+        str(item.get("id") or "")
+        for item in local_state.get("nodes") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    old_sub_ids = {
+        str(item.get("id") or "")
+        for item in local_state.get("subscriptions") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+
+    # Full replace from remote (deletions included).
+    local_state["subscriptions"] = [dict(item) for item in remote_subs if item.get("id")]
+    local_state["nodes"] = [dict(item) for item in remote_nodes if item.get("id")]
+
+    new_browsers: list[dict[str, Any]] = []
+    new_browser_ids: set[str] = set()
     for item in remote_browsers:
         iid = str(item.get("id") or "")
         if not iid:
@@ -1064,20 +1205,35 @@ def apply_remote_state(
         node_id = str(record.get("node_id") or "")
         legacy = bool(record.get("legacy"))
         record["profile_path"] = str(profile_path_builder(node_id, iid, legacy))
-        # Preserve local launch_count max
-        local = browser_by_id.get(iid)
+        local = old_browser_by_id.get(iid)
         if local:
             try:
                 record["launch_count"] = max(int(local.get("launch_count") or 0), int(record.get("launch_count") or 0))
             except (TypeError, ValueError):
                 pass
-        browser_by_id[iid] = record
-    local_state["browser_instances"] = list(browser_by_id.values())
+        new_browsers.append(record)
+        new_browser_ids.add(iid)
+    local_state["browser_instances"] = new_browsers
+
+    new_node_ids = {
+        str(item.get("id") or "")
+        for item in local_state.get("nodes") or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    new_sub_ids = {
+        str(item.get("id") or "")
+        for item in local_state.get("subscriptions") or []
+        if isinstance(item, dict) and item.get("id")
+    }
 
     return {
         "subscriptions": len(remote_subs),
         "nodes": len(remote_nodes),
         "browser_instances": len(remote_browsers),
+        "removed_subscription_ids": sorted(old_sub_ids - new_sub_ids),
+        "removed_node_ids": sorted(old_node_ids - new_node_ids),
+        "removed_browser_ids": sorted(old_browser_ids - new_browser_ids),
+        "removed_browsers": [old_browser_by_id[i] for i in sorted(old_browser_ids - new_browser_ids)],
     }
 
 
@@ -1110,6 +1266,10 @@ class MemoryWebDAVClient:
 
     def put_bytes(self, url: str, data: bytes, content_type: str = "application/octet-stream") -> None:
         self.store.files[url] = data
+
+    def delete(self, url: str) -> bool:
+        self.store.files.pop(url, None)
+        return True
 
     def get_bytes(self, url: str) -> bytes:
         if url not in self.store.files:
