@@ -65,6 +65,11 @@
             <span class="nav-label">系统日志</span>
             <span class="nav-count" id="navCountSystem">0</span>
           </button>
+          <p class="nav-group-title">设置</p>
+          <button class="nav-item" type="button" data-view="sync">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>
+            <span class="nav-label">WebDAV 同步</span>
+          </button>
         </nav>
 
         <!-- 侧边栏底部:代理核心 / 指纹内核状态 + 主题切换 -->
@@ -263,6 +268,94 @@
                 <tbody id="logRows"></tbody>
               </table>
               <div class="empty-state visible" id="emptyLogs">暂无连接日志</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ---------- WebDAV 同步视图 ---------- -->
+        <section class="view" data-view="sync" aria-labelledby="syncTitle" hidden>
+          <header class="view-toolbar">
+            <div class="view-heading">
+              <h1 id="syncTitle">WebDAV 同步</h1>
+              <span class="countline" id="syncStatusLine">未配置</span>
+            </div>
+            <div class="toolbar-controls">
+              <button class="toolbar-button" type="button" id="syncCheckBtn">检查远端</button>
+              <button class="toolbar-button" type="button" id="syncTestBtn">测试连接</button>
+              <button class="toolbar-button primary-button" type="button" id="syncPushBtn">上传到远端</button>
+              <button class="toolbar-button" type="button" id="syncPullBtn">从远端拉取</button>
+            </div>
+          </header>
+          <div class="view-body sync-body">
+            <p class="view-hint">
+              在多台 Mac 之间同步<strong>订阅 / 节点</strong>与<strong>已停止的指纹浏览器 Profile</strong>（Cookie、LocalStorage 等），实现换机接力。
+              请先在本机关闭目标浏览器再上传；不要两边同时打开同一浏览器实例。
+            </p>
+            <form id="syncForm" class="sync-card">
+              <div class="import-card-title">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>
+                <h2>服务器</h2>
+              </div>
+              <div class="form-grid">
+                <label class="sync-span-2">
+                  <span>WebDAV URL</span>
+                  <input id="syncUrl" name="url" type="url" autocomplete="off" placeholder="https://dav.example.com/dav">
+                </label>
+                <label>
+                  <span>用户名</span>
+                  <input id="syncUsername" name="username" type="text" autocomplete="username" placeholder="可选">
+                </label>
+                <label>
+                  <span>密码</span>
+                  <input id="syncPassword" name="password" type="password" autocomplete="current-password" placeholder="已保存则留空不改">
+                </label>
+                <label>
+                  <span>远端目录</span>
+                  <input id="syncRemoteRoot" name="remote_root" type="text" autocomplete="off" placeholder="ProxyBridge">
+                </label>
+                <label class="sync-checkbox">
+                  <input id="syncEnabled" name="enabled" type="checkbox">
+                  <span>启用同步</span>
+                </label>
+              </div>
+
+              <div class="section-divider"><span>自动化（v1.1）</span></div>
+              <div class="form-grid">
+                <label class="sync-checkbox">
+                  <input id="syncAutoUpload" name="auto_upload_on_browser_stop" type="checkbox">
+                  <span>关闭浏览器后自动上传该 Profile</span>
+                </label>
+                <label class="sync-checkbox">
+                  <input id="syncCheckStartup" name="check_on_startup" type="checkbox">
+                  <span>启动时检查远端是否有更新</span>
+                </label>
+              </div>
+
+              <div class="section-divider"><span>加密（v2 可选）</span></div>
+              <div class="form-grid">
+                <label class="sync-checkbox">
+                  <input id="syncEncrypt" name="encrypt" type="checkbox">
+                  <span>端到端加密（OpenSSL AES-256-CBC）</span>
+                </label>
+                <label>
+                  <span>加密密码</span>
+                  <input id="syncEncryptPassword" name="encrypt_password" type="password" autocomplete="off" placeholder="已设置则留空不改">
+                </label>
+              </div>
+
+              <div class="import-card-actions">
+                <button class="primary-button" type="submit">保存设置</button>
+              </div>
+            </form>
+
+            <div class="sync-meta-card" id="syncMetaCard">
+              <div class="sync-meta-row"><span>本机设备 ID</span><code id="syncDeviceId">-</code></div>
+              <div class="sync-meta-row"><span>上次上传</span><span id="syncLastPush">-</span></div>
+              <div class="sync-meta-row"><span>上次拉取</span><span id="syncLastPull">-</span></div>
+              <div class="sync-meta-row"><span>远端更新时间</span><span id="syncLastRemote">-</span></div>
+              <div class="sync-meta-row"><span>最近状态</span><span id="syncLastStatus">-</span></div>
+              <div class="sync-meta-row"><span>最近错误</span><span id="syncLastError">-</span></div>
+              <div class="sync-meta-row"><span>OpenSSL</span><span id="syncOpenssl">-</span></div>
             </div>
           </div>
         </section>

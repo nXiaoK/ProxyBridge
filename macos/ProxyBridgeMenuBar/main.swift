@@ -388,6 +388,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var isTerminating = false
     private let bootstrapGroup = DispatchGroup()
     private var expectedBackendTerminationProcess: Process?
+    private var isRestartingBackend = false
     private let helperTerminationGraceTimeout: TimeInterval = 2
     private let helperShutdownTimeout: TimeInterval = 4
     private let backendTerminationTimeout: TimeInterval = 12
@@ -1225,11 +1226,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let expectedStartupFailure = self.expectedBackendTerminationProcess === process
+            let restartInProgress = self.isRestartingBackend && expectedStartupFailure
             let exitedBeforeReadiness = self.api == nil
             guard self.clearBackendState(for: process, matching: logHandle) else {
                 return
             }
             guard !self.terminationRequested() else { return }
+            // 用户主动重启时由 finishBackendRestart 接管，不在这里报「意外退出」。
+            if restartInProgress {
+                return
+            }
             self.startupStatus = nil
             if expectedStartupFailure {
                 self.rebuildMenu()
@@ -1351,6 +1357,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 右键菜单「重启后端」：干净停掉当前 Python 后端并重新 bootstrap。
+    /// 后端已崩溃时也会直接重新启动，便于从「就绪前退出」等状态恢复。
+    @objc private func restartBackend() {
+        guard !terminationRequested(), !isRestartingBackend else { return }
+        isRestartingBackend = true
+        invalidateConsole()
+        api = nil
+        latestStatus = nil
+        lastError = nil
+        startupStatus = "正在重启后端"
+        rebuildMenu()
+
+        let process = backendProcess
+        if let process, process.isRunning {
+            expectedBackendTerminationProcess = process
+            if !sendSignal(SIGTERM, to: process) {
+                _ = sendSignal(SIGKILL, to: process)
+            }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else { return }
+                let deadline = self.monotonicDeadline(after: self.backendTerminationTimeout)
+                if !self.waitForProcessExit(process, until: deadline), process.isRunning {
+                    _ = self.sendSignal(SIGKILL, to: process)
+                    let forceDeadline = self.monotonicDeadline(after: self.forceKillConfirmationTimeout)
+                    _ = self.waitForProcessExit(process, until: forceDeadline)
+                }
+                DispatchQueue.main.async { [weak self] in
+                    self?.finishBackendRestart(stoppedProcess: process)
+                }
+            }
+        } else {
+            finishBackendRestart(stoppedProcess: process)
+        }
+    }
+
+    private func finishBackendRestart(stoppedProcess: Process?) {
+        guard !terminationRequested() else {
+            isRestartingBackend = false
+            return
+        }
+        if let stoppedProcess, backendProcess === stoppedProcess {
+            _ = clearBackendState(for: stoppedProcess, matching: backendLogHandle)
+        } else if backendProcess == nil {
+            try? backendLogHandle?.close()
+            backendLogHandle = nil
+        }
+        if expectedBackendTerminationProcess === stoppedProcess {
+            expectedBackendTerminationProcess = nil
+        }
+        isRestartingBackend = false
+        startupStatus = "正在准备 Python 运行时"
+        rebuildMenu()
+        bootstrapBackend()
+    }
+
     private func rebuildMenu() {
         let menu = NSMenu()
         let running = latestStatus?.bridges.filter { $0.status == "running" || $0.status == "starting" } ?? []
@@ -1388,6 +1449,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let refreshItem = actionItem("刷新", #selector(refreshNow))
         refreshItem.isEnabled = backendReady
         menu.addItem(refreshItem)
+        let restartItem = actionItem("重启后端", #selector(restartBackend))
+        restartItem.isEnabled = !isRestartingBackend && !terminationRequested()
+        menu.addItem(restartItem)
 
         if let status = latestStatus {
             if !status.subscriptions.isEmpty {

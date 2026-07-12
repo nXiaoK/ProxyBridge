@@ -144,7 +144,9 @@ swiftc \
 
 cp "$ROOT_DIR/macos/ProxyBridgeMenuBar/Info.plist" "$CONTENTS_DIR/Info.plist"
 cp "$ICON_PATH" "$RESOURCES_DIR/AppIcon.icns"
+# Backend Python modules (app.py plus any sibling packages it imports at startup).
 cp "$ROOT_DIR/app.py" "$BRIDGE_DIR/app.py"
+cp "$ROOT_DIR/webdav_sync.py" "$BRIDGE_DIR/webdav_sync.py"
 ditto "$ROOT_DIR/static" "$BRIDGE_DIR/static"
 rm -rf "$CORE_DIR"
 if [[ "$BUNDLE_CORES" == "1" ]]; then

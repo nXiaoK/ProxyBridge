@@ -28,6 +28,8 @@ const appState = {
     level: "all",
   },
   browserRecordNodeId: null,
+  sync: null,
+  syncOpenssl: null,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -37,7 +39,7 @@ let latestStatusRequest = 0;
 let kernelDownloadPromise = null;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
-const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system"];
+const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "sync"];
 
 // 切换当前视图:高亮对应侧边栏项、显示对应内容区,并记住上次选择。
 function setActiveView(view) {
@@ -171,6 +173,135 @@ function formatTime(seconds) {
   });
 }
 
+// WebDAV 表单：状态轮询会反复 render，不能把未保存的输入写回成服务端旧值。
+let syncFormHydrated = false;
+let syncFormDirty = false;
+
+function markSyncFormDirty() {
+  syncFormDirty = true;
+}
+
+function applySyncSettingsToForm(settings, { force = false } = {}) {
+  if (!settings) return;
+  if (syncFormDirty && !force) return;
+  const url = $("#syncUrl");
+  if (!url) return;
+  url.value = settings.url || "";
+  $("#syncUsername").value = settings.username || "";
+  $("#syncPassword").value = "";
+  $("#syncPassword").placeholder = settings.password_set ? "已保存，留空不改" : "WebDAV 密码";
+  $("#syncRemoteRoot").value = settings.remote_root || "ProxyBridge";
+  $("#syncEnabled").checked = Boolean(settings.enabled);
+  $("#syncAutoUpload").checked = Boolean(settings.auto_upload_on_browser_stop);
+  $("#syncCheckStartup").checked = Boolean(settings.check_on_startup);
+  $("#syncEncrypt").checked = Boolean(settings.encrypt);
+  $("#syncEncryptPassword").value = "";
+  $("#syncEncryptPassword").placeholder = settings.encrypt_password_set ? "已设置，留空不改" : "加密密码";
+  syncFormHydrated = true;
+}
+
+function renderSyncMeta(settings) {
+  const line = $("#syncStatusLine");
+  if (line) {
+    if (!settings.url) line.textContent = "未配置";
+    else if (settings.enabled) line.textContent = settings.last_status || "已启用";
+    else line.textContent = "已配置 · 未启用";
+  }
+  const setText = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  };
+  setText("syncDeviceId", settings.device_id || "—");
+  setText("syncLastPush", formatTime(settings.last_push_at));
+  setText("syncLastPull", formatTime(settings.last_pull_at));
+  setText("syncLastRemote", formatTime(settings.last_remote_updated_at));
+  setText("syncLastStatus", settings.last_status || "—");
+  setText("syncLastError", settings.last_error || "—");
+  setText(
+    "syncOpenssl",
+    appState.syncOpenssl == null ? "—" : appState.syncOpenssl ? "可用" : "未找到（加密不可用）"
+  );
+}
+
+function renderSync() {
+  const settings = appState.sync || {};
+  // 仅首次灌入或表单未改动时同步输入框；元数据始终刷新。
+  if (!syncFormHydrated || !syncFormDirty) {
+    applySyncSettingsToForm(settings);
+  }
+  renderSyncMeta(settings);
+}
+
+async function loadSyncStatus() {
+  const result = await api("/api/sync/status");
+  appState.sync = result.settings || null;
+  appState.syncOpenssl = Boolean(result.openssl);
+  renderSync();
+  return result;
+}
+
+async function saveSyncSettings(event) {
+  event.preventDefault();
+  const payload = {
+    url: $("#syncUrl").value.trim(),
+    username: $("#syncUsername").value.trim(),
+    remote_root: $("#syncRemoteRoot").value.trim() || "ProxyBridge",
+    enabled: $("#syncEnabled").checked,
+    auto_upload_on_browser_stop: $("#syncAutoUpload").checked,
+    check_on_startup: $("#syncCheckStartup").checked,
+    encrypt: $("#syncEncrypt").checked,
+  };
+  const password = $("#syncPassword").value;
+  if (password) payload.password = password;
+  const enc = $("#syncEncryptPassword").value;
+  if (enc) payload.encrypt_password = enc;
+  const result = await api("/api/sync/settings", payload);
+  appState.sync = result.settings || null;
+  // 保存成功后以服务端结果回填，并清空密码输入框。
+  syncFormDirty = false;
+  applySyncSettingsToForm(result.settings || {}, { force: true });
+  renderSyncMeta(result.settings || {});
+  showToast("同步设置已保存");
+}
+
+async function runSyncAction(kind) {
+  const paths = {
+    test: "/api/sync/test",
+    push: "/api/sync/push",
+    pull: "/api/sync/pull",
+    check: "/api/sync/check",
+  };
+  const path = paths[kind];
+  if (!path) return;
+  const result = await api(path, {});
+  if (result.settings) appState.sync = result.settings;
+  // 操作结果只刷新状态文案，不覆盖用户正在编辑的表单。
+  if (kind === "pull") await loadStatus();
+  else renderSyncMeta(appState.sync || {});
+  if (kind === "check") {
+    if (!result.has_remote) showToast("远端尚无同步数据");
+    else if (result.already_latest || !result.remote_newer) showToast("已是最新，无需拉取");
+    else showToast("远端有更新，可点击「从远端拉取」");
+  } else if (kind === "test") {
+    showToast(
+      result.layout_ok === false
+        ? `连接成功，但创建目录失败：${result.layout_error || ""}`
+        : "连接测试成功"
+    );
+  } else if (kind === "push") {
+    const n = (result.uploaded_profiles || []).length;
+    const skip = (result.skipped_unchanged || []).length;
+    if (result.ok === false) showToast((result.errors || []).join("; ") || "上传有错误", "error");
+    else showToast(`上传完成：${n} 个 Profile，跳过未变 ${skip}`);
+  } else if (kind === "pull") {
+    if (result.skipped && result.reason === "already_latest") showToast("已是最新，跳过拉取");
+    else if (result.conflict_warning) showToast(result.conflict_warning);
+    else if (result.ok === false) showToast((result.errors || []).join("; ") || "拉取有错误", "error");
+    else showToast("拉取完成");
+  }
+  return result;
+}
+
 function formatLogTime(seconds) {
   if (!seconds) return "-";
   return new Date(seconds * 1000).toLocaleTimeString("zh-CN", {
@@ -269,6 +400,8 @@ async function loadStatus() {
   appState.requestLogs = status.request_logs || [];
   appState.systemLogs = status.system_logs || [];
   appState.pool = status.pool || null;
+  appState.sync = status.sync || appState.sync || null;
+  if ("sync_openssl" in status) appState.syncOpenssl = Boolean(status.sync_openssl);
   render();
   return true;
 }
@@ -284,6 +417,7 @@ function render() {
   renderLogFilters();
   renderRequestLogs();
   renderSystemLogs();
+  renderSync();
   if (appState.browserRecordNodeId && !$("#browserRecordModal").hidden) {
     renderBrowserRecords(appState.browserRecordNodeId);
   }
@@ -1227,6 +1361,39 @@ function bindEvents() {
     item.addEventListener("click", () => setActiveView(item.dataset.view));
   });
   $("#importForm").addEventListener("submit", handleImport);
+  const syncForm = $("#syncForm");
+  if (syncForm) {
+    // 任意输入/勾选都标记脏数据，避免 3.5s 状态轮询把未保存内容冲掉。
+    syncForm.addEventListener("input", markSyncFormDirty);
+    syncForm.addEventListener("change", markSyncFormDirty);
+    syncForm.addEventListener("submit", async (event) => {
+      try {
+        await saveSyncSettings(event);
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  }
+  const bindSyncBtn = (id, kind) => {
+    const btn = document.getElementById(id);
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.classList.add("is-busy");
+      try {
+        await runSyncAction(kind);
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        btn.disabled = false;
+        btn.classList.remove("is-busy");
+      }
+    });
+  };
+  bindSyncBtn("syncTestBtn", "test");
+  bindSyncBtn("syncPushBtn", "push");
+  bindSyncBtn("syncPullBtn", "pull");
+  bindSyncBtn("syncCheckBtn", "check");
   document.addEventListener("click", handleAction);
   $("#refreshStatus").addEventListener("click", async (event) => {
     const button = event.currentTarget;

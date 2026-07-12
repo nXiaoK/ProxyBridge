@@ -118,6 +118,35 @@ http://127.0.0.1:8787
 PROXY_BRIDGE_PORT=8790 python3 app.py
 ```
 
+## WebDAV 同步
+
+支持在多台 Mac 之间同步**订阅 / 节点**与**指纹浏览器 Profile**（Cookie、LocalStorage 等），用于换机接力。
+
+控制台侧边栏 **「WebDAV 同步」**：
+
+1. 填写 WebDAV URL（如坚果云 / Nextcloud / 群晖）、用户名密码与远端目录（默认 `ProxyBridge`）。
+2. 勾选「启用同步」并保存。
+3. **上传到远端**：打包已停止浏览器的 Profile + 订阅状态。
+4. **从远端拉取**：覆盖本机订阅/节点/浏览器记录，并解压 Profile。  
+   若远端 `state_sha256` 与本机上次成功同步一致，则**跳过拉取**（已是最新）；需要强制覆盖时可在 API 传 `{"force": true}`。
+
+约定：
+
+- 运行中的浏览器**不会**被上传；请先关闭再同步。
+- 不要两边同时打开同一浏览器实例。
+- 可选：关闭浏览器后自动上传（v1.1）、启动时检查远端更新（v1.1）。
+- 可选：OpenSSL AES-256-CBC 端到端加密（v2）；本机需有 `openssl`。
+- 冲突策略为远端后写覆盖（LWW），并记录设备 ID。
+
+远端目录结构：
+
+```text
+{remote_root}/
+  manifest.json
+  state.sync.json
+  profiles/{instance_id}.tar.gz
+```
+
 ## 代理池
 
 运行中的本地代理会自动进入**代理池**（`status` 为 `running` / `starting` 且端口有效）。控制台「本地代理」页可复制链接；也可在 `state.json` 的 `settings.pool_token` 中查看密钥。

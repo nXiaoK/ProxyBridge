@@ -1115,6 +1115,60 @@ tbody .row-actions .row-button {
   line-height: 1.5;
 }
 
+.sync-body {
+  max-width: 760px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sync-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: var(--bg-panel);
+  border: 0.5px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-panel);
+}
+.sync-span-2 {
+  grid-column: 1 / -1;
+}
+.sync-checkbox {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px !important;
+  padding-top: 18px;
+}
+.sync-checkbox input {
+  width: auto;
+}
+.sync-meta-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  background: var(--bg-panel);
+  border: 0.5px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+}
+.sync-meta-row {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr);
+  gap: 10px;
+  font-size: 12px;
+}
+.sync-meta-row > span:first-child {
+  color: var(--text-secondary);
+}
+.sync-meta-row code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .pool-card {
   display: flex;
   flex-direction: column;

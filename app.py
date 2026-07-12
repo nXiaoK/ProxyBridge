@@ -32,12 +32,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import webdav_sync
+
 
 APP_ROOT = Path(__file__).resolve().parent
 STATIC_ROOT = APP_ROOT / "static"
 WORK_ROOT = Path(os.environ.get("PROXY_BRIDGE_WORKDIR", APP_ROOT / "work")).expanduser()
 RUNTIME_ROOT = WORK_ROOT / "runtime"
 STATE_PATH = WORK_ROOT / "state.json"
+SYNC_ENGINE: webdav_sync.SyncEngine | None = None
 DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
 DEFAULT_BROWSER_START_URL = "https://ip.skk.moe/"
@@ -1465,6 +1468,10 @@ def _status_payload() -> dict[str, Any]:
                 "base_url": f"{console_base_url()}/pool/{token}",
                 "links": pool_links(token),
             },
+            "sync": webdav_sync.public_webdav_settings(
+                webdav_sync.normalize_webdav_settings((state.get("settings") or {}).get("webdav"))
+            ),
+            "sync_openssl": webdav_sync.openssl_available(),
             "version": "0.1.0",
         }
 
@@ -1484,12 +1491,57 @@ def ensure_pool_token(state: dict[str, Any]) -> tuple[str, bool]:
     if not isinstance(settings, dict):
         settings = {}
         state["settings"] = settings
+    # Ensure webdav settings block exists (device_id etc.).
+    settings["webdav"] = webdav_sync.normalize_webdav_settings(settings.get("webdav"))
     token = str(settings.get("pool_token") or "")
     if not (POOL_TOKEN_MIN_LEN <= len(token) <= POOL_TOKEN_MAX_LEN) or POOL_TOKEN_PATTERN.fullmatch(token) is None:
         token = new_pool_token()
         settings["pool_token"] = token
         return token, True
     return token, False
+
+
+def browser_process_is_active(instance_id: str) -> bool:
+    with PROCESS_LOCK:
+        process = BROWSER_PROCESS_TABLE.get(instance_id)
+    return bool(process and process.poll() is None)
+
+
+def get_sync_engine() -> webdav_sync.SyncEngine:
+    global SYNC_ENGINE
+    if SYNC_ENGINE is None:
+        SYNC_ENGINE = webdav_sync.SyncEngine(
+            work_root=WORK_ROOT,
+            state_path=STATE_PATH,
+            browser_profiles_root=browser_profiles_root(),
+            load_state=load_state,
+            save_state=save_state,
+            state_lock=STATE_LOCK,
+            browser_instance_profile_path=browser_instance_profile_path,
+            browser_runtime_is_active=browser_process_is_active,
+            log=log_event,
+        )
+    return SYNC_ENGINE
+
+
+def sync_status_payload() -> dict[str, Any]:
+    engine = get_sync_engine()
+    with STATE_LOCK:
+        state = load_state()
+        cfg = engine.get_settings(state)
+        state.setdefault("settings", {})["webdav"] = cfg
+        save_state(state)
+    return {
+        "settings": webdav_sync.public_webdav_settings(cfg),
+        "openssl": webdav_sync.openssl_available(),
+    }
+
+
+def mark_sync_local_change() -> None:
+    try:
+        get_sync_engine().mark_local_change()
+    except Exception:
+        pass
 
 
 def pool_tokens_equal(provided: str, expected: str) -> bool:
@@ -1793,6 +1845,7 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
             existing[node["id"]] = node
         state["nodes"] = list(existing.values())
         save_state(state)
+    mark_sync_local_change()
     return {"subscription": subscription, "nodes": [public_node(node) for node in node_dicts]}
 
 
@@ -1818,6 +1871,7 @@ def delete_subscription(subscription_id: str) -> dict[str, Any]:
         remove_ids = set(subscription.get("node_ids") or []) - referenced_node_ids(state["subscriptions"])
         state["nodes"] = [n for n in state["nodes"] if n.get("id") not in remove_ids]
         save_state(state)
+    mark_sync_local_change()
     return {"ok": True}
 
 
@@ -2271,10 +2325,12 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         node = find_node(state, node_id)
         changed = sync_process_status(state)
         changed |= sync_browser_instance_status(state)
+        created_browser_record = False
         if instance is None:
             instance = create_browser_instance_record(state, node_id)
             state["browser_instances"].append(instance)
             changed = True
+            created_browser_record = True
         elif str(instance.get("node_id") or "") != node_id:
             raise ValueError("浏览器记录与节点不匹配")
         elif instance.get("status") in ACTIVE_BROWSER_STATUSES:
@@ -2284,6 +2340,9 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         if changed:
             save_state(state)
         bridge = active_bridge_for_node(state, node_id)
+
+    if created_browser_record:
+        mark_sync_local_change()
 
     if not bridge:
         bridge = start_bridge({"node_id": node_id, "core": "auto"})
@@ -2532,17 +2591,31 @@ def _stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
     # 停止某节点的指纹浏览器:只结束浏览器进程组,保留该节点已启用的本地代理端口。
     node_id = str(payload.get("node_id") or "")
     instance_id = str(payload.get("instance_id") or "")
+    stopped_instance_ids: list[str] = []
     with STATE_LOCK:
         state = load_state()
         if instance_id:
             instance = find_browser_instance(state, instance_id)
             node_id = str(instance.get("node_id") or "")
             killed = stop_browser_instances(state, [instance_id])
+            stopped_instance_ids = [instance_id]
         else:
             if not node_id:
                 raise ValueError("缺少节点 ID")
+            stopped_instance_ids = [
+                str(item.get("id") or "")
+                for item in browser_instances_for_node(state, node_id)
+                if item.get("id")
+            ]
             killed = stop_browser_processes_for_node(node_id, state)
         save_state(state)
+    # v1.1: optional auto-upload after browser stop.
+    for iid in stopped_instance_ids:
+        if iid:
+            try:
+                get_sync_engine().maybe_auto_upload_instance(iid)
+            except Exception:
+                pass
     return {
         "ok": True,
         "node_id": node_id,
@@ -4031,6 +4104,12 @@ class AppHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 error_response(self, exc, 400)
             return
+        if parsed.path == "/api/sync/status":
+            try:
+                json_response(self, sync_status_payload())
+            except Exception as exc:
+                error_response(self, exc, 400)
+            return
         if parsed.path == "/api/core/logs":
             params = urllib.parse.parse_qs(parsed.query)
             core = first(params, "core", default="")
@@ -4138,6 +4217,23 @@ class AppHandler(BaseHTTPRequestHandler):
                 result = rotate_pool_token()
                 log_event("代理池 token 已轮换", category="代理")
                 json_response(self, result)
+            elif self.path == "/api/sync/settings":
+                result = get_sync_engine().update_settings(payload)
+                log_event("已更新 WebDAV 同步设置", category="同步")
+                json_response(self, {"ok": True, "settings": result})
+            elif self.path == "/api/sync/test":
+                json_response(self, get_sync_engine().test())
+            elif self.path == "/api/sync/push":
+                result = get_sync_engine().push()
+                log_event(result.get("settings", {}).get("last_status") or "同步上传完成", category="同步")
+                json_response(self, result)
+            elif self.path == "/api/sync/pull":
+                force = truthy(payload.get("force"))
+                result = get_sync_engine().pull(force=force)
+                log_event(result.get("settings", {}).get("last_status") or "同步下载完成", category="同步")
+                json_response(self, result)
+            elif self.path == "/api/sync/check":
+                json_response(self, get_sync_engine().check_remote())
             else:
                 error_response(self, ValueError("未知 API"), 404)
         except (urllib.error.URLError, TimeoutError) as exc:
@@ -4331,6 +4427,10 @@ def main() -> None:
     start_parent_monitor()
     start_core_auto_install()
     restore_enabled_bridges()
+    try:
+        get_sync_engine().maybe_check_on_startup()
+    except Exception as exc:
+        log_event(f"启动同步检查调度失败: {exc}", level="warn", category="同步")
     server = ProxyBridgeHTTPServer(("127.0.0.1", port), AppHandler)
     log_event(f"Proxy Bridge 已启动,监听 http://127.0.0.1:{port}", category="系统")
     try:
