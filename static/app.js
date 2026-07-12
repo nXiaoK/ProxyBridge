@@ -422,7 +422,18 @@ function render() {
   renderSystemLogs();
   renderSync();
   if (appState.browserRecordNodeId && !$("#browserRecordModal").hidden) {
-    renderBrowserRecords(appState.browserRecordNodeId);
+    // 正在输入标签时只刷新标题元信息，避免整表重建打断输入。
+    const ae = document.activeElement;
+    const typingLabel = ae && ae.classList && ae.classList.contains("browser-label-input");
+    if (typingLabel) {
+      const node = nodeById(appState.browserRecordNodeId);
+      const instances = browserInstancesForNode(appState.browserRecordNodeId);
+      const runningCount = instances.filter((i) => ["running", "starting"].includes(i.status)).length;
+      $("#browserRecordTitle").textContent = `${node?.name || "节点"} 浏览器记录`;
+      $("#browserRecordMeta").textContent = `${instances.length} 个记录 · ${runningCount} 个运行中`;
+    } else {
+      renderBrowserRecords(appState.browserRecordNodeId);
+    }
   }
 }
 
@@ -1122,6 +1133,25 @@ function renderBrowserRecords(nodeId) {
     `;
     return;
   }
+
+  // 状态轮询会反复 render：先保留输入草稿与光标，避免标签框刚输入就被清空。
+  const draftById = {};
+  body.querySelectorAll(".browser-label-input").forEach((el) => {
+    const id = el.dataset.instance;
+    if (id) draftById[id] = el.value;
+  });
+  const active = document.activeElement;
+  const activeId =
+    active && active.classList && active.classList.contains("browser-label-input")
+      ? active.dataset.instance
+      : null;
+  let selStart = null;
+  let selEnd = null;
+  if (activeId && active && typeof active.selectionStart === "number") {
+    selStart = active.selectionStart;
+    selEnd = active.selectionEnd;
+  }
+
   body.innerHTML = instances
     .map((instance) => {
       const running = ["running", "starting"].includes(instance.status);
@@ -1129,12 +1159,20 @@ function renderBrowserRecords(nodeId) {
       const action = running ? "stop-browser-instance" : "launch-browser-instance";
       const actionLabel = running ? "停止" : "启动";
       const actionIcon = running ? "stop" : "browser";
+      const savedLabel = instance.label || "";
+      // Prefer in-progress draft over server value while user is editing / mid-type.
+      const label =
+        Object.prototype.hasOwnProperty.call(draftById, instance.id)
+          ? draftById[instance.id]
+          : savedLabel;
+      const pillLabel = String(label || "").trim();
       return `
-        <article class="browser-record-entry ${running ? "is-running" : ""}">
+        <article class="browser-record-entry ${running ? "is-running" : ""}" data-instance-id="${escapeHtml(instance.id)}">
           <header>
             <div>
               <strong>${escapeHtml(instance.name || "浏览器")}</strong>
               <span>${instance.legacy ? "默认浏览器" : "独立指纹"} · ${escapeHtml(formatTime(instance.created_at))}</span>
+              ${pillLabel ? `<span class="browser-record-label-pill" title="${escapeHtml(pillLabel)}">${escapeHtml(pillLabel)}</span>` : ""}
             </div>
             <span class="status ${escapeHtml(instance.status || "stopped")}">${escapeHtml(browserStatusLabel(instance.status))}</span>
           </header>
@@ -1143,6 +1181,26 @@ function renderBrowserRecords(nodeId) {
             <span>Profile</span><code title="${escapeHtml(profilePath)}">${escapeHtml(compactPath(profilePath))}</code>
             <span>上次启动</span><code>${escapeHtml(formatTime(instance.last_started_at))}</code>
             <span>PID</span><code>${escapeHtml(instance.pid || "-")}</code>
+          </div>
+          <div class="browser-record-label-row">
+            <label>
+              <span>标签</span>
+              <input
+                type="text"
+                class="browser-label-input"
+                maxlength="120"
+                placeholder="例如：访问 xx 的浏览器"
+                value="${escapeHtml(label)}"
+                data-instance="${escapeHtml(instance.id)}"
+                aria-label="浏览器标签 ${escapeHtml(instance.name || "")}"
+              >
+            </label>
+            <button
+              class="row-button"
+              type="button"
+              data-action="save-browser-label"
+              data-instance="${escapeHtml(instance.id)}"
+            ><span>保存标签</span></button>
           </div>
           <div class="browser-record-actions">
             <button class="row-button ${running ? "danger" : ""}" type="button" data-action="${action}" data-node="${escapeHtml(nodeId)}" data-instance="${escapeHtml(instance.id)}" aria-label="${actionLabel} ${escapeHtml(instance.name || "浏览器")}">
@@ -1153,6 +1211,32 @@ function renderBrowserRecords(nodeId) {
       `;
     })
     .join("");
+
+  if (activeId) {
+    const input = body.querySelector(`.browser-label-input[data-instance="${activeId}"]`);
+    if (input) {
+      input.focus();
+      try {
+        if (selStart != null) {
+          input.setSelectionRange(selStart, selEnd != null ? selEnd : selStart);
+        }
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+}
+
+async function saveBrowserLabel(instanceId) {
+  if (!instanceId) return;
+  const input = document.querySelector(`.browser-label-input[data-instance="${instanceId}"]`);
+  const label = String(input?.value || "").trim();
+  await api("/api/browser/update", { instance_id: instanceId, label });
+  await loadStatus();
+  if (appState.browserRecordNodeId) {
+    renderBrowserRecords(appState.browserRecordNodeId);
+  }
+  showToast(label ? `标签已保存：${label}` : "标签已清空");
 }
 
 function showBrowserRecords(nodeId, trigger = null) {
@@ -1286,6 +1370,7 @@ async function handleAction(event) {
     "copy",
     "browser-records",
     "toggle-node-group",
+    "save-browser-label",
   ].includes(action);
   if (spins) button.classList.add("is-busy");
   try {
@@ -1309,6 +1394,8 @@ async function handleAction(event) {
       await stopBrowser(button.dataset.node, button.dataset.instance);
     } else if (action === "browser-records") {
       await openBrowserRecordsWithSync(button.dataset.node, button);
+    } else if (action === "save-browser-label") {
+      await saveBrowserLabel(button.dataset.instance);
     } else if (action === "download-kernel") {
       await downloadKernel();
     } else if (action === "copy") {

@@ -84,7 +84,8 @@ def default_webdav_settings() -> dict[str, Any]:
         "password": "",
         "remote_root": DEFAULT_REMOTE_ROOT,
         "enabled": False,
-        "auto_upload_on_browser_stop": False,
+        # Default on: closing a browser pushes profile when sync is enabled.
+        "auto_upload_on_browser_stop": True,
         "check_on_startup": False,
         # When True, HTTPS WebDAV skips certificate verification (expired/self-signed).
         "insecure_ssl": False,
@@ -340,6 +341,12 @@ def sanitize_browser_instance_for_sync(instance: dict[str, Any]) -> dict[str, An
     record["pid"] = None
     record["bridge_id"] = None
     record["proxy"] = ""
+    # Keep free-text label/tag for cross-machine notes (e.g. 访问 xx 的浏览器).
+    label = str(record.get("label") or record.get("tag") or "").strip()
+    if len(label) > 120:
+        label = label[:120].rstrip()
+    record["label"] = label
+    record.pop("tag", None)
     # Drop absolute path; receiver rebuilds from node_id + instance id.
     record.pop("profile_path", None)
     return record
@@ -1092,7 +1099,12 @@ class SyncEngine:
             self.save_state(state)
 
     def maybe_auto_upload_instance(self, instance_id: str) -> None:
-        """v1.1: fire-and-forget upload of a single stopped instance."""
+        """Fire-and-forget upload after a browser stops (API stop or process exit).
+
+        Requires WebDAV enabled + URL + auto_upload_on_browser_stop (default True).
+        Covers both explicit「停止」and user closing the Chromium window (process exit
+        detected on next status poll).
+        """
         if not instance_id:
             return
         if not self._bg_lock.acquire(blocking=False):
@@ -1103,8 +1115,13 @@ class SyncEngine:
                 with self.state_lock:
                     state = self.load_state()
                     cfg = self.get_settings(state)
-                    if not cfg.get("enabled") or not cfg.get("auto_upload_on_browser_stop") or not cfg.get("url"):
+                    if (
+                        not cfg.get("enabled")
+                        or not cfg.get("url")
+                        or not cfg.get("auto_upload_on_browser_stop")
+                    ):
                         return
+                self.log(f"浏览器已关闭，自动上传 Profile {instance_id[:12]}…", category="同步")
                 self.push(instance_ids=[instance_id])
             except Exception as exc:
                 self.log(f"自动上传浏览器 Profile 失败: {exc}", level="warn", category="同步")

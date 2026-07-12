@@ -428,6 +428,14 @@ def next_browser_instance_name(state: dict[str, Any], node_id: str) -> str:
     return f"浏览器 {max(numbers, default=count) + 1}"
 
 
+def normalize_browser_label(value: Any) -> str:
+    """Free-text tag/note for a browser instance (e.g. 访问 xx 的浏览器)."""
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) > 120:
+        text = text[:120].rstrip()
+    return text
+
+
 def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[str, Any]:
     existing_ids = {str(item.get("id") or "") for item in state.get("browser_instances", [])}
     instance_id = new_browser_instance_id(node_id)
@@ -438,6 +446,7 @@ def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[
         "id": instance_id,
         "node_id": node_id,
         "name": next_browser_instance_name(state, node_id),
+        "label": "",
         "status": "stopped",
         "profile_path": str(profile_path),
         "fingerprint_seed": browser_instance_seed(node_id, instance_id),
@@ -490,10 +499,13 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
         status = str(record.get("status") or "stopped")
         if status not in ACTIVE_BROWSER_STATUSES | {"stopped", "failed"}:
             status = "stopped"
+        # Prefer explicit label; accept legacy "tag" key if present.
+        label = normalize_browser_label(record.get("label") if "label" in record else record.get("tag"))
         record.update(
             {
                 "id": instance_id,
                 "node_id": node_id,
+                "label": label,
                 "status": status,
                 "profile_path": str(
                     record.get("profile_path") or browser_instance_profile_path(node_id, instance_id, legacy)
@@ -511,9 +523,33 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
                 "legacy": legacy,
             }
         )
+        record.pop("tag", None)
         normalized.append(record)
     state["browser_instances"] = normalized
     ensure_legacy_browser_instances(state)
+
+
+def update_browser_instance(payload: dict[str, Any]) -> dict[str, Any]:
+    """Update editable fields on a browser instance (currently: label)."""
+    instance_id = str(payload.get("instance_id") or payload.get("id") or "")
+    if not instance_id:
+        raise ValueError("缺少浏览器实例 ID")
+    if "label" not in payload and "tag" not in payload:
+        raise ValueError("没有可更新的字段")
+    label = normalize_browser_label(payload.get("label") if "label" in payload else payload.get("tag"))
+    with STATE_LOCK:
+        state = load_state()
+        instance = find_browser_instance(state, instance_id)
+        instance["label"] = label
+        save_state(state)
+        saved = dict(instance)
+    mark_sync_local_change()
+    # Push label to WebDAV when sync is enabled so other machines see the tag soon.
+    try:
+        get_sync_engine().maybe_auto_push(reason="更新浏览器标签")
+    except Exception:
+        pass
+    return {"ok": True, "instance": saved}
 
 
 def ensure_legacy_browser_instances(state: dict[str, Any]) -> None:
@@ -3940,7 +3976,14 @@ def sync_process_status(state: dict[str, Any]) -> bool:
 
 
 def sync_browser_instance_status(state: dict[str, Any]) -> bool:
+    """Reconcile browser instance status with live processes.
+
+    Returns True if any state field changed. Instances that transition from
+    running/starting → stopped (user closed/hidden until process exits) are
+    queued for a one-shot WebDAV upload when auto-upload is enabled.
+    """
     changed = False
+    newly_stopped: list[str] = []
     stopped_at = now_ts()
     for instance in state.get("browser_instances", []):
         instance_id = str(instance.get("id") or "")
@@ -3959,6 +4002,14 @@ def sync_browser_instance_status(state: dict[str, Any]) -> bool:
                 instance,
                 {"status": "stopped", "pid": None, "last_stopped_at": stopped_at},
             )
+            newly_stopped.append(instance_id)
+    if newly_stopped:
+        # Defer upload outside STATE_LOCK: status_payload holds locks; schedule after return.
+        for iid in newly_stopped:
+            try:
+                get_sync_engine().maybe_auto_upload_instance(iid)
+            except Exception:
+                pass
     return changed
 
 
@@ -4290,6 +4341,14 @@ class AppHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/browser/stop":
                 json_response(self, stop_browser(payload))
                 log_event("停止指纹浏览器", category="浏览器")
+            elif self.path == "/api/browser/update":
+                result = update_browser_instance(payload)
+                label = (result.get("instance") or {}).get("label") or ""
+                log_event(
+                    f"更新浏览器标签:{label or '（清空）'}",
+                    category="浏览器",
+                )
+                json_response(self, result)
             elif self.path == "/api/browser/download-kernel":
                 result = download_fingerprint_chromium(payload)
                 log_event(f"指纹内核下载/安装:{result.get('version') or '完成'}", category="浏览器")
