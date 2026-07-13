@@ -1,6 +1,6 @@
 # Proxy Bridge
 
-本地订阅节点到多协议代理端口的 macOS 菜单栏工具。
+本地订阅节点到多协议代理端口的工具。提供 macOS 菜单栏 App，以及可在 macOS / Linux / Windows 运行的无壳 Web 控制台。
 
 ## 功能
 
@@ -15,9 +15,16 @@
 
 ## 运行要求
 
+### macOS 菜单栏 App
 - Apple Silicon Mac，macOS 13+。
 - 菜单栏 App 不再要求目标 Mac 预装 `python3`；首次运行会自动下载独立 Python 运行时。
 - 默认轻量 App 首次运行需要能访问 GitHub,用于自动下载 Python 运行时和 `sing-box` / `xray` 代理核心。
+
+### 无壳跨平台 Web 控制台
+- Python 3.10+
+- macOS / Linux / Windows
+- 首次运行需要能访问 GitHub，用于自动下载 `sing-box` / `xray`
+- 指纹浏览器一键下载依赖上游是否发布对应平台包；也可手动设置 `PROXY_BRIDGE_FP_CHROMIUM`
 
 ## 构建机准备
 
@@ -108,12 +115,19 @@ scripts/build_menubar_app.sh --bundle-cores
 xattr -dr com.apple.quarantine /Applications/ProxyBridgeMenuBar.app
 ```
 
-## Web 控制台兼容模式
+## 无壳跨平台 Web 控制台（Linux / Windows / macOS）
 
-直接运行 Web 控制台仍需要本机命令行环境提供 `python3`：
+不依赖菜单栏壳，直接启动 Python 后端 + Web 控制台，即可使用订阅导入、本地代理、测速、连接日志等核心能力。
 
 ```bash
+# 默认监听 127.0.0.1:8787，数据目录为仓库下 ./work
 python3 app.py
+
+# 指定端口 / 工作目录，并自动打开系统浏览器
+python3 app.py --port 8790 --workdir ~/.proxybridge --open
+
+# Windows PowerShell 示例
+python app.py --port 8790 --workdir $env:APPDATA\ProxyBridge --open
 ```
 
 打开：
@@ -122,11 +136,24 @@ python3 app.py
 http://127.0.0.1:8787
 ```
 
-如果要改控制台端口：
+常用环境变量 / 参数：
 
-```bash
-PROXY_BRIDGE_PORT=8790 python3 app.py
-```
+| 项 | 说明 |
+|---|---|
+| `--port` / `PROXY_BRIDGE_PORT` | Web 控制台端口，默认 `8787` |
+| `--host` / `PROXY_BRIDGE_HOST` | 控制台绑定地址，默认 `127.0.0.1` |
+| `--workdir` / `PROXY_BRIDGE_WORKDIR` | 状态、日志、代理核心、浏览器 Profile 目录 |
+| `--open` | 启动后用系统浏览器打开控制台 |
+| `--no-core-auto-install` | 启动时不自动下载 `sing-box` / `xray` |
+| `PROXY_BRIDGE_SING_BOX` / `PROXY_BRIDGE_XRAY` | 手动指定核心可执行文件 |
+| `PROXY_BRIDGE_FP_CHROMIUM` | 手动指定指纹 Chromium 可执行文件 |
+
+说明：
+
+- 无壳模式与菜单栏 App 共用同一套 `app.py` 后端与 `static/` 前端。
+- 代理核心会按当前操作系统/架构从 GitHub Releases 自动选择 Linux / Windows / macOS 包。
+- 指纹浏览器若上游未提供当前平台安装包，可手动下载后通过 `PROXY_BRIDGE_FP_CHROMIUM` 指向可执行文件。
+- 管理控制台默认仅本机访问；局域网共享开关只影响本地代理端口，不会把控制台暴露到局域网。
 
 ## 局域网共享
 

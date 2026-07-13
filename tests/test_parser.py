@@ -98,10 +98,81 @@ class ParserTests(unittest.TestCase):
             ]
         }
 
-        self.assertEqual(app._pick_sing_box_asset(release, "arm64")["browser_download_url"], "https://example/sing-arm")
-        self.assertEqual(app._pick_sing_box_asset(release, "x86_64")["browser_download_url"], "https://example/sing-amd")
-        self.assertEqual(app._pick_xray_asset(release, "arm64")["browser_download_url"], "https://example/xray-arm")
-        self.assertEqual(app._pick_xray_asset(release, "x86_64")["browser_download_url"], "https://example/xray-amd")
+        self.assertEqual(
+            app._pick_sing_box_asset(release, "arm64", "darwin")["browser_download_url"],
+            "https://example/sing-arm",
+        )
+        self.assertEqual(
+            app._pick_sing_box_asset(release, "x86_64", "darwin")["browser_download_url"],
+            "https://example/sing-amd",
+        )
+        self.assertEqual(
+            app._pick_xray_asset(release, "arm64", "darwin")["browser_download_url"],
+            "https://example/xray-arm",
+        )
+        self.assertEqual(
+            app._pick_xray_asset(release, "x86_64", "darwin")["browser_download_url"],
+            "https://example/xray-amd",
+        )
+
+    def test_release_asset_pickers_select_linux_and_windows_archives(self):
+        release = {
+            "assets": [
+                {"name": "sing-box_1.0.0_linux_amd64.tar.gz", "browser_download_url": "https://example/sing-linux-amd"},
+                {"name": "sing-box_1.0.0_linux_arm64.tar.gz", "browser_download_url": "https://example/sing-linux-arm"},
+                {"name": "sing-box_1.0.0_windows_amd64.zip", "browser_download_url": "https://example/sing-win-amd"},
+                {"name": "sing-box_1.0.0_darwin_arm64.tar.gz", "browser_download_url": "https://example/sing-mac"},
+                {"name": "Xray-linux-64.zip", "browser_download_url": "https://example/xray-linux-amd"},
+                {"name": "Xray-linux-arm64-v8a.zip", "browser_download_url": "https://example/xray-linux-arm"},
+                {"name": "Xray-windows-64.zip", "browser_download_url": "https://example/xray-win-amd"},
+                {"name": "Xray-windows-arm64-v8a.zip", "browser_download_url": "https://example/xray-win-arm"},
+                {"name": "Xray-macos-arm64-v8a.zip", "browser_download_url": "https://example/xray-mac"},
+            ]
+        }
+
+        self.assertEqual(
+            app._pick_sing_box_asset(release, "x86_64", "linux")["browser_download_url"],
+            "https://example/sing-linux-amd",
+        )
+        self.assertEqual(
+            app._pick_sing_box_asset(release, "arm64", "linux")["browser_download_url"],
+            "https://example/sing-linux-arm",
+        )
+        self.assertEqual(
+            app._pick_sing_box_asset(release, "x86_64", "windows")["browser_download_url"],
+            "https://example/sing-win-amd",
+        )
+        self.assertEqual(
+            app._pick_xray_asset(release, "x86_64", "linux")["browser_download_url"],
+            "https://example/xray-linux-amd",
+        )
+        self.assertEqual(
+            app._pick_xray_asset(release, "arm64", "linux")["browser_download_url"],
+            "https://example/xray-linux-arm",
+        )
+        self.assertEqual(
+            app._pick_xray_asset(release, "x86_64", "windows")["browser_download_url"],
+            "https://example/xray-win-amd",
+        )
+        self.assertEqual(
+            app._pick_xray_asset(release, "arm64", "windows")["browser_download_url"],
+            "https://example/xray-win-arm",
+        )
+
+    def test_fingerprint_asset_picker_is_os_aware(self):
+        releases = [
+            {
+                "tag_name": "v1",
+                "assets": [
+                    {"name": "fingerprint-chromium_macos.dmg", "browser_download_url": "https://example/mac.dmg"},
+                    {"name": "fingerprint-chromium_windows_x64.zip", "browser_download_url": "https://example/win.zip"},
+                    {"name": "fingerprint-chromium_linux_x64.zip", "browser_download_url": "https://example/linux.zip"},
+                ],
+            }
+        ]
+        self.assertEqual(app._pick_fingerprint_asset(releases, "darwin")["url"], "https://example/mac.dmg")
+        self.assertEqual(app._pick_fingerprint_asset(releases, "windows")["url"], "https://example/win.zip")
+        self.assertEqual(app._pick_fingerprint_asset(releases, "linux")["url"], "https://example/linux.zip")
 
     def test_xray_runtime_install_only_requires_binary(self):
         old_work_root = app.WORK_ROOT
@@ -224,7 +295,7 @@ class ParserTests(unittest.TestCase):
                 self.assertIn("--proxy-server=socks5://127.0.0.1:25080", command)
                 # 校验方案 B 的指纹伪造标志已下发。
                 self.assertTrue(any(arg.startswith("--fingerprint=") for arg in command))
-                self.assertIn("--fingerprint-platform=macos", command)
+                self.assertIn(f"--fingerprint-platform={app.fingerprint_platform_token()}", command)
                 self.assertIn("--webrtc-ip-handling-policy=disable_non_proxied_udp", command)
                 self.assertTrue(any(arg.startswith("--timezone=") for arg in command))
                 self.assertTrue(any(arg.startswith("--lang=") for arg in command))
@@ -1484,3 +1555,34 @@ class ParserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class PlatformSupportTests(unittest.TestCase):
+    def test_cli_parser_accepts_headless_flags(self):
+        args = app.parse_cli_args(["--port", "8799", "--host", "127.0.0.1", "--workdir", "/tmp/pb-work", "--no-core-auto-install"])
+        self.assertEqual(args.port, 8799)
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertEqual(args.workdir, "/tmp/pb-work")
+        self.assertTrue(args.no_core_auto_install)
+
+    def test_configure_work_root_updates_paths(self):
+        old_work = app.WORK_ROOT
+        old_runtime = app.RUNTIME_ROOT
+        old_state = app.STATE_PATH
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                target = Path(temp_dir) / "data"
+                app.configure_work_root(target)
+                self.assertEqual(app.WORK_ROOT, target.resolve())
+                self.assertEqual(app.RUNTIME_ROOT, target.resolve() / "runtime")
+                self.assertEqual(app.STATE_PATH, target.resolve() / "state.json")
+        finally:
+            app.WORK_ROOT = old_work
+            app.RUNTIME_ROOT = old_runtime
+            app.STATE_PATH = old_state
+
+    def test_host_tokens_are_stable(self):
+        self.assertIn(app.host_os_token(), {"darwin", "linux", "windows", "unknown"})
+        self.assertIn(app.host_arch_token(), {"arm64", "x86_64"})
+        self.assertIn(app.fingerprint_platform_token(), {"macos", "linux", "windows"})

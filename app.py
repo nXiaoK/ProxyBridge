@@ -42,10 +42,58 @@ VENDOR_ROOT = APP_ROOT / "vendor"
 if VENDOR_ROOT.is_dir() and str(VENDOR_ROOT) not in sys.path:
     sys.path.insert(0, str(VENDOR_ROOT))
 STATIC_ROOT = APP_ROOT / "static"
-WORK_ROOT = Path(os.environ.get("PROXY_BRIDGE_WORKDIR", APP_ROOT / "work")).expanduser()
+SYNC_ENGINE: webdav_sync.SyncEngine | None = None
+
+
+def host_os_token() -> str:
+    """Return a stable OS token used for release asset selection."""
+    system = platform.system().lower()
+    if system == "darwin":
+        return "darwin"
+    if system == "windows":
+        return "windows"
+    if system == "linux":
+        return "linux"
+    return system or "unknown"
+
+
+def host_arch_token() -> str:
+    """Return arm64 or x86_64 for host architecture checks and downloads."""
+    machine = platform.machine().lower()
+    if machine in {"arm64", "aarch64"}:
+        return "arm64"
+    return "x86_64"
+
+
+def fingerprint_platform_token() -> str:
+    os_token = host_os_token()
+    if os_token == "darwin":
+        return "macos"
+    if os_token == "windows":
+        return "windows"
+    return "linux"
+
+
+def default_work_root() -> Path:
+    env = os.environ.get("PROXY_BRIDGE_WORKDIR")
+    if env:
+        return Path(env).expanduser()
+    # Source/dev default stays repo-local so existing macOS workflows keep working.
+    # Production hosts can point PROXY_BRIDGE_WORKDIR at a user data directory.
+    return APP_ROOT / "work"
+
+
+def configure_work_root(path: Path | str) -> None:
+    """Rebind runtime data directories. Used by CLI flags and tests."""
+    global WORK_ROOT, RUNTIME_ROOT, STATE_PATH
+    WORK_ROOT = Path(path).expanduser().resolve()
+    RUNTIME_ROOT = WORK_ROOT / "runtime"
+    STATE_PATH = WORK_ROOT / "state.json"
+
+
+WORK_ROOT = default_work_root()
 RUNTIME_ROOT = WORK_ROOT / "runtime"
 STATE_PATH = WORK_ROOT / "state.json"
-SYNC_ENGINE: webdav_sync.SyncEngine | None = None
 DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
 DEFAULT_BROWSER_START_URL = "https://ip.skk.moe/"
@@ -216,7 +264,11 @@ def ensure_dirs() -> None:
         browser_extensions_root(),
     ):
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
-        path.chmod(0o700)
+        try:
+            path.chmod(0o700)
+        except OSError:
+            # Windows and some mounted filesystems ignore or reject POSIX modes.
+            pass
 
 
 def browser_profiles_root() -> Path:
@@ -1133,13 +1185,23 @@ def _fsync_directory(path: Path) -> None:
 def _write_private_atomic(path: Path, data: bytes, *, temp_path: Path, mode: int = 0o600) -> None:
     try:
         with temp_path.open("wb") as f:
-            os.fchmod(f.fileno(), mode)
+            if hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(f.fileno(), mode)
+                except OSError:
+                    pass
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        temp_path.chmod(mode)
+        try:
+            temp_path.chmod(mode)
+        except OSError:
+            pass
         temp_path.replace(path)
-        path.chmod(mode)
+        try:
+            path.chmod(mode)
+        except OSError:
+            pass
         _fsync_directory(path.parent)
     except BaseException:
         try:
@@ -1291,26 +1353,47 @@ def public_node(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_executable_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    if os.name == "nt":
+        return True
+    return os.access(path, os.X_OK)
+
+
+def _core_binary_candidates(base_name: str) -> list[str]:
+    if os.name == "nt":
+        return [f"{base_name}.exe", base_name]
+    return [base_name, f"{base_name}.exe"]
+
+
 def core_paths() -> dict[str, str | None]:
     core_dir = Path(os.environ.get("PROXY_BRIDGE_CORE_DIR", APP_ROOT / "bin")).expanduser()
 
     def executable(path: Path) -> str | None:
-        return str(path) if path.is_file() and os.access(path, os.X_OK) else None
+        return str(path) if _is_executable_file(path) else None
+
+    def first_existing(*paths: Path) -> str | None:
+        for path in paths:
+            found = executable(path)
+            if found:
+                return found
+        return None
+
+    sing_names = _core_binary_candidates("sing-box")
+    xray_names = _core_binary_candidates("xray") + _core_binary_candidates("xray-core")
 
     sing_box = (
         executable(Path(os.environ.get("PROXY_BRIDGE_SING_BOX", "")))
-        or executable(core_dir / "sing-box")
-        or executable(proxy_core_bin_dir() / "sing-box")
-        or shutil.which("sing-box")
+        or first_existing(*(core_dir / name for name in sing_names))
+        or first_existing(*(proxy_core_bin_dir() / name for name in sing_names))
+        or next((shutil.which(name) for name in sing_names if shutil.which(name)), None)
     )
     xray = (
         executable(Path(os.environ.get("PROXY_BRIDGE_XRAY", "")))
-        or executable(core_dir / "xray")
-        or executable(core_dir / "xray-core")
-        or executable(proxy_core_bin_dir() / "xray")
-        or executable(proxy_core_bin_dir() / "xray-core")
-        or shutil.which("xray")
-        or shutil.which("xray-core")
+        or first_existing(*(core_dir / name for name in xray_names))
+        or first_existing(*(proxy_core_bin_dir() / name for name in xray_names))
+        or next((shutil.which(name) for name in xray_names if shutil.which(name)), None)
     )
     return {"sing-box": sing_box, "xray": xray}
 
@@ -1336,10 +1419,45 @@ def _asset_name(asset: dict[str, Any]) -> str:
     return str(asset.get("name") or "")
 
 
-def _pick_sing_box_asset(release: dict[str, Any], host_arch: str) -> dict[str, Any] | None:
+def _sing_box_os_terms(host_os: str) -> tuple[str, ...]:
+    if host_os == "darwin":
+        return ("darwin", "macos", "apple")
+    if host_os == "windows":
+        return ("windows", "win32", "win64")
+    if host_os == "linux":
+        return ("linux",)
+    return (host_os,)
+
+
+def _xray_os_terms(host_os: str) -> tuple[str, ...]:
+    if host_os == "darwin":
+        return ("macos", "darwin")
+    if host_os == "windows":
+        return ("windows", "win")
+    if host_os == "linux":
+        return ("linux",)
+    return (host_os,)
+
+
+def _foreign_os_skip_terms(host_os: str) -> tuple[str, ...]:
+    foreign = {
+        "darwin": ("windows", "linux", "android", "openwrt"),
+        "windows": ("darwin", "macos", "apple", "linux", "android", "openwrt"),
+        "linux": ("darwin", "macos", "apple", "windows", "android", "openwrt"),
+    }
+    return foreign.get(host_os, ("android", "openwrt"))
+
+
+def _pick_sing_box_asset(
+    release: dict[str, Any],
+    host_arch: str,
+    host_os: str | None = None,
+) -> dict[str, Any] | None:
     assets = release.get("assets") or []
+    os_token = host_os or host_os_token()
     arch_terms = ("arm64", "aarch64") if host_arch == "arm64" else ("amd64", "x86_64", "x64")
-    os_terms = ("darwin", "macos", "apple")
+    os_terms = _sing_box_os_terms(os_token)
+    skip_terms = _foreign_os_skip_terms(os_token) + (".apk", ".ipk", ".deb", ".rpm")
     archive_terms = (".tar.gz", ".tgz", ".zip")
 
     def score(asset: dict[str, Any]) -> int:
@@ -1352,14 +1470,20 @@ def _pick_sing_box_asset(release: dict[str, Any], host_arch: str) -> dict[str, A
             return -1
         if not any(term in name for term in arch_terms):
             return -1
-        if any(skip in name for skip in ("android", "openwrt", "windows", "linux", ".apk", ".ipk", ".deb", ".rpm")):
+        if any(skip in name for skip in skip_terms):
             return -1
-        value = 0
-        if "darwin" in name:
+        value = 10
+        if os_token == "darwin" and "darwin" in name:
             value += 20
-        if "apple" in name:
+        if os_token == "darwin" and "apple" in name:
             value += 10
+        if os_token == "windows" and "windows" in name:
+            value += 20
+        if os_token == "linux" and "linux" in name:
+            value += 20
         if name.endswith(".tar.gz") or name.endswith(".tgz"):
+            value += 5
+        if os_token == "windows" and name.endswith(".zip"):
             value += 5
         return value
 
@@ -1369,14 +1493,24 @@ def _pick_sing_box_asset(release: dict[str, Any], host_arch: str) -> dict[str, A
     return candidates[0][1] if candidates else None
 
 
-def _pick_xray_asset(release: dict[str, Any], host_arch: str) -> dict[str, Any] | None:
+def _pick_xray_asset(
+    release: dict[str, Any],
+    host_arch: str,
+    host_os: str | None = None,
+) -> dict[str, Any] | None:
     assets = release.get("assets") or []
+    os_token = host_os or host_os_token()
+    os_terms = _xray_os_terms(os_token)
 
     def score(asset: dict[str, Any]) -> int:
         name = _asset_name(asset).lower()
         if not _asset_url(asset) or not name.endswith(".zip"):
             return -1
-        if "macos" not in name and "darwin" not in name:
+        if not name.startswith("xray"):
+            return -1
+        if not any(term in name for term in os_terms):
+            return -1
+        if any(skip in name for skip in _foreign_os_skip_terms(os_token)):
             return -1
         if host_arch == "arm64":
             if not any(term in name for term in ("arm64", "aarch64", "arm64-v8a")):
@@ -1449,6 +1583,8 @@ def _install_executable(source: Path, dest: Path) -> None:
 
 
 def _write_xray_wrapper() -> None:
+    if os.name == "nt":
+        return
     wrapper = proxy_core_bin_dir() / "xray"
     wrapper.write_text(
         '#!/bin/sh\n'
@@ -1469,17 +1605,28 @@ def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
         _download_asset(asset, archive_path)
         _extract_archive(archive_path, extract_root)
         if core == "sing-box":
-            binary = _find_extracted_file(extract_root, {"sing-box"})
+            binary = _find_extracted_file(extract_root, set(_core_binary_candidates("sing-box")))
             if not binary:
                 raise RuntimeError("sing-box 压缩包中未找到 sing-box 可执行文件")
-            _install_executable(binary, proxy_core_bin_dir() / "sing-box")
+            target = proxy_core_bin_dir() / ("sing-box.exe" if os.name == "nt" else "sing-box")
+            _install_executable(binary, target)
             version_path = proxy_core_root() / "sing-box.version"
             version_path.write_text(f"{tag}\n{_asset_name(asset)}\n", encoding="utf-8")
-            return str(proxy_core_bin_dir() / "sing-box")
+            return str(target)
 
-        binary = _find_extracted_file(extract_root, {"xray", "xray-core"})
+        binary = _find_extracted_file(
+            extract_root,
+            set(_core_binary_candidates("xray") + _core_binary_candidates("xray-core")),
+        )
         if not binary:
             raise RuntimeError("Xray 压缩包中未找到 xray 可执行文件")
+        if os.name == "nt":
+            target = proxy_core_bin_dir() / "xray.exe"
+            _install_executable(binary, target)
+            version_path = proxy_core_root() / "xray.version"
+            version_path.write_text(f"{tag}\n{_asset_name(asset)}\n", encoding="utf-8")
+            return str(target)
+
         _install_executable(binary, proxy_core_bin_dir() / "xray-core")
         _write_xray_wrapper()
         version_path = proxy_core_root() / "xray.version"
@@ -1498,15 +1645,16 @@ def ensure_core_installed(core: str) -> str:
         paths = core_paths()
         if paths.get(core):
             return str(paths[core])
-        host_arch = _macos_arch_token()
+        host_arch = host_arch_token()
+        host_os = host_os_token()
         if core == "sing-box":
             release = _github_json(SING_BOX_RELEASES_API)
-            asset = _pick_sing_box_asset(release if isinstance(release, dict) else {}, host_arch)
+            asset = _pick_sing_box_asset(release if isinstance(release, dict) else {}, host_arch, host_os)
         else:
             release = _github_json(XRAY_RELEASES_API)
-            asset = _pick_xray_asset(release if isinstance(release, dict) else {}, host_arch)
+            asset = _pick_xray_asset(release if isinstance(release, dict) else {}, host_arch, host_os)
         if not asset:
-            raise RuntimeError(f"未找到适配 macOS/{host_arch} 的 {core} release 资源")
+            raise RuntimeError(f"未找到适配 {host_os}/{host_arch} 的 {core} release 资源")
         tag = str(release.get("tag_name") or release.get("name") or "")
         log_event(f"正在下载 {core}:{_asset_name(asset)}", category="核心")
         installed = _install_core_from_asset(core, asset, tag)
@@ -1540,16 +1688,48 @@ def chrome_path() -> str | None:
     candidates: list[Path] = []
     if env_path:
         candidates.append(Path(env_path).expanduser())
-    candidates.extend(
-        [
-            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        ]
-    )
+    os_token = host_os_token()
+    if os_token == "darwin":
+        candidates.extend(
+            [
+                Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            ]
+        )
+    elif os_token == "windows":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        program_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+        program_files_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+        for root in (local_app, program_files, program_files_x86):
+            if not root:
+                continue
+            candidates.append(Path(root) / "Google" / "Chrome" / "Application" / "chrome.exe")
+            candidates.append(Path(root) / "Chromium" / "Application" / "chrome.exe")
+    else:
+        candidates.extend(
+            [
+                Path("/usr/bin/google-chrome"),
+                Path("/usr/bin/google-chrome-stable"),
+                Path("/usr/bin/chromium"),
+                Path("/usr/bin/chromium-browser"),
+                Path("/snap/bin/chromium"),
+            ]
+        )
     for candidate in candidates:
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        if _is_executable_file(candidate):
             return str(candidate)
-    return shutil.which("google-chrome") or shutil.which("chrome") or shutil.which("google-chrome-stable")
+    for name in (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "chrome",
+        "chrome.exe",
+    ):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
 
 
 def fingerprint_chromium_root() -> Path:
@@ -1582,35 +1762,61 @@ def _fingerprint_chromium_cache_key() -> tuple[str | None, str, str]:
     )
 
 
+def _fingerprint_binary_names() -> tuple[str, ...]:
+    if os.name == "nt":
+        return ("chrome.exe", "chromium.exe", "Chromium.exe", "chrome", "chromium")
+    return ("chrome", "chromium", "Chromium", "chrome.exe", "chromium.exe")
+
+
+def _resolve_fingerprint_executable_in_root(root: Path) -> str | None:
+    if not root.exists():
+        return None
+    if root.is_file() and _is_executable_file(root):
+        return str(root)
+    if root.suffix == ".app" and root.is_dir():
+        exe = _bundle_executable(root)
+        if exe:
+            return exe
+    if root.is_dir():
+        direct_app = root / "Chromium.app"
+        app_candidates = [direct_app] if direct_app.is_dir() else []
+        app_candidates.extend(app_dir for app_dir in root.glob("**/Chromium.app") if app_dir != direct_app)
+        for app_dir in app_candidates:
+            exe = _bundle_executable(app_dir)
+            if exe:
+                return exe
+        for name in _fingerprint_binary_names():
+            direct = root / name
+            if _is_executable_file(direct):
+                return str(direct)
+        for name in _fingerprint_binary_names():
+            for candidate in sorted(root.rglob(name)):
+                if _is_executable_file(candidate):
+                    return str(candidate)
+    return None
+
+
 def _resolve_fingerprint_chromium_path() -> str | None:
     # 定位指纹内核可执行文件。优先级:环境变量 > 工作目录安装位 > 系统 Applications。
     # 指纹内核必须是打过补丁的 Chromium(而非本机 Google Chrome),否则无法在底层伪造指纹。
     env_path = os.environ.get("PROXY_BRIDGE_FP_CHROMIUM")
     if env_path:
-        candidate = Path(env_path).expanduser()
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-        if candidate.suffix == ".app" and candidate.is_dir():
-            exe = _bundle_executable(candidate)
-            if exe:
-                return str(exe)
+        resolved = _resolve_fingerprint_executable_in_root(Path(env_path).expanduser())
+        if resolved:
+            return resolved
 
-    # 下载器会把内核安装到工作目录下,这里允许递归查找以兼容 dmg 内部层级。
+    # 下载器会把内核安装到工作目录下,这里允许递归查找以兼容 dmg/zip 内部层级。
     install_root = fingerprint_chromium_root()
-    if install_root.is_dir():
-        direct_app = install_root / "Chromium.app"
-        candidates = [direct_app] if direct_app.is_dir() else []
-        candidates.extend(app_dir for app_dir in install_root.glob("**/Chromium.app") if app_dir != direct_app)
-        for app_dir in candidates:
-            exe = _bundle_executable(app_dir)
-            if exe:
-                return str(exe)
+    resolved = _resolve_fingerprint_executable_in_root(install_root)
+    if resolved:
+        return resolved
 
     # 系统应用目录只检查常见直接安装位置。递归扫描整个 /Applications 在状态轮询中代价太高。
-    for app_dir in (Path("/Applications/Chromium.app"), Path.home() / "Applications/Chromium.app"):
-        exe = _bundle_executable(app_dir)
-        if exe:
-            return str(exe)
+    if host_os_token() == "darwin":
+        for app_dir in (Path("/Applications/Chromium.app"), Path.home() / "Applications/Chromium.app"):
+            exe = _bundle_executable(app_dir)
+            if exe:
+                return exe
     return None
 
 
@@ -1815,6 +2021,13 @@ def _status_payload() -> dict[str, Any]:
             for bridge in state["bridges"]
         ]
         return {
+            "platform": {
+                "os": host_os_token(),
+                "arch": host_arch_token(),
+                "fingerprint_platform": fingerprint_platform_token(),
+                "work_root": str(WORK_ROOT),
+                "shell_mode": "headless",
+            },
             "cores": core_paths(),
             "chrome": chrome_path(),
             "fingerprint_chromium": fingerprint_chromium_path(),
@@ -2779,8 +2992,24 @@ def core_command(core: str, config_path: Path) -> list[str]:
     return [binary, "run", "-c", str(config_path)]
 
 
+def _popen_kwargs() -> dict[str, Any]:
+    """Process group isolation where supported (POSIX new session / Windows new group)."""
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": creationflags} if creationflags else {}
+    return {"start_new_session": True}
+
+
 def terminate_process(process: subprocess.Popen) -> None:
     if process.poll() is not None:
+        return
+    if os.name == "nt" or not hasattr(os, "killpg"):
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -2918,13 +3147,17 @@ def _run_prepared_bridge(plan: dict[str, Any], command: list[str]) -> dict[str, 
     rotate_runtime_log(log_path)
     log_file = log_path.open("ab")
     try:
-        os.fchmod(log_file.fileno(), 0o600)
+        if hasattr(os, "fchmod"):
+            try:
+                os.fchmod(log_file.fileno(), 0o600)
+            except OSError:
+                pass
         process = subprocess.Popen(
             command,
             cwd=str(APP_ROOT),
             stdout=log_file,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
+            **_popen_kwargs(),
         )
     finally:
         log_file.close()
@@ -3160,7 +3393,7 @@ def _run_browser_launch(
         f"--user-data-dir={profile_path}",
         # --fingerprint 是指纹伪造的总开关:同种子必得同指纹,不同种子必得不同指纹。
         f"--fingerprint={seed}",
-        "--fingerprint-platform=macos",
+        f"--fingerprint-platform={fingerprint_platform_token()}",
         f"--timezone={timezone}",
         f"--lang={language}",
         f"--accept-lang={accept_language}",
@@ -3180,7 +3413,7 @@ def _run_browser_launch(
         cwd=str(APP_ROOT),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=True,
+        **_popen_kwargs(),
     )
     try:
         # 记录浏览器进程,便于后续「停止浏览器」结束整个进程组;同时清理已退出的旧句柄。
@@ -3419,29 +3652,73 @@ FP_CHROMIUM_RELEASES_API = "https://api.github.com/repos/adryfish/fingerprint-ch
 
 
 def _macos_arch_token() -> str:
-    # 返回本机 CPU 架构标记,用于安装后校验内核二进制与主机是否兼容。
-    machine = platform.machine().lower()
-    if machine in {"arm64", "aarch64"}:
-        return "arm64"
-    return "x86_64"
+    # Backward-compatible alias used by older tests/call sites.
+    return host_arch_token()
 
 
-def _pick_macos_asset(releases: list[dict[str, Any]]) -> dict[str, str] | None:
-    # 从 GitHub releases 列表中挑选第一个 macOS dmg 资源。
-    # 注意:fingerprint-chromium 的 macOS 包命名为 ..._macos.dmg,文件名不含架构标记
-    # (目前只发布单一 arm64 包),因此这里按 "_macos.dmg" 结尾识别,不按架构 token 过滤。
-    # 并非每个版本都发布 macOS 包,所以需要遍历多个 release 兜底取最新可用者。
+def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None = None) -> dict[str, str] | None:
+    """Pick the newest fingerprint-chromium package for the current OS.
+
+    macOS packages are typically `*_macos.dmg` and often omit arch tokens.
+    Windows/Linux packages, when published, are usually zip/tar archives with
+    `windows`/`linux` and arch markers in the file name.
+    """
+    os_token = host_os or host_os_token()
+    host_arch = host_arch_token()
+    arch_terms = ("arm64", "aarch64") if host_arch == "arm64" else ("amd64", "x86_64", "x64", "64")
+
+    def asset_score(name: str) -> int:
+        lowered = name.lower()
+        if os_token == "darwin":
+            if not (lowered.endswith(".dmg") and "macos" in lowered):
+                return -1
+            return 100
+        if os_token == "windows":
+            if not any(term in lowered for term in ("windows", "win64", "win32")):
+                return -1
+            if not lowered.endswith((".zip", ".7z")):
+                return -1
+        elif os_token == "linux":
+            if "linux" not in lowered:
+                return -1
+            if not lowered.endswith((".zip", ".tar.gz", ".tgz", ".tar.xz", ".tar")):
+                return -1
+        else:
+            return -1
+        if any(skip in lowered for skip in _foreign_os_skip_terms(os_token)):
+            return -1
+        value = 10
+        if any(term in lowered for term in arch_terms):
+            value += 20
+        if lowered.endswith(".zip"):
+            value += 5
+        return value
+
+    best: dict[str, str] | None = None
+    best_score = -1
     for release in releases:
         if release.get("draft") or release.get("prerelease"):
             continue
         for asset in release.get("assets") or []:
             name = str(asset.get("name") or "")
-            lowered = name.lower()
-            if lowered.endswith(".dmg") and "macos" in lowered:
-                url = asset.get("browser_download_url")
-                if url:
-                    return {"name": name, "url": str(url), "tag": str(release.get("tag_name") or "")}
-    return None
+            score = asset_score(name)
+            if score < 0:
+                continue
+            url = asset.get("browser_download_url")
+            if not url:
+                continue
+            if score > best_score:
+                best_score = score
+                best = {"name": name, "url": str(url), "tag": str(release.get("tag_name") or "")}
+        if best is not None and os_token == "darwin":
+            # Preserve previous behavior: first non-prerelease macOS dmg wins.
+            return best
+    return best
+
+
+def _pick_macos_asset(releases: list[dict[str, Any]]) -> dict[str, str] | None:
+    # Backward-compatible wrapper around the multi-platform picker.
+    return _pick_fingerprint_asset(releases, host_os="darwin")
 
 
 def _verify_macos_binary_arch(app_path: Path) -> str | None:
@@ -3460,6 +3737,8 @@ def _verify_macos_binary_arch(app_path: Path) -> str | None:
 
 def _install_from_dmg(dmg_path: Path, dest_root: Path) -> Path:
     # 挂载 dmg,复制其中的 Chromium.app 到目标目录,再卸载。全程使用 macOS 自带 hdiutil。
+    if host_os_token() != "darwin":
+        raise RuntimeError("仅 macOS 支持从 dmg 安装指纹内核")
     mount_point = dest_root / "_mnt"
     if mount_point.exists():
         subprocess.run(["hdiutil", "detach", str(mount_point), "-force"], capture_output=True)
@@ -3489,17 +3768,50 @@ def _install_from_dmg(dmg_path: Path, dest_root: Path) -> Path:
     return target_app
 
 
+def _install_fingerprint_from_archive(archive_path: Path, dest_root: Path) -> Path:
+    extract_root = dest_root / "_extract"
+    if extract_root.exists():
+        shutil.rmtree(extract_root, ignore_errors=True)
+    extract_root.mkdir(parents=True, exist_ok=True)
+    try:
+        _extract_archive(archive_path, extract_root)
+        resolved = _resolve_fingerprint_executable_in_root(extract_root)
+        if not resolved:
+            raise RuntimeError("压缩包中未找到 Chromium/chrome 可执行文件")
+        resolved_path = Path(resolved)
+        # Prefer keeping a Chromium.app bundle layout when present.
+        app_root = next((parent for parent in resolved_path.parents if parent.name.endswith(".app")), None)
+        if app_root is not None:
+            target_app = dest_root / app_root.name
+            if target_app.exists():
+                shutil.rmtree(target_app, ignore_errors=True)
+            shutil.copytree(app_root, target_app, symlinks=True)
+            return target_app
+
+        target_dir = dest_root / "chromium"
+        if target_dir.exists():
+            shutil.rmtree(target_dir, ignore_errors=True)
+        # Copy the directory that contains the executable so shared libs remain nearby.
+        source_dir = resolved_path.parent
+        shutil.copytree(source_dir, target_dir, symlinks=True)
+        return target_dir / resolved_path.name
+    finally:
+        shutil.rmtree(extract_root, ignore_errors=True)
+
+
 def download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
     with FINGERPRINT_INSTALL_LOCK:
         return _download_fingerprint_chromium(payload)
 
 
 def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
-    # 一键下载指纹内核:查询 GitHub Releases,取最新的 macOS dmg,下载并安装到工作目录。
+    # 一键下载指纹内核:查询 GitHub Releases,按当前 OS 选择包并安装到工作目录。
     existing = fingerprint_chromium_path()
     if existing and not truthy(payload.get("force")):
         return {"ok": True, "already_installed": True, "path": existing}
 
+    host_os = host_os_token()
+    host_arch = host_arch_token()
     request = urllib.request.Request(
         f"{FP_CHROMIUM_RELEASES_API}?per_page=20",
         headers={"User-Agent": "ProxyBridge/0.1", "Accept": "application/vnd.github+json"},
@@ -3510,36 +3822,39 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as error:
         raise RuntimeError(f"获取指纹内核版本列表失败:{error}") from error
 
-    asset = _pick_macos_asset(releases if isinstance(releases, list) else [])
+    asset = _pick_fingerprint_asset(releases if isinstance(releases, list) else [], host_os=host_os)
     if not asset:
         raise RuntimeError(
-            "未找到 macOS 指纹内核包(..._macos.dmg)。"
-            "该项目并非每个版本都发布 macOS 包,请稍后重试或手动下载。"
+            f"未找到适配 {host_os}/{host_arch} 的指纹内核包。"
+            "该项目并非每个版本都为全部平台发布安装包;可稍后重试,"
+            "或手动下载后设置 PROXY_BRIDGE_FP_CHROMIUM 指向 Chromium 可执行文件。"
         )
 
-    host_arch = _macos_arch_token()
     dest_root = fingerprint_chromium_root()
     dest_root.mkdir(parents=True, exist_ok=True)
-    dmg_path = dest_root / asset["name"]
+    package_path = dest_root / asset["name"]
     try:
-        # 流式下载 dmg 到工作目录,再从中安装。
         with urllib.request.urlopen(
             urllib.request.Request(asset["url"], headers={"User-Agent": "ProxyBridge/0.1"}),
             timeout=600,
-        ) as response, dmg_path.open("wb") as out:
+        ) as response, package_path.open("wb") as out:
             shutil.copyfileobj(response, out)
     except Exception as error:
-        dmg_path.unlink(missing_ok=True)
+        package_path.unlink(missing_ok=True)
         raise RuntimeError(f"下载指纹内核失败:{error}") from error
 
     try:
-        target_app = _install_from_dmg(dmg_path, dest_root)
+        lowered = asset["name"].lower()
+        if lowered.endswith(".dmg"):
+            target = _install_from_dmg(package_path, dest_root)
+        else:
+            target = _install_fingerprint_from_archive(package_path, dest_root)
     finally:
-        dmg_path.unlink(missing_ok=True)
+        package_path.unlink(missing_ok=True)
 
     # 安装后校验二进制架构:若与主机不一致,给出明确提示(arm64 内核在 Intel Mac 无法运行;
     # 反之 Apple Silicon 可通过 Rosetta 兼容 x86_64,但仍提醒用户以免困惑)。
-    binary_arch = _verify_macos_binary_arch(target_app)
+    binary_arch = _verify_macos_binary_arch(target) if host_os == "darwin" else None
     arch_warning = ""
     if binary_arch and binary_arch != host_arch:
         if host_arch == "x86_64" and binary_arch == "arm64":
@@ -3552,14 +3867,14 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "ok": True,
         "already_installed": False,
-        "path": resolved or str(target_app),
+        "path": resolved or str(target),
         "version": asset.get("tag"),
+        "host_os": host_os,
         "host_arch": host_arch,
         "binary_arch": binary_arch,
         "arch_warning": arch_warning,
         "asset": asset["name"],
     }
-
 
 def runtime_log_backup_path(path: Path, index: int) -> Path:
     return path.with_name(f"{path.name}.{index}")
@@ -3603,7 +3918,11 @@ def rotate_runtime_log(
             temp_path=backup.with_suffix(backup.suffix + ".tmp"),
         )
         with path.open("r+b") as current:
-            os.fchmod(current.fileno(), 0o600)
+            if hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(current.fileno(), 0o600)
+                except OSError:
+                    pass
             current.truncate(0)
             current.flush()
             os.fsync(current.fileno())
@@ -4575,13 +4894,17 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
             rotate_runtime_log(log_path)
             log_file = log_path.open("ab")
             try:
-                os.fchmod(log_file.fileno(), 0o600)
+                if hasattr(os, "fchmod"):
+                    try:
+                        os.fchmod(log_file.fileno(), 0o600)
+                    except OSError:
+                        pass
                 process = subprocess.Popen(
                     command,
                     cwd=str(APP_ROOT),
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
-                    start_new_session=True,
+                    **_popen_kwargs(),
                 )
             finally:
                 log_file.close()
@@ -4917,10 +5240,35 @@ def sync_browser_instance_status(state: dict[str, Any]) -> bool:
 
 
 def copy_to_clipboard(text: str) -> dict[str, Any]:
-    if sys.platform == "darwin" and shutil.which("pbcopy"):
-        proc = subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
-        if proc.returncode == 0:
-            return {"ok": True}
+    os_token = host_os_token()
+    try:
+        if os_token == "darwin" and shutil.which("pbcopy"):
+            proc = subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+            if proc.returncode == 0:
+                return {"ok": True}
+        elif os_token == "windows":
+            # `clip` reads UTF-16LE text from stdin on modern Windows.
+            proc = subprocess.run(
+                ["clip"],
+                input=text.encode("utf-16le"),
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if proc.returncode == 0:
+                return {"ok": True}
+        else:
+            for command in (
+                ["wl-copy"],
+                ["xclip", "-selection", "clipboard"],
+                ["xsel", "--clipboard", "--input"],
+            ):
+                if not shutil.which(command[0]):
+                    continue
+                proc = subprocess.run(command, input=text.encode("utf-8"), check=False)
+                if proc.returncode == 0:
+                    return {"ok": True}
+    except OSError:
+        pass
     return {"ok": False, "text": text}
 
 
@@ -5481,21 +5829,82 @@ def start_parent_monitor() -> None:
     threading.Thread(target=monitor, name="parent-process-monitor", daemon=True).start()
 
 
-def main() -> None:
+def parse_cli_args(argv: list[str] | None = None) -> Any:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="proxybridge",
+        description="ProxyBridge headless console (macOS / Linux / Windows)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"Web console port (default: env PROXY_BRIDGE_PORT or {DEFAULT_SERVER_PORT})",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.environ.get("PROXY_BRIDGE_HOST", "127.0.0.1"),
+        help="Console bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--workdir",
+        default=None,
+        help="Data directory for state/runtime/cores (default: env PROXY_BRIDGE_WORKDIR or ./work)",
+    )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the web console in the system browser after startup",
+    )
+    parser.add_argument(
+        "--no-core-auto-install",
+        action="store_true",
+        help="Do not auto-download sing-box/xray on startup",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parse_cli_args(argv)
+    if args.workdir:
+        configure_work_root(args.workdir)
+        os.environ["PROXY_BRIDGE_WORKDIR"] = str(WORK_ROOT)
+    elif os.environ.get("PROXY_BRIDGE_WORKDIR"):
+        configure_work_root(os.environ["PROXY_BRIDGE_WORKDIR"])
+
     ensure_dirs()
     atexit.register(shutdown)
-    signal.signal(signal.SIGTERM, handle_shutdown_signal)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, handle_shutdown_signal)
     signal.signal(signal.SIGINT, handle_shutdown_signal)
-    port = safe_int(os.environ.get("PROXY_BRIDGE_PORT"), DEFAULT_SERVER_PORT)
+    port = safe_int(args.port if args.port is not None else os.environ.get("PROXY_BRIDGE_PORT"), DEFAULT_SERVER_PORT)
+    if port <= 0 or port > 65535:
+        raise SystemExit(f"无效端口: {port}")
+    host = str(args.host or "127.0.0.1").strip() or "127.0.0.1"
     start_parent_monitor()
-    start_core_auto_install()
+    if not args.no_core_auto_install:
+        start_core_auto_install()
     restore_enabled_bridges()
     try:
         get_sync_engine().maybe_check_on_startup()
     except Exception as exc:
         log_event(f"启动同步检查调度失败: {exc}", level="warn", category="同步")
-    server = ProxyBridgeHTTPServer(("127.0.0.1", port), AppHandler)
-    log_event(f"Proxy Bridge 已启动,监听 http://127.0.0.1:{port}", category="系统")
+    server = ProxyBridgeHTTPServer((host, port), AppHandler)
+    console_url = f"http://{host}:{port}"
+    log_event(
+        f"Proxy Bridge 已启动({host_os_token()}/{host_arch_token()}),监听 {console_url}",
+        category="系统",
+    )
+    print(f"Proxy Bridge console: {console_url}", flush=True)
+    print(f"Work dir: {WORK_ROOT}", flush=True)
+    if args.open:
+        try:
+            import webbrowser
+
+            webbrowser.open(console_url)
+        except Exception as exc:
+            log_event(f"自动打开浏览器失败: {exc}", level="warn", category="系统")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
