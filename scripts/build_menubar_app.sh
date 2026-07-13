@@ -2,17 +2,35 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-APP_DIR="$ROOT_DIR/outputs/ProxyBridgeMenuBar.app"
-CONTENTS_DIR="$APP_DIR/Contents"
-MACOS_DIR="$CONTENTS_DIR/MacOS"
-RESOURCES_DIR="$CONTENTS_DIR/Resources"
-BRIDGE_DIR="$RESOURCES_DIR/bridge"
-CORE_DIR="$BRIDGE_DIR/bin"
+OUTPUT_DIR="$ROOT_DIR/outputs"
+FINAL_APP_DIR="$OUTPUT_DIR/ProxyBridgeMenuBar.app"
+STAGING_ROOT=""
+APP_DIR=""
+BUILD_LOCK_DIR="$OUTPUT_DIR/.ProxyBridgeMenuBar.build.lock"
+BUILD_LOCK_HELD=0
+TARGET_ARCH="arm64"
+SWIFT_TARGET="${TARGET_ARCH}-apple-macos13.0"
+REQUIREMENTS_LOCK="$ROOT_DIR/scripts/requirements.lock"
+VENDOR_PYTHON="${PYTHON_FOR_VENDOR:-}"
 ICON_PATH="$ROOT_DIR/macos/ProxyBridgeMenuBar/AppIcon.icns"
 WEB_ICON_PATH="$ROOT_DIR/static/assets/app-icon.png"
 PREVIEW_ICON_PATH="$ROOT_DIR/outputs/ProxyBridgeAppIcon.png"
 ICON_TOOL="$ROOT_DIR/work/generate_app_icon"
+ATOMIC_REPLACE_TOOL="$ROOT_DIR/work/atomic_replace_app"
 BUNDLE_CORES=0
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "$STAGING_ROOT" && -d "$STAGING_ROOT" ]]; then
+    rm -rf "$STAGING_ROOT"
+  fi
+  if [[ "$BUILD_LOCK_HELD" == "1" && -d "$BUILD_LOCK_DIR" ]]; then
+    rm -rf "$BUILD_LOCK_DIR"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
 
 for arg in "$@"; do
   case "$arg" in
@@ -30,6 +48,10 @@ Usage: scripts/build_menubar_app.sh [--bundle-cores]
 Options:
   --bundle-cores, --with-cores  从构建机复制 sing-box/xray 到 App 内部。
   -h, --help                   显示帮助。
+
+Environment:
+  PYTHON_FOR_VENDOR=/path/python3          用于构建 bridge/vendor 的 Python。
+  PROXY_BRIDGE_VENDOR_WHEELHOUSE=/path     从离线 wheelhouse 安装锁定依赖。
 EOF
       exit 0
       ;;
@@ -40,9 +62,39 @@ EOF
   esac
 done
 
-mkdir -p "$APP_DIR" "$CONTENTS_DIR" "$MACOS_DIR" "$RESOURCES_DIR" "$BRIDGE_DIR" "$ROOT_DIR/outputs"
-mkdir -p "$ROOT_DIR/static/assets"
+acquire_build_lock() {
+  local owner_pid=""
+  if ! mkdir "$BUILD_LOCK_DIR" 2>/dev/null; then
+    if [[ -r "$BUILD_LOCK_DIR/pid" ]]; then
+      IFS= read -r owner_pid < "$BUILD_LOCK_DIR/pid" || true
+    fi
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+      echo "已有 ProxyBridge 构建正在运行 (PID $owner_pid)" >&2
+      exit 1
+    fi
+    rm -rf "$BUILD_LOCK_DIR"
+    if ! mkdir "$BUILD_LOCK_DIR" 2>/dev/null; then
+      echo "无法获取 ProxyBridge 构建锁：$BUILD_LOCK_DIR" >&2
+      exit 1
+    fi
+  fi
+  printf '%s\n' "$$" > "$BUILD_LOCK_DIR/pid"
+  BUILD_LOCK_HELD=1
+}
+
+mkdir -p "$OUTPUT_DIR" "$ROOT_DIR/static/assets"
 mkdir -p "$ROOT_DIR/work/clang-module-cache" "$ROOT_DIR/work/swift-module-cache"
+acquire_build_lock
+STAGING_ROOT="$(mktemp -d "$OUTPUT_DIR/.ProxyBridgeMenuBar.build.XXXXXX")"
+APP_DIR="$STAGING_ROOT/ProxyBridgeMenuBar.app"
+CONTENTS_DIR="$APP_DIR/Contents"
+MACOS_DIR="$CONTENTS_DIR/MacOS"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
+BRIDGE_DIR="$RESOURCES_DIR/bridge"
+CORE_DIR="$BRIDGE_DIR/bin"
+VENDOR_DIR="$BRIDGE_DIR/vendor"
+
+mkdir -p "$APP_DIR" "$CONTENTS_DIR" "$MACOS_DIR" "$RESOURCES_DIR" "$BRIDGE_DIR"
 
 export CLANG_MODULE_CACHE_PATH="$ROOT_DIR/work/clang-module-cache"
 
@@ -94,6 +146,71 @@ resolve_mach_o_binary() {
   exit 1
 }
 
+verify_mach_o_arch() {
+  local label="$1"
+  local binary_path="$2"
+  local required_arch="$3"
+  local kind=""
+
+  kind="$(file -b "$binary_path")"
+  if [[ "$kind" != *"Mach-O"* || "$kind" != *"$required_arch"* ]]; then
+    echo "$label 架构不匹配，需要 $required_arch：$binary_path ($kind)" >&2
+    exit 1
+  fi
+}
+
+vendor_python_dependencies() {
+  local wheelhouse="${PROXY_BRIDGE_VENDOR_WHEELHOUSE:-}"
+  # macOS 自带 Bash 3.2 在 `set -u` 下展开空数组会报 unbound variable。
+  # 保持数组至少有一个通用参数，兼容系统 Bash 与新版 Bash。
+  local pip_args=(--disable-pip-version-check)
+
+  if [[ ! -f "$REQUIREMENTS_LOCK" ]]; then
+    echo "缺少 Python 依赖锁文件：$REQUIREMENTS_LOCK" >&2
+    exit 1
+  fi
+  if [[ -z "$VENDOR_PYTHON" ]]; then
+    VENDOR_PYTHON="$(command -v python3 || true)"
+  fi
+  if [[ -z "$VENDOR_PYTHON" || ! -x "$VENDOR_PYTHON" ]]; then
+    echo "找不到用于 vendor 依赖的 python3，请设置 PYTHON_FOR_VENDOR=/path/to/python3。" >&2
+    exit 1
+  fi
+  if ! "$VENDOR_PYTHON" -m pip --version >/dev/null 2>&1; then
+    echo "指定的 Python 不包含 pip：$VENDOR_PYTHON" >&2
+    exit 1
+  fi
+
+  if [[ -n "$wheelhouse" ]]; then
+    if [[ ! -d "$wheelhouse" ]]; then
+      echo "离线 wheelhouse 不存在：$wheelhouse" >&2
+      exit 1
+    fi
+    pip_args+=(--no-index --find-links "$wheelhouse")
+  fi
+
+  rm -rf "$VENDOR_DIR"
+  mkdir -p "$VENDOR_DIR"
+  "$VENDOR_PYTHON" -m pip install \
+    "${pip_args[@]}" \
+    --no-deps \
+    --no-compile \
+    --require-hashes \
+    --only-binary=:all: \
+    --platform macosx_11_0_arm64 \
+    --python-version 39 \
+    --implementation cp \
+    --abi cp39 \
+    --target "$VENDOR_DIR" \
+    -r "$REQUIREMENTS_LOCK"
+
+  # PyYAML's Python modules work across runtime minor versions; discard any
+  # build-machine-specific extension so the downloaded standalone runtime can import it.
+  find "$VENDOR_DIR" -type f \( -name '*.so' -o -name '*.dylib' \) -delete
+  find "$VENDOR_DIR" -type d -name '__pycache__' -prune -exec rm -rf {} +
+  PYTHONPATH="$VENDOR_DIR" "$VENDOR_PYTHON" -c 'import yaml; assert yaml.safe_load("ok: true") == {"ok": True}'
+}
+
 bundle_proxy_cores() {
   local sing_box_source=""
   local sing_box_binary=""
@@ -104,6 +221,8 @@ bundle_proxy_cores() {
   sing_box_binary="$(resolve_mach_o_binary "sing-box" "$sing_box_source")"
   xray_source="$(find_required_binary "xray" "XRAY_BIN" "xray")"
   xray_binary="$(resolve_mach_o_binary "xray" "$xray_source")"
+  verify_mach_o_arch "sing-box" "$sing_box_binary" "$TARGET_ARCH"
+  verify_mach_o_arch "xray" "$xray_binary" "$TARGET_ARCH"
 
   mkdir -p "$CORE_DIR"
   install -m 0755 "$sing_box_binary" "$CORE_DIR/sing-box"
@@ -122,7 +241,7 @@ EOS
 
 swiftc \
   -O \
-  -target arm64-apple-macos13.0 \
+  -target "$SWIFT_TARGET" \
   -module-cache-path "$ROOT_DIR/work/swift-module-cache" \
   -framework CoreGraphics \
   -framework Foundation \
@@ -134,7 +253,14 @@ swiftc \
 
 swiftc \
   -O \
-  -target arm64-apple-macos13.0 \
+  -target "$SWIFT_TARGET" \
+  -module-cache-path "$ROOT_DIR/work/swift-module-cache" \
+  "$ROOT_DIR/scripts/atomic_replace_app.swift" \
+  -o "$ATOMIC_REPLACE_TOOL"
+
+swiftc \
+  -O \
+  -target "$SWIFT_TARGET" \
   -module-cache-path "$ROOT_DIR/work/swift-module-cache" \
   -framework AppKit \
   -framework Foundation \
@@ -148,7 +274,7 @@ cp "$ICON_PATH" "$RESOURCES_DIR/AppIcon.icns"
 cp "$ROOT_DIR/app.py" "$BRIDGE_DIR/app.py"
 cp "$ROOT_DIR/webdav_sync.py" "$BRIDGE_DIR/webdav_sync.py"
 ditto "$ROOT_DIR/static" "$BRIDGE_DIR/static"
-rm -rf "$CORE_DIR"
+vendor_python_dependencies
 if [[ "$BUNDLE_CORES" == "1" ]]; then
   bundle_proxy_cores
 else
@@ -157,4 +283,7 @@ fi
 
 chmod +x "$MACOS_DIR/ProxyBridgeMenuBar"
 codesign --force --deep --sign - "$APP_DIR"
-echo "$APP_DIR"
+codesign --verify --deep --strict "$APP_DIR"
+
+"$ATOMIC_REPLACE_TOOL" "$APP_DIR" "$FINAL_APP_DIR"
+echo "$FINAL_APP_DIR"

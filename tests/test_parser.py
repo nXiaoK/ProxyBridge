@@ -138,6 +138,7 @@ class ParserTests(unittest.TestCase):
         old_fp_kernel = os.environ.get("PROXY_BRIDGE_FP_CHROMIUM")
         old_popen = app.subprocess.Popen
         old_start_bridge = app.start_bridge
+        old_synchronize_process_state = app.synchronize_process_state
 
         class FakePopen:
             calls: list[tuple[list[str], dict[str, object]]] = []
@@ -192,7 +193,8 @@ class ParserTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 app.subprocess.Popen = FakePopen
-                app.start_bridge = lambda payload: {
+                app.synchronize_process_state = lambda: None
+                fake_bridge = {
                     "id": "bridge-browser",
                     "node_id": node_id,
                     "node_name": "Browser Node",
@@ -200,6 +202,16 @@ class ParserTests(unittest.TestCase):
                     "socks_url": "socks5://127.0.0.1:25080",
                     "status": "running",
                 }
+
+                def fake_start_bridge(_payload):
+                    with app.STATE_LOCK:
+                        state = app.load_state()
+                        if not any(item.get("id") == fake_bridge["id"] for item in state["bridges"]):
+                            state["bridges"].append(dict(fake_bridge))
+                            app.save_state(state)
+                    return dict(fake_bridge)
+
+                app.start_bridge = fake_start_bridge
 
                 result = app.launch_browser({"node_id": node_id})
                 self.assertEqual(result["proxy"], "socks5://127.0.0.1:25080")
@@ -253,6 +265,7 @@ class ParserTests(unittest.TestCase):
             app.STATE_PATH = old_state_path
             app.subprocess.Popen = old_popen
             app.start_bridge = old_start_bridge
+            app.synchronize_process_state = old_synchronize_process_state
             if old_chrome is None:
                 os.environ.pop("PROXY_BRIDGE_CHROME", None)
             else:
@@ -882,6 +895,20 @@ class ParserTests(unittest.TestCase):
             app.WORK_ROOT = old_work_root
             app.RUNTIME_ROOT = old_runtime_root
             app.STATE_PATH = old_state_path
+
+    def test_read_tail_seeks_from_end_and_rotation_caps_backups(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "bridge.log"
+            log_path.write_bytes(b"x" * 10000 + b"TAIL")
+            app.runtime_log_backup_path(log_path, 1).write_bytes(b"older")
+
+            self.assertEqual(app.read_tail(log_path, 4), "TAIL")
+            self.assertTrue(app.rotate_runtime_log(log_path, max_bytes=5, backup_count=2))
+
+            self.assertEqual(log_path.read_bytes(), b"")
+            self.assertEqual(app.runtime_log_backup_path(log_path, 1).read_bytes(), b"xTAIL")
+            self.assertEqual(app.runtime_log_backup_path(log_path, 2).read_bytes(), b"older")
+            self.assertEqual(app.runtime_log_backup_path(log_path, 1).stat().st_mode & 0o777, 0o600)
 
     def test_start_bridge_cleans_process_table_when_core_exits_immediately(self):
         old_work_root = app.WORK_ROOT

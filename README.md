@@ -7,7 +7,7 @@
 - 导入订阅 URL 或原始订阅内容。
 - 解析 `VLESS`、`VMess`、`Shadowsocks/SS2022`、`Trojan`、`Hysteria2/HY2`、`TUIC`、`SOCKS5`、`NaiveProxy`、`AnyTLS` 分享链接。
 - 尝试解析 Clash/Mihomo YAML 中的 `proxies`。
-- 为节点生成本地代理端口,同一端口同时支持 `socks5://127.0.0.1:端口` 与 `http://127.0.0.1:端口`。
+- 为节点生成本地代理端口,同一端口同时支持 SOCKS5 与 HTTP/HTTPS CONNECT；默认仅本机可用，也可在设置中按需共享给局域网设备。
 - HTTP 代理模式支持普通 HTTP 请求和 HTTPS CONNECT,兼容不支持 SOCKS5 的软件。
 - 普通协议走 `sing-box`，`VLESS + XHTTP` 自动走 `xray` fallback。
 - 菜单栏 App 默认不内置 `sing-box` / `xray`，首次运行时会自动下载到用户数据目录;也可构建时选择内置核心。
@@ -26,6 +26,15 @@
 ```bash
 scripts/build_menubar_app.sh
 ```
+
+构建脚本会按 `scripts/requirements.lock` 将锁定版本的 PyYAML 放入 App，用于解析 Clash/Mihomo YAML 订阅。默认从 Python 包索引下载；离线构建可准备 wheelhouse，并通过以下环境变量指定：
+
+```bash
+PROXY_BRIDGE_VENDOR_WHEELHOUSE=/path/to/wheelhouse \
+scripts/build_menubar_app.sh
+```
+
+如需指定用于安装 vendored 依赖的构建机 Python，可设置 `PYTHON_FOR_VENDOR=/path/to/python3`。依赖安装启用哈希校验，wheelhouse 中的文件必须与锁文件一致。
 
 如果希望构建离线版/内置核心版，携带 `--bundle-cores` 参数；此时会从构建机复制 `sing-box` / `xray` 到 App 内部，因此构建机需要先安装：
 
@@ -61,6 +70,7 @@ outputs/ProxyBridgeMenuBar.app
 - 控制台底部的 `连接日志` 会显示通过本地代理的 CONNECT/HTTP 目标、客户端本地端口、使用节点、代理协议、上下行流量、耗时和成功/失败状态。
 - 运行中的每个本地代理卡片会显示累计上行、下行和合计流量,并分别展示 SOCKS5 URL 与 HTTP/HTTPS 代理 URL。
 - 连接日志支持关键词搜索、按节点筛选和按状态筛选。
+- 控制台侧边栏「通用设置」可开启**局域网共享**；开关会立即重绑正在运行的代理端口，并展示局域网设备可直接使用的 SOCKS5 / HTTP 地址。
 
 连接日志记录的是本地代理层能看到的目标域名/IP 与端口；HTTPS 通过 CONNECT 建立隧道,内容不会被解密，第一版也不会自动识别 macOS 进程名。
 
@@ -118,6 +128,17 @@ http://127.0.0.1:8787
 PROXY_BRIDGE_PORT=8790 python3 app.py
 ```
 
+## 局域网共享
+
+默认情况下，所有代理端口都只监听 `127.0.0.1`，其他局域网设备无法连接。在控制台侧边栏进入 **「通用设置」**，开启 **「允许局域网设备连接本地代理」** 后：
+
+- 外层 SOCKS5 / HTTP 代理会监听 `0.0.0.0`，但只接受本机与 RFC1918 私有 IPv4 来源（`10/8`、`172.16/12`、`192.168/16`）；设置页会优先显示物理网卡的私有 IP 和可复制地址。
+- 正在运行的代理会立即重新绑定，无需重启 App；切换时已有代理连接会中断并需重新连接。
+- 管理控制台及管理 API 仍只监听 `127.0.0.1`，不会向局域网开放。
+- 代理端口当前没有用户名或密码；可达本机的私有网络/VPN 客户端都可能使用。请只在可信网络开启，并留意 macOS 防火墙是否允许入站连接。
+
+关闭开关后，运行中的代理会立即恢复为仅本机监听。
+
 ## WebDAV 同步
 
 支持在多台 Mac 之间同步**订阅 / 节点**与**指纹浏览器 Profile**（Cookie、LocalStorage 等），用于换机接力。
@@ -140,16 +161,19 @@ PROXY_BRIDGE_PORT=8790 python3 app.py
 - 关闭浏览器窗口或点「停止」（且开启「关闭后自动上传」）会**自动上传**该 Profile（含标签）。
 - 拉取时以远端为权威：本机多出来的订阅/节点/浏览器记录会被移除，对应本地 Profile 目录也会清理。
 - 可选：关闭浏览器后自动上传、启动时检查远端更新、**忽略 SSL 证书**（过期/自签）。
-- 可选：OpenSSL AES-256-CBC 端到端加密；本机需有 `openssl`。
+- 可选：PBENC2 端到端加密（PBKDF2 + OpenSSL AES-256-CBC + HMAC 完整性校验）；本机需有 `openssl`。仍可读取旧 PBENC1 数据，新上传统一使用 PBENC2。
 - 冲突策略为远端后写覆盖（LWW），并记录设备 ID。
+- 每次上传先写入不可变的版本化 state/Profile 对象，再通过 WebDAV `MOVE` 原子切换 `manifest.json`；拉取时必须通过 manifest 中的 SHA-256 校验才会覆盖本地数据。
 
 远端目录结构：
 
 ```text
 {remote_root}/
   manifest.json
-  state.sync.json
-  profiles/{instance_id}.tar.gz
+  state-{sha16}-{snapshot_id}.sync.json
+  state.sync.json                         # 旧客户端兼容别名
+  profiles/{instance_id}-{sha16}-{snapshot_id}.tar.gz
+  profiles/{instance_id}.tar.gz          # 旧客户端兼容别名
 ```
 
 ## 代理池
@@ -171,14 +195,17 @@ curl -sS "http://127.0.0.1:8787/pool/<token>/get?strategy=random&protocol=socks5
 - `/get` 默认只返回**已就绪**端口（`running` 且本地代理进程活跃）；需要包含启动中成员时可加 `?include_starting=1`。
 - `proxies.txt` 默认每个成员输出 socks5 一行 + http 一行；可用 `?protocol=socks5` 或 `http` 收窄。
 - 轮换密钥后旧链接立即失效（控制台「轮换密钥」，或 `POST /api/pool/token/rotate`）。
-- 服务仍只监听 `127.0.0.1`；access log 会脱敏 path 中的 token。
+- 代理池 HTTP 接口和管理控制台始终只监听 `127.0.0.1`；即使开启局域网共享，远端设备也只能使用设置页列出的直连代理地址。access log 会脱敏 path 中的 token。
 
 ## 数据位置
 
 Web 控制台模式：
 
 - 状态文件：`work/state.json`
+- 上一份有效状态备份：`work/state.json.bak`
 - 运行配置：`work/runtime/*.json`
 - 核心日志：`work/runtime/*.log`
+
+状态保存采用临时文件 + `fsync` + 原子替换；主状态损坏或缺失时会尝试读取 `.bak`，两者都不可用时会拒绝以空状态启动，避免静默丢失数据。数据目录权限为 `0700`，状态与运行日志等敏感文件为 `0600`。
 
 第一版会把节点参数保存在本地明文状态文件中。后续版本建议接入 macOS Keychain。

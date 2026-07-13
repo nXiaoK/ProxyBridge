@@ -5,8 +5,10 @@ import atexit
 import base64
 import collections
 import concurrent.futures
+import errno
 import hashlib
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -36,6 +38,9 @@ import webdav_sync
 
 
 APP_ROOT = Path(__file__).resolve().parent
+VENDOR_ROOT = APP_ROOT / "vendor"
+if VENDOR_ROOT.is_dir() and str(VENDOR_ROOT) not in sys.path:
+    sys.path.insert(0, str(VENDOR_ROOT))
 STATIC_ROOT = APP_ROOT / "static"
 WORK_ROOT = Path(os.environ.get("PROXY_BRIDGE_WORKDIR", APP_ROOT / "work")).expanduser()
 RUNTIME_ROOT = WORK_ROOT / "runtime"
@@ -44,6 +49,11 @@ SYNC_ENGINE: webdav_sync.SyncEngine | None = None
 DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
 DEFAULT_BROWSER_START_URL = "https://ip.skk.moe/"
+LOCAL_PROXY_LISTEN_HOST = "127.0.0.1"
+LAN_PROXY_LISTEN_HOST = "0.0.0.0"
+PRIVATE_IPV4_NETWORKS = tuple(
+    ipaddress.IPv4Network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
 REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
 HTTP_PROXY_HEADER_LIMIT = 65536
@@ -56,6 +66,9 @@ ACTIVE_BROWSER_STATUSES = {"running", "starting"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
 CORE_LOG_ENTRY_LIMIT = 30
+CORE_LOG_MAX_BYTES = 8 * 1024 * 1024
+CORE_LOG_BACKUP_COUNT = 3
+SUBSCRIPTION_RESPONSE_LIMIT = 8 * 1024 * 1024
 POOL_TOKEN_MIN_LEN = 16
 POOL_TOKEN_MAX_LEN = 128
 # 字符集与 BACKEND_INSTANCE_TOKEN_PATTERN 对齐；长度策略刻意更严（min 16）。
@@ -71,23 +84,33 @@ BROWSER_TABLE: dict[str, list[subprocess.Popen]] = {}
 BROWSER_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
 LOG_PROXY_TABLE: dict[str, "Socks5LogProxy"] = {}
 TRAFFIC_TABLE: dict[str, dict[str, int]] = {}
+REQUEST_LOG_PENDING_UPDATES: dict[str, dict[str, Any]] = {}
+REQUEST_LOG_TERMINAL_STATUSES = frozenset({"closed", "failed"})
 TEST_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
 STATE_LOCK = threading.RLock()
 PROCESS_LOCK = threading.RLock()
 TRAFFIC_LOCK = threading.RLock()
+REQUEST_LOG_PENDING_LOCK = threading.RLock()
 SHUTTING_DOWN = threading.Event()
 SHUTDOWN_SIGNAL_CLAIMED = threading.Event()
 SHUTDOWN_SIGNAL_CLAIM_LOCK = threading.Lock()
 PATH_CACHE_LOCK = threading.RLock()
+LAN_ADDRESS_CACHE_LOCK = threading.RLock()
 CORE_INSTALL_LOCK = threading.RLock()
+BRIDGE_START_LOCK = threading.RLock()
 BROWSER_LAUNCH_LOCK = threading.RLock()
 FINGERPRINT_INSTALL_LOCK = threading.RLock()
 SHUTDOWN_LOCK = threading.RLock()
+SUBSCRIPTION_LOCK = threading.RLock()
+LOG_ROTATION_LOCK = threading.RLock()
 POOL_RR_LOCK = threading.Lock()
 POOL_RR_COUNTER = 0
 CORE_AUTO_INSTALL_STARTED = threading.Event()
 FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
 FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
+LAN_ADDRESS_CACHE_TTL = 30.0
+LAN_ADDRESS_CACHE: dict[str, Any] = {"addresses": [], "checked_at": 0.0}
+PROXY_REBIND_RETRY_TIMEOUT = 1.0
 
 # 系统日志:App 自身运行事件的内存环形缓冲区,用于在控制台「系统日志」视图里
 # 排查软件使用中的问题(启动、订阅导入、本地代理启停、测试、报错等)。
@@ -184,11 +207,16 @@ def proxy_core_bin_dir() -> Path:
 
 
 def ensure_dirs() -> None:
-    WORK_ROOT.mkdir(parents=True, exist_ok=True)
-    RUNTIME_ROOT.mkdir(parents=True, exist_ok=True)
-    proxy_core_bin_dir().mkdir(parents=True, exist_ok=True)
-    browser_profiles_root().mkdir(parents=True, exist_ok=True)
-    browser_extensions_root().mkdir(parents=True, exist_ok=True)
+    for path in (
+        WORK_ROOT,
+        RUNTIME_ROOT,
+        proxy_core_root(),
+        proxy_core_bin_dir(),
+        browser_profiles_root(),
+        browser_extensions_root(),
+    ):
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.chmod(0o700)
 
 
 def browser_profiles_root() -> Path:
@@ -984,18 +1012,33 @@ def parse_subscription_payload(payload: str, source: str = "手动导入") -> li
 
 
 def empty_state() -> dict[str, Any]:
-    return {"subscriptions": [], "nodes": [], "bridges": [], "browser_instances": [], "tests": {}, "request_logs": []}
+    return {
+        "subscriptions": [],
+        "nodes": [],
+        "bridges": [],
+        "browser_instances": [],
+        "tests": {},
+        "request_logs": [],
+        "settings": {"allow_lan": False},
+    }
 
 
-def load_state(reset_running: bool = False) -> dict[str, Any]:
-    ensure_dirs()
-    if not STATE_PATH.exists():
-        return empty_state()
-    try:
-        with STATE_PATH.open("r", encoding="utf-8") as f:
-            state = json.load(f)
-    except Exception:
-        return empty_state()
+def apply_pending_request_log_updates(state: dict[str, Any]) -> None:
+    with REQUEST_LOG_PENDING_LOCK:
+        pending = {log_id: dict(updates) for log_id, updates in REQUEST_LOG_PENDING_UPDATES.items()}
+    if not pending:
+        return
+    for entry in state.get("request_logs", []):
+        log_id = str(entry.get("id") or "")
+        if log_id in pending and entry.get("status") not in REQUEST_LOG_TERMINAL_STATUSES:
+            entry.update(pending[log_id])
+
+
+def state_backup_path() -> Path:
+    return STATE_PATH.with_name(f"{STATE_PATH.name}.bak")
+
+
+def _normalize_loaded_state(state: Any, *, reset_running: bool = False) -> dict[str, Any]:
     if not isinstance(state, dict):
         state = {}
     for field_name in ("subscriptions", "nodes", "bridges", "browser_instances", "request_logs"):
@@ -1005,6 +1048,8 @@ def load_state(reset_running: bool = False) -> dict[str, Any]:
         state["tests"] = {}
     settings = state.get("settings")
     state["settings"] = settings if isinstance(settings, dict) else {}
+    # 局域网共享是设备本地安全设置：只接受持久化的 JSON 布尔值，旧状态默认关闭。
+    state["settings"]["allow_lan"] = state["settings"].get("allow_lan") is True
     for bridge in state["bridges"]:
         if "enabled" not in bridge:
             bridge["enabled"] = bridge.get("status") in ACTIVE_BRIDGE_STATUSES
@@ -1027,15 +1072,109 @@ def load_state(reset_running: bool = False) -> dict[str, Any]:
             if instance.get("status") in ACTIVE_BROWSER_STATUSES:
                 instance["status"] = "stopped"
                 instance["pid"] = None
+    apply_pending_request_log_updates(state)
     return state
+
+
+def _read_state_candidate(path: Path, *, reset_running: bool = False) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return _normalize_loaded_state(json.load(f), reset_running=reset_running)
+
+
+def _state_file_exists(path: Path) -> bool:
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def load_state(reset_running: bool = False) -> dict[str, Any]:
+    ensure_dirs()
+    primary = STATE_PATH
+    backup = state_backup_path()
+    if not _state_file_exists(primary):
+        if _state_file_exists(backup):
+            try:
+                recovered = _read_state_candidate(backup, reset_running=reset_running)
+            except Exception as exc:
+                raise RuntimeError(f"状态文件和备份均不可读: {exc}") from exc
+            log_event("主状态文件缺失，已从备份恢复", level="warn", category="状态")
+            return recovered
+        return empty_state()
+
+    try:
+        return _read_state_candidate(primary, reset_running=reset_running)
+    except Exception as primary_error:
+        if _state_file_exists(backup):
+            try:
+                recovered = _read_state_candidate(backup, reset_running=reset_running)
+            except Exception as backup_error:
+                raise RuntimeError(f"状态文件损坏且备份不可用: {backup_error}") from primary_error
+            log_event("状态文件损坏，已从备份恢复", level="error", category="状态")
+            return recovered
+        raise RuntimeError(f"状态文件不可读，已拒绝回落为空状态: {primary_error}") from primary_error
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        fd = os.open(str(path), flags)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_private_atomic(path: Path, data: bytes, *, temp_path: Path, mode: int = 0o600) -> None:
+    try:
+        with temp_path.open("wb") as f:
+            os.fchmod(f.fileno(), mode)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        temp_path.chmod(mode)
+        temp_path.replace(path)
+        path.chmod(mode)
+        _fsync_directory(path.parent)
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _valid_state_bytes(raw: bytes) -> bool:
+    try:
+        return isinstance(json.loads(raw.decode("utf-8")), dict)
+    except Exception:
+        return False
 
 
 def save_state(state: dict[str, Any]) -> None:
     ensure_dirs()
-    tmp = STATE_PATH.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    tmp.replace(STATE_PATH)
+    data = json.dumps(state, ensure_ascii=False, indent=2).encode("utf-8")
+    backup = state_backup_path()
+    if _state_file_exists(STATE_PATH):
+        try:
+            previous = STATE_PATH.read_bytes()
+        except Exception as exc:
+            raise RuntimeError(f"无法读取现有状态，已拒绝覆盖: {exc}") from exc
+        if not _valid_state_bytes(previous):
+            if not _state_file_exists(backup):
+                raise RuntimeError("现有状态文件损坏且没有可用备份，已拒绝覆盖")
+        else:
+            _write_private_atomic(
+                backup,
+                previous,
+                temp_path=backup.with_suffix(backup.suffix + ".tmp"),
+            )
+    _write_private_atomic(STATE_PATH, data, temp_path=STATE_PATH.with_suffix(".tmp"))
 
 
 def traffic_defaults(upload_bytes: Any = 0, download_bytes: Any = 0) -> dict[str, int]:
@@ -1096,7 +1235,26 @@ def append_request_log(entry: dict[str, Any]) -> None:
 
 
 def update_request_log(log_id: str, updates: dict[str, Any]) -> None:
+    if updates == {"status": "connected"}:
+        # Serialize the coalesced intermediate update with terminal persistence.
+        # A late "connected" callback must never resurrect a closed/failed entry.
+        with STATE_LOCK:
+            state = load_state(reset_running=False)
+            entry = next(
+                (item for item in state.setdefault("request_logs", []) if item.get("id") == log_id),
+                None,
+            )
+            if entry is None or entry.get("status") in REQUEST_LOG_TERMINAL_STATUSES:
+                return
+            with REQUEST_LOG_PENDING_LOCK:
+                REQUEST_LOG_PENDING_UPDATES.setdefault(log_id, {}).update(updates)
+        return
     with STATE_LOCK:
+        # STATE_LOCK -> REQUEST_LOG_PENDING_LOCK is the same order used by
+        # load_state/apply_pending_request_log_updates. Consume pending before the
+        # read+save transaction so no other state write can reapply stale data.
+        with REQUEST_LOG_PENDING_LOCK:
+            REQUEST_LOG_PENDING_UPDATES.pop(log_id, None)
         state = load_state(reset_running=False)
         for entry in state.setdefault("request_logs", []):
             if entry.get("id") == log_id:
@@ -1110,6 +1268,8 @@ def clear_request_logs() -> dict[str, Any]:
         state = load_state(reset_running=False)
         state["request_logs"] = []
         save_state(state)
+    with REQUEST_LOG_PENDING_LOCK:
+        REQUEST_LOG_PENDING_UPDATES.clear()
     return {"ok": True}
 
 
@@ -1472,6 +1632,163 @@ def fingerprint_chromium_path(force_refresh: bool = False) -> str | None:
         return resolved
 
 
+def allow_lan_access(state: dict[str, Any]) -> bool:
+    settings = state.get("settings")
+    return bool(isinstance(settings, dict) and settings.get("allow_lan") is True)
+
+
+def proxy_listen_host(state: dict[str, Any]) -> str:
+    return LAN_PROXY_LISTEN_HOST if allow_lan_access(state) else LOCAL_PROXY_LISTEN_HOST
+
+
+def _usable_lan_ipv4(value: Any) -> str | None:
+    try:
+        address = ipaddress.IPv4Address(str(value or "").strip())
+    except ipaddress.AddressValueError:
+        return None
+    if (
+        not any(address in network for network in PRIVATE_IPV4_NETWORKS)
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_reserved
+        or address.is_unspecified
+    ):
+        return None
+    return str(address)
+
+
+def proxy_client_allowed(value: Any) -> bool:
+    try:
+        address = ipaddress.IPv4Address(str(value or "").strip())
+    except ipaddress.AddressValueError:
+        return False
+    return address.is_loopback or any(address in network for network in PRIVATE_IPV4_NETWORKS)
+
+
+def _discover_lan_ipv4_addresses() -> list[str]:
+    """Return usable IPv4 addresses, preferring the interface used by the default route.
+
+    The UDP sockets are only used for local route selection; no packet is sent.
+    Hostname resolution supplies additional active-interface addresses on multi-homed Macs.
+    """
+    candidates: list[str] = []
+
+    def add(value: Any) -> None:
+        normalized = _usable_lan_ipv4(value)
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    # On macOS, prefer addresses on physical Ethernet/Wi-Fi interfaces. The default
+    # route may point at a VPN/TUN interface whose address is not reachable by LAN peers.
+    if sys.platform == "darwin" and Path("/sbin/ifconfig").exists():
+        try:
+            result = subprocess.run(
+                ["/sbin/ifconfig"],
+                capture_output=True,
+                text=True,
+                timeout=1.0,
+                check=False,
+            )
+            interface = ""
+            interface_up = False
+            for line in result.stdout.splitlines():
+                header = re.match(r"^([A-Za-z0-9._-]+):\s+flags=[^<]*<([^>]*)>", line)
+                if header:
+                    interface = header.group(1)
+                    interface_up = "UP" in header.group(2).split(",")
+                    continue
+                address_match = re.match(r"\s+inet\s+([0-9.]+)\b", line)
+                if interface_up and interface.startswith("en") and address_match:
+                    add(address_match.group(1))
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    for target in (("192.0.2.1", 9), ("198.51.100.1", 9)):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(target)
+                add(probe.getsockname()[0])
+        except OSError:
+            continue
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET, socket.SOCK_STREAM):
+            add(info[4][0])
+    except OSError:
+        pass
+    return candidates
+
+
+def lan_ipv4_addresses(force_refresh: bool = False) -> list[str]:
+    now = time.monotonic()
+    with LAN_ADDRESS_CACHE_LOCK:
+        checked_at = float(LAN_ADDRESS_CACHE.get("checked_at") or 0.0)
+        if not force_refresh and now - checked_at < LAN_ADDRESS_CACHE_TTL:
+            return list(LAN_ADDRESS_CACHE.get("addresses") or [])
+        addresses = _discover_lan_ipv4_addresses()
+        LAN_ADDRESS_CACHE.update({"addresses": list(addresses), "checked_at": now})
+        return addresses
+
+
+def bridge_network_payload(
+    bridge: dict[str, Any],
+    *,
+    allow_lan: bool,
+    lan_addresses: list[str],
+) -> dict[str, Any]:
+    result = dict(bridge)
+    port = safe_int(bridge.get("port"), 0)
+    shared_addresses = lan_addresses if allow_lan and port > 0 else []
+    result.update(
+        {
+            "listen_host": LAN_PROXY_LISTEN_HOST if allow_lan else LOCAL_PROXY_LISTEN_HOST,
+            "lan_socks_urls": [f"socks5://{address}:{port}" for address in shared_addresses],
+            "lan_http_urls": [f"http://{address}:{port}" for address in shared_addresses],
+            "lan_socks_url": f"socks5://{shared_addresses[0]}:{port}" if shared_addresses else "",
+            "lan_http_url": f"http://{shared_addresses[0]}:{port}" if shared_addresses else "",
+        }
+    )
+    return result
+
+
+def network_settings_payload(
+    state: dict[str, Any] | None = None,
+    *,
+    lan_addresses: list[str] | None = None,
+) -> dict[str, Any]:
+    if state is None:
+        with STATE_LOCK:
+            state = load_state()
+    allow_lan = allow_lan_access(state)
+    addresses = list(lan_addresses) if lan_addresses is not None else lan_ipv4_addresses()
+    proxy_urls: list[dict[str, Any]] = []
+    if allow_lan:
+        for bridge in state.get("bridges", []):
+            port = safe_int(bridge.get("port"), 0)
+            if bridge.get("status") not in ACTIVE_BRIDGE_STATUSES or port <= 0:
+                continue
+            proxy_urls.append(
+                {
+                    "bridge_id": str(bridge.get("id") or ""),
+                    "node_name": str(bridge.get("node_name") or ""),
+                    "port": port,
+                    "socks_url": f"socks5://{addresses[0]}:{port}" if addresses else "",
+                    "http_url": f"http://{addresses[0]}:{port}" if addresses else "",
+                    "socks_urls": [f"socks5://{address}:{port}" for address in addresses],
+                    "http_urls": [f"http://{address}:{port}" for address in addresses],
+                }
+            )
+    return {
+        "allow_lan": allow_lan,
+        "listen_host": LAN_PROXY_LISTEN_HOST if allow_lan else LOCAL_PROXY_LISTEN_HOST,
+        "lan_addresses": addresses,
+        "primary_lan_address": addresses[0] if addresses else "",
+        "console_shared": False,
+        "client_scope": "loopback_and_private_ipv4",
+        "proxy_urls": proxy_urls,
+    }
+
+
 def status_payload() -> dict[str, Any]:
     with SHUTDOWN_LOCK:
         return _status_payload()
@@ -1479,6 +1796,7 @@ def status_payload() -> dict[str, Any]:
 
 def _status_payload() -> dict[str, Any]:
     synchronize_process_state()
+    lan_addresses = lan_ipv4_addresses()
     with STATE_LOCK:
         state = load_state()
         changed = sync_process_status(state)
@@ -1487,6 +1805,15 @@ def _status_payload() -> dict[str, Any]:
         members = pool_members(state, ready_only=False)
         if changed or token_changed:
             save_state(state)
+        network = network_settings_payload(state, lan_addresses=lan_addresses)
+        bridges = [
+            bridge_network_payload(
+                bridge,
+                allow_lan=bool(network["allow_lan"]),
+                lan_addresses=list(network["lan_addresses"]),
+            )
+            for bridge in state["bridges"]
+        ]
         return {
             "cores": core_paths(),
             "chrome": chrome_path(),
@@ -1495,7 +1822,7 @@ def _status_payload() -> dict[str, Any]:
             "browser_instances": state.get("browser_instances", []),
             "subscriptions": state["subscriptions"],
             "nodes": [public_node(node) for node in state["nodes"]],
-            "bridges": state["bridges"],
+            "bridges": bridges,
             "tests": state.get("tests", {}),
             "request_logs": state.get("request_logs", [])[:200],
             "system_logs": system_log_entries()[:300],
@@ -1508,6 +1835,7 @@ def _status_payload() -> dict[str, Any]:
                 webdav_sync.normalize_webdav_settings((state.get("settings") or {}).get("webdav"))
             ),
             "sync_openssl": webdav_sync.openssl_available(),
+            "network": network,
             "version": "0.1.0",
         }
 
@@ -1822,6 +2150,9 @@ def parse_pool_path(path: str) -> tuple[str | None, str | None, str | None]:
 
 
 def fetch_subscription(url: str) -> str:
+    parsed_url = urllib.parse.urlsplit(url)
+    if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.netloc:
+        raise ValueError("订阅 URL 必须是 http(s)://host/path")
     request = urllib.request.Request(
         url,
         headers={
@@ -1830,9 +2161,28 @@ def fetch_subscription(url: str) -> str:
         },
     )
     with urllib.request.urlopen(request, timeout=20) as response:
-        data = response.read()
+        final_url = urllib.parse.urlsplit(response.geturl())
+        if final_url.scheme.lower() not in {"http", "https"} or not final_url.netloc:
+            raise ValueError("订阅重定向目标必须是 HTTP(S) URL")
+        declared_length = safe_int(response.headers.get("Content-Length"), 0)
+        if declared_length > SUBSCRIPTION_RESPONSE_LIMIT:
+            raise ValueError(f"订阅响应超过 {SUBSCRIPTION_RESPONSE_LIMIT} 字节限制")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = response.read(min(65536, SUBSCRIPTION_RESPONSE_LIMIT - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > SUBSCRIPTION_RESPONSE_LIMIT:
+                raise ValueError(f"订阅响应超过 {SUBSCRIPTION_RESPONSE_LIMIT} 字节限制")
+            chunks.append(chunk)
+        data = b"".join(chunks)
         charset = response.headers.get_content_charset() or "utf-8"
-        return data.decode(charset, errors="replace")
+        try:
+            return data.decode(charset, errors="replace")
+        except LookupError:
+            return data.decode("utf-8", errors="replace")
 
 
 def referenced_node_ids(subscriptions: list[dict[str, Any]]) -> set[str]:
@@ -1845,6 +2195,144 @@ def referenced_node_ids(subscriptions: list[dict[str, Any]]) -> set[str]:
     }
 
 
+def _subscription_replacement_plan(
+    state: dict[str, Any],
+    *,
+    url: str,
+    subscription: dict[str, Any],
+    node_dicts: list[dict[str, Any]],
+) -> set[str]:
+    replaced_subscriptions = [s for s in state["subscriptions"] if url and s.get("url") == url]
+    replaced_node_ids = referenced_node_ids(replaced_subscriptions)
+    remaining_subscriptions = [s for s in state["subscriptions"] if s.get("url") != url or not url]
+    retained_node_ids = referenced_node_ids(remaining_subscriptions)
+    new_node_ids = {str(node.get("id") or "") for node in node_dicts if node.get("id")}
+    return replaced_node_ids - retained_node_ids - new_node_ids
+
+
+def _apply_subscription_replacement(
+    state: dict[str, Any],
+    *,
+    url: str,
+    subscription: dict[str, Any],
+    node_dicts: list[dict[str, Any]],
+    remove_ids: set[str] | None = None,
+) -> set[str]:
+    if remove_ids is None:
+        remove_ids = _subscription_replacement_plan(
+            state,
+            url=url,
+            subscription=subscription,
+            node_dicts=node_dicts,
+        )
+    state["subscriptions"] = [s for s in state["subscriptions"] if s.get("url") != url or not url]
+    state["subscriptions"].append(subscription)
+    existing = {node["id"]: node for node in state["nodes"] if node.get("id") not in remove_ids}
+    for node in node_dicts:
+        existing[node["id"]] = node
+    state["nodes"] = list(existing.values())
+    return set(remove_ids)
+
+
+def _runtime_snapshot_for_nodes(state: dict[str, Any], node_ids: set[str]) -> dict[str, Any]:
+    node_ids = {str(node_id) for node_id in node_ids if node_id}
+    with PROCESS_LOCK:
+        bridge_ids = {
+            str(bridge_id)
+            for bridge_id, owner_node_id in BRIDGE_NODE_TABLE.items()
+            if str(owner_node_id or "") in node_ids
+        }
+    bridges = [
+        dict(bridge)
+        for bridge in state.get("bridges", [])
+        if isinstance(bridge, dict) and str(bridge.get("node_id") or "") in node_ids
+    ]
+    bridge_ids.update(str(bridge.get("id") or "") for bridge in bridges if bridge.get("id"))
+    instances = [
+        dict(instance)
+        for instance in state.get("browser_instances", [])
+        if isinstance(instance, dict) and str(instance.get("node_id") or "") in node_ids
+    ]
+    return {
+        "node_ids": node_ids,
+        "bridges": bridges,
+        "bridge_ids": {bridge_id for bridge_id in bridge_ids if bridge_id},
+        "browser_instances": instances,
+    }
+
+
+def _stop_runtime_for_nodes(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Stop removed-node processes without holding STATE_LOCK."""
+    killed_browsers = 0
+    traffic_by_bridge: dict[str, dict[str, int]] = {}
+    failures: list[tuple[str, BaseException]] = []
+    instances = snapshot.get("browser_instances") or []
+    for instance in instances:
+        instance_id = str(instance.get("id") or "")
+        if not instance_id:
+            continue
+        try:
+            killed_browsers += stop_browser_instance_process(instance_id)
+        except BaseException as error:
+            failures.append((f"浏览器 {instance_id}", error))
+    for node_id in snapshot.get("node_ids") or set():
+        try:
+            killed_browsers += stop_untracked_browser_processes_for_node(str(node_id))
+        except BaseException as error:
+            failures.append((f"节点 {node_id} 浏览器", error))
+
+    for bridge_id in sorted(snapshot.get("bridge_ids") or set()):
+        try:
+            live_traffic = live_bridge_traffic_snapshot(bridge_id)
+            stopped_traffic = stop_process(bridge_id, pop_traffic=False)
+            if live_traffic is not None:
+                traffic_by_bridge[bridge_id] = stopped_traffic
+        except BaseException as error:
+            failures.append((f"代理 {bridge_id}", error))
+    if failures:
+        details = "; ".join(f"{label}: {error}" for label, error in failures)
+        raise RuntimeError(f"清理已删除节点资源失败（{len(failures)} 项）: {details}") from failures[0][1]
+    return {
+        "killed_browsers": killed_browsers,
+        "traffic_by_bridge": traffic_by_bridge,
+        "browser_instances": instances,
+    }
+
+
+def _mark_removed_nodes_stopped(state: dict[str, Any], node_ids: set[str], traffic_by_bridge: dict[str, dict[str, int]]) -> None:
+    node_ids = {str(node_id) for node_id in node_ids if node_id}
+    state["browser_instances"] = [
+        item
+        for item in state.get("browser_instances", [])
+        if not (isinstance(item, dict) and str(item.get("node_id") or "") in node_ids)
+    ]
+    stopped_at = now_ts()
+    for bridge in state.get("bridges", []):
+        if not isinstance(bridge, dict) or str(bridge.get("node_id") or "") not in node_ids:
+            continue
+        bridge_id = str(bridge.get("id") or "")
+        traffic = traffic_by_bridge.get(bridge_id) or traffic_defaults(
+            bridge.get("upload_bytes"),
+            bridge.get("download_bytes"),
+        )
+        bridge.update({**traffic, "status": "stopped", "enabled": False, "pid": None, "stopped_at": stopped_at})
+        bridge.pop("error", None)
+
+
+def _remove_profiles_for_nodes(node_ids: set[str]) -> int:
+    removed = 0
+    for node_id in {str(node_id) for node_id in node_ids if node_id}:
+        root = browser_node_profile_root(node_id)
+        if not root.exists():
+            continue
+        shutil.rmtree(root, ignore_errors=True)
+        if not root.exists():
+            removed += 1
+        else:
+            log_event(f"清理节点 Profile 失败: {node_id}", level="warn", category="浏览器")
+    return removed
+
+
 def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
     name = clean_name(str(payload.get("name") or ""), "未命名订阅")
     url = str(payload.get("url") or "").strip()
@@ -1855,6 +2343,12 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("需要订阅 URL 或原始订阅内容")
 
     nodes = parse_subscription_payload(raw, name)
+    if not nodes:
+        decoded = decode_base64_text(raw)
+        looks_like_clash = any("proxies:" in candidate.lower() for candidate in (raw, decoded or ""))
+        if looks_like_clash and import_yaml() is None:
+            raise RuntimeError("无法解析 Clash YAML 订阅:缺少 PyYAML 解析器")
+        raise ValueError("订阅中没有可用节点，已保留原有订阅状态")
     raw_digest = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
     subscription_id = stable_id(name, url, str(time.time_ns()), raw_digest)
     imported_at = now_ts()
@@ -1868,33 +2362,56 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
         "node_count": len(nodes),
         "node_ids": node_ids,
     }
-    with STATE_LOCK:
-        state = load_state()
-        replaced_subscriptions = [s for s in state["subscriptions"] if url and s.get("url") == url]
-        replaced_node_ids = referenced_node_ids(replaced_subscriptions)
-        state["subscriptions"] = [s for s in state["subscriptions"] if s.get("url") != url or not url]
-        retained_node_ids = referenced_node_ids(state["subscriptions"])
-        remove_ids = replaced_node_ids - retained_node_ids
-        state["subscriptions"].append(subscription)
-        existing = {node["id"]: node for node in state["nodes"] if node.get("id") not in remove_ids}
-        for node in node_dicts:
-            existing[node["id"]] = node
-        state["nodes"] = list(existing.values())
-        save_state(state)
+    with SUBSCRIPTION_LOCK:
+        with SHUTDOWN_LOCK:
+            with STATE_LOCK:
+                state = load_state()
+                remove_ids = _subscription_replacement_plan(
+                    state,
+                    url=url,
+                    subscription=subscription,
+                    node_dicts=node_dicts,
+                )
+                runtime_snapshot = _runtime_snapshot_for_nodes(state, remove_ids)
+            runtime_cleanup = _stop_runtime_for_nodes(runtime_snapshot) if remove_ids else {
+                "killed_browsers": 0,
+                "traffic_by_bridge": {},
+                "browser_instances": [],
+            }
+            with STATE_LOCK:
+                state = load_state()
+                _apply_subscription_replacement(
+                    state,
+                    url=url,
+                    subscription=subscription,
+                    node_dicts=node_dicts,
+                    remove_ids=remove_ids,
+                )
+                _mark_removed_nodes_stopped(state, remove_ids, runtime_cleanup["traffic_by_bridge"])
+                save_state(state)
+            release_persisted_bridge_traffic(runtime_cleanup["traffic_by_bridge"])
+        removed_profiles = _remove_profiles_for_nodes(remove_ids) if remove_ids else 0
     mark_sync_local_change()
-    return {"subscription": subscription, "nodes": [public_node(node) for node in node_dicts]}
+    return {
+        "subscription": subscription,
+        "nodes": [public_node(node) for node in node_dicts],
+        "removed_node_ids": sorted(remove_ids),
+        "killed_browsers": runtime_cleanup["killed_browsers"],
+        "removed_profiles": removed_profiles,
+    }
 
 
 def refresh_subscription(subscription_id: str) -> dict[str, Any]:
-    with STATE_LOCK:
-        state = load_state()
-        subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
-    if not subscription:
-        raise ValueError("订阅不存在")
-    url = subscription.get("url")
-    if not url:
-        raise ValueError("这个订阅没有 URL，无法刷新")
-    return import_subscription({"name": subscription.get("name"), "url": url})
+    with SUBSCRIPTION_LOCK:
+        with STATE_LOCK:
+            state = load_state()
+            subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+        if not subscription:
+            raise ValueError("订阅不存在")
+        url = subscription.get("url")
+        if not url:
+            raise ValueError("这个订阅没有 URL，无法刷新")
+        return import_subscription({"name": subscription.get("name"), "url": url})
 
 
 def _purge_browser_resources_for_nodes(state: dict[str, Any], node_ids: set[str]) -> dict[str, Any]:
@@ -1906,85 +2423,59 @@ def _purge_browser_resources_for_nodes(state: dict[str, Any], node_ids: set[str]
     node_ids = {str(n) for n in node_ids if n}
     if not node_ids:
         return {"removed_instances": [], "killed_browsers": 0, "removed_profiles": 0}
-
-    instances = [
-        item
-        for item in state.get("browser_instances", [])
-        if isinstance(item, dict) and str(item.get("node_id") or "") in node_ids
-    ]
-    instance_ids = [str(item.get("id") or "") for item in instances if item.get("id")]
-    killed = stop_browser_instances(state, instance_ids) if instance_ids else 0
-    for node_id in node_ids:
-        try:
-            killed += stop_untracked_browser_processes_for_node(node_id)
-        except Exception:
-            pass
-
-    state["browser_instances"] = [
-        item
-        for item in state.get("browser_instances", [])
-        if not (isinstance(item, dict) and str(item.get("node_id") or "") in node_ids)
-    ]
-
-    removed_profiles = 0
-    for item in instances:
-        iid = str(item.get("id") or "")
-        node_id = str(item.get("node_id") or "")
-        legacy = bool(item.get("legacy"))
-        try:
-            path = browser_instance_profile_path(node_id, iid, legacy)
-            if path.exists():
-                shutil.rmtree(path, ignore_errors=True)
-                removed_profiles += 1
-            # Remove empty node-level profile root.
-            root = browser_node_profile_root(node_id)
-            if root.exists() and root.is_dir() and not any(root.iterdir()):
-                shutil.rmtree(root, ignore_errors=True)
-        except Exception:
-            pass
-
+    snapshot = _runtime_snapshot_for_nodes(state, node_ids)
+    cleanup = _stop_runtime_for_nodes(snapshot)
+    _mark_removed_nodes_stopped(state, node_ids, cleanup["traffic_by_bridge"])
+    release_persisted_bridge_traffic(cleanup["traffic_by_bridge"])
     return {
-        "removed_instances": instance_ids,
-        "killed_browsers": killed,
-        "removed_profiles": removed_profiles,
+        "removed_instances": [str(item.get("id") or "") for item in snapshot["browser_instances"] if item.get("id")],
+        "killed_browsers": cleanup["killed_browsers"],
+        "removed_profiles": _remove_profiles_for_nodes(node_ids),
     }
 
 
 def delete_subscription(subscription_id: str) -> dict[str, Any]:
-    bridge_ids_to_stop: list[str] = []
-    remove_ids: set[str] = set()
-    purge_summary: dict[str, Any] = {"removed_instances": [], "killed_browsers": 0, "removed_profiles": 0}
-    with STATE_LOCK:
-        state = load_state()
-        subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
-        if not subscription:
-            raise ValueError("订阅不存在")
-        state["subscriptions"] = [s for s in state["subscriptions"] if s.get("id") != subscription_id]
-        remove_ids = {
-            str(n)
-            for n in (set(subscription.get("node_ids") or []) - referenced_node_ids(state["subscriptions"]))
-            if n
-        }
-        # Stop + drop fingerprint browsers / local Profile dirs for purged nodes.
-        purge_summary = _purge_browser_resources_for_nodes(state, remove_ids)
-        state["nodes"] = [n for n in state["nodes"] if n.get("id") not in remove_ids]
-        # Collect bridges that belong to removed nodes (stop outside lock).
-        for bridge in state.get("bridges", []):
-            if not isinstance(bridge, dict):
-                continue
-            if str(bridge.get("node_id") or "") in remove_ids and (
-                bridge.get("status") in ACTIVE_BRIDGE_STATUSES or bridge.get("enabled")
-            ):
-                bid = str(bridge.get("id") or "")
-                if bid:
-                    bridge_ids_to_stop.append(bid)
-        save_state(state)
-
-    for bridge_id in bridge_ids_to_stop:
-        try:
-            stop_bridge(bridge_id)
-        except Exception:
-            pass
+    with SUBSCRIPTION_LOCK:
+        with SHUTDOWN_LOCK:
+            with STATE_LOCK:
+                state = load_state()
+                subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+                if not subscription:
+                    raise ValueError("订阅不存在")
+                remaining = [s for s in state["subscriptions"] if s.get("id") != subscription_id]
+                remove_ids = {
+                    str(node_id)
+                    for node_id in (set(subscription.get("node_ids") or []) - referenced_node_ids(remaining))
+                    if node_id
+                }
+                runtime_snapshot = _runtime_snapshot_for_nodes(state, remove_ids)
+            runtime_cleanup = _stop_runtime_for_nodes(runtime_snapshot) if remove_ids else {
+                "killed_browsers": 0,
+                "traffic_by_bridge": {},
+                "browser_instances": [],
+            }
+            with STATE_LOCK:
+                state = load_state()
+                state["subscriptions"] = [s for s in state["subscriptions"] if s.get("id") != subscription_id]
+                current_remove_ids = {
+                    str(node_id)
+                    for node_id in (set(subscription.get("node_ids") or []) - referenced_node_ids(state["subscriptions"]))
+                    if node_id
+                }
+                state["nodes"] = [n for n in state["nodes"] if n.get("id") not in current_remove_ids]
+                _mark_removed_nodes_stopped(state, current_remove_ids, runtime_cleanup["traffic_by_bridge"])
+                save_state(state)
+            release_persisted_bridge_traffic(runtime_cleanup["traffic_by_bridge"])
+            purge_summary = {
+                "removed_instances": [
+                    str(item.get("id") or "")
+                    for item in runtime_snapshot["browser_instances"]
+                    if item.get("id")
+                ],
+                "killed_browsers": runtime_cleanup["killed_browsers"],
+                "removed_profiles": 0,
+            }
+        purge_summary["removed_profiles"] = _remove_profiles_for_nodes(remove_ids)
 
     mark_sync_local_change()
     # WebDAV enabled → push deletion (subscriptions + remote Profile packages).
@@ -2034,20 +2525,27 @@ def remembered_port_for_node(state: dict[str, Any], node_id: str) -> int | None:
     return safe_int(bridges[0].get("port"), 0) or None
 
 
-def is_port_free(port: int) -> bool:
+def is_port_free(port: int, listen_host: str = LOCAL_PROXY_LISTEN_HOST) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            s.bind(("127.0.0.1", port))
+            s.bind((listen_host, port))
         except OSError:
             return False
     return True
 
 
-def next_free_port(preferred: int | None = None) -> int:
+def next_free_port(
+    preferred: int | None = None,
+    listen_host: str = LOCAL_PROXY_LISTEN_HOST,
+) -> int:
     start = preferred or DEFAULT_SOCKS_PORT
     for port in range(start, start + 1000):
-        if is_port_free(port):
+        free = (
+            is_port_free(port)
+            if listen_host == LOCAL_PROXY_LISTEN_HOST
+            else is_port_free(port, listen_host)
+        )
+        if free:
             return port
     raise RuntimeError("没有可用的本地端口")
 
@@ -2298,17 +2796,25 @@ def terminate_process(process: subprocess.Popen) -> None:
         process.wait(timeout=3)
 
 
-def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
-    with SHUTDOWN_LOCK:
-        if SHUTTING_DOWN.is_set():
-            raise RuntimeError("程序正在退出，不能启动新的本地代理")
-        synchronize_process_state()
-        return _start_bridge(payload)
+def _validate_active_bridge_request(
+    active_bridge: dict[str, Any],
+    *,
+    requested_core: str,
+    requested_port: int | None,
+) -> None:
+    active_core = str(active_bridge.get("core") or "")
+    active_port = safe_int(active_bridge.get("port"), 0)
+    if requested_core != "auto" and requested_core != active_core:
+        raise ValueError(f"活动本地代理核心为 {active_core}，与请求的 {requested_core} 冲突")
+    if requested_port is not None and requested_port != active_port:
+        raise ValueError(f"活动本地代理端口为 {active_port}，与请求的 {requested_port} 冲突")
 
 
-def _start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
+def _prepare_bridge_start(payload: dict[str, Any]) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
     requested_port = safe_int(payload.get("port"), 0) or None
+    if requested_port is not None and not 1 <= requested_port <= 65535:
+        raise ValueError("本地代理端口必须在 1..65535 之间")
     requested_core = str(payload.get("core") or "auto")
     if requested_core not in {"auto", "sing-box", "xray"}:
         raise ValueError("核心只能是 sing-box、xray 或 auto")
@@ -2317,19 +2823,18 @@ def _start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
     initial_download = safe_int(payload.get("download_bytes"), 0) if preserve_traffic else 0
     with STATE_LOCK:
         state = load_state()
-        node = find_node(state, node_id)
+        node = dict(find_node(state, node_id))
         changed = sync_process_status(state)
         active_bridge = active_bridge_for_node(state, node_id)
         if active_bridge:
-            active_core = str(active_bridge.get("core") or "")
-            active_port = safe_int(active_bridge.get("port"), 0)
-            if requested_core != "auto" and requested_core != active_core:
-                raise ValueError(f"活动本地代理核心为 {active_core}，与请求的 {requested_core} 冲突")
-            if requested_port is not None and requested_port != active_port:
-                raise ValueError(f"活动本地代理端口为 {active_port}，与请求的 {requested_port} 冲突")
+            _validate_active_bridge_request(
+                active_bridge,
+                requested_core=requested_core,
+                requested_port=requested_port,
+            )
             if changed:
                 save_state(state)
-            return active_bridge
+            return {"active_bridge": active_bridge}
         with PROCESS_LOCK:
             residual_bridge_ids = [
                 bridge_id
@@ -2342,90 +2847,216 @@ def _start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
         if core not in {"sing-box", "xray"}:
             raise ValueError("核心只能是 sing-box、xray 或 auto")
         preferred_port = requested_port or remembered_port_for_node(state, node_id)
-        local_port = next_free_port(preferred_port)
-        core_port = next_free_port(max(local_port + 1000, 23080))
-        bridge_id = stable_id(node_id, str(local_port), core)
-        config = generate_config(core, node, core_port)
-        config_path = RUNTIME_ROOT / f"{bridge_id}.json"
-        log_path = RUNTIME_ROOT / f"{bridge_id}.log"
-        with config_path.open("w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=2)
-        command = core_command(core, config_path)
-        log_file = log_path.open("ab")
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(APP_ROOT),
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        finally:
-            log_file.close()
+        listen_host = proxy_listen_host(state)
+    return {
+        "node_id": node_id,
+        "node": node,
+        "requested_core": requested_core,
+        "requested_port": requested_port,
+        "core": core,
+        "preferred_port": preferred_port,
+        "listen_host": listen_host,
+        "initial_upload": initial_upload,
+        "initial_download": initial_download,
+    }
+
+
+def _prepare_core_command(plan: dict[str, Any]) -> list[str]:
+    placeholder = RUNTIME_ROOT / f".{plan['core']}-preflight.json"
+    return core_command(str(plan["core"]), placeholder)
+
+
+def _retarget_core_command(command: list[str], core: str, config_path: Path) -> list[str]:
+    prepared = list(command)
+    expected_flag = "-config" if core == "xray" else "-c"
+    if len(prepared) >= 4 and prepared[-2] == expected_flag:
+        prepared[-1] = str(config_path)
+    return prepared
+
+
+def _complete_bridge_plan(plan: dict[str, Any], command: list[str]) -> tuple[dict[str, Any], list[str]]:
+    listen_host = str(plan.get("listen_host") or LOCAL_PROXY_LISTEN_HOST)
+    local_port = (
+        next_free_port(plan.get("preferred_port"), listen_host)
+        if listen_host != LOCAL_PROXY_LISTEN_HOST
+        else next_free_port(plan.get("preferred_port"))
+    )
+    core_port = next_free_port(max(local_port + 1000, 23080))
+    bridge_id = stable_id(str(plan["node_id"]), str(local_port), str(plan["core"]))
+    config = generate_config(str(plan["core"]), dict(plan["node"]), core_port)
+    config_path = RUNTIME_ROOT / f"{bridge_id}.json"
+    log_path = RUNTIME_ROOT / f"{bridge_id}.log"
+    _write_private_atomic(
+        config_path,
+        json.dumps(config, ensure_ascii=False, indent=2).encode("utf-8"),
+        temp_path=config_path.with_suffix(config_path.suffix + ".tmp"),
+    )
+    completed = dict(plan)
+    completed.update(
+        {
+            "local_port": local_port,
+            "core_port": core_port,
+            "bridge_id": bridge_id,
+            "config": config,
+            "config_path": config_path,
+            "log_path": log_path,
+        }
+    )
+    return completed, _retarget_core_command(command, str(plan["core"]), config_path)
+
+
+def _run_prepared_bridge(plan: dict[str, Any], command: list[str]) -> dict[str, Any]:
+    node_id = str(plan["node_id"])
+    node = dict(plan["node"])
+    core = str(plan["core"])
+    local_port = safe_int(plan["local_port"], 0)
+    core_port = safe_int(plan["core_port"], 0)
+    listen_host = str(plan.get("listen_host") or LOCAL_PROXY_LISTEN_HOST)
+    bridge_id = str(plan["bridge_id"])
+    config_path = Path(plan["config_path"])
+    log_path = Path(plan["log_path"])
+    rotate_runtime_log(log_path)
+    log_file = log_path.open("ab")
+    try:
+        os.fchmod(log_file.fileno(), 0o600)
+        process = subprocess.Popen(
+            command,
+            cwd=str(APP_ROOT),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_file.close()
+    with PROCESS_LOCK:
+        PROCESS_TABLE[bridge_id] = process
+        BRIDGE_NODE_TABLE[bridge_id] = node_id
+    try:
+        core_started = wait_for_port(core_port, timeout=2.5)
+        if process.poll() is not None:
+            error = read_tail(log_path)
+            raise RuntimeError(error or f"{core} 启动失败")
+        if not core_started:
+            raise RuntimeError("核心内部端口启动超时")
+        proxy = Socks5LogProxy(
+            bridge_id=bridge_id,
+            node_id=node_id,
+            node_name=str(node.get("name") or ""),
+            listen_port=local_port,
+            upstream_port=core_port,
+        )
+        proxy.listen_host = listen_host
+        proxy.start()
         with PROCESS_LOCK:
-            PROCESS_TABLE[bridge_id] = process
-            BRIDGE_NODE_TABLE[bridge_id] = node_id
-        try:
-            core_started = wait_for_port(core_port, timeout=2.5)
-            if process.poll() is not None:
-                error = read_tail(log_path)
-                raise RuntimeError(error or f"{core} 启动失败")
-            if not core_started:
-                raise RuntimeError("核心内部端口启动超时")
-            proxy = Socks5LogProxy(
-                bridge_id=bridge_id,
-                node_id=node_id,
-                node_name=str(node.get("name") or ""),
-                listen_port=local_port,
-                upstream_port=core_port,
-            )
-            proxy.start()
-            with PROCESS_LOCK:
-                LOG_PROXY_TABLE[bridge_id] = proxy
-            started = wait_for_port(local_port, timeout=1.0)
-            traffic = init_bridge_traffic(bridge_id, initial_upload, initial_download)
-            bridge = {
-                "id": bridge_id,
-                "node_id": node_id,
-                "node_name": node.get("name"),
-                "protocol": node.get("protocol"),
-                "region": node.get("region"),
-                "core": core,
-                "port": local_port,
-                "core_port": core_port,
-                "socks_url": f"socks5://127.0.0.1:{local_port}",
-                "http_url": f"http://127.0.0.1:{local_port}",
-                "supported_proxy_protocols": ["socks5", "http", "https-connect"],
-                "status": "running" if started else "starting",
-                "enabled": True,
-                "pid": process.pid,
-                "started_at": now_ts(),
-                "config_path": str(config_path),
-                "log_path": str(log_path),
-                **traffic,
-            }
+            LOG_PROXY_TABLE[bridge_id] = proxy
+        started = wait_for_port(local_port, timeout=1.0)
+        traffic = init_bridge_traffic(
+            bridge_id,
+            safe_int(plan.get("initial_upload"), 0),
+            safe_int(plan.get("initial_download"), 0),
+        )
+        bridge = {
+            "id": bridge_id,
+            "node_id": node_id,
+            "node_name": node.get("name"),
+            "protocol": node.get("protocol"),
+            "region": node.get("region"),
+            "core": core,
+            "port": local_port,
+            "core_port": core_port,
+            "listen_host": listen_host,
+            "socks_url": f"socks5://127.0.0.1:{local_port}",
+            "http_url": f"http://127.0.0.1:{local_port}",
+            "supported_proxy_protocols": ["socks5", "http", "https-connect"],
+            "status": "running" if started else "starting",
+            "enabled": True,
+            "pid": process.pid,
+            "started_at": now_ts(),
+            "config_path": str(config_path),
+            "log_path": str(log_path),
+            **traffic,
+        }
+        with STATE_LOCK:
+            state = load_state()
+            current_node = find_node(state, node_id)
+            current_active = active_bridge_for_node(state, node_id)
+            if current_active and str(current_active.get("id") or "") != bridge_id:
+                raise RuntimeError("该节点在启动期间已创建另一个本地代理")
+            # Preserve any state changes made while runtime setup was in flight.
+            bridge["node_name"] = current_node.get("name")
+            bridge["protocol"] = current_node.get("protocol")
+            bridge["region"] = current_node.get("region")
             state["bridges"] = [b for b in state["bridges"] if b.get("id") != bridge_id]
             state["bridges"].append(bridge)
             save_state(state)
-            return bridge
+        return bridge
+    except BaseException:
+        try:
+            stop_process(bridge_id)
         except BaseException:
-            try:
-                stop_process(bridge_id)
-            except BaseException:
-                pass
-            raise
+            pass
+        raise
+
+
+def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
+    with BRIDGE_START_LOCK:
+        while True:
+            with SHUTDOWN_LOCK:
+                if SHUTTING_DOWN.is_set():
+                    raise RuntimeError("程序正在退出，不能启动新的本地代理")
+                synchronize_process_state()
+                plan = _prepare_bridge_start(payload)
+                if plan.get("active_bridge"):
+                    return dict(plan["active_bridge"])
+
+            # Core discovery/download can take minutes. It intentionally runs outside
+            # SHUTDOWN_LOCK; no process is created until the lifecycle barrier is reacquired.
+            command = _prepare_core_command(plan)
+
+            with SHUTDOWN_LOCK:
+                if SHUTTING_DOWN.is_set():
+                    raise RuntimeError("程序正在退出，不能启动新的本地代理")
+                synchronize_process_state()
+                with STATE_LOCK:
+                    state = load_state()
+                    node = dict(find_node(state, str(plan["node_id"])))
+                    active_bridge = active_bridge_for_node(state, str(plan["node_id"]))
+                    if active_bridge:
+                        _validate_active_bridge_request(
+                            active_bridge,
+                            requested_core=str(plan["requested_core"]),
+                            requested_port=plan.get("requested_port"),
+                        )
+                        return active_bridge
+                    with PROCESS_LOCK:
+                        residual = any(
+                            owner_node_id == plan["node_id"]
+                            for owner_node_id in BRIDGE_NODE_TABLE.values()
+                        )
+                    if residual:
+                        raise RuntimeError("该节点仍有未清理的本地代理资源，无法重复启动")
+                    desired_core = (
+                        node.get("preferred_core")
+                        if plan["requested_core"] == "auto"
+                        else plan["requested_core"]
+                    )
+                if desired_core != plan["core"]:
+                    continue
+                plan["node"] = node
+                completed_plan, runtime_command = _complete_bridge_plan(plan, command)
+                return _run_prepared_bridge(completed_plan, runtime_command)
 
 
 def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    with BROWSER_LAUNCH_LOCK:
+        return _launch_browser(payload)
+
+
+def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     with SHUTDOWN_LOCK:
         if SHUTTING_DOWN.is_set():
             raise RuntimeError("程序正在退出，不能启动新的浏览器")
         synchronize_process_state()
-        with BROWSER_LAUNCH_LOCK:
-            return _launch_browser(payload)
-
-
-def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
     requested_instance_id = str(payload.get("instance_id") or "")
     # 方案 B:使用打过补丁的指纹内核(fingerprint-chromium),从底层伪造 Canvas/WebGL/Audio/
@@ -2471,6 +3102,41 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     if not bridge:
         bridge = start_bridge({"node_id": node_id, "core": "auto"})
 
+    # start_bridge() has its own two-phase lifecycle barrier and may spend minutes
+    # resolving a core. Never hold SHUTDOWN_LOCK while calling it. Reacquire the
+    # barrier only for the final browser-process launch, then re-read all state that
+    # may have changed while the bridge was being prepared.
+    with SHUTDOWN_LOCK:
+        if SHUTTING_DOWN.is_set():
+            raise RuntimeError("程序正在退出，不能启动新的浏览器")
+        synchronize_process_state()
+        with STATE_LOCK:
+            state = load_state()
+            node = dict(find_node(state, node_id))
+            instance = dict(find_browser_instance(state, str(instance["id"])))
+            if instance.get("status") in ACTIVE_BROWSER_STATUSES:
+                raise ValueError("浏览器实例已在运行")
+            bridge = active_bridge_for_node(state, node_id)
+            if not bridge:
+                raise RuntimeError("本地代理在浏览器启动前已停止")
+        return _run_browser_launch(
+            node_id=node_id,
+            node=node,
+            instance=instance,
+            bridge=dict(bridge),
+            fp_chromium=fp_chromium,
+        )
+
+
+def _run_browser_launch(
+    *,
+    node_id: str,
+    node: dict[str, Any],
+    instance: dict[str, Any],
+    bridge: dict[str, Any],
+    fp_chromium: str,
+) -> dict[str, Any]:
+    """Launch and register Chromium while the caller holds SHUTDOWN_LOCK."""
     local_port = safe_int(bridge.get("port"), 0)
     if local_port <= 0:
         raise RuntimeError("当前节点没有可用的本地代理端口")
@@ -2895,9 +3561,64 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def runtime_log_backup_path(path: Path, index: int) -> Path:
+    return path.with_name(f"{path.name}.{index}")
+
+
+def rotate_runtime_log(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    backup_count: int | None = None,
+) -> bool:
+    max_bytes = CORE_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    backup_count = CORE_LOG_BACKUP_COUNT if backup_count is None else backup_count
+    if max_bytes <= 0 or backup_count <= 0:
+        return False
+    try:
+        if path.stat().st_size <= max_bytes:
+            return False
+    except FileNotFoundError:
+        return False
+    with LOG_ROTATION_LOCK:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return False
+        if size <= max_bytes:
+            return False
+        oldest = runtime_log_backup_path(path, backup_count)
+        oldest.unlink(missing_ok=True)
+        for index in range(backup_count - 1, 0, -1):
+            source = runtime_log_backup_path(path, index)
+            if source.exists():
+                source.replace(runtime_log_backup_path(path, index + 1))
+        with path.open("rb") as source:
+            source.seek(max(0, size - max_bytes), os.SEEK_SET)
+            archived = source.read(max_bytes)
+        backup = runtime_log_backup_path(path, 1)
+        _write_private_atomic(
+            backup,
+            archived,
+            temp_path=backup.with_suffix(backup.suffix + ".tmp"),
+        )
+        with path.open("r+b") as current:
+            os.fchmod(current.fileno(), 0o600)
+            current.truncate(0)
+            current.flush()
+            os.fsync(current.fileno())
+        return True
+
+
 def read_tail(path: Path, limit: int = 6000) -> str:
     try:
-        data = path.read_bytes()[-limit:]
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max(0, limit)), os.SEEK_SET)
+            data = f.read(max(0, limit))
+        if size > CORE_LOG_MAX_BYTES:
+            rotate_runtime_log(path)
         return data.decode("utf-8", errors="replace").strip()
     except Exception:
         return ""
@@ -3104,28 +3825,73 @@ class Socks5LogProxy:
         node_name: str,
         listen_port: int,
         upstream_port: int,
+        listen_host: str = LOCAL_PROXY_LISTEN_HOST,
     ) -> None:
+        if listen_host not in {LOCAL_PROXY_LISTEN_HOST, LAN_PROXY_LISTEN_HOST}:
+            raise ValueError("本地代理监听地址无效")
         self.bridge_id = bridge_id
         self.node_id = node_id
         self.node_name = node_name
         self.listen_port = listen_port
         self.upstream_port = upstream_port
+        self.listen_host = listen_host
         self._stop = threading.Event()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._client_lock = threading.RLock()
         self._client_sockets: set[socket.socket] = set()
+        self._upstream_sockets: set[socket.socket] = set()
         self._client_threads: set[threading.Thread] = set()
 
     def start(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("127.0.0.1", self.listen_port))
-        server.listen(128)
-        server.settimeout(0.5)
+        try:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind((self.listen_host, self.listen_port))
+            server.listen(128)
+            server.settimeout(0.5)
+        except BaseException:
+            server.close()
+            raise
         self._server = server
         self._thread = threading.Thread(target=self._serve, name=f"request-log-proxy-{self.bridge_id}", daemon=True)
         self._thread.start()
+
+    def _start_after_rebind(self) -> None:
+        # macOS can retain a just-closed wildcard listener briefly after an accepted
+        # connection. Retry only EADDRINUSE for a bounded window; other bind errors are final.
+        deadline = time.monotonic() + PROXY_REBIND_RETRY_TIMEOUT
+        while True:
+            try:
+                self.start()
+                return
+            except OSError as exc:
+                if exc.errno != errno.EADDRINUSE or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
+
+    def rebind(self, listen_host: str) -> None:
+        """Move the public listener to another host, restoring the old listener on failure."""
+        if listen_host not in {LOCAL_PROXY_LISTEN_HOST, LAN_PROXY_LISTEN_HOST}:
+            raise ValueError("本地代理监听地址无效")
+        if listen_host == self.listen_host and self.is_alive():
+            return
+        old_host = self.listen_host
+        try:
+            self.stop()
+            self.listen_host = listen_host
+            self._stop = threading.Event()
+            self._start_after_rebind()
+        except BaseException as rebind_error:
+            self.listen_host = old_host
+            self._stop = threading.Event()
+            try:
+                self._start_after_rebind()
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    f"代理监听切换失败且无法恢复 {old_host}: {rollback_error}"
+                ) from rebind_error
+            raise
 
     def stop(self) -> None:
         self._stop.set()
@@ -3138,13 +3904,14 @@ class Socks5LogProxy:
                 pass
         with self._client_lock:
             clients = list(self._client_sockets)
-        for client in clients:
+            upstreams = list(self._upstream_sockets)
+        for active_socket in clients + upstreams:
             try:
-                client.shutdown(socket.SHUT_RDWR)
+                active_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             try:
-                client.close()
+                active_socket.close()
             except OSError:
                 pass
         current = threading.current_thread()
@@ -3169,11 +3936,37 @@ class Socks5LogProxy:
             lingering = [thread for thread in self._client_threads if thread.is_alive()]
         if (accept_thread and accept_thread.is_alive()) or lingering:
             raise RuntimeError("本地代理连接未能及时停止")
+        with self._client_lock:
+            self._client_sockets.clear()
+            self._upstream_sockets.clear()
+            self._client_threads = {thread for thread in self._client_threads if thread.is_alive()}
         self._server = None
         self._thread = None
 
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive() and not self._stop.is_set())
+
+    def _track_upstream(self, upstream: socket.socket) -> None:
+        with self._client_lock:
+            if self._stop.is_set():
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+                raise RuntimeError("本地代理正在停止")
+            self._upstream_sockets.add(upstream)
+
+    def _close_upstream(self, upstream: socket.socket) -> None:
+        with self._client_lock:
+            self._upstream_sockets.discard(upstream)
+        try:
+            upstream.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            upstream.close()
+        except OSError:
+            pass
 
     def _serve(self) -> None:
         assert self._server is not None
@@ -3184,6 +3977,9 @@ class Socks5LogProxy:
                 continue
             except OSError:
                 break
+            if self.listen_host == LAN_PROXY_LISTEN_HOST and not proxy_client_allowed(address[0]):
+                client.close()
+                continue
             thread = threading.Thread(
                 target=self._run_client_handler,
                 args=(client, address),
@@ -3323,10 +4119,7 @@ class Socks5LogProxy:
                 pass
         finally:
             if upstream:
-                try:
-                    upstream.close()
-                except OSError:
-                    pass
+                self._close_upstream(upstream)
 
     def _handle_http_proxy_client(self, client: socket.socket, address: tuple[str, int], first: bytes) -> None:
         log_id = ""
@@ -3413,14 +4206,12 @@ class Socks5LogProxy:
                     pass
         finally:
             if upstream:
-                try:
-                    upstream.close()
-                except OSError:
-                    pass
+                self._close_upstream(upstream)
 
     def _connect_upstream_for_socks_request(self, request: bytes) -> tuple[socket.socket, bytes]:
         upstream = socket.create_connection(("127.0.0.1", self.upstream_port), timeout=12.0)
         try:
+            self._track_upstream(upstream)
             upstream.settimeout(12.0)
             upstream.sendall(b"\x05\x01\x00")
             upstream_greeting = read_exact(upstream, 2)
@@ -3430,20 +4221,14 @@ class Socks5LogProxy:
             reply = self._read_socks_reply(upstream)
             return upstream, reply
         except Exception:
-            try:
-                upstream.close()
-            except OSError:
-                pass
+            self._close_upstream(upstream)
             raise
 
     def _open_upstream_tunnel(self, host: str, port: int) -> socket.socket:
         request = b"\x05\x01\x00" + self._socks_address_tail(host, port)
         upstream, reply = self._connect_upstream_for_socks_request(request)
         if len(reply) < 2 or reply[1] != 0:
-            try:
-                upstream.close()
-            except OSError:
-                pass
+            self._close_upstream(upstream)
             raise RuntimeError(f"核心返回 SOCKS5 状态码 {reply[1] if len(reply) > 1 else '-'}")
         return upstream
 
@@ -3746,29 +4531,51 @@ def socks5_http_probe(
 def test_node(payload: dict[str, Any]) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
     requested_core = str(payload.get("core") or "auto")
+    if requested_core not in {"auto", "sing-box", "xray"}:
+        raise ValueError("核心只能是 sing-box、xray 或 auto")
     process: subprocess.Popen | None = None
     test_id = ""
     log_path: Path | None = None
     result: dict[str, Any]
-    with SHUTDOWN_LOCK:
-        if SHUTTING_DOWN.is_set():
-            raise RuntimeError("程序正在退出，不能启动新的节点测试")
-        with STATE_LOCK:
-            state = load_state()
-            node = find_node(state, node_id)
-            core = node.get("preferred_core") if requested_core == "auto" else requested_core
-            if core not in {"sing-box", "xray"}:
-                raise ValueError("核心只能是 sing-box、xray 或 auto")
+    while True:
+        with SHUTDOWN_LOCK:
+            if SHUTTING_DOWN.is_set():
+                raise RuntimeError("程序正在退出，不能启动新的节点测试")
+            with STATE_LOCK:
+                state = load_state()
+                node = dict(find_node(state, node_id))
+                core = node.get("preferred_core") if requested_core == "auto" else requested_core
+                if core not in {"sing-box", "xray"}:
+                    raise ValueError("核心只能是 sing-box、xray 或 auto")
+
+        # Core discovery/download is slow and must not block state reads or shutdown.
+        placeholder = RUNTIME_ROOT / f".{core}-test-preflight.json"
+        prepared_command = core_command(core, placeholder)
+
+        with SHUTDOWN_LOCK:
+            if SHUTTING_DOWN.is_set():
+                raise RuntimeError("程序正在退出，不能启动新的节点测试")
+            with STATE_LOCK:
+                state = load_state()
+                node = dict(find_node(state, node_id))
+                desired_core = node.get("preferred_core") if requested_core == "auto" else requested_core
+            if desired_core != core:
+                continue
             local_port = next_free_port(22080)
             test_id = stable_id("test", node_id, str(time.time_ns()), str(local_port))
             config = generate_config(core, node, local_port)
             config_path = RUNTIME_ROOT / f"{test_id}.json"
             log_path = RUNTIME_ROOT / f"{test_id}.log"
-            with config_path.open("w", encoding="utf-8") as f:
-                json.dump(config, f, ensure_ascii=False, indent=2)
-            command = core_command(core, config_path)
+            _write_private_atomic(
+                config_path,
+                json.dumps(config, ensure_ascii=False, indent=2).encode("utf-8"),
+                temp_path=config_path.with_suffix(config_path.suffix + ".tmp"),
+            )
+            command = _retarget_core_command(prepared_command, core, config_path)
+            rotate_runtime_log(log_path)
             log_file = log_path.open("ab")
             try:
+                os.fchmod(log_file.fileno(), 0o600)
                 process = subprocess.Popen(
                     command,
                     cwd=str(APP_ROOT),
@@ -3778,8 +4585,9 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
                 )
             finally:
                 log_file.close()
-        with PROCESS_LOCK:
-            TEST_PROCESS_TABLE[test_id] = process
+            with PROCESS_LOCK:
+                TEST_PROCESS_TABLE[test_id] = process
+            break
 
     try:
         if not wait_for_port(local_port, timeout=3.0):
@@ -3897,6 +4705,101 @@ def _stop_all_bridges() -> dict[str, Any]:
         details = "; ".join(f"{label}: {error}" for label, error in failures)
         raise RuntimeError(f"停止部分本地代理失败（{len(failures)} 项）: {details}") from failures[0][1]
     return {"ok": True, "killed_browsers": killed_browsers}
+
+
+def rebind_running_log_proxies(listen_host: str) -> list[str]:
+    """Rebind every active public proxy listener as one best-effort transaction."""
+    with PROCESS_LOCK:
+        proxies = list(LOG_PROXY_TABLE.items())
+    changed: list[tuple[str, Socks5LogProxy, str]] = []
+    current: tuple[str, Socks5LogProxy, str] | None = None
+    try:
+        for bridge_id, proxy in proxies:
+            old_host = str(getattr(proxy, "listen_host", LOCAL_PROXY_LISTEN_HOST))
+            if old_host == listen_host and proxy.is_alive():
+                continue
+            current = (bridge_id, proxy, old_host)
+            proxy.rebind(listen_host)
+            changed.append(current)
+            current = None
+    except BaseException as rebind_error:
+        rollback_failures: list[str] = []
+        rollback_items = list(reversed(changed))
+        if current is not None:
+            current_proxy = current[1]
+            host_changed = str(getattr(current_proxy, "listen_host", "")) != current[2]
+            if host_changed or not current_proxy.is_alive():
+                rollback_items.insert(0, current)
+        for bridge_id, proxy, old_host in rollback_items:
+            try:
+                proxy.rebind(old_host)
+            except BaseException as rollback_error:
+                rollback_failures.append(f"{bridge_id}: {rollback_error}")
+        if rollback_failures:
+            raise RuntimeError(
+                "局域网共享切换失败，且部分代理监听恢复失败：" + "; ".join(rollback_failures)
+            ) from rebind_error
+        raise RuntimeError(f"局域网共享切换失败：{rebind_error}") from rebind_error
+    return [bridge_id for bridge_id, _proxy, _old_host in changed]
+
+
+def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if "allow_lan" not in payload or not isinstance(payload.get("allow_lan"), bool):
+        raise ValueError("allow_lan 必须是布尔值")
+    desired = bool(payload["allow_lan"])
+    desired_host = LAN_PROXY_LISTEN_HOST if desired else LOCAL_PROXY_LISTEN_HOST
+    lan_addresses = lan_ipv4_addresses()
+
+    # 与 start_bridge 使用相同锁顺序，避免设置切换与新监听器启动交错。
+    with BRIDGE_START_LOCK:
+        with SHUTDOWN_LOCK:
+            if SHUTTING_DOWN.is_set():
+                raise RuntimeError("程序正在退出，不能修改局域网共享设置")
+            synchronize_process_state()
+            rebound_ids = rebind_running_log_proxies(desired_host)
+            try:
+                with STATE_LOCK:
+                    state = load_state()
+                    settings = state.setdefault("settings", {})
+                    settings["allow_lan"] = desired
+                    for bridge in state.get("bridges", []):
+                        bridge["listen_host"] = desired_host
+                    save_state(state)
+                    network = network_settings_payload(state, lan_addresses=lan_addresses)
+            except BaseException as save_error:
+                persisted_allow_lan: bool | None = None
+                state_read_error: BaseException | None = None
+                try:
+                    with STATE_LOCK:
+                        persisted_allow_lan = allow_lan_access(load_state())
+                except BaseException as read_error:
+                    state_read_error = read_error
+                # save_state may fail after the atomic replace has already committed.
+                # Reconcile listeners to what is actually readable on disk; if the
+                # state cannot be read, fail closed to loopback rather than expose LAN.
+                reconciled_host = (
+                    LAN_PROXY_LISTEN_HOST
+                    if persisted_allow_lan is True
+                    else LOCAL_PROXY_LISTEN_HOST
+                )
+                try:
+                    rebind_running_log_proxies(reconciled_host)
+                except BaseException as reconcile_error:
+                    raise RuntimeError(
+                        f"设置保存失败，且代理监听与磁盘状态协调失败：{reconcile_error}"
+                    ) from save_error
+                if state_read_error is not None:
+                    raise RuntimeError(
+                        f"设置保存失败，状态文件不可读，代理已收紧为仅本机：{state_read_error}"
+                    ) from save_error
+                raise
+
+    return {
+        "ok": True,
+        "network": network,
+        "rebound_count": len(rebound_ids),
+        "connections_interrupted": bool(rebound_ids),
+    }
 
 
 def apply_updates(target: dict[str, Any], updates: dict[str, Any]) -> bool:
@@ -4155,6 +5058,9 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            response_kind = "json"
+            response_status = 200
+            response_body: Any = None
             with SHUTDOWN_LOCK:
                 synchronize_process_state()
                 with STATE_LOCK:
@@ -4164,10 +5070,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     if changed or token_changed:
                         save_state(state)
                     if not pool_tokens_equal(token, expected_token):
-                        json_response(self, {"error": "无效的代理池凭证"}, 403, head_only=head_only)
-                        return
-
-                    if action == "list.json":
+                        response_body = {"error": "无效的代理池凭证"}
+                        response_status = 403
+                    elif action == "list.json":
                         members = [
                             public_pool_member(m)
                             for m in pool_members(state, region=region, q=q, ready_only=False)
@@ -4179,50 +5084,50 @@ class AppHandler(BaseHTTPRequestHandler):
                         }
                         if protocol is not None:
                             payload["protocol"] = protocol
-                        json_response(self, payload, head_only=head_only)
-                        return
-
-                    if action == "proxies.txt":
+                        response_body = payload
+                    elif action == "proxies.txt":
                         members = [
                             public_pool_member(m)
                             for m in pool_members(state, region=region, q=q, ready_only=False)
                         ]
-                        body = render_proxies_txt(members, protocol)
-                        text_response(self, body, head_only=head_only)
-                        return
-
-                    # action == "get"
-                    ready_members = [
-                        public_pool_member(m)
-                        for m in pool_members(state, region=region, q=q, ready_only=True)
-                    ]
-                    candidates = ready_members
-                    if not candidates and include_starting:
-                        candidates = [
+                        response_kind = "text"
+                        response_body = render_proxies_txt(members, protocol)
+                    else:
+                        # action == "get"
+                        ready_members = [
                             public_pool_member(m)
-                            for m in pool_members(state, region=region, q=q, ready_only=False)
+                            for m in pool_members(state, region=region, q=q, ready_only=True)
                         ]
-                    if not candidates:
-                        if response_format == "text":
-                            text_response(self, "error: pool empty\n", 404, head_only=head_only)
+                        candidates = ready_members
+                        if not candidates and include_starting:
+                            candidates = [
+                                public_pool_member(m)
+                                for m in pool_members(state, region=region, q=q, ready_only=False)
+                            ]
+                        if not candidates:
+                            response_status = 404
+                            if response_format == "text":
+                                response_kind = "text"
+                                response_body = "error: pool empty\n"
+                            else:
+                                response_body = {"error": "代理池为空"}
                         else:
-                            json_response(self, {"error": "代理池为空"}, 404, head_only=head_only)
-                        return
-                    picked = pick_pool_member(candidates, strategy)
-                    picked_url = select_proxy_url(picked, protocol)
-                    if response_format == "text":
-                        text_response(self, f"{picked_url}\n", head_only=head_only)
-                        return
-                    json_response(
-                        self,
-                        {
-                            "strategy": strategy,
-                            "protocol": protocol or "socks5",
-                            "picked_url": picked_url,
-                            "proxy": picked,
-                        },
-                        head_only=head_only,
-                    )
+                            picked = pick_pool_member(candidates, strategy)
+                            picked_url = select_proxy_url(picked, protocol)
+                            if response_format == "text":
+                                response_kind = "text"
+                                response_body = f"{picked_url}\n"
+                            else:
+                                response_body = {
+                                    "strategy": strategy,
+                                    "protocol": protocol or "socks5",
+                                    "picked_url": picked_url,
+                                    "proxy": picked,
+                                }
+            if response_kind == "text":
+                text_response(self, str(response_body or ""), response_status, head_only=head_only)
+            else:
+                json_response(self, response_body, response_status, head_only=head_only)
         except Exception as exc:
             error_response(self, exc, 400)
 
@@ -4235,7 +5140,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_request_error(403, "不可信请求来源")
             return
         if parsed.path == "/api/status":
-            json_response(self, status_payload())
+            try:
+                json_response(self, status_payload())
+            except Exception as exc:
+                error_response(self, exc, 500)
             return
         if parsed.path == "/api/pool":
             try:
@@ -4363,6 +5271,14 @@ class AppHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/pool/token/rotate":
                 result = rotate_pool_token()
                 log_event("代理池 token 已轮换", category="代理")
+                json_response(self, result)
+            elif self.path == "/api/settings/network":
+                result = update_network_settings(payload)
+                state_label = "开启" if result.get("network", {}).get("allow_lan") else "关闭"
+                log_event(
+                    f"局域网共享已{state_label}，重绑 {result.get('rebound_count', 0)} 个代理端口",
+                    category="设置",
+                )
                 json_response(self, result)
             elif self.path == "/api/sync/settings":
                 result = get_sync_engine().update_settings(payload)

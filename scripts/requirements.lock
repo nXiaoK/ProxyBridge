@@ -1,0 +1,5 @@
+# Vendored into Contents/Resources/bridge/vendor by build_menubar_app.sh.
+# The arm64 CPython 3.9 wheel is treated as a zip container; the build removes
+# its native extension and keeps the version-independent pure Python modules.
+PyYAML==6.0.2 \
+    --hash=sha256:a8786accb172bd8afb8be14490a16625cbc387036876ab6ba70912730faf8e1f

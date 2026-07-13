@@ -40,33 +40,37 @@
 
         <nav class="sidebar-nav" aria-label="视图切换">
           <p class="nav-group-title">通用</p>
-          <button class="nav-item" type="button" data-view="nodes" aria-current="true">
+          <button class="nav-item" type="button" data-view="nodes" aria-current="true" aria-label="节点">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.2"/><circle cx="18" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="18" r="2.2"/><path d="M8 6h8M6 8v8M18 8v8M8 18h8"/></svg>
             <span class="nav-label">节点</span>
             <span class="nav-count" id="navCountNodes">0</span>
           </button>
-          <button class="nav-item" type="button" data-view="subscriptions">
+          <button class="nav-item" type="button" data-view="subscriptions" aria-label="订阅">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 9h8M8 13h8M8 17h5"/></svg>
             <span class="nav-label">订阅</span>
             <span class="nav-count" id="navCountSubs">0</span>
           </button>
-          <button class="nav-item" type="button" data-view="bridges">
+          <button class="nav-item" type="button" data-view="bridges" aria-label="本地代理">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 11V7a6 6 0 0 1 12 0v4"/><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M12 15v2"/></svg>
             <span class="nav-label">本地代理</span>
             <span class="nav-count" id="navCountBridges">0</span>
           </button>
-          <button class="nav-item" type="button" data-view="logs">
+          <button class="nav-item" type="button" data-view="logs" aria-label="连接日志">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
             <span class="nav-label">连接日志</span>
             <span class="nav-count" id="navCountLogs">0</span>
           </button>
-          <button class="nav-item" type="button" data-view="system">
+          <button class="nav-item" type="button" data-view="system" aria-label="系统日志">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
             <span class="nav-label">系统日志</span>
             <span class="nav-count" id="navCountSystem">0</span>
           </button>
           <p class="nav-group-title">设置</p>
-          <button class="nav-item" type="button" data-view="sync">
+          <button class="nav-item" type="button" data-view="settings" aria-label="通用设置">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
+            <span class="nav-label">通用设置</span>
+          </button>
+          <button class="nav-item" type="button" data-view="sync" aria-label="WebDAV 同步">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>
             <span class="nav-label">WebDAV 同步</span>
           </button>
@@ -193,7 +197,7 @@
               <span class="countline" id="bridgesCount">0 个运行中</span>
             </div>
             <div class="toolbar-controls">
-              <button class="toolbar-button danger" id="stopAll" type="button">
+              <button class="toolbar-button danger" id="stopAll" type="button" data-action="stop-all">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10H7z"/></svg>
                 <span>全部停止</span>
               </button>
@@ -269,6 +273,71 @@
               </table>
               <div class="empty-state visible" id="emptyLogs">暂无连接日志</div>
             </div>
+          </div>
+        </section>
+
+        <!-- ---------- 通用设置视图 ---------- -->
+        <section class="view" data-view="settings" aria-labelledby="settingsTitle" hidden>
+          <header class="view-toolbar">
+            <div class="view-heading">
+              <h1 id="settingsTitle">通用设置</h1>
+              <span class="countline" id="settingsStatusLine">网络状态正在加载</span>
+            </div>
+          </header>
+          <div class="view-body settings-body">
+            <p class="view-hint">管理本地代理的访问范围。设置只影响代理端口，控制台始终仅允许从本机访问。</p>
+
+            <form id="networkSettingsForm" class="settings-card">
+              <div class="import-card-title">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="12" r="2"/><circle cx="19" cy="12" r="2"/><path d="M7 12h2M15 12h2M12 9V5"/><circle cx="12" cy="3" r="2"/></svg>
+                <h2>局域网共享</h2>
+              </div>
+
+              <div class="settings-toggle-row">
+                <div class="settings-toggle-copy">
+                  <strong>允许局域网设备连接本地代理</strong>
+                  <span id="networkShareDescription">默认关闭。开启后，运行中的 SOCKS5 和 HTTP / HTTPS 代理会接受私有 IPv4 网络连接。</span>
+                </div>
+                <label class="settings-switch">
+                  <input id="allowLan" name="allow_lan" type="checkbox" aria-label="允许局域网设备连接本地代理" aria-describedby="networkShareDescription networkShareWarning" disabled>
+                  <span class="settings-switch-track" aria-hidden="true"></span>
+                </label>
+              </div>
+
+              <div class="network-warning" id="networkShareWarning" role="note">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.8 20h18.4L12 3z"/><path d="M12 9v5M12 17.5v.1"/></svg>
+                <p><strong>请仅在可信网络开启。</strong>代理端口没有用户名或密码，同一局域网或可达本机的私有 IPv4 / VPN 设备可能直接使用你的代理。Proxy Bridge 控制台不会因此对外开放。</p>
+              </div>
+
+              <div class="import-card-actions">
+                <button class="primary-button" id="networkSaveButton" type="submit" disabled>保存设置</button>
+              </div>
+            </form>
+
+            <section class="settings-info-card" aria-labelledby="networkInfoTitle">
+              <div class="settings-info-head">
+                <h2 id="networkInfoTitle">当前网络</h2>
+                <span class="network-state" id="networkEffectiveStatus" aria-live="polite">正在加载</span>
+              </div>
+              <div class="settings-meta-row">
+                <span>代理监听</span>
+                <code id="networkListenHost">—</code>
+              </div>
+              <div class="settings-meta-row">
+                <span>局域网 IP</span>
+                <div class="network-address-list" id="networkAddressList"><span class="settings-empty-inline">正在检测…</span></div>
+              </div>
+            </section>
+
+            <section class="settings-info-card" aria-labelledby="networkProxyTitle">
+              <div class="settings-info-head">
+                <h2 id="networkProxyTitle">运行中代理共享地址</h2>
+                <span class="countline" id="networkProxyCount">—</span>
+              </div>
+              <div class="network-proxy-list" id="networkProxyList" aria-live="polite">
+                <div class="settings-empty">正在加载网络状态…</div>
+              </div>
+            </section>
           </div>
         </section>
 

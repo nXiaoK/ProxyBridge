@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from email.message import Message
@@ -238,6 +239,54 @@ class ProxyPoolTests(unittest.TestCase):
         self.assertEqual(payload["count"], 1)
         self.assertEqual(payload["proxies"][0]["socks_url"], "socks5://127.0.0.1:21080")
         self.assertEqual(headers.get_content_type(), "application/json")
+
+    def test_pool_response_write_does_not_hold_lifecycle_or_state_lock(self):
+        token = "valid-pool-token-001"
+        self._save_bridges([self._bridge()], token=token)
+        handler = make_handler(
+            "GET",
+            f"/pool/{token}/list.json",
+            {"Host": "127.0.0.1:8787"},
+        )
+        write_started = threading.Event()
+        allow_write = threading.Event()
+
+        class BlockingWriter:
+            def write(self, data: bytes) -> int:
+                write_started.set()
+                if not allow_write.wait(timeout=2):
+                    raise RuntimeError("test writer timed out")
+                return len(data)
+
+            def flush(self) -> None:
+                return None
+
+        handler.wfile = BlockingWriter()
+        errors: list[BaseException] = []
+
+        def serve() -> None:
+            try:
+                handler.do_GET()
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch.object(app, "synchronize_process_state", return_value=None):
+            thread = threading.Thread(target=serve)
+            thread.start()
+            self.assertTrue(write_started.wait(timeout=2))
+            state_available = app.STATE_LOCK.acquire(blocking=False)
+            if state_available:
+                app.STATE_LOCK.release()
+            shutdown_available = app.SHUTDOWN_LOCK.acquire(blocking=False)
+            if shutdown_available:
+                app.SHUTDOWN_LOCK.release()
+            allow_write.set()
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(state_available)
+        self.assertTrue(shutdown_available)
 
     def test_handler_wrong_token_is_quiet_403(self):
         token = "valid-pool-token-001"

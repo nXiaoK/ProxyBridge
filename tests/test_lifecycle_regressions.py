@@ -941,6 +941,134 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(app.PROCESS_TABLE, {})
         self.assertEqual(app.LOG_PROXY_TABLE, {})
 
+    def test_core_resolution_does_not_hold_shutdown_lock(self) -> None:
+        node_id = "node-core-download-outside-shutdown"
+        self._write_state(node_id)
+        core_entered = threading.Event()
+        release_core = threading.Event()
+        ports = iter([24310, 25310])
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        class FakePopen:
+            pid = 4371
+
+            def __init__(self, _command: list[str], **_kwargs: object) -> None:
+                return None
+
+            def poll(self) -> None:
+                return None
+
+        def blocking_core_command(_core: str, _path: Path) -> list[str]:
+            core_entered.set()
+            if not release_core.wait(timeout=2):
+                raise AssertionError("core resolution was not released")
+            return ["fake-core"]
+
+        def worker() -> None:
+            try:
+                results.append(app.start_bridge({"node_id": node_id, "core": "auto"}))
+            except BaseException as error:
+                errors.append(error)
+
+        with (
+            mock.patch.object(app, "generate_config", return_value={"test": True}),
+            mock.patch.object(app, "core_command", side_effect=blocking_core_command),
+            mock.patch.object(app, "next_free_port", side_effect=lambda _preferred=None: next(ports)),
+            mock.patch.object(app, "wait_for_port", return_value=True),
+            mock.patch.object(app.subprocess, "Popen", FakePopen),
+            mock.patch.object(app, "Socks5LogProxy", FakeProxy),
+        ):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            self.assertTrue(core_entered.wait(timeout=2))
+            lifecycle_lock_free = app.SHUTDOWN_LOCK.acquire(blocking=False)
+            if lifecycle_lock_free:
+                app.SHUTDOWN_LOCK.release()
+            release_core.set()
+            thread.join(timeout=2)
+
+        self.assertTrue(lifecycle_lock_free)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        with mock.patch.object(app, "terminate_process", return_value=None):
+            app.shutdown()
+
+    def test_browser_waiting_for_bridge_start_does_not_hold_shutdown_lock(self) -> None:
+        node_id = "node-browser-bridge-lock-order"
+        instance_id = "browser-bridge-lock-order"
+        instance = self._browser_instance(node_id, instance_id)
+        self._write_state(node_id, browser_instances=[instance])
+        core_entered = threading.Event()
+        release_core = threading.Event()
+        browser_calls_start_bridge = threading.Event()
+        start_errors: list[BaseException] = []
+        browser_errors: list[BaseException] = []
+        bridge = self._bridge("bridge-lock-order", node_id, 4372, 24311)
+        original_start_bridge = app.start_bridge
+
+        def blocking_prepare(_plan: dict[str, object]) -> list[str]:
+            core_entered.set()
+            if not release_core.wait(timeout=2):
+                raise AssertionError("bridge core preparation was not released")
+            return ["fake-core"]
+
+        def complete_plan(plan: dict[str, object], command: list[str]):
+            return plan, command
+
+        def publish_bridge(_plan: dict[str, object], _command: list[str]) -> dict[str, object]:
+            with app.STATE_LOCK:
+                state = app.load_state()
+                state["bridges"].append(dict(bridge))
+                app.save_state(state)
+            return dict(bridge)
+
+        def observed_start_bridge(payload: dict[str, object]) -> dict[str, object]:
+            if threading.current_thread().name == "browser-lock-order":
+                browser_calls_start_bridge.set()
+            return original_start_bridge(payload)
+
+        def start_worker() -> None:
+            try:
+                app.start_bridge({"node_id": node_id, "core": "auto"})
+            except BaseException as error:
+                start_errors.append(error)
+
+        def browser_worker() -> None:
+            try:
+                app.launch_browser({"node_id": node_id, "instance_id": instance_id})
+            except BaseException as error:
+                browser_errors.append(error)
+
+        with (
+            mock.patch.object(app, "start_bridge", side_effect=observed_start_bridge),
+            mock.patch.object(app, "_prepare_core_command", side_effect=blocking_prepare),
+            mock.patch.object(app, "_complete_bridge_plan", side_effect=complete_plan),
+            mock.patch.object(app, "_run_prepared_bridge", side_effect=publish_bridge),
+            mock.patch.object(app, "_run_browser_launch", return_value={"ok": True}),
+            mock.patch.object(app, "fingerprint_chromium_path", return_value="/fake/Chromium"),
+            mock.patch.object(app, "synchronize_process_state"),
+        ):
+            start_thread = threading.Thread(target=start_worker, name="bridge-lock-order")
+            start_thread.start()
+            self.assertTrue(core_entered.wait(timeout=2))
+            browser_thread = threading.Thread(target=browser_worker, name="browser-lock-order")
+            browser_thread.start()
+            self.assertTrue(browser_calls_start_bridge.wait(timeout=2))
+            lifecycle_lock_free = app.SHUTDOWN_LOCK.acquire(blocking=False)
+            if lifecycle_lock_free:
+                app.SHUTDOWN_LOCK.release()
+            release_core.set()
+            start_thread.join(timeout=2)
+            browser_thread.join(timeout=2)
+
+        self.assertTrue(lifecycle_lock_free)
+        self.assertFalse(start_thread.is_alive())
+        self.assertFalse(browser_thread.is_alive())
+        self.assertEqual(start_errors, [])
+        self.assertEqual(browser_errors, [])
+
     def test_launch_browser_and_shutdown_share_lifecycle_barrier(self) -> None:
         node_id = "node-browser-shutdown-barrier"
         bridge = self._bridge("bridge-browser-shutdown-barrier", node_id, 4380, 24301)
@@ -1631,6 +1759,65 @@ class LifecycleRegressionTests(unittest.TestCase):
         self.assertEqual(terminate_calls, [4836])
         self.assertEqual(getattr(app, "TEST_PROCESS_TABLE", {}), {})
         self.assertNotIn(node_id, app.load_state()["tests"])
+
+    def test_node_core_resolution_holds_no_lifecycle_or_state_lock(self) -> None:
+        node_id = "node-test-core-outside-locks"
+        self._write_state(node_id)
+        core_entered = threading.Event()
+        release_core = threading.Event()
+        errors: list[BaseException] = []
+        results: list[dict[str, object]] = []
+        process = FakeProcess(4844)
+
+        def blocking_core_command(_core: str, _path: Path) -> list[str]:
+            core_entered.set()
+            if not release_core.wait(timeout=2):
+                raise AssertionError("node test core resolution was not released")
+            return ["fake-core", "run", "-c", "placeholder"]
+
+        def worker() -> None:
+            try:
+                results.append(app.test_node({"node_id": node_id, "core": "auto"}))
+            except BaseException as error:
+                errors.append(error)
+
+        with (
+            mock.patch.object(app, "core_command", side_effect=blocking_core_command),
+            mock.patch.object(app, "generate_config", return_value={"test": True}),
+            mock.patch.object(app, "next_free_port", return_value=24534),
+            mock.patch.object(app, "wait_for_port", return_value=True),
+            mock.patch.object(app.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                app,
+                "socks5_http_probe",
+                return_value={
+                    "ok": True,
+                    "latency_ms": 1,
+                    "target": "example.test:80/",
+                    "status_code": 204,
+                    "message": "通信正常",
+                },
+            ),
+            mock.patch.object(app, "terminate_process", return_value=None),
+        ):
+            thread = threading.Thread(target=worker)
+            thread.start()
+            self.assertTrue(core_entered.wait(timeout=2))
+            lifecycle_lock_free = app.SHUTDOWN_LOCK.acquire(blocking=False)
+            if lifecycle_lock_free:
+                app.SHUTDOWN_LOCK.release()
+            state_lock_free = app.STATE_LOCK.acquire(blocking=False)
+            if state_lock_free:
+                app.STATE_LOCK.release()
+            release_core.set()
+            thread.join(timeout=2)
+
+        self.assertTrue(lifecycle_lock_free)
+        self.assertTrue(state_lock_free)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0]["ok"])
 
     def test_node_result_save_is_serialized_with_shutdown_start(self) -> None:
         node_id = "node-test-save-shutdown-race"

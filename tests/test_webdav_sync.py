@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
+import os
+import subprocess
+import tarfile
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -103,6 +108,18 @@ class WebDAVSyncUnitTests(unittest.TestCase):
     def _save(self, state: dict) -> None:
         self.state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
+    def _remote_manifest(self) -> tuple[webdav_sync.MemoryWebDAVClient, dict]:
+        client = self.store.client(self._load()["settings"]["webdav"])
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        return client, json.loads(self.store.files[manifest_url].decode("utf-8"))
+
+    def _remote_state_url(self, client, manifest: dict) -> str:
+        return client.url_for("ProxyBridge", manifest.get("state_file") or "state.sync.json")
+
+    def _remote_profile_url(self, client, manifest: dict, instance_id: str) -> str:
+        filename = (manifest.get("profile_files") or {}).get(instance_id) or f"{instance_id}.tar.gz"
+        return client.url_for("ProxyBridge", "profiles", filename)
+
     def test_pack_excludes_cache(self):
         profile = self.profiles / "nodehash" / "inst1"
         blob = webdav_sync.pack_profile_dir(profile)
@@ -110,6 +127,35 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         webdav_sync.unpack_profile_dir(blob, dest)
         self.assertTrue((dest / "Default" / "Cookies").exists())
         self.assertFalse((dest / "GPUCache").exists())
+
+    def test_pack_is_deterministic_and_excludes_sync_marker(self):
+        profile = self.profiles / "nodehash" / "inst1"
+        first = webdav_sync.pack_profile_dir(profile)
+        (profile / webdav_sync.PROFILE_SYNC_MARKER).write_text("f" * 64, encoding="utf-8")
+        time.sleep(1.05)
+        second = webdav_sync.pack_profile_dir(profile)
+        self.assertEqual(first, second)
+
+    def test_unpack_rejects_unsafe_members_without_replacing_destination(self):
+        dest = self.work / "existing-profile"
+        dest.mkdir()
+        (dest / "keep.txt").write_text("keep", encoding="utf-8")
+
+        for name, member_type in (("../escape", tarfile.REGTYPE), ("fifo", tarfile.FIFOTYPE)):
+            with self.subTest(name=name):
+                buffer = io.BytesIO()
+                with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+                    member = tarfile.TarInfo(name)
+                    member.type = member_type
+                    if member_type == tarfile.REGTYPE:
+                        payload = b"bad"
+                        member.size = len(payload)
+                        archive.addfile(member, io.BytesIO(payload))
+                    else:
+                        archive.addfile(member)
+                with self.assertRaises(RuntimeError):
+                    webdav_sync.unpack_profile_dir(buffer.getvalue(), dest)
+                self.assertEqual((dest / "keep.txt").read_text(encoding="utf-8"), "keep")
 
     def test_push_and_pull_roundtrip(self):
         push = self.engine.push()
@@ -139,12 +185,209 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertEqual(state["browser_instances"][0]["status"], "stopped")
         self.assertTrue((self.profiles / "nodehash" / "inst1" / "Default" / "Cookies").exists())
 
+    def test_pull_rejects_tampered_profile_hash(self):
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        profile_url = self._remote_profile_url(client, manifest, "inst1")
+        profile = self.profiles / "nodehash" / "inst1"
+        cookie = profile / "Default" / "Cookies"
+        cookie.write_bytes(b"tampered-remote")
+        self.store.files[profile_url] = webdav_sync.pack_profile_dir(profile)
+        cookie.write_bytes(b"cookie-data")
+        self.engine.mark_local_change()
+
+        result = self.engine.pull(force=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("哈希不匹配" in error for error in result["errors"]))
+        self.assertEqual(cookie.read_bytes(), b"cookie-data")
+        self.assertEqual(self._load()["settings"]["webdav"]["last_applied_state_sha256"], "")
+
+    def test_failed_pull_does_not_mark_snapshot_applied(self):
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        profile_url = self._remote_profile_url(client, manifest, "inst1")
+        self.store.files.pop(profile_url)
+        self.engine.mark_local_change()
+
+        failed = self.engine.pull(force=True)
+        self.assertFalse(failed["ok"])
+        self.assertEqual(self._load()["settings"]["webdav"]["last_applied_state_sha256"], "")
+        retried = self.engine.pull()
+        self.assertFalse(retried["ok"])
+        self.assertFalse(retried.get("skipped", False))
+
+    def test_pull_rejects_unsafe_remote_instance_id(self):
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        state_url = self._remote_state_url(client, manifest)
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        remote_state = json.loads(self.store.files[state_url].decode("utf-8"))
+        remote_state["browser_instances"].append(
+            {"id": "../escape", "node_id": "n1", "name": "bad", "legacy": False}
+        )
+        remote_state["profile_hashes"]["../escape"] = "0" * 64
+        state_bytes = json.dumps(remote_state, ensure_ascii=False, indent=2).encode("utf-8")
+        manifest["state_sha256"] = webdav_sync.sha256_bytes(state_bytes)
+        manifest["profile_hashes"] = dict(remote_state["profile_hashes"])
+        manifest["browser_instance_count"] = len(remote_state["browser_instances"])
+        manifest["profile_count"] = len(remote_state["profile_hashes"])
+        self.store.files[state_url] = state_bytes
+        self.store.files[manifest_url] = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        self.engine.mark_local_change()
+
+        with self.assertRaisesRegex(RuntimeError, "ID 无效"):
+            self.engine.pull(force=True)
+
+    def test_pull_rejects_profile_destination_outside_root(self):
+        self.engine.push()
+        outside = self.work / "outside-profile"
+        self.engine.browser_instance_profile_path = lambda *_args, **_kwargs: outside
+        self.engine.mark_local_change()
+
+        result = self.engine.pull(force=True)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any("越出同步目录" in error for error in result["errors"]))
+        self.assertFalse(outside.exists())
+
+    def test_pull_rejects_state_hash_mismatch(self):
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        state_url = self._remote_state_url(client, manifest)
+        remote_state = json.loads(self.store.files[state_url].decode("utf-8"))
+        remote_state["subscriptions"][0]["name"] = "tampered"
+        self.store.files[state_url] = json.dumps(remote_state, ensure_ascii=False, indent=2).encode("utf-8")
+        self.engine.mark_local_change()
+
+        with self.assertRaisesRegex(RuntimeError, "哈希与 manifest 不一致"):
+            self.engine.pull(force=True)
+        self.assertEqual(self._load()["subscriptions"][0]["name"], "机场A")
+        self.assertEqual(self._load()["settings"]["webdav"]["last_applied_state_sha256"], "")
+
+    def test_pull_rejects_unsupported_schema(self):
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        state_url = self._remote_state_url(client, manifest)
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        remote_state = json.loads(self.store.files[state_url].decode("utf-8"))
+        remote_state["schema_version"] = 99
+        state_bytes = json.dumps(remote_state, ensure_ascii=False, indent=2).encode("utf-8")
+        manifest["state_sha256"] = webdav_sync.sha256_bytes(state_bytes)
+        self.store.files[state_url] = state_bytes
+        self.store.files[manifest_url] = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        self.engine.mark_local_change()
+
+        with self.assertRaisesRegex(RuntimeError, "schema_version"):
+            self.engine.pull(force=True)
+
+    def test_push_operations_are_serialized(self):
+        original_pack = webdav_sync.pack_profile_dir
+        counter_lock = threading.Lock()
+        start = threading.Barrier(3)
+        active = 0
+        max_active = 0
+        results: list[dict] = []
+        failures: list[BaseException] = []
+
+        def observed_pack(path: Path) -> bytes:
+            nonlocal active, max_active
+            with counter_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.05)
+                return original_pack(path)
+            finally:
+                with counter_lock:
+                    active -= 1
+
+        def worker() -> None:
+            try:
+                start.wait()
+                results.append(self.engine.push())
+            except BaseException as exc:
+                failures.append(exc)
+
+        with mock.patch.object(webdav_sync, "pack_profile_dir", side_effect=observed_pack):
+            threads = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertEqual(max_active, 1)
+
+    def test_push_fails_closed_when_manifest_cannot_be_read(self):
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        state_url = self._remote_state_url(client, manifest)
+        original_manifest = self.store.files[manifest_url]
+        original_state = self.store.files[state_url]
+        put_calls: list[str] = []
+
+        class FailingManifestClient(webdav_sync.MemoryWebDAVClient):
+            def get_bytes(self, url: str, *, max_bytes=None) -> bytes:
+                if url == manifest_url:
+                    raise RuntimeError("temporary read failure")
+                return super().get_bytes(url, max_bytes=max_bytes)
+
+            def put_bytes(self, url: str, data: bytes, content_type="application/octet-stream") -> None:
+                put_calls.append(url)
+                super().put_bytes(url, data, content_type)
+
+        self.engine.client_factory = lambda cfg: FailingManifestClient(self.store, cfg["url"])
+        with self.assertRaisesRegex(RuntimeError, "temporary read failure"):
+            self.engine.push(instance_ids=["inst1"])
+
+        self.assertEqual(put_calls, [])
+        self.assertEqual(self.store.files[manifest_url], original_manifest)
+        self.assertEqual(self.store.files[state_url], original_state)
+
+    def test_failed_manifest_move_keeps_previous_snapshot_readable(self):
+        self.engine.push()
+        client, _manifest = self._remote_manifest()
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        original_manifest = self.store.files[manifest_url]
+        with self.lock:
+            state = self._load()
+            state["subscriptions"][0]["name"] = "new-local-name"
+            self._save(state)
+        self.engine.mark_local_change()
+
+        class FailingMoveClient(webdav_sync.MemoryWebDAVClient):
+            def move(self, source_url: str, destination_url: str, *, overwrite=True) -> None:
+                if destination_url == manifest_url:
+                    raise RuntimeError("MOVE interrupted")
+                super().move(source_url, destination_url, overwrite=overwrite)
+
+        self.engine.client_factory = lambda cfg: FailingMoveClient(self.store, cfg["url"])
+        with self.assertRaisesRegex(RuntimeError, "MOVE interrupted"):
+            self.engine.push()
+
+        self.assertEqual(self.store.files[manifest_url], original_manifest)
+        pulled = self.engine.pull(force=True)
+        self.assertTrue(pulled["ok"])
+        self.assertEqual(self._load()["subscriptions"][0]["name"], "机场A")
+
     def test_hash_skip_on_second_push(self):
         first = self.engine.push()
         self.assertEqual(len(first["uploaded_profiles"]), 1)
         second = self.engine.push()
         self.assertEqual(second["uploaded_profiles"], [])
         self.assertIn("inst1", second["skipped_unchanged"])
+
+    def test_push_creates_nested_remote_collections_in_order(self):
+        self.engine.update_settings({"remote_root": "nested/root"})
+        result = self.engine.push()
+        self.assertTrue(result["ok"])
+        base = "https://dav.test/base"
+        self.assertIn(f"{base}/nested", self.store.collections)
+        self.assertIn(f"{base}/nested/root", self.store.collections)
+        self.assertIn(f"{base}/nested/root/profiles", self.store.collections)
 
     def test_pull_skips_when_already_latest(self):
         push = self.engine.push()
@@ -169,13 +412,11 @@ class WebDAVSyncUnitTests(unittest.TestCase):
 
     def test_push_deletes_remote_profile_for_removed_instance(self):
         self.engine.push()
-        profile_url = self.engine.client_factory(self._load()["settings"]["webdav"]).url_for(
-            "ProxyBridge", "profiles", "inst1.tar.gz"
-        )
-        # Re-resolve via store: memory client base + path
-        store_client = self.store.client(self._load()["settings"]["webdav"])
+        store_client, manifest = self._remote_manifest()
+        versioned_url = self._remote_profile_url(store_client, manifest, "inst1")
         purl = store_client.url_for("ProxyBridge", "profiles", "inst1.tar.gz")
         self.assertIn(purl, self.store.files)
+        self.assertIn(versioned_url, self.store.files)
 
         with self.lock:
             state = self._load()
@@ -188,6 +429,7 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("inst1", result.get("deleted_remote_profiles") or [])
         self.assertNotIn(purl, self.store.files)
+        self.assertNotIn(versioned_url, self.store.files)
         # Manifest should not list removed profile.
         man = json.loads(self.store.files[store_client.url_for("ProxyBridge", "manifest.json")].decode("utf-8"))
         self.assertNotIn("inst1", man.get("profile_hashes") or {})
@@ -245,30 +487,44 @@ class WebDAVSyncUnitTests(unittest.TestCase):
     def test_exists_retries_get_when_head_404(self):
         """Some WebDAV servers lie on HEAD; file may still be fetchable via GET."""
 
-        class FlakyHeadClient(webdav_sync.MemoryWebDAVClient):
-            def request(self, method, url, *, data=None, headers=None, allow_statuses=None):
+        class FlakyHeadClient(webdav_sync.WebDAVClient):
+            def __init__(self):
+                self.files: dict[str, bytes] = {}
+
+            def request(
+                self,
+                method,
+                url,
+                *,
+                data=None,
+                headers=None,
+                allow_statuses=None,
+                max_body_bytes=None,
+                read_body=True,
+            ):
                 if method == "HEAD":
                     return 404, {}, b""
                 if method == "GET":
-                    if url in self.store.files:
-                        return 200, {}, self.store.files[url]
+                    if url in self.files:
+                        return 200, {}, self.files[url] if read_body else b""
                     return 404, {}, b""
-                return super().request(method, url, data=data, headers=headers, allow_statuses=allow_statuses)
 
-            def exists(self, url: str) -> bool:
-                # Exercise the real WebDAVClient.exists logic with a thin adapter.
-                status, _, _ = self.request("HEAD", url, allow_statuses={200, 204, 404, 405, 501})
-                if status in {200, 204}:
-                    return True
-                status, _, _ = self.request("GET", url, allow_statuses={200, 204, 404})
-                return status in {200, 204}
-
-        store = webdav_sync.MemoryWebDAV()
-        client = FlakyHeadClient(store, "https://dav.test/base")
-        url = client.url_for("ProxyBridge", "manifest.json")
+        client = FlakyHeadClient()
+        url = "https://dav.test/base/ProxyBridge/manifest.json"
         self.assertFalse(client.exists(url))
-        store.files[url] = b'{"ok":true}'
+        client.files[url] = b'{"ok":true}'
         self.assertTrue(client.exists(url))
+
+    def test_exists_propagates_authentication_errors(self):
+        class AuthFailureClient(webdav_sync.WebDAVClient):
+            def __init__(self):
+                pass
+
+            def request(self, *args, **kwargs):
+                raise RuntimeError("WebDAV HEAD failed (401)")
+
+        with self.assertRaisesRegex(RuntimeError, "401"):
+            AuthFailureClient().exists("https://dav.test/manifest.json")
 
     def test_public_settings_masks_secrets(self):
         pub = webdav_sync.public_webdav_settings(self._load()["settings"]["webdav"])
@@ -315,8 +571,57 @@ class WebDAVSyncUnitTests(unittest.TestCase):
             self.skipTest("openssl not available")
         raw = b"hello-sync-payload"
         enc = webdav_sync.encrypt_payload(raw, "secret")
-        self.assertTrue(enc.startswith(b"PBENC1"))
+        self.assertTrue(enc.startswith(b"PBENC2"))
         self.assertEqual(webdav_sync.decrypt_payload(enc, "secret"), raw)
+        tampered = bytearray(enc)
+        tampered[-webdav_sync.PBENC2_TAG_BYTES - 1] ^= 1
+        with self.assertRaisesRegex(RuntimeError, "篡改"):
+            webdav_sync.decrypt_payload(bytes(tampered), "secret")
+
+    def test_encrypt_requires_password(self):
+        with self.assertRaises(ValueError):
+            webdav_sync.encrypt_payload(b"plain", "")
+        with self.assertRaises(ValueError):
+            self.engine.update_settings({"encrypt": True})
+        self.assertFalse(self._load()["settings"]["webdav"].get("encrypt"))
+
+    def test_decrypt_reads_legacy_pbenc1(self):
+        if not webdav_sync.openssl_available():
+            self.skipTest("openssl not available")
+        raw = b"legacy-sync-payload"
+        env = os.environ.copy()
+        env["PB_SYNC_PASS"] = "secret"
+        proc = subprocess.run(
+            ["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-salt", "-pass", "env:PB_SYNC_PASS"],
+            input=raw,
+            capture_output=True,
+            env=env,
+            check=True,
+        )
+        self.assertEqual(webdav_sync.decrypt_payload(b"PBENC1" + proc.stdout, "secret"), raw)
+
+    def test_encrypted_push_pull_uses_pbenc2(self):
+        if not webdav_sync.openssl_available():
+            self.skipTest("openssl not available")
+        self.engine.update_settings({"encrypt": True, "encrypt_password": "secret"})
+        pushed = self.engine.push()
+        self.assertTrue(pushed["ok"])
+        client = self.store.client(self._load()["settings"]["webdav"])
+        for relative in (
+            ("ProxyBridge", "manifest.json"),
+            ("ProxyBridge", "state.sync.json"),
+            ("ProxyBridge", "profiles", "inst1.tar.gz"),
+        ):
+            self.assertTrue(self.store.files[client.url_for(*relative)].startswith(b"PBENC2"))
+
+        profile = self.profiles / "nodehash" / "inst1"
+        import shutil
+
+        shutil.rmtree(profile)
+        self.engine.mark_local_change()
+        pulled = self.engine.pull(force=True)
+        self.assertTrue(pulled["ok"])
+        self.assertEqual((profile / "Default" / "Cookies").read_bytes(), b"cookie-data")
 
 
 class WebDAVAppAPITests(unittest.TestCase):

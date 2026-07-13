@@ -162,6 +162,159 @@ private final class BoundedProcessOutput {
     }
 }
 
+private final class RotatingLogWriter {
+    private let lock = NSLock()
+    private let fileURL: URL
+    private let rotatedURL: URL
+    private let maxBytes: UInt64
+    private var handle: FileHandle?
+    private var currentBytes: UInt64 = 0
+    private var closed = false
+
+    init(fileURL: URL, maxBytes: UInt64) throws {
+        self.fileURL = fileURL
+        self.rotatedURL = fileURL.appendingPathExtension("1")
+        self.maxBytes = maxBytes
+        try prepareInitialFile()
+    }
+
+    private func prepareInitialFile() throws {
+        let fileManager = FileManager.default
+        if let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path),
+           let size = attributes[.size] as? NSNumber,
+           size.uint64Value >= maxBytes {
+            if fileManager.fileExists(atPath: rotatedURL.path) {
+                try fileManager.removeItem(at: rotatedURL)
+            }
+            try fileManager.moveItem(at: fileURL, to: rotatedURL)
+            try fileManager.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o600)],
+                ofItemAtPath: rotatedURL.path
+            )
+        }
+        try openCurrentFile()
+    }
+
+    private func openCurrentFile() throws {
+        let fileManager = FileManager.default
+        if !fileManager.fileExists(atPath: fileURL.path) {
+            guard fileManager.createFile(atPath: fileURL.path, contents: nil) else {
+                throw ProxyBridgeError.message("无法创建后端日志文件")
+            }
+        }
+        try fileManager.setAttributes(
+            [.posixPermissions: NSNumber(value: 0o600)],
+            ofItemAtPath: fileURL.path
+        )
+        let newHandle = try FileHandle(forWritingTo: fileURL)
+        currentBytes = try newHandle.seekToEnd()
+        handle = newHandle
+    }
+
+    private func rotate() throws {
+        try handle?.close()
+        handle = nil
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: rotatedURL.path) {
+            try fileManager.removeItem(at: rotatedURL)
+        }
+        if fileManager.fileExists(atPath: fileURL.path) {
+            try fileManager.moveItem(at: fileURL, to: rotatedURL)
+            try fileManager.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o600)],
+                ofItemAtPath: rotatedURL.path
+            )
+        }
+        try openCurrentFile()
+    }
+
+    func append(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        do {
+            if currentBytes > 0 && currentBytes + UInt64(data.count) > maxBytes {
+                try rotate()
+            }
+            try handle?.write(contentsOf: data)
+            currentBytes += UInt64(data.count)
+        } catch {
+            NSLog("ProxyBridge: backend log write failed: %@", error.localizedDescription)
+        }
+    }
+
+    func close() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !closed else { return }
+        closed = true
+        try? handle?.close()
+        handle = nil
+    }
+}
+
+private final class BackendLogSession {
+    let pipe = Pipe()
+    private let writer: RotatingLogWriter
+    private let drainFinished = DispatchSemaphore(value: 0)
+    private let finishCondition = NSCondition()
+    private var finishing = false
+    private var finished = false
+
+    init(fileURL: URL, maxBytes: UInt64) throws {
+        writer = try RotatingLogWriter(fileURL: fileURL, maxBytes: maxBytes)
+        let readHandle = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .utility).async { [writer, drainFinished] in
+            defer { drainFinished.signal() }
+            while true {
+                do {
+                    guard let chunk = try readHandle.read(upToCount: 64 * 1024),
+                          !chunk.isEmpty else {
+                        return
+                    }
+                    writer.append(chunk)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    func closeParentWriteHandle() {
+        try? pipe.fileHandleForWriting.close()
+    }
+
+    func finish(timeout: TimeInterval, closeConfirmationTimeout: TimeInterval) {
+        finishCondition.lock()
+        if finished {
+            finishCondition.unlock()
+            return
+        }
+        if finishing {
+            let deadline = Date().addingTimeInterval(timeout + closeConfirmationTimeout)
+            while !finished && finishCondition.wait(until: deadline) {}
+            finishCondition.unlock()
+            return
+        }
+        finishing = true
+        finishCondition.unlock()
+
+        let timedOut = drainFinished.wait(timeout: .now() + timeout) == .timedOut
+        if timedOut {
+            try? pipe.fileHandleForReading.close()
+            _ = drainFinished.wait(timeout: .now() + closeConfirmationTimeout)
+        }
+        writer.close()
+
+        finishCondition.lock()
+        finished = true
+        finishing = false
+        finishCondition.broadcast()
+        finishCondition.unlock()
+    }
+}
+
 enum ProxyBridgeError: LocalizedError {
     case message(String)
 
@@ -380,15 +533,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastError: String?
     private var startupStatus: String?
     private var statusMenu = NSMenu()
-    private var backendLogHandle: FileHandle?
+    private var backendLogSession: BackendLogSession?
     private var consoleWindowController: ConsoleWindowController?
     private let pythonReleaseAPI = URL(string: "https://api.github.com/repos/astral-sh/python-build-standalone/releases/latest")!
     private let processLifecycleLock = NSLock()
     private var helperProcesses: [Process] = []
     private var isTerminating = false
     private let bootstrapGroup = DispatchGroup()
+    private var isBootstrappingBackend = false
+    private var bootstrapGeneration: UInt64 = 0
     private var expectedBackendTerminationProcess: Process?
     private var isRestartingBackend = false
+    private var statusRefreshGeneration: UInt64 = 0
+    private var activeStatusRefreshGeneration: UInt64?
+    private var statusRefreshPending = false
     private let helperTerminationGraceTimeout: TimeInterval = 2
     private let helperShutdownTimeout: TimeInterval = 4
     private let backendTerminationTimeout: TimeInterval = 12
@@ -399,6 +557,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let processOutputFinalizationTimeout: TimeInterval = 0.75
     private let processOutputCloseConfirmationTimeout: TimeInterval = 0.1
     private let processOutputLimit = 1_048_576
+    private let backendLogMaxBytes: UInt64 = 5 * 1_024 * 1_024
 
     private var backendIsReady: Bool {
         guard api != nil,
@@ -470,6 +629,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let helpers = helperProcesses
         processLifecycleLock.unlock()
 
+        bootstrapGeneration &+= 1
+        isBootstrappingBackend = false
+        invalidateStatusRefreshes()
+
         refreshTimer?.invalidate()
         refreshTimer = nil
         invalidateConsole()
@@ -513,8 +676,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         latestStatus = nil
         expectedBackendTerminationProcess = nil
         backendProcess = nil
-        try? backendLogHandle?.close()
-        backendLogHandle = nil
+        backendLogSession?.finish(
+            timeout: processOutputFinalizationTimeout,
+            closeConfirmationTimeout: processOutputCloseConfirmationTimeout
+        )
+        backendLogSession = nil
     }
 
     private func configureStatusItem() {
@@ -565,6 +731,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func bootstrapBackend() {
+        guard !terminationRequested(), !isBootstrappingBackend else { return }
+        isBootstrappingBackend = true
+        bootstrapGeneration &+= 1
+        let generation = bootstrapGeneration
         updateStartupStatus("正在准备 Python 运行时")
         let group = bootstrapGroup
         group.enter()
@@ -575,12 +745,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 let pythonExecutable = try self.resolvePythonExecutable()
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, !self.terminationRequested() else { return }
-                    self.startBackend(pythonExecutable: pythonExecutable)
+                    guard let self, self.bootstrapIsCurrent(generation) else { return }
+                    self.startBackend(pythonExecutable: pythonExecutable, generation: generation)
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
-                    guard let self, !self.terminationRequested() else { return }
+                    guard let self, self.bootstrapIsCurrent(generation) else { return }
+                    self.isBootstrappingBackend = false
                     self.startupStatus = nil
                     self.lastError = "Python 运行时准备失败：\(error.localizedDescription)"
                     self.rebuildMenu()
@@ -593,6 +764,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         processLifecycleLock.lock()
         defer { processLifecycleLock.unlock() }
         return isTerminating
+    }
+
+    private func bootstrapIsCurrent(_ generation: UInt64) -> Bool {
+        generation == bootstrapGeneration && isBootstrappingBackend && !terminationRequested()
+    }
+
+    private func invalidateStatusRefreshes() {
+        statusRefreshGeneration &+= 1
+        activeStatusRefreshGeneration = nil
+        statusRefreshPending = false
     }
 
     private func ensureNotTerminating() throws {
@@ -1069,9 +1250,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return value
     }
 
-    private func startBackend(pythonExecutable: URL) {
-        guard !terminationRequested() else { return }
+    private func startBackend(pythonExecutable: URL, generation: UInt64) {
+        guard bootstrapIsCurrent(generation) else { return }
+        guard backendProcess == nil else {
+            isBootstrappingBackend = false
+            startupStatus = nil
+            lastError = "后端启动被拒绝：已有后端进程"
+            rebuildMenu()
+            return
+        }
         invalidateConsole()
+        invalidateStatusRefreshes()
         api = nil
         latestStatus = nil
         startupStatus = "正在启动后端"
@@ -1081,6 +1270,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try FileManager.default.createDirectory(at: appSupportURL, withIntermediateDirectories: true)
             guard let script = resourceBridgeScript() else {
+                isBootstrappingBackend = false
                 lastError = "找不到 app.py 后端脚本"
                 startupStatus = nil
                 api = nil
@@ -1105,25 +1295,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             process.environment = env
 
             let logURL = appSupportURL.appendingPathComponent("menubar-backend.log")
-            FileManager.default.createFile(atPath: logURL.path, contents: nil)
-            let logHandle = try FileHandle(forWritingTo: logURL)
-            logHandle.seekToEndOfFile()
-            process.standardOutput = logHandle
-            process.standardError = logHandle
+            let logSession = try BackendLogSession(fileURL: logURL, maxBytes: backendLogMaxBytes)
+            process.standardOutput = logSession.pipe
+            process.standardError = logSession.pipe
             process.terminationHandler = { [weak self] terminatedProcess in
-                self?.backendDidTerminate(terminatedProcess, logHandle: logHandle)
+                guard let self else { return }
+                logSession.finish(
+                    timeout: self.processOutputFinalizationTimeout,
+                    closeConfirmationTimeout: self.processOutputCloseConfirmationTimeout
+                )
+                self.backendDidTerminate(terminatedProcess, logSession: logSession)
             }
             do {
                 try process.run()
             } catch {
-                try? logHandle.close()
+                logSession.closeParentWriteHandle()
+                logSession.finish(
+                    timeout: processOutputFinalizationTimeout,
+                    closeConfirmationTimeout: processOutputCloseConfirmationTimeout
+                )
                 throw error
             }
-            backendLogHandle = logHandle
+            logSession.closeParentWriteHandle()
+            backendLogSession = logSession
             backendProcess = process
             let readinessDeadline = monotonicDeadline(after: backendReadinessTimeout)
             DispatchQueue.main.asyncAfter(deadline: .now() + backendReadinessTimeout) { [weak self] in
                 guard let self,
+                      self.bootstrapIsCurrent(generation),
                       self.backendProcess === process,
                       self.api == nil,
                       self.expectedBackendTerminationProcess !== process else {
@@ -1131,22 +1330,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 self.failBackendStartup(
                     process: process,
-                    message: "后端启动失败：/api/status 在 6 秒内未就绪"
+                    message: "后端启动失败：/api/status 在 6 秒内未就绪",
+                    generation: generation
                 )
             }
             waitForBackendReady(
                 candidateAPI: candidateAPI,
                 process: process,
                 instanceToken: instanceToken,
-                deadline: readinessDeadline
+                deadline: readinessDeadline,
+                generation: generation
             )
         } catch {
+            if generation == bootstrapGeneration {
+                isBootstrappingBackend = false
+            }
             startupStatus = nil
             api = nil
             latestStatus = nil
             backendProcess = nil
-            try? backendLogHandle?.close()
-            backendLogHandle = nil
+            backendLogSession?.finish(
+                timeout: processOutputFinalizationTimeout,
+                closeConfirmationTimeout: processOutputCloseConfirmationTimeout
+            )
+            backendLogSession = nil
             guard !terminationRequested() else { return }
             lastError = "后端启动失败：\(error.localizedDescription)"
             rebuildMenu()
@@ -1157,22 +1364,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         candidateAPI: BridgeAPI,
         process: Process,
         instanceToken: String,
-        deadline: UInt64
+        deadline: UInt64,
+        generation: UInt64
     ) {
-        guard backendProcess === process,
+        guard bootstrapIsCurrent(generation),
+              backendProcess === process,
               expectedBackendTerminationProcess !== process else {
             return
         }
         guard process.isRunning else {
             failBackendStartup(
                 process: process,
-                message: "后端进程在就绪前退出（状态码 \(process.terminationStatus)）"
+                message: "后端进程在就绪前退出（状态码 \(process.terminationStatus)）",
+                generation: generation
             )
             return
         }
         let remaining = remainingTime(until: deadline)
         guard remaining > 0 else {
-            failBackendStartup(process: process, message: "后端启动失败：/api/status 在 6 秒内未就绪")
+            failBackendStartup(
+                process: process,
+                message: "后端启动失败：/api/status 在 6 秒内未就绪",
+                generation: generation
+            )
             return
         }
 
@@ -1182,6 +1396,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self,
+                      self.bootstrapIsCurrent(generation),
                       self.backendProcess === process,
                       self.expectedBackendTerminationProcess !== process else {
                     return
@@ -1189,20 +1404,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard process.isRunning else {
                     self.failBackendStartup(
                         process: process,
-                        message: "后端进程在就绪前退出（状态码 \(process.terminationStatus)）"
+                        message: "后端进程在就绪前退出（状态码 \(process.terminationStatus)）",
+                        generation: generation
                     )
                     return
                 }
                 guard self.remainingTime(until: deadline) > 0 else {
                     self.failBackendStartup(
                         process: process,
-                        message: "后端启动失败：/api/status 在 6 秒内未就绪"
+                        message: "后端启动失败：/api/status 在 6 秒内未就绪",
+                        generation: generation
                     )
                     return
                 }
 
                 switch result {
                 case .success(let status):
+                    self.isBootstrappingBackend = false
                     self.api = candidateAPI
                     self.latestStatus = status
                     self.startupStatus = nil
@@ -1214,7 +1432,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                             candidateAPI: candidateAPI,
                             process: process,
                             instanceToken: instanceToken,
-                            deadline: deadline
+                            deadline: deadline,
+                            generation: generation
                         )
                     }
                 }
@@ -1222,14 +1441,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func backendDidTerminate(_ process: Process, logHandle: FileHandle) {
+    private func backendDidTerminate(_ process: Process, logSession: BackendLogSession) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let expectedStartupFailure = self.expectedBackendTerminationProcess === process
             let restartInProgress = self.isRestartingBackend && expectedStartupFailure
             let exitedBeforeReadiness = self.api == nil
-            guard self.clearBackendState(for: process, matching: logHandle) else {
+            guard self.clearBackendState(for: process, matching: logSession) else {
                 return
+            }
+            if exitedBeforeReadiness {
+                self.isBootstrappingBackend = false
             }
             guard !self.terminationRequested() else { return }
             // 用户主动重启时由 finishBackendRestart 接管，不在这里报「意外退出」。
@@ -1250,9 +1472,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func failBackendStartup(process: Process, message: String) {
-        guard backendProcess === process else { return }
+    private func failBackendStartup(process: Process, message: String, generation: UInt64) {
+        guard generation == bootstrapGeneration,
+              backendProcess === process else { return }
+        guard expectedBackendTerminationProcess !== process else { return }
         invalidateConsole()
+        invalidateStatusRefreshes()
         api = nil
         latestStatus = nil
         expectedBackendTerminationProcess = process
@@ -1277,6 +1502,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 guard self.sendSignal(SIGKILL, to: process) else {
                     if !self.terminationRequested() {
+                        self.isBootstrappingBackend = false
                         self.lastError = "\(message)；无法发送 SIGKILL"
                         self.rebuildMenu()
                     }
@@ -1291,25 +1517,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         return
                     }
                     self.lastError = "\(message)；无法确认后端退出"
+                    self.isBootstrappingBackend = false
                     self.rebuildMenu()
                 }
             }
+        } else {
+            isBootstrappingBackend = false
+            _ = clearBackendState(for: process, matching: backendLogSession)
+            rebuildMenu()
         }
     }
 
     @discardableResult
-    private func clearBackendState(for process: Process, matching logHandle: FileHandle?) -> Bool {
+    private func clearBackendState(for process: Process, matching logSession: BackendLogSession?) -> Bool {
         guard backendProcess === process else { return false }
         invalidateConsole()
+        invalidateStatusRefreshes()
         backendProcess = nil
         api = nil
         latestStatus = nil
         if expectedBackendTerminationProcess === process {
             expectedBackendTerminationProcess = nil
         }
-        if let logHandle, backendLogHandle === logHandle {
-            backendLogHandle = nil
-            try? logHandle.close()
+        if let logSession, backendLogSession === logSession {
+            backendLogSession = nil
+            logSession.finish(
+                timeout: processOutputFinalizationTimeout,
+                closeConfirmationTimeout: processOutputCloseConfirmationTimeout
+            )
         }
         return true
     }
@@ -1334,12 +1569,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let currentAPI = api,
               let process = backendProcess,
               process.isRunning else {
+            statusRefreshPending = false
             rebuildMenu()
             return
         }
+        if activeStatusRefreshGeneration != nil {
+            statusRefreshPending = true
+            return
+        }
+        let generation = statusRefreshGeneration
+        activeStatusRefreshGeneration = generation
         currentAPI.getStatus { [weak self] result in
             DispatchQueue.main.async {
                 guard let self,
+                      self.activeStatusRefreshGeneration == generation else {
+                    return
+                }
+                self.activeStatusRefreshGeneration = nil
+                let runPendingRefresh = self.statusRefreshPending
+                self.statusRefreshPending = false
+                guard self.statusRefreshGeneration == generation,
                       self.api === currentAPI,
                       self.backendProcess === process,
                       process.isRunning else {
@@ -1353,6 +1602,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.lastError = error.localizedDescription
                 }
                 self.rebuildMenu()
+                if runPendingRefresh {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.refreshNow()
+                    }
+                }
             }
         }
     }
@@ -1360,9 +1614,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 右键菜单「重启后端」：干净停掉当前 Python 后端并重新 bootstrap。
     /// 后端已崩溃时也会直接重新启动，便于从「就绪前退出」等状态恢复。
     @objc private func restartBackend() {
-        guard !terminationRequested(), !isRestartingBackend else { return }
+        guard !terminationRequested(), !isRestartingBackend, !isBootstrappingBackend else { return }
         isRestartingBackend = true
         invalidateConsole()
+        invalidateStatusRefreshes()
         api = nil
         latestStatus = nil
         lastError = nil
@@ -1378,30 +1633,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self else { return }
                 let deadline = self.monotonicDeadline(after: self.backendTerminationTimeout)
-                if !self.waitForProcessExit(process, until: deadline), process.isRunning {
+                var confirmedExit = self.waitForProcessExit(process, until: deadline)
+                if !confirmedExit, process.isRunning {
                     _ = self.sendSignal(SIGKILL, to: process)
                     let forceDeadline = self.monotonicDeadline(after: self.forceKillConfirmationTimeout)
-                    _ = self.waitForProcessExit(process, until: forceDeadline)
+                    confirmedExit = self.waitForProcessExit(process, until: forceDeadline)
                 }
                 DispatchQueue.main.async { [weak self] in
-                    self?.finishBackendRestart(stoppedProcess: process)
+                    self?.finishBackendRestart(stoppedProcess: process, confirmedExit: confirmedExit)
                 }
             }
         } else {
-            finishBackendRestart(stoppedProcess: process)
+            finishBackendRestart(stoppedProcess: process, confirmedExit: true)
         }
     }
 
-    private func finishBackendRestart(stoppedProcess: Process?) {
+    private func finishBackendRestart(stoppedProcess: Process?, confirmedExit: Bool) {
         guard !terminationRequested() else {
             isRestartingBackend = false
             return
         }
+        if let stoppedProcess, !confirmedExit || stoppedProcess.isRunning {
+            isRestartingBackend = false
+            startupStatus = nil
+            lastError = "无法确认旧后端进程退出，已取消重新启动"
+            rebuildMenu()
+            return
+        }
         if let stoppedProcess, backendProcess === stoppedProcess {
-            _ = clearBackendState(for: stoppedProcess, matching: backendLogHandle)
+            _ = clearBackendState(for: stoppedProcess, matching: backendLogSession)
         } else if backendProcess == nil {
-            try? backendLogHandle?.close()
-            backendLogHandle = nil
+            backendLogSession?.finish(
+                timeout: processOutputFinalizationTimeout,
+                closeConfirmationTimeout: processOutputCloseConfirmationTimeout
+            )
+            backendLogSession = nil
         }
         if expectedBackendTerminationProcess === stoppedProcess {
             expectedBackendTerminationProcess = nil
@@ -1450,7 +1716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshItem.isEnabled = backendReady
         menu.addItem(refreshItem)
         let restartItem = actionItem("重启后端", #selector(restartBackend))
-        restartItem.isEnabled = !isRestartingBackend && !terminationRequested()
+        restartItem.isEnabled = !isRestartingBackend && !isBootstrappingBackend && !terminationRequested()
         menu.addItem(restartItem)
 
         if let status = latestStatus {

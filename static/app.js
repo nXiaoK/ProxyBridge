@@ -10,6 +10,9 @@ const appState = {
   requestLogs: [],
   systemLogs: [],
   pool: null,
+  network: null,
+  networkStatus: "loading",
+  activeView: "nodes",
   filters: {
     protocol: "all",
     region: "all",
@@ -35,15 +38,31 @@ const appState = {
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
 let lastBrowserRecordTrigger = null;
-let latestStatusRequest = 0;
+let lastCoreLogTriggerKey = null;
+let lastBrowserRecordTriggerKey = null;
+let pendingModalFocusKey = null;
+let coreLogRequestGeneration = 0;
+let coreLogAbortController = null;
 let kernelDownloadPromise = null;
+let statusRequestPromise = null;
+let statusAbortController = null;
+let statusPollTimer = null;
+let syncOperationPromise = null;
+let networkSettingsSavePromise = null;
+const actionInFlight = new Set();
+const renderSignatures = new Map();
+
+const STATUS_REQUEST_TIMEOUT_MS = 12_000;
+const STATUS_POLL_VISIBLE_MS = 3_500;
+const STATUS_POLL_HIDDEN_MS = 30_000;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
-const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "sync"];
+const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "settings", "sync"];
 
 // 切换当前视图:高亮对应侧边栏项、显示对应内容区,并记住上次选择。
 function setActiveView(view) {
   if (!VIEW_IDS.includes(view)) view = "nodes";
+  appState.activeView = view;
   try { localStorage.setItem("pb-view", view); } catch (e) {}
   document.querySelectorAll(".nav-item").forEach((item) => {
     item.setAttribute("aria-current", item.dataset.view === view ? "true" : "false");
@@ -51,6 +70,8 @@ function setActiveView(view) {
   document.querySelectorAll(".view").forEach((section) => {
     section.hidden = section.dataset.view !== view;
   });
+  renderActiveView({ force: true });
+  applyActionInFlightState();
 }
 
 // 更新单个侧边栏计数徽标;为 0 时通过 data-zero 隐藏,避免视觉噪音。
@@ -138,7 +159,7 @@ function subscriptionIndexByNodeId() {
   return map;
 }
 
-async function api(path, body = null) {
+async function api(path, body = null, { signal } = {}) {
   const options = body
     ? {
         method: "POST",
@@ -146,6 +167,7 @@ async function api(path, body = null) {
         body: JSON.stringify(body),
       }
     : {};
+  if (signal) options.signal = signal;
   const response = await fetch(path, options);
   const payload = await response.json();
   if (!response.ok || payload.error) {
@@ -171,6 +193,333 @@ function formatTime(seconds) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+// 通用网络设置表单：与 WebDAV 表单一样，状态轮询不能覆盖尚未保存的开关。
+let networkFormHydrated = false;
+let networkFormDirty = false;
+
+function markNetworkFormDirty() {
+  networkFormDirty = true;
+}
+
+function applyNetworkSettingsToForm(network, { force = false } = {}) {
+  if (networkFormDirty && !force) return;
+  const allowLan = $("#allowLan");
+  if (!allowLan) return;
+  allowLan.checked = Boolean(network?.allow_lan);
+  networkFormHydrated = true;
+}
+
+function networkLanAddresses(network) {
+  const values = [
+    network?.primary_lan_address,
+    ...(Array.isArray(network?.lan_addresses) ? network.lan_addresses : []),
+  ]
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+  return [...new Set(values)];
+}
+
+function networkUrlList(...values) {
+  return [...new Set(
+    values
+      .flatMap((value) => (Array.isArray(value) ? value : [value]))
+      .map((value) => String(value || "").trim())
+      .filter(Boolean)
+  )];
+}
+
+function proxyPortFromUrls(entry) {
+  if (entry?.port != null && String(entry.port).trim()) return String(entry.port);
+  for (const value of networkUrlList(entry?.socks_urls, entry?.socks_url, entry?.http_urls, entry?.http_url)) {
+    if (!value) continue;
+    try {
+      const port = new URL(value).port;
+      if (port) return port;
+    } catch (_) {
+      // Ignore malformed optional display URLs; the other protocol may still be usable.
+    }
+  }
+  return "";
+}
+
+function normalizeNetworkProxyEntry(entry, fallback = {}) {
+  if (!entry || typeof entry !== "object") return null;
+  const socksUrls = networkUrlList(
+    entry.socks_urls,
+    entry.lan_socks_urls,
+    entry.socks_url,
+    entry.lan_socks_url,
+    fallback.socks_urls,
+    fallback.socks_url
+  );
+  const httpUrls = networkUrlList(
+    entry.http_urls,
+    entry.lan_http_urls,
+    entry.http_url,
+    entry.lan_http_url,
+    fallback.http_urls,
+    fallback.http_url
+  );
+  const normalized = {
+    bridge_id: entry.bridge_id || entry.id || fallback.bridge_id || "",
+    port: entry.port ?? fallback.port ?? "",
+    node_name: entry.node_name || entry.name || fallback.node_name || "",
+    socks_urls: socksUrls,
+    http_urls: httpUrls,
+  };
+  normalized.port = proxyPortFromUrls(normalized);
+  return normalized;
+}
+
+function networkProxyEntries(network) {
+  const direct = (Array.isArray(network?.proxy_urls) ? network.proxy_urls : [])
+    .map((entry) => normalizeNetworkProxyEntry(entry))
+    .filter(Boolean);
+
+  const entries = direct.length
+    ? direct
+    : runningBridges()
+        .map((bridge) => {
+          const lanUrls = bridge.lan_urls && typeof bridge.lan_urls === "object" ? bridge.lan_urls : {};
+          return normalizeNetworkProxyEntry(
+            {
+              port: bridge.port,
+              bridge_id: bridge.id,
+              node_name: bridge.node_name,
+              socks_urls: bridge.lan_socks_urls || lanUrls.socks_urls,
+              socks_url: bridge.lan_socks_url || bridge.lan_socks5_url || lanUrls.socks_url,
+              http_urls: bridge.lan_http_urls || lanUrls.http_urls,
+              http_url: bridge.lan_http_url || lanUrls.http_url,
+            },
+            { bridge_id: bridge.id, port: bridge.port, node_name: bridge.node_name }
+          );
+        })
+        .filter(Boolean);
+
+  const seen = new Set();
+  return entries.filter((entry) => {
+    const key = [
+      entry.bridge_id,
+      entry.node_name,
+      entry.port,
+      ...entry.socks_urls,
+      ...entry.http_urls,
+    ].join("\n");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function proxyAddressFromUrl(url) {
+  try {
+    return new URL(url).hostname;
+  } catch (_) {
+    return "";
+  }
+}
+
+function networkProxyUrlRow(label, url, entry) {
+  if (!url) return "";
+  const nodeName = entry.node_name || "本地代理";
+  const port = entry.port || proxyPortFromUrls({ socks_urls: [url] }) || "未知";
+  const address = proxyAddressFromUrl(url) || "未知";
+  const copyLabel = `复制 ${nodeName} 的 ${label} 代理，地址 ${address}，端口 ${port}`;
+  return `
+    <div class="network-proxy-url-row">
+      <div>
+        <span>${escapeHtml(label)}</span>
+        <code title="${escapeHtml(url)}">${escapeHtml(url)}</code>
+      </div>
+      <button class="row-button copy-icon" type="button" data-action="copy" data-text="${escapeHtml(url)}" aria-label="${escapeHtml(copyLabel)}" title="${escapeHtml(copyLabel)}">${icon("copy")}</button>
+    </div>`;
+}
+
+function renderNetworkProxyList(network, networkStatus) {
+  const list = $("#networkProxyList");
+  const count = $("#networkProxyCount");
+  if (!list || !count) return;
+
+  if (!network) {
+    count.textContent = "—";
+    list.innerHTML = `<div class="settings-empty">${
+      networkStatus === "loading" ? "正在加载网络状态…" : "网络状态暂时不可用，无法显示共享地址。"
+    }</div>`;
+    return;
+  }
+
+  const staleNotice = networkStatus === "error"
+    ? `<div class="network-stale-note">状态刷新失败，以下为上次成功获取的结果。</div>`
+    : "";
+
+  if (!network?.allow_lan) {
+    count.textContent = "0 个";
+    list.innerHTML = `${staleNotice}<div class="settings-empty">局域网共享已关闭，代理仅可在本机使用。</div>`;
+    return;
+  }
+
+  const entries = networkProxyEntries(network);
+  count.textContent = `${entries.length} 个`;
+  if (!entries.length) {
+    list.innerHTML = `${staleNotice}<div class="settings-empty">暂无运行中的本地代理。启动节点后，这里会显示可供局域网设备使用的地址。</div>`;
+    return;
+  }
+
+  const hasShareableUrl = entries.some((entry) => entry.socks_urls.length || entry.http_urls.length);
+  if (!hasShareableUrl) {
+    const reason = networkLanAddresses(network).length
+      ? "后端尚未生成可用的共享地址"
+      : "未检测到可用的局域网 IP";
+    list.innerHTML = `${staleNotice}<div class="settings-empty">检测到 ${entries.length} 个运行中的本地代理，但${reason}，暂时无法供局域网设备连接。</div>`;
+    return;
+  }
+
+  list.innerHTML = staleNotice + entries
+    .map((entry) => {
+      const title = entry.node_name || "本地代理";
+      const port = entry.port ? `<span>端口 ${escapeHtml(entry.port)}</span>` : "";
+      const urlRows = [
+        ...entry.socks_urls.map((url) => networkProxyUrlRow("SOCKS5", url, entry)),
+        ...entry.http_urls.map((url) => networkProxyUrlRow("HTTP / HTTPS", url, entry)),
+      ].join("");
+      return `
+        <article class="network-proxy-entry">
+          <header>
+            <strong>${escapeHtml(title)}</strong>
+            ${port}
+          </header>
+          ${urlRows || `<div class="settings-empty">此代理暂无可用的共享地址。</div>`}
+        </article>`;
+    })
+    .join("");
+}
+
+function networkSettingsRenderSnapshot() {
+  const network = appState.network;
+  return {
+    status: appState.networkStatus,
+    allow_lan: network?.allow_lan ?? null,
+    listen_host: network?.listen_host || "",
+    lan_addresses: networkLanAddresses(network),
+    proxies: networkProxyEntries(network).map((entry) => ({
+      bridge_id: entry.bridge_id,
+      node_name: entry.node_name,
+      port: entry.port,
+      socks_urls: entry.socks_urls,
+      http_urls: entry.http_urls,
+    })),
+  };
+}
+
+function syncNetworkSettingsControlState() {
+  const unavailable = !networkFormHydrated || !appState.network;
+  const disabled = unavailable || Boolean(networkSettingsSavePromise);
+  [$("#allowLan"), $("#networkSaveButton")].filter(Boolean).forEach((control) => {
+    control.disabled = disabled;
+  });
+}
+
+function renderNetworkSettings() {
+  const network = appState.network;
+  const networkStatus = appState.networkStatus;
+  const hasSnapshot = Boolean(network);
+  if (networkStatus === "ready" && hasSnapshot && (!networkFormHydrated || !networkFormDirty)) {
+    applyNetworkSettingsToForm(network);
+  }
+
+  syncNetworkSettingsControlState();
+
+  const isLoading = networkStatus === "loading" && !hasSnapshot;
+  const isUnavailable = networkStatus === "error" && !hasSnapshot;
+  const isStale = networkStatus === "error" && hasSnapshot;
+  const enabled = Boolean(network?.allow_lan);
+
+  const statusLine = $("#settingsStatusLine");
+  if (statusLine) {
+    if (isLoading) statusLine.textContent = "网络状态正在加载";
+    else if (isUnavailable) statusLine.textContent = "网络状态暂时不可用";
+    else statusLine.textContent = `${enabled ? "局域网共享已开启" : "局域网共享已关闭"}${isStale ? "（状态可能已过期）" : ""}`;
+  }
+
+  const effectiveStatus = $("#networkEffectiveStatus");
+  if (effectiveStatus) {
+    if (isLoading) effectiveStatus.textContent = "正在加载";
+    else if (isUnavailable) effectiveStatus.textContent = "不可用";
+    else effectiveStatus.textContent = `${enabled ? "已共享" : "仅本机"}${isStale ? " · 状态过期" : ""}`;
+    effectiveStatus.classList.toggle("is-enabled", enabled && !isStale);
+    effectiveStatus.classList.toggle("is-stale", isStale || isUnavailable);
+  }
+
+  const listenHost = $("#networkListenHost");
+  if (listenHost) {
+    listenHost.textContent = hasSnapshot
+      ? network.listen_host || (enabled ? "0.0.0.0" : "127.0.0.1")
+      : "—";
+  }
+
+  const addressList = $("#networkAddressList");
+  if (addressList) {
+    const addresses = networkLanAddresses(network);
+    addressList.innerHTML = addresses.length
+      ? addresses.map((address) => `<code class="network-address-pill">${escapeHtml(address)}</code>`).join("")
+      : `<span class="settings-empty-inline">${
+          isLoading ? "正在检测…" : isUnavailable ? "暂时无法读取网络信息" : "未检测到可用的局域网 IP"
+        }</span>`;
+  }
+
+  renderNetworkProxyList(network, networkStatus);
+}
+
+function setNetworkSettingsBusy(busy, trigger = null) {
+  syncNetworkSettingsControlState();
+  if (trigger) {
+    trigger.classList.toggle("is-busy", busy);
+    if (busy) trigger.setAttribute("aria-busy", "true");
+    else trigger.removeAttribute("aria-busy");
+  }
+}
+
+async function withNetworkSettingsSave(task, trigger = null) {
+  if (networkSettingsSavePromise) {
+    throw new Error("网络设置正在保存，请稍候");
+  }
+  const operation = Promise.resolve().then(task);
+  networkSettingsSavePromise = operation;
+  setNetworkSettingsBusy(true, trigger);
+  try {
+    return await operation;
+  } finally {
+    if (networkSettingsSavePromise === operation) networkSettingsSavePromise = null;
+    setNetworkSettingsBusy(false, trigger);
+  }
+}
+
+async function saveNetworkSettings(event) {
+  event.preventDefault();
+  const allowLan = Boolean($("#allowLan")?.checked);
+  const result = await api("/api/settings/network", { allow_lan: allowLan });
+  appState.network = result.network || { ...(appState.network || {}), allow_lan: allowLan };
+  appState.networkStatus = "ready";
+  networkFormDirty = false;
+  applyNetworkSettingsToForm(appState.network, { force: true });
+  renderNetworkSettings();
+
+  try {
+    await loadStatus({ forceFresh: true });
+  } catch (error) {
+    showToast(`设置已保存，但状态刷新失败：${error.message}`, "error");
+    return result;
+  }
+
+  const reboundCount = Number(result.rebound_count || 0);
+  showToast(
+    reboundCount > 0
+      ? `网络设置已保存，已重新绑定 ${reboundCount} 个运行中代理，原有连接可能已中断`
+      : "网络设置已保存"
+  );
+  return result;
 }
 
 // WebDAV 表单：状态轮询会反复 render，不能把未保存的输入写回成服务端旧值。
@@ -279,7 +628,7 @@ async function runSyncAction(kind) {
   const result = await api(path, {});
   if (result.settings) appState.sync = result.settings;
   // 操作结果只刷新状态文案，不覆盖用户正在编辑的表单。
-  if (kind === "pull") await loadStatus();
+  if (kind === "pull") await loadStatus({ forceFresh: true });
   else renderSyncMeta(appState.sync || {});
   if (kind === "check") {
     if (!result.has_remote) showToast("远端尚无同步数据");
@@ -303,6 +652,46 @@ async function runSyncAction(kind) {
     else showToast("拉取完成");
   }
   return result;
+}
+
+function setSyncControlsBusy(busy, trigger = null) {
+  const controls = [
+    "syncCheckBtn",
+    "syncTestBtn",
+    "syncPushBtn",
+    "syncPullBtn",
+  ]
+    .map((id) => document.getElementById(id))
+    .filter(Boolean);
+  const submit = $("#syncForm button[type=\"submit\"]");
+  if (submit) controls.push(submit);
+  controls.forEach((control) => {
+    if (busy) {
+      if (!("syncPreviousDisabled" in control.dataset)) {
+        control.dataset.syncPreviousDisabled = control.disabled ? "true" : "false";
+      }
+      control.disabled = true;
+    } else if ("syncPreviousDisabled" in control.dataset) {
+      control.disabled = control.dataset.syncPreviousDisabled === "true";
+      delete control.dataset.syncPreviousDisabled;
+    }
+    control.classList.toggle("is-busy", busy && control === trigger);
+  });
+}
+
+async function withSyncOperation(task, trigger = null) {
+  if (syncOperationPromise) {
+    throw new Error("已有同步操作正在进行，请等待完成");
+  }
+  const operation = Promise.resolve().then(task);
+  syncOperationPromise = operation;
+  setSyncControlsBusy(true, trigger);
+  try {
+    return await operation;
+  } finally {
+    if (syncOperationPromise === operation) syncOperationPromise = null;
+    setSyncControlsBusy(false, trigger);
+  }
 }
 
 function formatLogTime(seconds) {
@@ -388,39 +777,175 @@ function endpointParts(socksUrl, fallbackPort) {
   }
 }
 
-async function loadStatus() {
-  const requestId = ++latestStatusRequest;
-  const status = await api("/api/status");
-  if (requestId !== latestStatusRequest) return false;
-  appState.cores = status.cores || {};
-  appState.fingerprint_chromium = status.fingerprint_chromium || null;
-  appState.active_browsers = status.active_browsers || [];
-  appState.browser_instances = status.browser_instances || [];
-  appState.subscriptions = status.subscriptions || [];
-  appState.nodes = status.nodes || [];
-  appState.bridges = status.bridges || [];
-  appState.tests = status.tests || {};
-  appState.requestLogs = status.request_logs || [];
-  appState.systemLogs = status.system_logs || [];
-  appState.pool = status.pool || null;
-  appState.sync = status.sync || appState.sync || null;
-  if ("sync_openssl" in status) appState.syncOpenssl = Boolean(status.sync_openssl);
-  render();
-  return true;
+function renderSignature(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function renderWhenChanged(key, value, renderer, force = false) {
+  const signature = renderSignature(value);
+  if (!force && renderSignatures.get(key) === signature) return;
+  renderSignatures.set(key, signature);
+  renderer();
+}
+
+function renderActiveView({ force = false } = {}) {
+  switch (appState.activeView) {
+    case "nodes":
+      renderWhenChanged(
+        "nodes",
+        {
+          nodes: appState.nodes,
+          subscriptions: appState.subscriptions,
+          bridges: appState.bridges,
+          tests: appState.tests,
+          activeBrowsers: appState.active_browsers,
+          browserInstances: appState.browser_instances,
+          filters: appState.filters,
+          collapsed: appState.collapsedNodeGroups,
+        },
+        () => {
+          renderFilters();
+          renderNodes();
+        },
+        force
+      );
+      break;
+    case "subscriptions":
+      renderWhenChanged("subscriptions", appState.subscriptions, renderSubscriptions, force);
+      break;
+    case "bridges":
+      renderWhenChanged(
+        "bridges",
+        { bridges: appState.bridges, pool: appState.pool },
+        () => {
+          renderPool();
+          renderBridges();
+        },
+        force
+      );
+      break;
+    case "logs":
+      renderWhenChanged(
+        "logs",
+        { logs: appState.requestLogs, filters: appState.logFilters },
+        () => {
+          renderLogFilters();
+          renderRequestLogs();
+        },
+        force
+      );
+      break;
+    case "system":
+      renderWhenChanged(
+        "system",
+        { logs: appState.systemLogs, filters: appState.systemLogFilters },
+        renderSystemLogs,
+        force
+      );
+      break;
+    case "settings":
+      renderWhenChanged(
+        "settings",
+        networkSettingsRenderSnapshot(),
+        renderNetworkSettings,
+        force
+      );
+      break;
+    case "sync":
+      renderWhenChanged(
+        "sync",
+        { settings: appState.sync, openssl: appState.syncOpenssl },
+        renderSync,
+        force
+      );
+      break;
+    default:
+      break;
+  }
+}
+
+async function loadStatus({ forceFresh = false } = {}) {
+  if (statusRequestPromise) {
+    const current = statusRequestPromise;
+    if (!forceFresh) return current;
+    try {
+      await current;
+    } catch (_) {
+      // A fresh request below provides the authoritative result.
+    }
+    return loadStatus();
+  }
+
+  const controller = new AbortController();
+  statusAbortController = controller;
+  const timeout = window.setTimeout(() => controller.abort(), STATUS_REQUEST_TIMEOUT_MS);
+  const request = (async () => {
+    try {
+      const status = await api("/api/status", null, { signal: controller.signal });
+      appState.cores = status.cores || {};
+      appState.fingerprint_chromium = status.fingerprint_chromium || null;
+      appState.active_browsers = status.active_browsers || [];
+      appState.browser_instances = status.browser_instances || [];
+      appState.subscriptions = status.subscriptions || [];
+      appState.nodes = status.nodes || [];
+      appState.bridges = status.bridges || [];
+      appState.tests = status.tests || {};
+      appState.requestLogs = status.request_logs || [];
+      appState.systemLogs = status.system_logs || [];
+      appState.pool = status.pool || null;
+      if (status.network && typeof status.network === "object") {
+        appState.network = status.network;
+        appState.networkStatus = "ready";
+      } else {
+        appState.networkStatus = "error";
+      }
+      appState.sync = status.sync || appState.sync || null;
+      if ("sync_openssl" in status) appState.syncOpenssl = Boolean(status.sync_openssl);
+      render();
+      return true;
+    } catch (error) {
+      let statusError = error;
+      if (error?.name === "AbortError") {
+        statusError = new Error("状态请求超时，请检查后端是否仍在运行");
+      }
+      appState.networkStatus = "error";
+      renderActiveView();
+      throw statusError;
+    } finally {
+      window.clearTimeout(timeout);
+      if (statusAbortController === controller) statusAbortController = null;
+    }
+  })();
+  statusRequestPromise = request;
+  try {
+    return await request;
+  } finally {
+    if (statusRequestPromise === request) statusRequestPromise = null;
+  }
 }
 
 function render() {
-  renderNav();
-  renderCores();
-  renderSubscriptions();
-  renderFilters();
-  renderNodes();
-  renderPool();
-  renderBridges();
-  renderLogFilters();
-  renderRequestLogs();
-  renderSystemLogs();
-  renderSync();
+  renderWhenChanged(
+    "nav",
+    {
+      nodes: appState.nodes.length,
+      subscriptions: appState.subscriptions.length,
+      bridges: runningBridges().length,
+      logs: (appState.requestLogs || []).length,
+      system: (appState.systemLogs || []).length,
+    },
+    renderNav
+  );
+  renderWhenChanged(
+    "cores",
+    { cores: appState.cores, fingerprint: appState.fingerprint_chromium, busy: Boolean(kernelDownloadPromise) },
+    renderCores
+  );
+  renderActiveView();
   if (appState.browserRecordNodeId && !$("#browserRecordModal").hidden) {
     // 正在输入标签时只刷新标题元信息，避免整表重建打断输入。
     const ae = document.activeElement;
@@ -435,6 +960,7 @@ function render() {
       renderBrowserRecords(appState.browserRecordNodeId);
     }
   }
+  applyActionInFlightState();
 }
 
 function renderCores() {
@@ -861,6 +1387,7 @@ function renderBridges() {
 
   list.innerHTML = bridges.map((bridge) => {
     const endpoint = endpointParts(bridge.socks_url, bridge.port);
+    const listenAddress = bridge.listen_host || endpoint.address;
     const httpUrl = bridge.http_url || `http://127.0.0.1:${bridge.port}`;
     const uploadBytes = Number(bridge.upload_bytes || 0);
     const downloadBytes = Number(bridge.download_bytes || 0);
@@ -902,9 +1429,9 @@ function renderBridges() {
           <div class="endpoint-row">
             <div>
               <span class="endpoint-label">监听地址</span>
-              <span class="endpoint-value">${escapeHtml(endpoint.address)}</span>
+              <span class="endpoint-value">${escapeHtml(listenAddress)}</span>
             </div>
-            <button class="row-button copy-icon" data-action="copy" data-text="${escapeHtml(endpoint.address)}" aria-label="复制监听地址" title="复制监听地址">${icon("copy")}</button>
+            <button class="row-button copy-icon" data-action="copy" data-text="${escapeHtml(listenAddress)}" aria-label="复制监听地址" title="复制监听地址">${icon("copy")}</button>
           </div>
           <div class="endpoint-row endpoint-url">
             <div>
@@ -1033,12 +1560,45 @@ function renderSystemLogs() {
     .join("");
 }
 
+function openModal(modal) {
+  modal.hidden = false;
+  const shell = $(".app-shell");
+  if (shell) {
+    shell.inert = true;
+    shell.setAttribute("aria-hidden", "true");
+  }
+}
+
+function closeModal(modal) {
+  modal.hidden = true;
+  if ($("#coreLogModal").hidden && $("#browserRecordModal").hidden) {
+    const shell = $(".app-shell");
+    if (shell) {
+      shell.inert = false;
+      shell.removeAttribute("aria-hidden");
+    }
+  }
+}
+
+function findActionTrigger(key) {
+  if (!key) return null;
+  return [...document.querySelectorAll("button[data-action]")].find((button) => actionLockKey(button) === key) || null;
+}
+
 function closeCoreLogModal() {
-  $("#coreLogModal").hidden = true;
-  if (lastCoreLogTrigger?.isConnected) {
-    lastCoreLogTrigger.focus();
+  coreLogRequestGeneration += 1;
+  coreLogAbortController?.abort();
+  coreLogAbortController = null;
+  closeModal($("#coreLogModal"));
+  const trigger = lastCoreLogTrigger?.isConnected ? lastCoreLogTrigger : findActionTrigger(lastCoreLogTriggerKey);
+  if (trigger && !trigger.disabled) {
+    trigger.focus();
+    pendingModalFocusKey = null;
+  } else {
+    pendingModalFocusKey = lastCoreLogTriggerKey;
   }
   lastCoreLogTrigger = null;
+  lastCoreLogTriggerKey = null;
 }
 
 function renderCoreLogPayload(payload) {
@@ -1088,28 +1648,36 @@ function renderCoreLogPayload(payload) {
 
 async function showCoreLog(core) {
   if (!core) return;
+  coreLogAbortController?.abort();
+  const controller = new AbortController();
+  const generation = ++coreLogRequestGeneration;
+  coreLogAbortController = controller;
   const modal = $("#coreLogModal");
-  modal.hidden = false;
+  openModal(modal);
   modal.querySelector('[data-action="close-core-log"]')?.focus();
   $("#coreLogTitle").textContent = `${core} 运行日志`;
   $("#coreLogMeta").textContent = "加载中";
   $("#coreLogBody").innerHTML = '<div class="core-log-loading">正在读取日志...</div>';
   try {
-    const payload = await api(`/api/core/logs?core=${encodeURIComponent(core)}`);
+    const payload = await api(`/api/core/logs?core=${encodeURIComponent(core)}`, null, { signal: controller.signal });
+    if (generation !== coreLogRequestGeneration || modal.hidden) return;
     renderCoreLogPayload(payload);
   } catch (error) {
+    if (generation !== coreLogRequestGeneration || error?.name === "AbortError" || modal.hidden) return;
     $("#coreLogMeta").textContent = "读取失败";
     $("#coreLogBody").innerHTML = `<div class="core-log-empty error"><strong>日志读取失败</strong><span>${escapeHtml(error.message)}</span></div>`;
+  } finally {
+    if (coreLogAbortController === controller) coreLogAbortController = null;
   }
 }
 
 function closeBrowserRecordModal() {
-  $("#browserRecordModal").hidden = true;
+  closeModal($("#browserRecordModal"));
   appState.browserRecordNodeId = null;
-  if (lastBrowserRecordTrigger?.isConnected) {
-    lastBrowserRecordTrigger.focus();
-  }
+  const trigger = lastBrowserRecordTrigger?.isConnected ? lastBrowserRecordTrigger : findActionTrigger(lastBrowserRecordTriggerKey);
+  trigger?.focus();
   lastBrowserRecordTrigger = null;
+  lastBrowserRecordTriggerKey = null;
 }
 
 function compactPath(value) {
@@ -1232,7 +1800,7 @@ async function saveBrowserLabel(instanceId) {
   const input = document.querySelector(`.browser-label-input[data-instance="${instanceId}"]`);
   const label = String(input?.value || "").trim();
   await api("/api/browser/update", { instance_id: instanceId, label });
-  await loadStatus();
+  await loadStatus({ forceFresh: true });
   if (appState.browserRecordNodeId) {
     renderBrowserRecords(appState.browserRecordNodeId);
   }
@@ -1243,8 +1811,9 @@ function showBrowserRecords(nodeId, trigger = null) {
   if (!nodeId) return;
   appState.browserRecordNodeId = nodeId;
   lastBrowserRecordTrigger = trigger;
+  lastBrowserRecordTriggerKey = trigger ? actionLockKey(trigger) : null;
   const modal = $("#browserRecordModal");
-  modal.hidden = false;
+  openModal(modal);
   renderBrowserRecords(nodeId);
   modal.querySelector('[data-action="close-browser-records"]')?.focus();
 }
@@ -1256,9 +1825,9 @@ async function openBrowserRecordsWithSync(nodeId, trigger = null) {
   if (sync.enabled && sync.url) {
     try {
       showToast("正在从远端同步浏览器数据…");
-      const result = await api("/api/sync/pull", {});
+      const result = await withSyncOperation(() => api("/api/sync/pull", {}));
       if (result.settings) appState.sync = result.settings;
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       if (result.skipped && result.reason === "already_latest") {
         showToast("已是最新");
       } else if (result.ok === false) {
@@ -1269,7 +1838,7 @@ async function openBrowserRecordsWithSync(nodeId, trigger = null) {
     } catch (error) {
       showToast(`同步失败，显示本地记录：${error.message}`, "error");
       try {
-        await loadStatus();
+        await loadStatus({ forceFresh: true });
       } catch (_) {
         /* ignore */
       }
@@ -1300,13 +1869,13 @@ async function copyText(text) {
 
 async function startNode(nodeId) {
   const bridge = await api("/api/bridges/start", { node_id: nodeId, core: "auto" });
-  await loadStatus();
+  await loadStatus({ forceFresh: true });
   await copyText(bridge.socks_url);
 }
 
 async function testNode(nodeId) {
   const result = await api("/api/nodes/test", { node_id: nodeId, core: "auto" });
-  await loadStatus();
+  await loadStatus({ forceFresh: true });
   if (result.ok) {
     showToast(`通信正常：${result.latency_ms} ms`);
   } else {
@@ -1318,7 +1887,7 @@ async function testNode(nodeId) {
 async function launchBrowser(nodeId, instanceId = "") {
   const payload = instanceId ? { node_id: nodeId, instance_id: instanceId } : { node_id: nodeId };
   const result = await api("/api/browser/launch", payload);
-  await loadStatus();
+  await loadStatus({ forceFresh: true });
   showToast(`已启动${result.browser_name ? ` ${result.browser_name}` : "指纹浏览器"}：${result.proxy}`);
   return result;
 }
@@ -1327,7 +1896,7 @@ async function launchBrowser(nodeId, instanceId = "") {
 async function stopBrowser(nodeId, instanceId = "") {
   const payload = instanceId ? { instance_id: instanceId } : { node_id: nodeId };
   const result = await api("/api/browser/stop", payload);
-  await loadStatus();
+  await loadStatus({ forceFresh: true });
   showToast("已停止浏览器，SOCKS5 端口保持运行");
   return result;
 }
@@ -1339,7 +1908,7 @@ function downloadKernel() {
   showToast("正在下载指纹内核，约 150-250MB，请耐心等待…");
   kernelDownloadPromise = (async () => {
     const result = await api("/api/browser/download-kernel", {});
-    await loadStatus();
+    await loadStatus({ forceFresh: true });
     if (result.already_installed) {
       showToast("指纹内核已安装");
     } else if (result.arch_warning) {
@@ -1357,14 +1926,41 @@ function downloadKernel() {
   return kernelDownloadPromise;
 }
 
-async function handleAction(event) {
-  const button = event.target.closest("button[data-action]");
-  if (!button) return;
-  const action = button.dataset.action;
-  button.disabled = true;
-  // 点击后立即进入加载态:隐藏图标、显示旋转 spinner,给用户即时反馈。
-  // close / copy 这类瞬时操作不需要转圈。
-  const spins = ![
+function actionLockKey(button) {
+  const action = button?.dataset?.action || "action";
+  switch (action) {
+    case "start":
+    case "stop":
+    case "restart":
+    case "stop-all":
+      return "bridge-lifecycle";
+    case "refresh-sub":
+    case "delete-sub":
+      return `subscription:${button.dataset.id || ""}`;
+    case "launch-browser":
+    case "stop-browser":
+      return `browser-node:${button.dataset.node || ""}`;
+    case "launch-browser-instance":
+    case "stop-browser-instance":
+    case "save-browser-label":
+      return `browser-instance:${button.dataset.instance || ""}`;
+    case "test":
+      return `node-test:${button.dataset.node || ""}`;
+    case "browser-records":
+      return `browser-records:${button.dataset.node || ""}`;
+    case "copy":
+      return `copy:${button.dataset.text || ""}`;
+    case "show-core-log":
+      return `core-log:${button.dataset.core || ""}`;
+    case "toggle-node-group":
+      return `node-group:${button.dataset.group || ""}`;
+    default:
+      return `${action}:${button.dataset.id || button.id || "global"}`;
+  }
+}
+
+function actionUsesSpinner(action) {
+  return ![
     "close-core-log",
     "close-browser-records",
     "copy",
@@ -1372,7 +1968,40 @@ async function handleAction(event) {
     "toggle-node-group",
     "save-browser-label",
   ].includes(action);
-  if (spins) button.classList.add("is-busy");
+}
+
+function applyActionInFlightState() {
+  document.querySelectorAll("button[data-action]").forEach((button) => {
+    const busy = actionInFlight.has(actionLockKey(button));
+    if (busy) {
+      if (!("actionPreviousDisabled" in button.dataset)) {
+        button.dataset.actionPreviousDisabled = button.disabled ? "true" : "false";
+      }
+      button.disabled = true;
+      if (actionUsesSpinner(button.dataset.action)) button.classList.add("is-busy");
+    } else if ("actionPreviousDisabled" in button.dataset) {
+      button.disabled = button.dataset.actionPreviousDisabled === "true";
+      delete button.dataset.actionPreviousDisabled;
+      button.classList.remove("is-busy");
+    }
+  });
+  if (pendingModalFocusKey) {
+    const trigger = findActionTrigger(pendingModalFocusKey);
+    if (trigger && !trigger.disabled) {
+      trigger.focus();
+      pendingModalFocusKey = null;
+    }
+  }
+}
+
+async function handleAction(event) {
+  const button = event.target.closest("button[data-action]");
+  if (!button) return;
+  const action = button.dataset.action;
+  const lockKey = actionLockKey(button);
+  if (actionInFlight.has(lockKey)) return;
+  actionInFlight.add(lockKey);
+  applyActionInFlightState();
   try {
     if (action === "toggle-node-group") {
       const groupId = button.dataset.group;
@@ -1401,33 +2030,42 @@ async function handleAction(event) {
     } else if (action === "copy") {
       await copyText(button.dataset.text);
     } else if (action === "rotate-pool-token") {
+      if (!window.confirm("轮换代理池密钥后，所有旧链接会立即失效。确定继续吗？")) return;
       await api("/api/pool/token/rotate", {});
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast("代理池密钥已轮换，旧链接立即失效");
     } else if (action === "stop") {
       const result = await api("/api/bridges/stop", { id: button.dataset.id });
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast(result.killed_browsers ? "已停止端口，关联浏览器已关闭" : "已停止端口");
+    } else if (action === "stop-all") {
+      const result = await api("/api/bridges/stop-all", {});
+      await loadStatus({ forceFresh: true });
+      showToast(result.killed_browsers ? "已停止全部端口，关联浏览器已关闭" : "已停止全部端口");
     } else if (action === "restart") {
       const stopped = await api("/api/bridges/stop", { id: button.dataset.id });
       await api("/api/bridges/start", { node_id: button.dataset.node, core: "auto" });
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast(stopped.killed_browsers ? "已重启服务，关联浏览器已关闭" : "已重启服务");
     } else if (action === "refresh-sub") {
       await api("/api/subscriptions/refresh", { id: button.dataset.id });
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast("订阅已刷新");
     } else if (action === "delete-sub") {
+      const subscription = appState.subscriptions.find((item) => item.id === button.dataset.id);
+      const name = subscription?.name || "该订阅";
+      const nodeCount = Number(subscription?.node_count || (subscription?.node_ids || []).length || 0);
+      if (!window.confirm(`删除「${name}」将清理最多 ${nodeCount} 个未被其他订阅引用的节点及浏览器 Profile。确定继续吗？`)) return;
       await api("/api/subscriptions/delete", { id: button.dataset.id });
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast("订阅已删除");
     } else if (action === "clear-logs") {
       await api("/api/logs/clear", {});
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast("连接日志已清空");
     } else if (action === "clear-system-logs") {
       await api("/api/system/logs/clear", {});
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast("系统日志已清空");
     } else if (action === "reset-log-filters") {
       appState.logFilters.search = "";
@@ -1438,6 +2076,7 @@ async function handleAction(event) {
       showToast("日志筛选已重置");
     } else if (action === "show-core-log") {
       lastCoreLogTrigger = button;
+      lastCoreLogTriggerKey = lockKey;
       await showCoreLog(button.dataset.core);
     } else if (action === "close-core-log") {
       closeCoreLogModal();
@@ -1447,8 +2086,11 @@ async function handleAction(event) {
   } catch (error) {
     showToast(error.message, "error");
   } finally {
-    button.disabled = false;
-    button.classList.remove("is-busy");
+    actionInFlight.delete(lockKey);
+    applyActionInFlightState();
+    if (action === "stop-all" && appState.activeView === "bridges") {
+      renderActiveView({ force: true });
+    }
   }
 }
 
@@ -1465,12 +2107,61 @@ async function handleImport(event) {
       raw: formData.get("raw"),
     });
     form.reset();
-    await loadStatus();
+    await loadStatus({ forceFresh: true });
     showToast(`导入 ${result.subscription.node_count} 个节点`);
   } catch (error) {
     showToast(error.message, "error");
   } finally {
     submit.disabled = false;
+  }
+}
+
+function trapModalFocus(event) {
+  if (event.key !== "Tab") return false;
+  const modal = !$("#browserRecordModal").hidden
+    ? $("#browserRecordModal")
+    : !$("#coreLogModal").hidden
+      ? $("#coreLogModal")
+      : null;
+  if (!modal) return false;
+  const dialog = modal.querySelector('[role="dialog"]');
+  const focusable = [...dialog.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+  )].filter((element) => !element.hidden && element.getClientRects().length > 0);
+  if (!focusable.length) {
+    event.preventDefault();
+    dialog.focus();
+    return true;
+  }
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
+
+function scheduleStatusPoll(delay = document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_VISIBLE_MS) {
+  window.clearTimeout(statusPollTimer);
+  statusPollTimer = window.setTimeout(runStatusPoll, delay);
+}
+
+async function runStatusPoll({ reportError = false } = {}) {
+  window.clearTimeout(statusPollTimer);
+  statusPollTimer = null;
+  try {
+    await loadStatus();
+  } catch (error) {
+    if (reportError) showToast(error.message, "error");
+  } finally {
+    scheduleStatusPoll();
   }
 }
 
@@ -1480,14 +2171,30 @@ function bindEvents() {
     item.addEventListener("click", () => setActiveView(item.dataset.view));
   });
   $("#importForm").addEventListener("submit", handleImport);
+  const networkForm = $("#networkSettingsForm");
+  if (networkForm) {
+    networkForm.addEventListener("input", markNetworkFormDirty);
+    networkForm.addEventListener("change", markNetworkFormDirty);
+    networkForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const submit = $("#networkSaveButton");
+      try {
+        await withNetworkSettingsSave(() => saveNetworkSettings(event), submit);
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+    });
+  }
   const syncForm = $("#syncForm");
   if (syncForm) {
     // 任意输入/勾选都标记脏数据，避免 3.5s 状态轮询把未保存内容冲掉。
     syncForm.addEventListener("input", markSyncFormDirty);
     syncForm.addEventListener("change", markSyncFormDirty);
     syncForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const submit = syncForm.querySelector('button[type="submit"]');
       try {
-        await saveSyncSettings(event);
+        await withSyncOperation(() => saveSyncSettings(event), submit);
       } catch (error) {
         showToast(error.message, "error");
       }
@@ -1497,15 +2204,10 @@ function bindEvents() {
     const btn = document.getElementById(id);
     if (!btn) return;
     btn.addEventListener("click", async () => {
-      btn.disabled = true;
-      btn.classList.add("is-busy");
       try {
-        await runSyncAction(kind);
+        await withSyncOperation(() => runSyncAction(kind), btn);
       } catch (error) {
         showToast(error.message, "error");
-      } finally {
-        btn.disabled = false;
-        btn.classList.remove("is-busy");
       }
     });
   };
@@ -1519,7 +2221,7 @@ function bindEvents() {
     button.classList.add("is-busy");
     button.disabled = true;
     try {
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast("状态已刷新");
     } catch (error) {
       showToast(error.message, "error");
@@ -1533,22 +2235,13 @@ function bindEvents() {
     button.classList.add("is-busy");
     button.disabled = true;
     try {
-      await loadStatus();
+      await loadStatus({ forceFresh: true });
       showToast("列表已刷新");
     } catch (error) {
       showToast(error.message, "error");
     } finally {
       button.classList.remove("is-busy");
       button.disabled = false;
-    }
-  });
-  $("#stopAll").addEventListener("click", async () => {
-    try {
-      const result = await api("/api/bridges/stop-all", {});
-      await loadStatus();
-      showToast(result.killed_browsers ? "已停止全部端口，关联浏览器已关闭" : "已停止全部端口");
-    } catch (error) {
-      showToast(error.message, "error");
     }
   });
   $("#testVisible").addEventListener("click", async (event) => {
@@ -1560,8 +2253,8 @@ function bindEvents() {
     }
     button.disabled = true;
     try {
-      for (const node of nodes) {
-        button.querySelector("span").textContent = `测试中 ${nodes.indexOf(node) + 1}/${nodes.length}`;
+      for (const [index, node] of nodes.entries()) {
+        button.querySelector("span").textContent = `测试中 ${index + 1}/${nodes.length}`;
         await testNode(node.id);
       }
       showToast("可见节点测试完成");
@@ -1622,16 +2315,23 @@ function bindEvents() {
     }
   });
   document.addEventListener("keydown", (event) => {
+    if (trapModalFocus(event)) return;
     if (event.key === "Escape" && !$("#coreLogModal").hidden) {
       closeCoreLogModal();
     } else if (event.key === "Escape" && !$("#browserRecordModal").hidden) {
       closeBrowserRecordModal();
     }
   });
+  document.addEventListener("visibilitychange", () => {
+    scheduleStatusPoll(document.hidden ? STATUS_POLL_HIDDEN_MS : 0);
+  });
+  window.addEventListener("beforeunload", () => {
+    window.clearTimeout(statusPollTimer);
+    statusAbortController?.abort();
+  });
 }
 
 bindEvents();
 // 初始视图:优先使用上次记忆的选择(在 <html> 上的 data-initial-view)。
 setActiveView(document.documentElement.getAttribute("data-initial-view") || "nodes");
-loadStatus().catch((error) => showToast(error.message, "error"));
-window.setInterval(() => loadStatus().catch(() => {}), 3500);
+runStatusPoll({ reportError: true });
