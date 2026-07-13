@@ -26,6 +26,20 @@
 - 首次运行需要能访问 GitHub，用于自动下载 `sing-box` / `xray`
 - 指纹浏览器一键下载依赖上游是否发布对应平台包；也可手动设置 `PROXY_BRIDGE_FP_CHROMIUM`
 
+## Windows / Linux 文档入口
+
+完整安装与使用教程（双击 exe、托盘、无壳控制台、开机自启、systemd、排障）：
+
+- [Windows / Linux 安装与使用教程](docs/windows-linux-install.md)
+
+快速选择：
+
+| 场景 | 推荐方式 |
+|---|---|
+| Windows 日常使用 | 构建/获取 `ProxyBridge.exe` 后双击 |
+| Linux 桌面 | `scripts/run_tray.sh` 托盘壳 |
+| Linux 服务器 / 无 GUI | `python3 app.py` 无壳控制台 |
+
 ## 构建机准备
 
 默认构建轻量 App，不会把 `sing-box` / `xray` 打进 App 包里：
@@ -119,6 +133,8 @@ xattr -dr com.apple.quarantine /Applications/ProxyBridgeMenuBar.app
 
 不依赖菜单栏壳，直接启动 Python 后端 + Web 控制台，即可使用订阅导入、本地代理、测速、连接日志等核心能力。
 
+> 完整安装/排障教程见 [`docs/windows-linux-install.md`](docs/windows-linux-install.md)。
+
 ```bash
 # 默认监听 127.0.0.1:8787，数据目录为仓库下 ./work
 python3 app.py
@@ -158,6 +174,8 @@ http://127.0.0.1:8787
 ## Windows / Linux 托盘常驻壳
 
 在无壳 Web 控制台之上，额外提供系统托盘常驻入口（打开控制台 / 重启后端 / 停止全部代理 / 退出）。
+
+> 分系统步骤、开机自启、依赖安装见 [`docs/windows-linux-install.md`](docs/windows-linux-install.md)。
 
 ### 安装托盘依赖
 
@@ -221,6 +239,8 @@ python -m desktop.tray_host --port 18787
 ## Windows 双击启动（.exe）
 
 可在 **Windows 机器**上把托盘壳打成单文件 `ProxyBridge.exe`，双击即可启动（无需先装 Python）。
+
+> 从构建到卸载的完整 Windows 教程见 [`docs/windows-linux-install.md`](docs/windows-linux-install.md#21-方式-a双击-proxybridgeexe推荐)。
 
 ### 在 Windows 上构建
 
