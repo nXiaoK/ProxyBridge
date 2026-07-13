@@ -201,6 +201,7 @@ python -m desktop.tray_host --port 18787
 - **打开控制台**：用系统浏览器打开 Web 控制台
 - **重启后端**：重启 `app.py`
 - **停止全部代理**：调用后端停止全部本地代理端口
+- **开机自启**：登录后自动启动托盘壳（默认不自动弹控制台）
 - **退出**：停止后端并退出托盘进程
 
 默认数据目录：
@@ -252,6 +253,31 @@ outputs\windows\release\ProxyBridge.exe
 scripts/build_linux_bin.sh
 # 产物: outputs/linux/dist/ProxyBridge
 ```
+
+### 开机自启
+
+托盘菜单可直接切换「开机自启」。也可以命令行操作：
+
+```bash
+# 开启 / 关闭 / 查询
+python3 -m desktop.tray_host --enable-autostart
+python3 -m desktop.tray_host --disable-autostart
+python3 -m desktop.tray_host --autostart-status
+```
+
+Windows 额外可用快捷方式脚本（桌面 + 开机启动）：
+
+```powershell
+.\scripts\create_windows_shortcuts.ps1 -ExePath .\outputs\windows\release\ProxyBridge.exe
+```
+
+实现位置：
+
+| 平台 | 机制 |
+|---|---|
+| Windows | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\ProxyBridge.lnk` |
+| Linux | `~/.config/autostart/proxybridge.desktop` |
+| macOS | `~/Library/LaunchAgents/com.proxybridge.tray.plist` |
 
 ## 局域网共享
 

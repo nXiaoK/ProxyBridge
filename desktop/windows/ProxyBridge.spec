@@ -20,6 +20,7 @@ hiddenimports = [
     "webdav_sync",
     "desktop",
     "desktop.tray_host",
+    "desktop.autostart",
     "pystray",
     "pystray._base",
     "pystray._win32",

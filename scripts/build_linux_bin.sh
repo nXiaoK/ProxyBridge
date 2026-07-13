@@ -25,6 +25,7 @@ python3 -m PyInstaller \
   --hidden-import webdav_sync \
   --hidden-import desktop \
   --hidden-import desktop.tray_host \
+  --hidden-import desktop.autostart \
   --hidden-import pystray \
   --hidden-import PIL \
   --hidden-import PIL.Image \

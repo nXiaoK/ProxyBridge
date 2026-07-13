@@ -24,6 +24,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+try:
+    from desktop import autostart
+except ImportError:  # pragma: no cover - frozen layout fallback
+    import autostart  # type: ignore
+
 
 DEFAULT_BACKEND_PORT = 18787
 BACKEND_INSTANCE_HEADER = "X-ProxyBridge-Instance"
@@ -113,6 +118,59 @@ def backend_command(python_executable: str, app_script: Path) -> list[str]:
         # Packaged Windows/Linux binary re-enters itself in backend-only mode.
         return [sys.executable, BACKEND_ONLY_FLAG]
     return [python_executable, str(app_script)]
+
+
+def single_instance_lock_path(work_root: Path) -> Path:
+    return work_root / "tray-host.lock"
+
+
+def acquire_single_instance_lock(work_root: Path) -> Any:
+    """Best-effort single-instance lock. Returns an open lock handle."""
+    ensure_dirs(work_root)
+    lock_path = single_instance_lock_path(work_root)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            handle.write("0")
+            handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()}\n")
+        handle.flush()
+        return handle
+    except OSError as error:
+        handle.close()
+        raise RuntimeError(f"ProxyBridge tray is already running (lock: {lock_path})") from error
+
+
+def release_single_instance_lock(handle: Any) -> None:
+    if handle is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        handle.close()
+    except Exception:
+        pass
 
 
 def is_port_free(port: int, host: str = "127.0.0.1") -> bool:
@@ -349,6 +407,8 @@ class TrayApp:
         self._error: str | None = None
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
+        self._autostart_enabled = autostart.is_autostart_enabled()
+        self._instance_lock = None
 
     def run(self) -> int:
         try:
@@ -383,6 +443,11 @@ class TrayApp:
                 MenuItem("打开控制台", lambda icon, item: self.open_console()),
                 MenuItem("重启后端", lambda icon, item: self.restart_backend()),
                 MenuItem("停止全部代理", lambda icon, item: self.stop_all_bridges()),
+                MenuItem(
+                    "开机自启",
+                    lambda icon, item: self.toggle_autostart(),
+                    checked=lambda item: self._autostart_enabled,
+                ),
                 Menu.SEPARATOR,
                 MenuItem("退出", lambda icon, item: self.quit(icon)),
             ),
@@ -435,11 +500,33 @@ class TrayApp:
             self._error = str(error)
             self._refresh_icon_title()
 
+    def toggle_autostart(self) -> None:
+        try:
+            desired = not self._autostart_enabled
+            result = autostart.set_autostart_enabled(desired)
+            self._autostart_enabled = bool(result.get("enabled"))
+            self._error = None
+            _write_tray_host_log(
+                f"autostart enabled={self._autostart_enabled} path={result.get('path')}"
+            )
+        except Exception as error:  # noqa: BLE001
+            self._error = f"autostart failed: {error}"
+            _write_tray_host_log(self._error)
+        self._refresh_icon_title()
+        icon = self._icon
+        if icon is not None:
+            try:
+                icon.update_menu()
+            except Exception:
+                pass
+
     def quit(self, icon=None) -> None:
         self._stop_event.set()
         try:
             self.backend.stop()
         finally:
+            release_single_instance_lock(self._instance_lock)
+            self._instance_lock = None
             target = icon or self._icon
             if target is not None:
                 target.stop()
@@ -483,6 +570,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--no-open",
         action="store_true",
         help="do not open the web console automatically on ready",
+    )
+    parser.add_argument(
+        "--enable-autostart",
+        action="store_true",
+        help="enable login autostart and exit",
+    )
+    parser.add_argument(
+        "--disable-autostart",
+        action="store_true",
+        help="disable login autostart and exit",
+    )
+    parser.add_argument(
+        "--autostart-status",
+        action="store_true",
+        help="print whether login autostart is enabled and exit",
+    )
+    parser.add_argument(
+        "--allow-multiple",
+        action="store_true",
+        help="allow multiple tray host instances",
     )
     return parser.parse_args(argv)
 
@@ -531,6 +638,19 @@ def main(argv: list[str] | None = None) -> int:
         return run_backend_only(raw_argv)
 
     args = parse_args(raw_argv)
+
+    if args.enable_autostart and args.disable_autostart:
+        print("--enable-autostart and --disable-autostart are mutually exclusive", file=sys.stderr)
+        return 2
+    if args.autostart_status:
+        print("enabled" if autostart.is_autostart_enabled() else "disabled")
+        return 0
+    if args.enable_autostart or args.disable_autostart:
+        result = autostart.set_autostart_enabled(bool(args.enable_autostart))
+        state = "enabled" if result.get("enabled") else "disabled"
+        print(f"autostart {state}: {result.get('path')}")
+        return 0
+
     # On Linux, pystray may need an AppIndicator/dbus session; fail with a clear message.
     if host_os_token() == "linux" and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
         print("未检测到图形会话（DISPLAY/WAYLAND_DISPLAY）。托盘壳需要桌面环境。", file=sys.stderr)
@@ -539,6 +659,13 @@ def main(argv: list[str] | None = None) -> int:
     os.environ["PROXY_BRIDGE_WORKDIR"] = str(config.work_root)
     _write_tray_host_log(f"starting tray host frozen={is_frozen()} port={config.port} workdir={config.work_root}")
     app = TrayApp(config)
+    if not args.allow_multiple:
+        try:
+            app._instance_lock = acquire_single_instance_lock(config.work_root)
+        except RuntimeError as error:
+            _write_tray_host_log(str(error))
+            print(str(error), file=sys.stderr)
+            return 1
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         del signum
@@ -552,6 +679,7 @@ def main(argv: list[str] | None = None) -> int:
         return app.run()
     except Exception as error:  # noqa: BLE001
         _write_tray_host_log(f"tray host failed: {error}")
+        release_single_instance_lock(app._instance_lock)
         raise
 
 

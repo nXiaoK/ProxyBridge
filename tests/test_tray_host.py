@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from desktop import tray_host
+from desktop import autostart, tray_host
 
 
 def free_port() -> int:
@@ -121,3 +121,37 @@ class TrayHostHelperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutostartTests(unittest.TestCase):
+    def test_linux_autostart_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_home = Path(temp_dir) / "config"
+            with mock.patch.object(autostart, "host_os_token", return_value="linux"):
+                with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config_home)}, clear=False):
+                    with mock.patch.object(
+                        autostart,
+                        "current_launch_command",
+                        return_value=["/usr/bin/proxybridge", "--no-open"],
+                    ):
+                        self.assertFalse(autostart.is_autostart_enabled())
+                        result = autostart.set_autostart_enabled(True)
+                        self.assertTrue(result["enabled"])
+                        desktop = Path(result["path"])
+                        self.assertTrue(desktop.is_file())
+                        content = desktop.read_text(encoding="utf-8")
+                        self.assertIn("Exec=/usr/bin/proxybridge --no-open", content)
+                        self.assertTrue(autostart.is_autostart_enabled())
+                        disabled = autostart.set_autostart_enabled(False)
+                        self.assertFalse(disabled["enabled"])
+                        self.assertFalse(desktop.exists())
+
+    def test_single_instance_lock_blocks_second_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = tray_host.acquire_single_instance_lock(root)
+            try:
+                with self.assertRaises(RuntimeError):
+                    tray_host.acquire_single_instance_lock(root)
+            finally:
+                tray_host.release_single_instance_lock(first)

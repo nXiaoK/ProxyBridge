@@ -103,6 +103,7 @@ $pyiArgs += @(
   "--hidden-import", "webdav_sync",
   "--hidden-import", "desktop",
   "--hidden-import", "desktop.tray_host",
+  "--hidden-import", "desktop.autostart",
   "--hidden-import", "pystray",
   "--hidden-import", "pystray._win32",
   "--hidden-import", "PIL",
@@ -145,3 +146,6 @@ Write-Host "Build succeeded:"
 Write-Host "  $exePath"
 Write-Host "  $(Join-Path $releaseDir 'ProxyBridge.exe')"
 Write-Host "Double-click the release exe to start the tray host."
+Write-Host "Optional shortcuts:"
+Write-Host "  .\scripts\create_windows_shortcuts.ps1 -ExePath `"$(Join-Path $releaseDir 'ProxyBridge.exe')`""
+Write-Host "Tray menu also supports 开机自启 / --enable-autostart."
