@@ -37,7 +37,15 @@ from typing import Any
 import webdav_sync
 
 
-APP_ROOT = Path(__file__).resolve().parent
+def _detect_app_root() -> Path:
+    # PyInstaller onefile/onedir exposes bundled files under sys._MEIPASS.
+    meipass = getattr(sys, "_MEIPASS", None)
+    if getattr(sys, "frozen", False) and meipass:
+        return Path(str(meipass))
+    return Path(__file__).resolve().parent
+
+
+APP_ROOT = _detect_app_root()
 VENDOR_ROOT = APP_ROOT / "vendor"
 if VENDOR_ROOT.is_dir() and str(VENDOR_ROOT) not in sys.path:
     sys.path.insert(0, str(VENDOR_ROOT))
@@ -2026,7 +2034,7 @@ def _status_payload() -> dict[str, Any]:
                 "arch": host_arch_token(),
                 "fingerprint_platform": fingerprint_platform_token(),
                 "work_root": str(WORK_ROOT),
-                "shell_mode": "headless",
+                "shell_mode": os.environ.get("PROXY_BRIDGE_SHELL_MODE", "headless"),
             },
             "cores": core_paths(),
             "chrome": chrome_path(),

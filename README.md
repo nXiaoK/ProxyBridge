@@ -155,6 +155,104 @@ http://127.0.0.1:8787
 - 指纹浏览器若上游未提供当前平台安装包，可手动下载后通过 `PROXY_BRIDGE_FP_CHROMIUM` 指向可执行文件。
 - 管理控制台默认仅本机访问；局域网共享开关只影响本地代理端口，不会把控制台暴露到局域网。
 
+## Windows / Linux 托盘常驻壳
+
+在无壳 Web 控制台之上，额外提供系统托盘常驻入口（打开控制台 / 重启后端 / 停止全部代理 / 退出）。
+
+### 安装托盘依赖
+
+```bash
+python3 -m pip install -r desktop/requirements.txt
+```
+
+Windows:
+
+```powershell
+python -m pip install -r desktop/requirements.txt
+```
+
+Linux 还需桌面会话，并通常安装 AppIndicator 相关包，例如：
+
+```bash
+# Debian / Ubuntu 示例
+sudo apt install python3-gi gir1.2-ayatanaappindicator3-0.1
+```
+
+### 启动
+
+```bash
+# Linux / macOS
+scripts/run_tray.sh
+
+# 或
+python3 -m desktop.tray_host --port 18787
+```
+
+```powershell
+# Windows
+.\scripts\run_tray.ps1 -Port 18787
+
+# 或
+python -m desktop.tray_host --port 18787
+```
+
+托盘菜单：
+
+- **打开控制台**：用系统浏览器打开 Web 控制台
+- **重启后端**：重启 `app.py`
+- **停止全部代理**：调用后端停止全部本地代理端口
+- **退出**：停止后端并退出托盘进程
+
+默认数据目录：
+
+| 平台 | 路径 |
+|---|---|
+| Windows | `%APPDATA%\ProxyBridge` |
+| Linux | `$XDG_DATA_HOME/ProxyBridge` 或 `~/.local/share/ProxyBridge` |
+| macOS | `~/Library/Application Support/ProxyBridge` |
+
+说明：
+
+- 托盘壳会拉起与无壳模式相同的 `app.py` 后端，并设置 `PROXY_BRIDGE_PARENT_PID` / `PROXY_BRIDGE_INSTANCE_TOKEN`。
+- 后端日志写入工作目录下的 `tray-backend.log`。
+- macOS 仍推荐使用菜单栏 App；托盘壳主要用于 Linux / Windows，也可作为 macOS 备用入口。
+
+## Windows 双击启动（.exe）
+
+可在 **Windows 机器**上把托盘壳打成单文件 `ProxyBridge.exe`，双击即可启动（无需先装 Python）。
+
+### 在 Windows 上构建
+
+```powershell
+# 需要已安装 Python 3.10+
+.\scripts\build_windows_exe.ps1
+```
+
+构建产物：
+
+```text
+outputs\windows\release\ProxyBridge.exe
+```
+
+把 `ProxyBridge.exe` 复制到任意目录，双击启动：
+
+1. 托盘出现 ProxyBridge 图标
+2. 自动打开 Web 控制台
+3. 数据与日志写入 `%APPDATA%\ProxyBridge`
+
+说明：
+
+- 首次运行可能从 GitHub 下载 `sing-box` / `xray`
+- 未签名时 Windows SmartScreen 可能提示“未知发布者”，选择仍要运行即可
+- 如需静默不自动打开浏览器，可在快捷方式目标后加 `--no-open`
+
+### Linux 单文件二进制（可选）
+
+```bash
+scripts/build_linux_bin.sh
+# 产物: outputs/linux/dist/ProxyBridge
+```
+
 ## 局域网共享
 
 默认情况下，所有代理端口都只监听 `127.0.0.1`，其他局域网设备无法连接。在控制台侧边栏进入 **「通用设置」**，开启 **「允许局域网设备连接本地代理」** 后：

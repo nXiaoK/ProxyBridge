@@ -23,3 +23,8 @@ DerivedData/
 
 # Generated iconset intermediates. The build script regenerates icons.
 macos/ProxyBridgeMenuBar/AppIcon.iconset/
+
+# Packaging artifacts
+outputs/windows/
+outputs/linux/
+desktop/**/__pycache__/
