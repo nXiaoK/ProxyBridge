@@ -56,6 +56,12 @@ PBENC2_MAGIC = b"PBENC2"
 PBENC2_SALT_BYTES = 16
 PBENC2_TAG_BYTES = 32
 PBENC2_KDF_ITERATIONS = 200_000
+URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
+URL_USERINFO_PATTERN = re.compile(r"(https?://)[^/?#\s<>'\"]*@", re.IGNORECASE)
+AUTHORIZATION_IN_TEXT_PATTERN = re.compile(
+    r"\b((?:proxy-)?authorization)\s*:\s*[^\r\n,;；，]+",
+    re.IGNORECASE,
+)
 
 # Chromium profile noise that is large and/or unsafe to copy while hot.
 PROFILE_EXCLUDE_DIR_NAMES = {
@@ -107,6 +113,48 @@ def _default_log(message: str, level: str = "info", category: str = "同步") ->
     print(f"[{level}] [{category}] {message}", flush=True)
 
 
+def _redact_url_userinfo(value: str) -> str:
+    raw = str(value or "")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        match = re.match(r"(https?://)([^/?#]*)(.*)\Z", raw, re.IGNORECASE | re.DOTALL)
+        if match and "@" in match.group(2):
+            raw = f"{match.group(1)}{match.group(2).rsplit('@', 1)[1]}{match.group(3)}"
+        return URL_USERINFO_PATTERN.sub(r"\1", raw)
+    if "@" in parsed.netloc:
+        netloc = parsed.netloc.rsplit("@", 1)[1]
+        raw = urllib.parse.urlunsplit(
+            (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+        )
+    return URL_USERINFO_PATTERN.sub(r"\1", raw)
+
+
+def redact_sensitive_text(value: Any) -> str:
+    text = str(value or "")
+    text = AUTHORIZATION_IN_TEXT_PATTERN.sub(r"\1: ***", text)
+    text = URL_USERINFO_PATTERN.sub(r"\1", text)
+    return URL_IN_TEXT_PATTERN.sub(lambda match: _redact_url_userinfo(match.group(0)), text)
+
+
+def _normalized_webdav_url(value: Any) -> tuple[str, str, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return "", "", ""
+    safe_url = _redact_url_userinfo(raw)
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return safe_url, "", ""
+    if "@" not in parsed.netloc:
+        return safe_url, "", ""
+    username = urllib.parse.unquote(parsed.username or "")
+    password = urllib.parse.unquote(parsed.password or "")
+    if any(ord(char) < 32 for char in username + password):
+        return safe_url, "", ""
+    return safe_url, username, password
+
+
 def new_device_id() -> str:
     return secrets.token_hex(8)
 
@@ -142,9 +190,14 @@ def normalize_webdav_settings(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return base
     base.update({k: raw.get(k, base[k]) for k in base})
-    base["url"] = str(base.get("url") or "").strip()
+    safe_url, embedded_username, embedded_password = _normalized_webdav_url(base.get("url"))
+    base["url"] = safe_url
     base["username"] = str(base.get("username") or "").strip()
     base["password"] = str(base.get("password") or "")
+    if not base["username"] and embedded_username:
+        base["username"] = embedded_username
+    if not base["password"] and embedded_password:
+        base["password"] = embedded_password
     try:
         base["remote_root"] = _normalize_remote_root(base.get("remote_root"))
     except ValueError:
@@ -169,8 +222,8 @@ def normalize_webdav_settings(raw: Any) -> dict[str, Any]:
             except (TypeError, ValueError):
                 base[key] = None
     base["last_applied_state_sha256"] = str(base.get("last_applied_state_sha256") or "").strip().lower()
-    base["last_error"] = str(base.get("last_error") or "")
-    base["last_status"] = str(base.get("last_status") or "")
+    base["last_error"] = redact_sensitive_text(base.get("last_error"))
+    base["last_status"] = redact_sensitive_text(base.get("last_status"))
     return base
 
 
@@ -872,14 +925,31 @@ class WebDAVClient:
         raw = (base_url or "").strip()
         if not raw:
             raise ValueError("WebDAV URL 不能为空")
-        parsed = urllib.parse.urlsplit(raw)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        safe_url, embedded_username, embedded_password = _normalized_webdav_url(raw)
+        try:
+            parsed = urllib.parse.urlsplit(safe_url)
+            parsed_port = parsed.port
+        except ValueError as exc:
+            raise ValueError("WebDAV URL 主机或端口无效") from exc
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.netloc
+            or not parsed.hostname
+            or any(ord(char) < 32 for char in safe_url)
+        ):
             raise ValueError("WebDAV URL 必须是 http(s)://host[/path]")
         # Normalize trailing slash off for join logic; collections use explicit slash.
         path = parsed.path or "/"
-        self.base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
-        self.username = username or ""
-        self.password = password or ""
+        netloc = parsed.hostname
+        if ":" in netloc and not netloc.startswith("["):
+            netloc = f"[{netloc}]"
+        if parsed_port is not None:
+            netloc = f"{netloc}:{parsed_port}"
+        self.base = urllib.parse.urlunsplit(
+            (parsed.scheme.lower(), netloc, path.rstrip("/"), "", "")
+        )
+        self.username = username or embedded_username
+        self.password = password or embedded_password
         self.timeout = timeout
         self.insecure_ssl = bool(insecure_ssl)
         if self.insecure_ssl:
@@ -943,6 +1013,7 @@ class WebDAVClient:
         read_body: bool = True,
     ) -> tuple[int, dict[str, str], bytes]:
         req_headers = dict(headers or {})
+        safe_url = _redact_url_userinfo(url)
         auth = self._auth_header()
         if auth:
             req_headers["Authorization"] = auth
@@ -954,7 +1025,8 @@ class WebDAVClient:
                 body = self._read_limited(response, max_body_bytes) if read_body else b""
                 if allow_statuses is not None and int(status) not in allow_statuses:
                     message = body.decode("utf-8", "ignore")[:300] if body else "unexpected status"
-                    raise RuntimeError(f"WebDAV {method} {url} 失败 ({status}): {message}")
+                    message = redact_sensitive_text(message)
+                    raise RuntimeError(f"WebDAV {method} {safe_url} 失败 ({status}): {message}")
                 return int(status), resp_headers, body
         except urllib.error.HTTPError as exc:
             body = (
@@ -967,9 +1039,10 @@ class WebDAVClient:
                 resp_headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
                 return status, resp_headers, body
             message = body.decode("utf-8", "ignore")[:300] if body else str(exc)
-            raise RuntimeError(f"WebDAV {method} {url} 失败 ({status}): {message}") from exc
+            message = redact_sensitive_text(message)
+            raise RuntimeError(f"WebDAV {method} {safe_url} 失败 ({status}): {message}") from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"WebDAV 连接失败: {exc}") from exc
+            raise RuntimeError(f"WebDAV 连接失败: {redact_sensitive_text(exc)}") from exc
 
     def ensure_collection(self, url: str) -> None:
         collection_url = url if url.endswith("/") else url + "/"
@@ -1145,7 +1218,18 @@ class SyncEngine:
             state = self.load_state()
             cfg = self.get_settings(state)
             if "url" in payload:
-                cfg["url"] = str(payload.get("url") or "").strip()
+                safe_url, embedded_username, embedded_password = _normalized_webdav_url(
+                    payload.get("url")
+                )
+                cfg["url"] = safe_url
+                if "username" not in payload and not cfg.get("username"):
+                    cfg["username"] = embedded_username
+                if (
+                    "password" not in payload
+                    and not payload.get("clear_password")
+                    and not cfg.get("password")
+                ):
+                    cfg["password"] = embedded_password
             if "username" in payload:
                 cfg["username"] = str(payload.get("username") or "").strip()
             if "password" in payload:
@@ -1319,11 +1403,12 @@ class SyncEngine:
         return result
 
     def _record_sync_failure(self, message: str, status: str) -> dict[str, Any]:
+        safe_message = redact_sensitive_text(message)
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
-            cfg["last_error"] = message
-            cfg["last_status"] = status
+            cfg["last_error"] = safe_message
+            cfg["last_status"] = redact_sensitive_text(status)
             state["settings"]["webdav"] = cfg
             self.save_state(state)
             return cfg

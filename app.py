@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import csv
 import collections
 import concurrent.futures
 import errno
@@ -10,6 +11,7 @@ import hashlib
 import hmac
 import http.client
 import ipaddress
+import io
 import json
 import mimetypes
 import os
@@ -117,8 +119,12 @@ REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
 HTTP_PROXY_HEADER_LIMIT = 65536
 PROXY_MAX_CLIENTS = 128
+PROXY_MAX_CLIENTS_LIMIT = 1024
 PROXY_HANDSHAKE_TIMEOUT = 2.0
 PROXY_RELAY_IDLE_TIMEOUT = 300.0
+DEFAULT_LAN_ALLOWED_CIDRS = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+LAN_ALLOWED_CIDR_LIMIT = 32
+LAN_SECRET_MAX_BYTES = 255
 API_JSON_BODY_LIMIT = 1_048_576
 BACKEND_INSTANCE_HEADER = "X-ProxyBridge-Instance"
 BACKEND_INSTANCE_TOKEN_MAX_LENGTH = 128
@@ -131,10 +137,45 @@ CORE_LOG_TAIL_LIMIT = 12000
 CORE_LOG_ENTRY_LIMIT = 30
 CORE_LOG_MAX_BYTES = 8 * 1024 * 1024
 CORE_LOG_BACKUP_COUNT = 3
+LOG_RETENTION_DAYS_MIN = 1
+LOG_RETENTION_DAYS_MAX = 365
+LOG_FILE_MAX_BYTES_MIN = 1 * 1024 * 1024
+LOG_FILE_MAX_BYTES_MAX = 128 * 1024 * 1024
+LOG_DISK_QUOTA_BYTES_MIN = 8 * 1024 * 1024
+LOG_DISK_QUOTA_BYTES_MAX = 2 * 1024 * 1024 * 1024
+LOG_PAGE_SIZE_DEFAULT = 50
+LOG_PAGE_SIZE_MAX = 100
 SUBSCRIPTION_RESPONSE_LIMIT = 8 * 1024 * 1024
 SUBSCRIPTION_REDIRECT_LIMIT = 5
 SUBSCRIPTION_FETCH_TIMEOUT = 120.0
 SUBSCRIPTION_IO_TIMEOUT = 20.0
+SUBSCRIPTION_REFRESH_MINUTES_MIN = 5
+SUBSCRIPTION_REFRESH_MINUTES_MAX = 7 * 24 * 60
+SUBSCRIPTION_BACKOFF_MAX_SECONDS = 24 * 60 * 60
+DEFAULT_SPEED_TEST_TARGETS = (
+    "http://cp.cloudflare.com/generate_204",
+    "http://connectivitycheck.gstatic.com/generate_204",
+    "http://www.msftconnecttest.com/connecttest.txt",
+)
+DIAGNOSTIC_GITHUB_HOST = "api.github.com"
+DIAGNOSTIC_GITHUB_PATH = "/repos/SagerNet/sing-box/releases/latest"
+DIAGNOSTIC_OUTBOUND_IP_HOST = "api.ipify.org"
+DIAGNOSTIC_OUTBOUND_IP_PATH = "/?format=json"
+DIAGNOSTIC_NETWORK_TIMEOUT = 8.0
+DIAGNOSTIC_RESPONSE_LIMIT = 64 * 1024
+DIAGNOSTIC_MAX_CONCURRENT_RUNS = 2
+SPEED_TEST_TARGET_LIMIT = 8
+SPEED_TEST_STALE_MIN_SECONDS = 60
+SPEED_TEST_STALE_MAX_SECONDS = 30 * 24 * 60 * 60
+SPEED_TEST_BATCH_MIN_CONCURRENCY = 3
+SPEED_TEST_BATCH_MAX_CONCURRENCY = 5
+SPEED_TEST_BATCH_NODE_LIMIT = 500
+SPEED_TEST_BATCH_TASK_LIMIT = 20
+POOL_CIRCUIT_FAILURE_THRESHOLD = 3
+POOL_CIRCUIT_BASE_SECONDS = 60
+POOL_CIRCUIT_MAX_SECONDS = 60 * 60
+POOL_HALF_OPEN_PROBE_SECONDS = 30
+POOL_MANUAL_EXCLUDE_MAX_SECONDS = 7 * 24 * 60 * 60
 DOWNLOAD_RETRY_COUNT = 3
 DOWNLOAD_RETRY_BACKOFF = 0.25
 DOWNLOAD_RESPONSE_LIMIT = 2 * 1024 * 1024 * 1024
@@ -158,6 +199,9 @@ TRAFFIC_TABLE: dict[str, dict[str, int]] = {}
 REQUEST_LOG_PENDING_UPDATES: dict[str, dict[str, Any]] = {}
 REQUEST_LOG_TERMINAL_STATUSES = frozenset({"closed", "failed"})
 TEST_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
+SPEED_TEST_TASKS: "collections.OrderedDict[str, dict[str, Any]]" = collections.OrderedDict()
+SPEED_TEST_CANCEL_EVENTS: dict[str, threading.Event] = {}
+ACTIVE_PROXY_CLIENTS: dict[str, dict[str, Any]] = {}
 STATE_LOCK = threading.RLock()
 PROCESS_LOCK = threading.RLock()
 TRAFFIC_LOCK = threading.RLock()
@@ -175,7 +219,15 @@ SHUTDOWN_LOCK = threading.RLock()
 SUBSCRIPTION_LOCK = threading.RLock()
 LOG_ROTATION_LOCK = threading.RLock()
 POOL_RR_LOCK = threading.Lock()
+SPEED_TEST_TASK_LOCK = threading.RLock()
+PROXY_CLIENT_LOCK = threading.RLock()
+SPEED_TEST_TARGET_LOCK = threading.Lock()
+DIAGNOSTIC_RUN_SEMAPHORE = threading.BoundedSemaphore(DIAGNOSTIC_MAX_CONCURRENT_RUNS)
+SUBSCRIPTION_SCHEDULER_LOCK = threading.Lock()
+SUBSCRIPTION_SCHEDULER_WAKE = threading.Event()
+SUBSCRIPTION_SCHEDULER_THREAD: threading.Thread | None = None
 POOL_RR_COUNTER = 0
+SPEED_TEST_TARGET_COUNTER = 0
 CORE_AUTO_INSTALL_STARTED = threading.Event()
 FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
 FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
@@ -188,6 +240,11 @@ PROXY_REBIND_RETRY_TIMEOUT = 1.0
 # 与「连接日志」(per-connection)、「核心日志」(sing-box/xray 输出)是三条独立的日志线。
 SYSTEM_LOGS: "collections.deque[dict[str, Any]]" = collections.deque(maxlen=SYSTEM_LOG_LIMIT)
 SYSTEM_LOG_LOCK = threading.RLock()
+RUNTIME_LOG_SETTINGS_CACHE: dict[str, int] = {
+    "retention_days": 14,
+    "max_file_bytes": CORE_LOG_MAX_BYTES,
+    "disk_quota_bytes": 128 * 1024 * 1024,
+}
 
 
 def _is_loopback_host(value: str) -> bool:
@@ -323,6 +380,11 @@ class Node:
     transport: str = ""
     security: str = ""
     preferred_core: str = "sing-box"
+    fallback_enabled: bool = False
+
+
+class CoreStartError(RuntimeError):
+    pass
 
 
 def now_ts() -> int:
@@ -412,6 +474,248 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return default
+
+
+def clamp_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    return min(max(safe_int(value, default), minimum), maximum)
+
+
+def normalize_speed_test_target(value: Any) -> str:
+    raw = str(value or "").strip()
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("测速目标 URL 格式无效") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("测速目标必须是 http(s) URL")
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise ValueError("测速目标不能包含凭据或 fragment")
+    target_port = port or (443 if parsed.scheme.lower() == "https" else 80)
+    if target_port <= 0 or target_port > 65535:
+        raise ValueError("测速目标端口无效")
+    hostname = parsed.hostname.encode("idna").decode("ascii")
+    display_hostname = f"[{hostname}]" if ":" in hostname else hostname
+    netloc = (
+        display_hostname
+        if target_port == (443 if parsed.scheme.lower() == "https" else 80)
+        else f"{display_hostname}:{target_port}"
+    )
+    path = urllib.parse.quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~")
+    query = urllib.parse.quote(parsed.query, safe="%=&?/:;+,@!$'()*-._~")
+    normalized = urllib.parse.urlunsplit((parsed.scheme.lower(), netloc, path, query, ""))
+    if len(normalized) > 2048:
+        raise ValueError("测速目标 URL 过长")
+    return normalized
+
+
+def normalize_speed_test_settings(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    targets: list[str] = []
+    source_targets = raw.get("targets") if isinstance(raw.get("targets"), list) else DEFAULT_SPEED_TEST_TARGETS
+    for candidate in source_targets[:SPEED_TEST_TARGET_LIMIT]:
+        try:
+            target = normalize_speed_test_target(candidate)
+        except ValueError:
+            continue
+        if target not in targets:
+            targets.append(target)
+    if not targets:
+        targets = list(DEFAULT_SPEED_TEST_TARGETS)
+    rotation = str(raw.get("rotation") or "round_robin")
+    if rotation not in {"round_robin", "random"}:
+        rotation = "round_robin"
+    return {
+        "targets": targets,
+        "rotation": rotation,
+        "stale_after_seconds": clamp_int(
+            raw.get("stale_after_seconds"),
+            6 * 60 * 60,
+            SPEED_TEST_STALE_MIN_SECONDS,
+            SPEED_TEST_STALE_MAX_SECONDS,
+        ),
+        "batch_concurrency": clamp_int(
+            raw.get("batch_concurrency"),
+            SPEED_TEST_BATCH_MIN_CONCURRENCY,
+            SPEED_TEST_BATCH_MIN_CONCURRENCY,
+            SPEED_TEST_BATCH_MAX_CONCURRENCY,
+        ),
+        "retry_failures": clamp_int(raw.get("retry_failures"), 1, 0, 2),
+    }
+
+
+def normalize_log_settings(value: Any) -> dict[str, int]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "retention_days": clamp_int(raw.get("retention_days"), 14, LOG_RETENTION_DAYS_MIN, LOG_RETENTION_DAYS_MAX),
+        "max_file_bytes": clamp_int(
+            raw.get("max_file_bytes"),
+            CORE_LOG_MAX_BYTES,
+            LOG_FILE_MAX_BYTES_MIN,
+            LOG_FILE_MAX_BYTES_MAX,
+        ),
+        "disk_quota_bytes": clamp_int(
+            raw.get("disk_quota_bytes"),
+            128 * 1024 * 1024,
+            LOG_DISK_QUOTA_BYTES_MIN,
+            LOG_DISK_QUOTA_BYTES_MAX,
+        ),
+    }
+
+
+def cache_log_settings(value: Any) -> dict[str, int]:
+    normalized = normalize_log_settings(value)
+    with LOG_ROTATION_LOCK:
+        RUNTIME_LOG_SETTINGS_CACHE.clear()
+        RUNTIME_LOG_SETTINGS_CACHE.update(normalized)
+    return normalized
+
+
+def runtime_log_settings_snapshot() -> dict[str, int]:
+    with LOG_ROTATION_LOCK:
+        return dict(RUNTIME_LOG_SETTINGS_CACHE)
+
+
+def normalize_subscription_schedule(subscription: dict[str, Any]) -> None:
+    interval = safe_int(subscription.get("refresh_interval_minutes"), 0)
+    if interval != 0:
+        interval = min(max(interval, SUBSCRIPTION_REFRESH_MINUTES_MIN), SUBSCRIPTION_REFRESH_MINUTES_MAX)
+    subscription["refresh_interval_minutes"] = interval
+    subscription["refresh_failures"] = max(0, safe_int(subscription.get("refresh_failures"), 0))
+    for field_name in ("last_attempt", "next_refresh_at"):
+        subscription[field_name] = max(0, safe_int(subscription.get(field_name), 0))
+    subscription["etag"] = str(subscription.get("etag") or "")[:512]
+    subscription["last_modified"] = str(subscription.get("last_modified") or "")[:512]
+    subscription["last_error"] = str(subscription.get("last_error") or "")[:1000]
+    changes = subscription.get("last_changes")
+    subscription["last_changes"] = changes if isinstance(changes, dict) else {}
+
+
+def normalize_lan_cidrs(value: Any, *, strict: bool = False) -> list[str]:
+    if not isinstance(value, list):
+        if strict:
+            raise ValueError("IP/CIDR 白名单必须是数组")
+        value = list(DEFAULT_LAN_ALLOWED_CIDRS)
+    if len(value) > LAN_ALLOWED_CIDR_LIMIT:
+        raise ValueError(f"IP/CIDR 白名单最多 {LAN_ALLOWED_CIDR_LIMIT} 项")
+    normalized: list[str] = []
+    for raw in value:
+        try:
+            network = ipaddress.ip_network(str(raw or "").strip(), strict=False)
+        except ValueError as exc:
+            if strict:
+                raise ValueError(f"IP/CIDR 白名单格式无效: {raw}") from exc
+            continue
+        if not isinstance(network, ipaddress.IPv4Network):
+            if strict:
+                raise ValueError("当前代理监听仅支持 IPv4 白名单")
+            continue
+        text = str(network)
+        if text not in normalized:
+            normalized.append(text)
+    if not normalized:
+        if strict:
+            raise ValueError("IP/CIDR 白名单不能为空")
+        return list(DEFAULT_LAN_ALLOWED_CIDRS)
+    return normalized
+
+
+def _validate_lan_secret(value: Any, label: str, *, required: bool = False) -> str:
+    secret = str(value or "")
+    encoded = secret.encode("utf-8")
+    if required and not encoded:
+        raise ValueError(f"{label}不能为空")
+    if len(encoded) > LAN_SECRET_MAX_BYTES or "\x00" in secret:
+        raise ValueError(f"{label}不能超过 {LAN_SECRET_MAX_BYTES} 字节")
+    return secret
+
+
+def normalize_lan_security(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    auth_mode = str(raw.get("auth_mode") or "none").lower()
+    if auth_mode not in {"none", "basic", "token"}:
+        auth_mode = "none"
+    return {
+        "auth_mode": auth_mode,
+        "username": str(raw.get("username") or "")[:128],
+        "password": str(raw.get("password") or ""),
+        "token": str(raw.get("token") or ""),
+        "allowed_cidrs": normalize_lan_cidrs(raw.get("allowed_cidrs")),
+        "max_connections": clamp_int(raw.get("max_connections"), PROXY_MAX_CLIENTS, 1, PROXY_MAX_CLIENTS_LIMIT),
+    }
+
+
+def validate_lan_security(value: Any, current: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("lan_security 必须是对象")
+    previous = normalize_lan_security(current)
+    auth_mode = str(value.get("auth_mode") or "none").lower()
+    if auth_mode not in {"none", "basic", "token"}:
+        raise ValueError("认证方式只能是 none、basic 或 token")
+    username = _validate_lan_secret(value.get("username", previous["username"]), "用户名")
+    password_value = value.get("password")
+    password = (
+        previous["password"]
+        if password_value is None or password_value == ""
+        else _validate_lan_secret(password_value, "密码")
+    )
+    token_value = value.get("token")
+    token = (
+        previous["token"]
+        if token_value is None or token_value == ""
+        else _validate_lan_secret(token_value, "Token")
+    )
+    if auth_mode == "basic":
+        username = _validate_lan_secret(username, "用户名", required=True)
+        password = _validate_lan_secret(password, "密码", required=True)
+        if ":" in username:
+            raise ValueError("用户名不能包含冒号")
+    if auth_mode == "token":
+        token = _validate_lan_secret(token, "Token", required=True)
+        if len(token) < 16:
+            raise ValueError("Token 至少需要 16 个字符")
+    max_connections = safe_int(value.get("max_connections", previous["max_connections"]), -1)
+    if not 1 <= max_connections <= PROXY_MAX_CLIENTS_LIMIT:
+        raise ValueError(f"连接数上限必须在 1..{PROXY_MAX_CLIENTS_LIMIT} 之间")
+    return {
+        "auth_mode": auth_mode,
+        "username": username,
+        "password": password,
+        "token": token,
+        "allowed_cidrs": normalize_lan_cidrs(
+            value.get("allowed_cidrs", previous["allowed_cidrs"]),
+            strict=True,
+        ),
+        "max_connections": max_connections,
+    }
+
+
+def public_lan_security(value: Any) -> dict[str, Any]:
+    settings = normalize_lan_security(value)
+    return {
+        "auth_mode": settings["auth_mode"],
+        "username": settings["username"],
+        "password_configured": bool(settings["password"]),
+        "token_configured": bool(settings["token"]),
+        "socks_username": "token" if settings["auth_mode"] == "token" else settings["username"],
+        "allowed_cidrs": settings["allowed_cidrs"],
+        "max_connections": settings["max_connections"],
+    }
+
+
+def normalize_pool_health(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    latency = safe_int(raw.get("latency_ewma_ms"), 0)
+    return {
+        "consecutive_failures": max(0, safe_int(raw.get("consecutive_failures"), 0)),
+        "last_success_at": max(0, safe_int(raw.get("last_success_at"), 0)),
+        "last_failure_at": max(0, safe_int(raw.get("last_failure_at"), 0)),
+        "latency_ewma_ms": latency if latency > 0 else None,
+        "circuit_open_until": max(0, safe_int(raw.get("circuit_open_until"), 0)),
+        "half_open_probe_until": max(0, safe_int(raw.get("half_open_probe_until"), 0)),
+        "manual_excluded_until": max(0, safe_int(raw.get("manual_excluded_until"), 0)),
+        "last_error": str(raw.get("last_error") or "")[:500],
+    }
 
 
 def stable_id(*parts: str) -> str:
@@ -792,6 +1096,70 @@ def preferred_core(protocol: str, transport: str) -> str:
     if protocol == "vless" and transport in {"xhttp", "splithttp"}:
         return "xray"
     return "sing-box"
+
+
+def compatible_cores(node: dict[str, Any]) -> list[str]:
+    protocol = str(node.get("protocol") or "").lower()
+    transport = guess_transport({}, str(node.get("transport") or ""))
+    security = str(node.get("security") or "").lower()
+    settings = node.get("settings") if isinstance(node.get("settings"), dict) else {}
+    cores: list[str] = []
+    sing_box_transports = {
+        "vless": {"", "tcp", "ws", "grpc", "http", "h2"},
+        "vmess": {"", "tcp", "ws", "grpc", "http", "h2"},
+        "trojan": {"", "tcp", "ws", "grpc", "http", "h2"},
+        "shadowsocks": {"", "tcp"},
+        "hysteria2": {"", "tcp"},
+        "tuic": {"", "tcp"},
+        "socks": {"", "tcp"},
+        "naive": {"", "tcp"},
+        "anytls": {"", "tcp"},
+    }
+    if transport in sing_box_transports.get(protocol, set()):
+        cores.append("sing-box")
+    xray_transports = {"", "tcp", "ws", "grpc", "http", "h2", "xhttp"}
+    xray_protocols = {"vless", "vmess", "trojan"}
+    if (
+        protocol in xray_protocols
+        and transport in xray_transports
+        and not (security == "reality" and protocol != "vless")
+        and not (transport == "xhttp" and protocol != "vless")
+    ):
+        cores.append("xray")
+    if (
+        protocol == "shadowsocks"
+        and transport in {"", "tcp"}
+        and not str(settings.get("plugin") or "")
+    ):
+        cores.append("xray")
+    return cores
+
+
+def normalize_node_core_settings(node: dict[str, Any]) -> None:
+    options = compatible_cores(node)
+    default_core = preferred_core(
+        str(node.get("protocol") or ""),
+        str(node.get("transport") or ""),
+    )
+    selected = str(node.get("preferred_core") or default_core)
+    if selected not in options:
+        selected = default_core if default_core in options else (options[0] if options else default_core)
+    node["preferred_core"] = selected
+    node["fallback_enabled"] = node.get("fallback_enabled") is True and len(options) > 1
+
+
+def core_attempt_order(node: dict[str, Any], requested_core: str = "auto") -> list[str]:
+    options = compatible_cores(node)
+    selected = str(node.get("preferred_core") or preferred_core(
+        str(node.get("protocol") or ""),
+        str(node.get("transport") or ""),
+    )) if requested_core == "auto" else requested_core
+    if selected not in options:
+        raise ValueError(f"节点配置不兼容 {selected}")
+    order = [selected]
+    if requested_core == "auto" and node.get("fallback_enabled") is True:
+        order.extend(core for core in options if core != selected)
+    return order
 
 
 def build_node(
@@ -1177,7 +1545,12 @@ def empty_state() -> dict[str, Any]:
         "browser_instances": [],
         "tests": {},
         "request_logs": [],
-        "settings": {"allow_lan": False},
+        "settings": {
+            "allow_lan": False,
+            "lan_security": normalize_lan_security({}),
+            "speed_test": normalize_speed_test_settings({}),
+            "logs": normalize_log_settings({}),
+        },
     }
 
 
@@ -1208,7 +1581,25 @@ def _normalize_loaded_state(state: Any, *, reset_running: bool = False) -> dict[
     state["settings"] = settings if isinstance(settings, dict) else {}
     # 局域网共享是设备本地安全设置：只接受持久化的 JSON 布尔值，旧状态默认关闭。
     state["settings"]["allow_lan"] = state["settings"].get("allow_lan") is True
+    state["settings"]["lan_security"] = normalize_lan_security(state["settings"].get("lan_security"))
+    state["settings"]["speed_test"] = normalize_speed_test_settings(state["settings"].get("speed_test"))
+    state["settings"]["logs"] = cache_log_settings(state["settings"].get("logs"))
+    for node in state["nodes"]:
+        normalize_node_core_settings(node)
+    for subscription in state["subscriptions"]:
+        normalize_subscription_schedule(subscription)
+    for result in state["tests"].values():
+        if not isinstance(result, dict):
+            continue
+        result["attempt_count"] = max(1, safe_int(result.get("attempt_count"), 1))
+        default_successes = 1 if result.get("ok") else 0
+        result["success_count"] = min(
+            result["attempt_count"],
+            max(0, safe_int(result.get("success_count"), default_successes)),
+        )
+        result["success_rate"] = round(result["success_count"] / result["attempt_count"], 4)
     for bridge in state["bridges"]:
+        bridge["pool_health"] = normalize_pool_health(bridge.get("pool_health"))
         if "enabled" not in bridge:
             bridge["enabled"] = bridge.get("status") in ACTIVE_BRIDGE_STATUSES
         else:
@@ -1441,8 +1832,124 @@ def clear_request_logs() -> dict[str, Any]:
     return {"ok": True}
 
 
+def _log_query_entries(kind: str) -> list[dict[str, Any]]:
+    if kind == "request":
+        with STATE_LOCK:
+            return [dict(item) for item in load_state(reset_running=False).get("request_logs", [])]
+    if kind == "system":
+        return [dict(item) for item in system_log_entries()]
+    raise ValueError("日志类型只能是 request 或 system")
+
+
+def _log_entry_matches(entry: dict[str, Any], kind: str, params: dict[str, list[str]]) -> bool:
+    search = first(params, "search", default="").strip().lower()[:256]
+    if kind == "request":
+        node = first(params, "node", default="all").strip()
+        status = first(params, "status", default="all").strip().lower()
+        if status not in {"all", "connecting", "connected", "closed", "failed"}:
+            raise ValueError("连接状态筛选值无效")
+        if node and node != "all" and node not in {
+            str(entry.get("node_id") or ""),
+            str(entry.get("node_name") or ""),
+        }:
+            return False
+        if status != "all" and str(entry.get("status") or "") != status:
+            return False
+        target = entry.get("target") or f"{entry.get('target_host') or ''}:{entry.get('target_port') or ''}"
+        values = (
+            target,
+            entry.get("target_host"),
+            entry.get("target_port"),
+            entry.get("node_name"),
+            entry.get("client"),
+            entry.get("status"),
+            entry.get("message"),
+            entry.get("command"),
+            entry.get("proxy_protocol"),
+        )
+    else:
+        level = first(params, "level", default="all").strip().lower()
+        if level not in {"all", "info", "warn", "error"}:
+            raise ValueError("系统日志级别筛选值无效")
+        if level != "all" and str(entry.get("level") or "") != level:
+            return False
+        values = (entry.get("message"), entry.get("category"), entry.get("level"))
+    return not search or any(search in str(value or "").lower() for value in values)
+
+
+def query_logs(params: dict[str, list[str]]) -> dict[str, Any]:
+    kind = first(params, "kind", default="request").strip().lower()
+    page = safe_int(first(params, "page", default="1"), -1)
+    limit = safe_int(first(params, "limit", default=str(LOG_PAGE_SIZE_DEFAULT)), -1)
+    if page < 1:
+        raise ValueError("page 必须大于等于 1")
+    if not 1 <= limit <= LOG_PAGE_SIZE_MAX:
+        raise ValueError(f"limit 必须在 1..{LOG_PAGE_SIZE_MAX} 之间")
+    entries = _log_query_entries(kind)
+    filtered = [entry for entry in entries if _log_entry_matches(entry, kind, params)]
+    filtered_total = len(filtered)
+    page_count = max(1, (filtered_total + limit - 1) // limit)
+    page = min(page, page_count)
+    start = (page - 1) * limit
+    return {
+        "kind": kind,
+        "items": filtered[start : start + limit],
+        "total": len(entries),
+        "filtered_total": filtered_total,
+        "page": page,
+        "limit": limit,
+        "page_count": page_count,
+    }
+
+
+def _csv_safe_cell(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    return f"'{value}" if value.startswith(("=", "+", "-", "@")) else value
+
+
+def export_logs(params: dict[str, list[str]]) -> tuple[bytes, str, str]:
+    kind = first(params, "kind", default="request").strip().lower()
+    export_format = first(params, "format", default="json").strip().lower()
+    entries = [
+        entry
+        for entry in _log_query_entries(kind)
+        if _log_entry_matches(entry, kind, params)
+    ]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    if export_format == "json":
+        data = json.dumps(
+            {"kind": kind, "count": len(entries), "exported_at": now_ts(), "logs": entries},
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+        return data, "application/json; charset=utf-8", f"proxybridge-{kind}-logs-{stamp}.json"
+    if export_format != "csv":
+        raise ValueError("导出格式只能是 csv 或 json")
+    fields = (
+        [
+            "id", "started_at", "status", "node_id", "node_name", "client", "target",
+            "target_host", "target_port", "proxy_protocol", "command", "upload_bytes",
+            "download_bytes", "duration_ms", "message",
+        ]
+        if kind == "request"
+        else ["ts", "level", "category", "message"]
+    )
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    for entry in entries:
+        writer.writerow({field: _csv_safe_cell(entry.get(field, "")) for field in fields})
+    return (
+        ("\ufeff" + output.getvalue()).encode("utf-8"),
+        "text/csv; charset=utf-8",
+        f"proxybridge-{kind}-logs-{stamp}.csv",
+    )
+
+
 def public_node(node: dict[str, Any]) -> dict[str, Any]:
     settings = node.get("settings") or {}
+    options = compatible_cores(node)
     return {
         "id": node.get("id"),
         "name": node.get("name"),
@@ -1455,8 +1962,97 @@ def public_node(node: dict[str, Any]) -> dict[str, Any]:
         "transport": node.get("transport"),
         "security": node.get("security"),
         "preferred_core": node.get("preferred_core"),
+        "fallback_enabled": node.get("fallback_enabled") is True,
+        "fallback_core": next((core for core in options if core != node.get("preferred_core")), None),
+        "core_options": options,
         "has_secret": bool(settings.get("password") or settings.get("uuid")),
     }
+
+
+def merge_test_result(previous: Any, current: dict[str, Any]) -> dict[str, Any]:
+    prior = previous if isinstance(previous, dict) else {}
+    attempts = max(0, safe_int(prior.get("attempt_count"), 0)) + 1
+    successes = max(0, safe_int(prior.get("success_count"), 1 if prior.get("ok") else 0))
+    if current.get("ok"):
+        successes += 1
+    merged = dict(current)
+    merged.update(
+        {
+            "attempt_count": attempts,
+            "success_count": min(attempts, successes),
+            "success_rate": round(min(attempts, successes) / attempts, 4),
+        }
+    )
+    return merged
+
+
+def public_test_results(state: dict[str, Any], current_time: int | None = None) -> dict[str, dict[str, Any]]:
+    now = now_ts() if current_time is None else current_time
+    settings = normalize_speed_test_settings((state.get("settings") or {}).get("speed_test"))
+    stale_after = settings["stale_after_seconds"]
+    results: dict[str, dict[str, Any]] = {}
+    for node_id, raw in (state.get("tests") or {}).items():
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        tested_at = max(0, safe_int(item.get("tested_at"), 0))
+        age_seconds = max(0, now - tested_at) if tested_at else None
+        item["age_seconds"] = age_seconds
+        item["stale"] = age_seconds is None or age_seconds >= stale_after
+        results[str(node_id)] = item
+    return results
+
+
+def speed_test_settings_payload(state: dict[str, Any] | None = None) -> dict[str, Any]:
+    if state is None:
+        with STATE_LOCK:
+            state = load_state()
+    return normalize_speed_test_settings((state.get("settings") or {}).get("speed_test"))
+
+
+def update_speed_test_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload.get("targets"), list):
+        raise ValueError("测速目标必须是 URL 数组")
+    if len(payload["targets"]) > SPEED_TEST_TARGET_LIMIT:
+        raise ValueError(f"测速目标最多 {SPEED_TEST_TARGET_LIMIT} 个")
+    normalized = normalize_speed_test_settings(payload)
+    if len(normalized["targets"]) != len({str(item).strip() for item in payload["targets"] if str(item).strip()}):
+        for item in payload["targets"]:
+            normalize_speed_test_target(item)
+    with STATE_LOCK:
+        state = load_state()
+        state.setdefault("settings", {})["speed_test"] = normalized
+        save_state(state)
+    return normalized
+
+
+def log_settings_payload(state: dict[str, Any] | None = None) -> dict[str, int]:
+    if state is None:
+        with STATE_LOCK:
+            state = load_state()
+    return normalize_log_settings((state.get("settings") or {}).get("logs"))
+
+
+def update_log_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("日志设置必须是对象")
+    required = {
+        "retention_days": (LOG_RETENTION_DAYS_MIN, LOG_RETENTION_DAYS_MAX),
+        "max_file_bytes": (LOG_FILE_MAX_BYTES_MIN, LOG_FILE_MAX_BYTES_MAX),
+        "disk_quota_bytes": (LOG_DISK_QUOTA_BYTES_MIN, LOG_DISK_QUOTA_BYTES_MAX),
+    }
+    for field_name, (minimum, maximum) in required.items():
+        value = safe_int(payload.get(field_name), -1)
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{field_name} 必须在 {minimum}..{maximum} 之间")
+    normalized = normalize_log_settings(payload)
+    with STATE_LOCK:
+        state = load_state()
+        state.setdefault("settings", {})["logs"] = normalized
+        save_state(state)
+    cache_log_settings(normalized)
+    cleanup = cleanup_runtime_logs(normalized)
+    return {**normalized, "storage": runtime_log_storage_payload(), "cleanup": cleanup}
 
 
 def _is_executable_file(path: Path) -> bool:
@@ -2243,12 +2839,102 @@ def _usable_lan_ipv4(value: Any) -> str | None:
     return str(address)
 
 
-def proxy_client_allowed(value: Any) -> bool:
+def proxy_client_allowed(value: Any, allowed_cidrs: Any = None) -> bool:
     try:
         address = ipaddress.IPv4Address(str(value or "").strip())
     except ipaddress.AddressValueError:
         return False
-    return address.is_loopback or any(address in network for network in PRIVATE_IPV4_NETWORKS)
+    if address.is_loopback:
+        return True
+    networks = normalize_lan_cidrs(allowed_cidrs)
+    return any(address in ipaddress.IPv4Network(network) for network in networks)
+
+
+def register_active_proxy_client(
+    *,
+    proxy: "Socks5LogProxy",
+    client: socket.socket,
+    address: tuple[str, int],
+    is_lan: bool,
+    max_connections: int,
+) -> str | None:
+    with PROXY_CLIENT_LOCK:
+        if is_lan:
+            active_lan = sum(1 for item in ACTIVE_PROXY_CLIENTS.values() if item.get("is_lan"))
+            if active_lan >= max_connections:
+                return None
+        client_id = stable_id("proxy-client", proxy.bridge_id, address[0], str(address[1]), str(time.time_ns()))
+        ACTIVE_PROXY_CLIENTS[client_id] = {
+            "id": client_id,
+            "bridge_id": proxy.bridge_id,
+            "node_id": proxy.node_id,
+            "node_name": proxy.node_name,
+            "address": str(address[0]),
+            "port": safe_int(address[1], 0),
+            "protocol": "detecting",
+            "connected_at": now_ts(),
+            "is_lan": is_lan,
+            "socket": client,
+        }
+        return client_id
+
+
+def update_active_proxy_client(client_id: str, **updates: Any) -> None:
+    with PROXY_CLIENT_LOCK:
+        client = ACTIVE_PROXY_CLIENTS.get(client_id)
+        if client is not None:
+            client.update(updates)
+
+
+def active_proxy_client_id(client_socket: socket.socket) -> str:
+    with PROXY_CLIENT_LOCK:
+        return next(
+            (
+                client_id
+                for client_id, item in ACTIVE_PROXY_CLIENTS.items()
+                if item.get("socket") is client_socket
+            ),
+            "",
+        )
+
+
+def unregister_active_proxy_client(client_id: str) -> None:
+    with PROXY_CLIENT_LOCK:
+        ACTIVE_PROXY_CLIENTS.pop(client_id, None)
+
+
+def active_proxy_clients_payload() -> dict[str, Any]:
+    with PROXY_CLIENT_LOCK:
+        clients = [
+            {key: value for key, value in item.items() if key != "socket"}
+            for item in ACTIVE_PROXY_CLIENTS.values()
+        ]
+    clients.sort(key=lambda item: (safe_int(item.get("connected_at"), 0), str(item.get("id") or "")))
+    return {
+        "count": len(clients),
+        "lan_count": sum(1 for item in clients if item.get("is_lan")),
+        "clients": clients,
+    }
+
+
+def kick_proxy_client(client_id: str) -> dict[str, Any]:
+    with PROXY_CLIENT_LOCK:
+        item = ACTIVE_PROXY_CLIENTS.pop(str(client_id or ""), None)
+    if item is None:
+        raise ValueError("客户端连接不存在或已断开")
+    client = item.get("socket")
+    if isinstance(client, socket.socket):
+        try:
+            client.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        client.close()
+    else:
+        try:
+            client.close()
+        except (AttributeError, OSError):
+            pass
+    return {"ok": True, "id": str(item.get("id") or client_id)}
 
 
 def _discover_lan_ipv4_addresses() -> list[str]:
@@ -2382,6 +3068,7 @@ def network_settings_payload(
                     "http_urls": [f"http://{address}:{port}" for address in addresses],
                 }
             )
+    security = public_lan_security((state.get("settings") or {}).get("lan_security"))
     return {
         "allow_lan": allow_lan,
         "listen_host": LAN_PROXY_LISTEN_HOST if allow_lan else LOCAL_PROXY_LISTEN_HOST,
@@ -2390,8 +3077,12 @@ def network_settings_payload(
         "console_shared": False,
         "client_scope": "docker_published_ports" if docker_managed else "loopback_and_private_ipv4",
         "configurable": not docker_managed,
+        "range_configurable": not docker_managed,
+        "security_configurable": True,
         "docker_managed": docker_managed,
         "proxy_urls": proxy_urls,
+        "security": security,
+        **active_proxy_clients_payload(),
     }
 
 
@@ -2454,13 +3145,25 @@ def _status_payload() -> dict[str, Any]:
                 or node.get(webdav_sync.LOCAL_BROWSER_NODE_MARKER) is not True
             ],
             "bridges": bridges,
-            "tests": state.get("tests", {}),
+            "tests": public_test_results(state),
+            "speed_test": {
+                "settings": speed_test_settings_payload(state),
+                **speed_test_task_payload(),
+            },
+            "logs": {
+                "settings": log_settings_payload(state),
+                "storage": runtime_log_storage_payload(),
+                "request_total": len(state.get("request_logs", [])),
+                "system_total": len(system_log_entries()),
+            },
             "request_logs": state.get("request_logs", [])[:200],
             "system_logs": system_log_entries()[:300],
             "pool": {
                 "member_count": len(members),
                 "base_url": f"{console_base_url()}/pool/{token}",
                 "links": pool_links(token),
+                "members": public_pool_members(state, members),
+                "strategies": ["random", "round_robin", "health", "latency"],
             },
             "sync": webdav_sync.public_webdav_settings(
                 webdav_sync.normalize_webdav_settings((state.get("settings") or {}).get("webdav")),
@@ -2470,6 +3173,451 @@ def _status_payload() -> dict[str, Any]:
             "network": network,
             "version": "0.1.0",
         }
+
+
+def _diagnostic_payload(
+    status: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if status not in {"ok", "warn", "error", "skipped"}:
+        raise ValueError("诊断状态无效")
+    return {
+        "status": status,
+        "message": str(message)[:500],
+        "details": details or {},
+    }
+
+
+def _run_diagnostic_check(
+    check_id: str,
+    label: str,
+    category: str,
+    check: Any,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        payload = check()
+        if not isinstance(payload, dict):
+            raise RuntimeError("诊断结果格式无效")
+        result = _diagnostic_payload(
+            str(payload.get("status") or "error"),
+            str(payload.get("message") or "检查未返回说明"),
+            details=payload.get("details") if isinstance(payload.get("details"), dict) else {},
+        )
+    except Exception as error:
+        result = _diagnostic_payload(
+            "error",
+            f"{label}检查失败（{type(error).__name__}）",
+        )
+    result.update(
+        {
+            "id": check_id,
+            "label": label,
+            "category": category,
+            "latency_ms": max(0, int(round((time.monotonic() - started) * 1000))),
+        }
+    )
+    return result
+
+
+def _core_version_line(path: str, core: str) -> str:
+    command = [path, "version"]
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=3,
+        check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+    line = next((item.strip() for item in output.splitlines() if item.strip()), "")
+    if completed.returncode != 0 and not line:
+        raise RuntimeError(f"{core} version 返回 {completed.returncode}")
+    return line[:180] or "版本未知"
+
+
+def _diagnose_cores() -> dict[str, Any]:
+    paths = core_paths()
+    details: dict[str, Any] = {}
+    unavailable: list[str] = []
+    unknown_versions: list[str] = []
+    for core in ("sing-box", "xray"):
+        path = paths.get(core)
+        if not path:
+            details[core] = {"installed": False, "version": ""}
+            unavailable.append(core)
+            continue
+        try:
+            version = _core_version_line(path, core)
+        except Exception:
+            version = "版本读取失败"
+            unknown_versions.append(core)
+        details[core] = {
+            "installed": True,
+            "binary": Path(path).name,
+            "version": version,
+        }
+    if unavailable:
+        return _diagnostic_payload(
+            "warn",
+            f"缺少核心：{'、'.join(unavailable)}；对应节点及回退能力不可用",
+            details=details,
+        )
+    if unknown_versions:
+        return _diagnostic_payload(
+            "warn",
+            f"核心已安装，但无法读取版本：{'、'.join(unknown_versions)}",
+            details=details,
+        )
+    return _diagnostic_payload("ok", "sing-box 与 xray 均可执行", details=details)
+
+
+def _diagnose_ports() -> dict[str, Any]:
+    def listening(port: int) -> bool:
+        if not 1 <= port <= 65535:
+            return False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.2)
+            return probe.connect_ex(("127.0.0.1", port)) == 0
+
+    host = str(os.environ.get("PROXY_BRIDGE_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+    console_port = safe_int(os.environ.get("PROXY_BRIDGE_PORT"), DEFAULT_SERVER_PORT)
+    with STATE_LOCK:
+        state = load_state()
+        active = [
+            {
+                "bridge_id": str(bridge.get("id") or ""),
+                "port": safe_int(bridge.get("port"), 0),
+                "status": str(bridge.get("status") or ""),
+            }
+            for bridge in state.get("bridges", [])
+            if bridge.get("status") in ACTIVE_BRIDGE_STATUSES
+        ]
+    ports = [entry["port"] for entry in active]
+    problems: list[str] = []
+    details: dict[str, Any] = {
+        "console_bind": host,
+        "console_port": console_port,
+        "console_listening": listening(console_port),
+        "active_proxy_ports": [
+            {"port": entry["port"], "listening": listening(entry["port"])} for entry in active
+        ],
+        "docker": docker_mode(),
+    }
+    if not 1 <= console_port <= 65535:
+        problems.append("控制台端口无效")
+    if any(not 1 <= port <= 65535 for port in ports):
+        problems.append("存在无效代理端口")
+    if len(ports) != len(set(ports)):
+        problems.append("运行中的代理端口存在重复")
+    if not details["console_listening"]:
+        problems.append("控制台端口未监听")
+    if any(not entry["listening"] for entry in details["active_proxy_ports"]):
+        problems.append("存在未监听的活动代理端口")
+    if docker_mode():
+        start, end = docker_proxy_port_range()
+        details["docker_proxy_port_range"] = [start, end]
+        if any(not start <= port <= end for port in ports):
+            problems.append("代理端口超出 Docker 发布范围")
+    elif host not in {"127.0.0.1", "localhost", "::1"}:
+        problems.append("控制台绑定到非回环地址")
+    if problems:
+        return _diagnostic_payload("warn", "；".join(problems), details=details)
+    mode = "Docker 端口发布范围一致" if docker_mode() else "控制台仅绑定本机"
+    return _diagnostic_payload("ok", f"{mode}，{len(ports)} 个活动代理端口配置有效", details=details)
+
+
+def _diagnose_storage() -> dict[str, Any]:
+    entries = (
+        ("work_root", WORK_ROOT, True, 0o700),
+        ("runtime_root", RUNTIME_ROOT, True, 0o700),
+        ("state", STATE_PATH, False, 0o600),
+    )
+    details: dict[str, Any] = {"work_root": str(WORK_ROOT), "entries": {}}
+    errors: list[str] = []
+    warnings: list[str] = []
+    for label, path, is_directory, expected_mode in entries:
+        exists = path.is_dir() if is_directory else path.is_file()
+        access_path = path if exists else path.parent
+        entry: dict[str, Any] = {
+            "exists": exists,
+            "readable": os.access(access_path, os.R_OK),
+            "writable": os.access(access_path, os.W_OK),
+        }
+        if exists and os.name != "nt":
+            mode = path.stat().st_mode & 0o777
+            entry["mode"] = f"{mode:03o}"
+            if mode & 0o077:
+                warnings.append(f"{label} 权限宽于 {expected_mode:03o}")
+        if not entry["readable"] or not entry["writable"]:
+            errors.append(f"{label} 不可读写")
+        details["entries"][label] = entry
+    usage_root = WORK_ROOT if WORK_ROOT.exists() else WORK_ROOT.parent
+    disk = shutil.disk_usage(usage_root)
+    details["disk"] = {
+        "free_bytes": disk.free,
+        "total_bytes": disk.total,
+        "free_percent": round((disk.free / disk.total) * 100, 1) if disk.total else 0,
+    }
+    if disk.free < 256 * 1024 * 1024 or (disk.total and disk.free / disk.total < 0.05):
+        warnings.append("数据盘剩余空间偏低")
+    if errors:
+        return _diagnostic_payload("error", "；".join(errors), details=details)
+    if warnings:
+        return _diagnostic_payload("warn", "；".join(warnings), details=details)
+    return _diagnostic_payload("ok", "数据目录可读写，权限与磁盘空间正常", details=details)
+
+
+def _diagnose_github() -> dict[str, Any]:
+    started = time.monotonic()
+    connection = http.client.HTTPSConnection(
+        DIAGNOSTIC_GITHUB_HOST,
+        timeout=DIAGNOSTIC_NETWORK_TIMEOUT,
+        context=ssl.create_default_context(),
+    )
+    try:
+        connection.request(
+            "HEAD",
+            DIAGNOSTIC_GITHUB_PATH,
+            headers={"User-Agent": "ProxyBridge/0.2", "Accept": "application/vnd.github+json"},
+        )
+        response = connection.getresponse()
+        status_code = int(response.status)
+        response.read(0)
+        details = {
+            "host": DIAGNOSTIC_GITHUB_HOST,
+            "status_code": status_code,
+            "rate_limit_remaining": response.getheader("X-RateLimit-Remaining") or "",
+        }
+    finally:
+        connection.close()
+    latency_ms = int(round((time.monotonic() - started) * 1000))
+    details["request_latency_ms"] = latency_ms
+    if 200 <= status_code < 400:
+        return _diagnostic_payload("ok", f"GitHub API 可达（{latency_ms} ms）", details=details)
+    if status_code in {403, 429}:
+        return _diagnostic_payload("warn", f"GitHub API 可达，但受到限流（HTTP {status_code}）", details=details)
+    return _diagnostic_payload("error", f"GitHub API 返回 HTTP {status_code}", details=details)
+
+
+def _diagnose_webdav() -> dict[str, Any]:
+    with STATE_LOCK:
+        state = load_state()
+        cfg = webdav_sync.normalize_webdav_settings((state.get("settings") or {}).get("webdav"))
+    if not cfg.get("enabled") or not cfg.get("url"):
+        return _diagnostic_payload("skipped", "WebDAV 未启用")
+    parsed = urllib.parse.urlsplit(str(cfg["url"]))
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return _diagnostic_payload(
+            "warn",
+            "WebDAV 未使用无凭据 HTTPS URL；为保护账号，诊断未发起连接",
+        )
+    if cfg.get("insecure_ssl"):
+        return _diagnostic_payload(
+            "warn",
+            "WebDAV 已关闭 TLS 证书校验；为保护账号，诊断未发起连接",
+            details={"host": str(parsed.hostname or "")[:253], "tls_verification": False},
+        )
+    client = webdav_sync.WebDAVClient(
+        str(cfg["url"]),
+        str(cfg.get("username") or ""),
+        str(cfg.get("password") or ""),
+        timeout=DIAGNOSTIC_NETWORK_TIMEOUT,
+        insecure_ssl=False,
+    )
+    result = client.test_connection()
+    details = {
+        "host": str(parsed.hostname or "")[:253],
+        "status_code": safe_int(result.get("status"), 0),
+        "tls_verification": not bool(cfg.get("insecure_ssl")),
+    }
+    return _diagnostic_payload("ok", "WebDAV 认证与远端 collection 正常", details=details)
+
+
+def _selected_diagnostic_bridge(bridge_id: str) -> dict[str, Any] | None:
+    with STATE_LOCK:
+        state = load_state()
+        candidates = [
+            dict(bridge)
+            for bridge in state.get("bridges", [])
+            if bridge.get("status") in ACTIVE_BRIDGE_STATUSES and safe_int(bridge.get("port"), 0) > 0
+        ]
+    if bridge_id:
+        return next((bridge for bridge in candidates if str(bridge.get("id") or "") == bridge_id), None)
+    return candidates[0] if candidates else None
+
+
+def _diagnostic_proxy_ip_lookup(bridge: dict[str, Any]) -> dict[str, Any]:
+    local_port = safe_int(bridge.get("port"), 0)
+    sock = socket.create_connection(("127.0.0.1", local_port), timeout=DIAGNOSTIC_NETWORK_TIMEOUT)
+    transport: socket.socket = sock
+    try:
+        sock.settimeout(DIAGNOSTIC_NETWORK_TIMEOUT)
+        sock.sendall(b"\x05\x01\x00")
+        if read_exact(sock, 2) != b"\x05\x00":
+            raise RuntimeError("本地 SOCKS5 握手失败")
+        host_bytes = DIAGNOSTIC_OUTBOUND_IP_HOST.encode("ascii")
+        request = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + (443).to_bytes(2, "big")
+        sock.sendall(request)
+        reply = read_exact(sock, 4)
+        if reply[0] != 5 or reply[1] != 0:
+            raise RuntimeError("代理无法连接固定诊断目标")
+        if reply[3] == 1:
+            read_exact(sock, 4)
+        elif reply[3] == 3:
+            read_exact(sock, read_exact(sock, 1)[0])
+        elif reply[3] == 4:
+            read_exact(sock, 16)
+        else:
+            raise RuntimeError("SOCKS5 返回未知地址类型")
+        read_exact(sock, 2)
+        transport = ssl.create_default_context().wrap_socket(sock, server_hostname=DIAGNOSTIC_OUTBOUND_IP_HOST)
+        transport.settimeout(DIAGNOSTIC_NETWORK_TIMEOUT)
+        transport.sendall(
+            (
+                f"GET {DIAGNOSTIC_OUTBOUND_IP_PATH} HTTP/1.1\r\n"
+                f"Host: {DIAGNOSTIC_OUTBOUND_IP_HOST}\r\n"
+                "Accept: application/json\r\n"
+                "Connection: close\r\n"
+                "User-Agent: ProxyBridge/0.2\r\n\r\n"
+            ).encode("ascii")
+        )
+        response = http.client.HTTPResponse(transport)
+        response.begin()
+        body = response.read(DIAGNOSTIC_RESPONSE_LIMIT + 1)
+        if len(body) > DIAGNOSTIC_RESPONSE_LIMIT:
+            raise RuntimeError("出口诊断响应过大")
+        if response.status != 200:
+            raise RuntimeError("出口诊断目标返回异常")
+        payload = json.loads(body.decode("utf-8"))
+        address = str(payload.get("ip") or "").strip()
+        ipaddress.ip_address(address)
+        return {
+            "ip": address,
+            "bridge_id": str(bridge.get("id") or ""),
+            "node_name": str(bridge.get("node_name") or "")[:120],
+            "core": str(bridge.get("core") or ""),
+            "remote_dns": True,
+        }
+    finally:
+        try:
+            transport.close()
+        finally:
+            if transport is not sock:
+                sock.close()
+
+
+def run_diagnostics(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise ValueError("诊断参数必须是对象")
+    if not DIAGNOSTIC_RUN_SEMAPHORE.acquire(blocking=False):
+        raise RuntimeError("诊断任务繁忙，请稍后重试")
+    try:
+        return _run_diagnostics(payload)
+    finally:
+        DIAGNOSTIC_RUN_SEMAPHORE.release()
+
+
+def _run_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
+    include_network = truthy(payload.get("network"))
+    bridge_id = str(payload.get("bridge_id") or "").strip()
+    if len(bridge_id) > 128:
+        raise ValueError("代理 ID 无效")
+
+    def skipped_network(label: str) -> dict[str, Any]:
+        return _diagnostic_payload("skipped", f"未启用网络诊断，未访问{label}")
+
+    bridge = _selected_diagnostic_bridge(bridge_id) if include_network else None
+    if include_network and bridge_id and bridge is None:
+        raise ValueError("指定的本地代理未运行或不存在")
+    proxy_cache: dict[str, Any] = {}
+    proxy_cache_lock = threading.Lock()
+
+    def proxy_result() -> dict[str, Any] | None:
+        if not include_network:
+            return None
+        if bridge is None:
+            return None
+        with proxy_cache_lock:
+            if "error" in proxy_cache:
+                raise RuntimeError("代理网络诊断失败") from proxy_cache["error"]
+            if "result" not in proxy_cache:
+                try:
+                    proxy_cache["result"] = _diagnostic_proxy_ip_lookup(bridge)
+                except Exception as error:
+                    proxy_cache["error"] = error
+                    raise RuntimeError("代理网络诊断失败") from error
+            return proxy_cache["result"]
+
+    def github_check() -> dict[str, Any]:
+        return _diagnose_github() if include_network else skipped_network("GitHub")
+
+    def webdav_check() -> dict[str, Any]:
+        return _diagnose_webdav() if include_network else skipped_network("WebDAV")
+
+    def outbound_check() -> dict[str, Any]:
+        if not include_network:
+            return skipped_network("出口 IP 服务")
+        result = proxy_result()
+        if result is None:
+            return _diagnostic_payload("skipped", "没有可用于出口检测的运行中代理")
+        return _diagnostic_payload(
+            "ok",
+            f"代理出口 IP：{result['ip']}",
+            details=result,
+        )
+
+    def dns_check() -> dict[str, Any]:
+        if not include_network:
+            return skipped_network("DNS 解析目标")
+        result = proxy_result()
+        if result is None:
+            return _diagnostic_payload("skipped", "没有可用于 DNS 路径检测的运行中代理")
+        return _diagnostic_payload(
+            "warn",
+            "代理请求使用 SOCKS5 域名转发；本检查无法观察系统或浏览器的其他 DNS 请求",
+            details={
+                "bridge_id": result["bridge_id"],
+                "core": result["core"],
+                "scope": "仅覆盖 ProxyBridge 代理请求，不覆盖系统其他应用",
+            },
+        )
+
+    checks = (
+        ("cores", "核心版本", "local", _diagnose_cores),
+        ("ports", "端口映射", "local", _diagnose_ports),
+        ("storage", "数据目录", "local", _diagnose_storage),
+        ("github", "GitHub 连通性", "network", github_check),
+        ("webdav", "WebDAV", "network", webdav_check),
+        ("outbound", "代理真实出口", "network", outbound_check),
+        ("dns", "DNS 泄漏风险", "network", dns_check),
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5, thread_name_prefix="diagnostic") as executor:
+        futures = [
+            executor.submit(_run_diagnostic_check, check_id, label, category, check)
+            for check_id, label, category, check in checks
+        ]
+        results = [future.result() for future in futures]
+    summary = {status: sum(item["status"] == status for item in results) for status in ("ok", "warn", "error", "skipped")}
+    return {
+        "generated_at": now_ts(),
+        "network_requested": include_network,
+        "selected_bridge_id": str(bridge.get("id") or "") if bridge else "",
+        "results": results,
+        "summary": summary,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2562,6 +3710,7 @@ def pool_links(token: str) -> dict[str, str]:
         "proxies_txt": f"{base}/proxies.txt",
         "get_random": f"{base}/get?strategy=random",
         "get_round_robin": f"{base}/get?strategy=round_robin",
+        "get_health": f"{base}/get?strategy=health",
         "get_random_socks5": f"{base}/get?strategy=random&protocol=socks5",
         "get_random_http": f"{base}/get?strategy=random&protocol=http",
     }
@@ -2582,10 +3731,80 @@ def is_pick_ready_member(bridge: dict[str, Any]) -> bool:
     if bridge.get("status") != "running":
         return False
     bridge_id = str(bridge.get("id") or "")
-    return bool(bridge_id and bridge_runtime_is_active(bridge_id))
+    return bool(bridge_id and bridge_runtime_is_active(bridge_id) and pool_member_available(bridge))
 
 
-def public_pool_member(bridge: dict[str, Any]) -> dict[str, Any]:
+def pool_member_availability(bridge: dict[str, Any], current_time: int | None = None) -> dict[str, Any]:
+    current = now_ts() if current_time is None else current_time
+    health = normalize_pool_health(bridge.get("pool_health"))
+    manual_until = health["manual_excluded_until"]
+    circuit_until = health["circuit_open_until"]
+    probe_until = health["half_open_probe_until"]
+    if manual_until > current:
+        state = "excluded"
+        excluded_until = manual_until
+    elif circuit_until > current:
+        state = "open"
+        excluded_until = circuit_until
+    elif circuit_until > 0 and health["consecutive_failures"] >= POOL_CIRCUIT_FAILURE_THRESHOLD:
+        state = "half_open"
+        excluded_until = 0
+    else:
+        state = "closed"
+        excluded_until = 0
+    return {
+        "available": state == "closed" or (state == "half_open" and probe_until <= current),
+        "circuit_state": state,
+        "excluded_until": excluded_until,
+        "manual_excluded_until": manual_until,
+        "probe_in_progress": state == "half_open" and probe_until > current,
+    }
+
+
+def pool_member_available(bridge: dict[str, Any], current_time: int | None = None) -> bool:
+    return bool(pool_member_availability(bridge, current_time)["available"])
+
+
+def pool_health_metrics(
+    bridge: dict[str, Any],
+    test_result: dict[str, Any] | None = None,
+    current_time: int | None = None,
+) -> dict[str, Any]:
+    health = normalize_pool_health(bridge.get("pool_health"))
+    test = test_result if isinstance(test_result, dict) else {}
+    latency = health["latency_ewma_ms"] or safe_int(test.get("latency_ms"), 0) or None
+    success_rate: float | None = None
+    try:
+        if test.get("success_rate") is not None:
+            success_rate = min(1.0, max(0.0, float(test["success_rate"])))
+    except (TypeError, ValueError):
+        success_rate = None
+    score = 80.0 if success_rate is None else 50.0 + success_rate * 50.0
+    if latency is not None:
+        score -= min(30.0, max(0.0, latency / 50.0))
+    score -= min(60.0, health["consecutive_failures"] * 15.0)
+    if test.get("stale"):
+        score -= 10.0
+    availability = pool_member_availability(bridge, current_time)
+    if not availability["available"]:
+        score = 0.0
+    return {
+        "latency_ms": latency,
+        "success_rate": success_rate,
+        "health_score": round(max(0.0, min(100.0, score)), 1),
+        "consecutive_failures": health["consecutive_failures"],
+        "last_success_at": health["last_success_at"],
+        "last_failure_at": health["last_failure_at"],
+        "last_error": health["last_error"],
+        **availability,
+    }
+
+
+def public_pool_member(
+    bridge: dict[str, Any],
+    test_result: dict[str, Any] | None = None,
+    current_time: int | None = None,
+) -> dict[str, Any]:
     port = safe_int(bridge.get("port"), 0)
     socks = bridge.get("socks_url") or (f"socks5://127.0.0.1:{port}" if port else "")
     http = bridge.get("http_url") or (f"http://127.0.0.1:{port}" if port else "")
@@ -2601,7 +3820,20 @@ def public_pool_member(bridge: dict[str, Any]) -> dict[str, Any]:
         "supported_proxy_protocols": bridge.get("supported_proxy_protocols")
         or ["socks5", "http", "https-connect"],
         "status": bridge.get("status"),
+        **pool_health_metrics(bridge, test_result, current_time),
     }
+
+
+def public_pool_members(
+    state: dict[str, Any],
+    members: list[dict[str, Any]],
+    current_time: int | None = None,
+) -> list[dict[str, Any]]:
+    tests = public_test_results(state, current_time)
+    return [
+        public_pool_member(member, tests.get(str(member.get("node_id") or "")), current_time)
+        for member in members
+    ]
 
 
 def pool_members(
@@ -2688,7 +3920,25 @@ def pick_pool_member(members: list[dict[str, Any]], strategy: str) -> dict[str, 
         return random.choice(members)
     if strategy == "round_robin":
         return pick_round_robin(members)
-    raise ValueError("strategy 只能是 random 或 round_robin")
+    if strategy == "health":
+        return min(
+            members,
+            key=lambda member: (
+                -float(member.get("health_score") or 0),
+                safe_int(member.get("latency_ms"), 2**31 - 1),
+                str(member.get("id") or ""),
+            ),
+        )
+    if strategy == "latency":
+        return min(
+            members,
+            key=lambda member: (
+                safe_int(member.get("latency_ms"), 2**31 - 1),
+                -float(member.get("health_score") or 0),
+                str(member.get("id") or ""),
+            ),
+        )
+    raise ValueError("strategy 只能是 random、round_robin、health 或 latency")
 
 
 def pool_snapshot(
@@ -2709,7 +3959,7 @@ def pool_snapshot(
                 save_state(state)
             return {
                 "token": token,
-                "members": [public_pool_member(m) for m in members],
+                "members": public_pool_members(state, members),
                 "updated_at": float(now_ts()),
             }
 
@@ -2723,9 +3973,93 @@ def pool_admin_payload() -> dict[str, Any]:
         "base_url": f"{console_base_url()}/pool/{token}",
         "links": pool_links(token),
         "members": members,
-        "strategies": ["random", "round_robin"],
+        "strategies": ["random", "round_robin", "health", "latency"],
         "formats": ["list.json", "proxies.txt", "get"],
     }
+
+
+def update_pool_health_record(
+    health: Any,
+    *,
+    ok: bool,
+    latency_ms: Any = None,
+    error: Any = "",
+    current_time: int | None = None,
+) -> dict[str, Any]:
+    current = now_ts() if current_time is None else current_time
+    updated = normalize_pool_health(health)
+    updated["half_open_probe_until"] = 0
+    latency = safe_int(latency_ms, 0)
+    if latency > 0:
+        previous_latency = safe_int(updated.get("latency_ewma_ms"), 0)
+        updated["latency_ewma_ms"] = latency if previous_latency <= 0 else round(previous_latency * 0.7 + latency * 0.3)
+    if ok:
+        updated.update(
+            {
+                "consecutive_failures": 0,
+                "last_success_at": current,
+                "circuit_open_until": 0,
+                "last_error": "",
+            }
+        )
+        return updated
+    failures = updated["consecutive_failures"] + 1
+    updated.update(
+        {
+            "consecutive_failures": failures,
+            "last_failure_at": current,
+            "last_error": str(error or "代理请求失败")[:500],
+        }
+    )
+    if failures >= POOL_CIRCUIT_FAILURE_THRESHOLD:
+        exponent = min(10, failures - POOL_CIRCUIT_FAILURE_THRESHOLD)
+        cooldown = min(POOL_CIRCUIT_MAX_SECONDS, POOL_CIRCUIT_BASE_SECONDS * (2**exponent))
+        updated["circuit_open_until"] = current + cooldown
+    return updated
+
+
+def update_pool_member_feedback(payload: dict[str, Any]) -> dict[str, Any]:
+    bridge_id = str(payload.get("bridge_id") or payload.get("id") or "")
+    if not isinstance(payload.get("ok"), bool):
+        raise ValueError("ok 必须是布尔值")
+    latency = safe_int(payload.get("latency_ms"), 0)
+    if latency < 0 or latency > 10 * 60 * 1000:
+        raise ValueError("latency_ms 超出范围")
+    with STATE_LOCK:
+        state = load_state()
+        bridge = next((item for item in state.get("bridges", []) if item.get("id") == bridge_id), None)
+        if bridge is None:
+            raise ValueError("代理池成员不存在")
+        bridge["pool_health"] = update_pool_health_record(
+            bridge.get("pool_health"),
+            ok=payload["ok"],
+            latency_ms=latency or None,
+            error=payload.get("error") or payload.get("message") or "",
+        )
+        save_state(state)
+        tests = public_test_results(state)
+        member = public_pool_member(bridge, tests.get(str(bridge.get("node_id") or "")))
+    return {"ok": True, "member": member}
+
+
+def set_pool_member_exclusion(payload: dict[str, Any]) -> dict[str, Any]:
+    bridge_id = str(payload.get("bridge_id") or payload.get("id") or "")
+    duration = safe_int(payload.get("duration_seconds"), -1)
+    if not 0 <= duration <= POOL_MANUAL_EXCLUDE_MAX_SECONDS:
+        raise ValueError(f"排除时长必须在 0..{POOL_MANUAL_EXCLUDE_MAX_SECONDS} 秒之间")
+    with STATE_LOCK:
+        state = load_state()
+        bridge = next((item for item in state.get("bridges", []) if item.get("id") == bridge_id), None)
+        if bridge is None:
+            raise ValueError("代理池成员不存在")
+        health = normalize_pool_health(bridge.get("pool_health"))
+        health["manual_excluded_until"] = now_ts() + duration if duration else 0
+        health["half_open_probe_until"] = 0
+        bridge["pool_health"] = health
+        save_state(state)
+        tests = public_test_results(state)
+        member = public_pool_member(bridge, tests.get(str(bridge.get("node_id") or "")))
+    return {"ok": True, "member": member}
 
 
 def rotate_pool_token() -> dict[str, Any]:
@@ -2844,6 +4178,7 @@ def _open_subscription_response(
     addresses: list[str],
     *,
     deadline: float,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse, threading.Timer]:
     scheme = parsed.scheme.lower()
     port = parsed.port or (443 if scheme == "https" else 80)
@@ -2870,15 +4205,19 @@ def _open_subscription_response(
                 timeout=timeout,
             )
         try:
+            headers = {
+                "Host": parsed.netloc,
+                "User-Agent": "ProxyBridge/0.1 (+https://localhost)",
+                "Accept": "*/*",
+                "Connection": "close",
+            }
+            for name, value in (request_headers or {}).items():
+                if name.lower() in {"if-none-match", "if-modified-since"} and value:
+                    headers[name] = str(value)[:512]
             connection.request(
                 "GET",
                 target,
-                headers={
-                    "Host": parsed.netloc,
-                    "User-Agent": "ProxyBridge/0.1 (+https://localhost)",
-                    "Accept": "*/*",
-                    "Connection": "close",
-                },
+                headers=headers,
             )
             remaining = deadline - time.monotonic()
             if remaining <= 0 or connection.sock is None:
@@ -2910,14 +4249,29 @@ def _open_subscription_response(
     raise RuntimeError(f"订阅 URL 连接失败: {detail}") from (errors[-1] if errors else None)
 
 
-def fetch_subscription(url: str) -> str:
+def fetch_subscription_response(
+    url: str,
+    *,
+    etag: str = "",
+    last_modified: str = "",
+) -> dict[str, Any]:
     current_url = url
     deadline = time.monotonic() + SUBSCRIPTION_FETCH_TIMEOUT
+    request_headers: dict[str, str] = {}
+    if etag:
+        request_headers["If-None-Match"] = str(etag)[:512]
+    if last_modified:
+        request_headers["If-Modified-Since"] = str(last_modified)[:512]
     for redirect_count in range(SUBSCRIPTION_REDIRECT_LIMIT + 1):
         if time.monotonic() >= deadline:
             raise TimeoutError("订阅下载超时")
         parsed, addresses = _public_subscription_addresses(current_url)
-        connection, response, deadline_timer = _open_subscription_response(parsed, addresses, deadline=deadline)
+        connection, response, deadline_timer = _open_subscription_response(
+            parsed,
+            addresses,
+            deadline=deadline,
+            request_headers=request_headers,
+        )
         try:
             if response.status in {301, 302, 303, 307, 308}:
                 location = response.headers.get("Location")
@@ -2925,8 +4279,34 @@ def fetch_subscription(url: str) -> str:
                     raise ValueError("订阅重定向缺少 Location")
                 if redirect_count >= SUBSCRIPTION_REDIRECT_LIMIT:
                     raise ValueError("订阅重定向次数过多")
-                current_url = urllib.parse.urljoin(current_url, location)
+                redirected_url = urllib.parse.urljoin(current_url, location)
+                redirected = urllib.parse.urlsplit(redirected_url)
+                if parsed.scheme.lower() == "https" and redirected.scheme.lower() != "https":
+                    raise ValueError("HTTPS 订阅不允许降级重定向到 HTTP")
+                current_origin = (
+                    parsed.scheme.lower(),
+                    str(parsed.hostname or "").lower(),
+                    parsed.port or (443 if parsed.scheme.lower() == "https" else 80),
+                )
+                redirected_origin = (
+                    redirected.scheme.lower(),
+                    str(redirected.hostname or "").lower(),
+                    redirected.port or (443 if redirected.scheme.lower() == "https" else 80),
+                )
+                if current_origin != redirected_origin:
+                    request_headers = {}
+                current_url = redirected_url
                 continue
+            response_etag = str(response.headers.get("ETag") or "")[:512]
+            response_last_modified = str(response.headers.get("Last-Modified") or "")[:512]
+            if response.status == 304:
+                return {
+                    "not_modified": True,
+                    "text": None,
+                    "etag": response_etag or str(etag),
+                    "last_modified": response_last_modified or str(last_modified),
+                    "final_url": current_url,
+                }
             if not 200 <= response.status < 300:
                 raise RuntimeError(f"订阅 URL 返回 HTTP {response.status}")
             declared_length = safe_int(response.headers.get("Content-Length"), 0)
@@ -2952,14 +4332,26 @@ def fetch_subscription(url: str) -> str:
             data = b"".join(chunks)
             charset = response.headers.get_content_charset() or "utf-8"
             try:
-                return data.decode(charset, errors="replace")
+                text = data.decode(charset, errors="replace")
             except LookupError:
-                return data.decode("utf-8", errors="replace")
+                text = data.decode("utf-8", errors="replace")
+            return {
+                "not_modified": False,
+                "text": text,
+                "etag": response_etag,
+                "last_modified": response_last_modified,
+                "final_url": current_url,
+            }
         finally:
             deadline_timer.cancel()
             response.close()
             connection.close()
     raise ValueError("订阅重定向次数过多")
+
+
+def fetch_subscription(url: str) -> str:
+    result = fetch_subscription_response(url)
+    return str(result.get("text") or "")
 
 
 def referenced_node_ids(subscriptions: list[dict[str, Any]]) -> set[str]:
@@ -3015,7 +4407,13 @@ def _apply_subscription_replacement(
             record[webdav_sync.LOCAL_BROWSER_NODE_MARKER] = True
         existing[node_id] = record
     for node in node_dicts:
-        existing[node["id"]] = node
+        record = dict(node)
+        previous = existing.get(str(record.get("id") or ""))
+        if isinstance(previous, dict):
+            record["preferred_core"] = previous.get("preferred_core")
+            record["fallback_enabled"] = previous.get("fallback_enabled") is True
+        normalize_node_core_settings(record)
+        existing[record["id"]] = record
     state["nodes"] = list(existing.values())
     return set(remove_ids)
 
@@ -3134,12 +4532,56 @@ def _remove_profiles_for_nodes(node_ids: set[str]) -> int:
     return removed
 
 
+def subscription_node_diff(
+    state: dict[str, Any],
+    previous: dict[str, Any] | None,
+    node_dicts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    old_ids = {str(item) for item in (previous or {}).get("node_ids") or [] if item}
+    old_nodes = {
+        str(node.get("id") or ""): node
+        for node in state.get("nodes", [])
+        if isinstance(node, dict) and str(node.get("id") or "") in old_ids
+    }
+    new_nodes = {str(node.get("id") or ""): node for node in node_dicts if node.get("id")}
+    old_by_name = {str(node.get("name") or ""): node_id for node_id, node in old_nodes.items()}
+    new_by_name = {str(node.get("name") or ""): node_id for node_id, node in new_nodes.items()}
+    changed_names = sorted(
+        name
+        for name in old_by_name.keys() & new_by_name.keys()
+        if old_by_name[name] != new_by_name[name]
+    )
+    changed_old_ids = {old_by_name[name] for name in changed_names}
+    changed_new_ids = {new_by_name[name] for name in changed_names}
+    added_ids = sorted(set(new_nodes) - set(old_nodes) - changed_new_ids)
+    removed_ids = sorted(set(old_nodes) - set(new_nodes) - changed_old_ids)
+    return {
+        "added": len(added_ids),
+        "removed": len(removed_ids),
+        "changed": len(changed_names),
+        "added_names": [str(new_nodes[node_id].get("name") or node_id) for node_id in added_ids][:50],
+        "removed_names": [str(old_nodes[node_id].get("name") or node_id) for node_id in removed_ids][:50],
+        "changed_names": changed_names[:50],
+    }
+
+
+def _subscription_next_refresh(interval_minutes: int, failures: int = 0, *, current_time: int | None = None) -> int:
+    if interval_minutes <= 0:
+        return 0
+    base = interval_minutes * 60
+    delay = min(base * (2 ** max(0, failures - 1)), SUBSCRIPTION_BACKOFF_MAX_SECONDS)
+    return (now_ts() if current_time is None else current_time) + delay
+
+
 def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
     name = clean_name(str(payload.get("name") or ""), "未命名订阅")
     url = str(payload.get("url") or "").strip()
     raw = str(payload.get("raw") or "").strip()
+    fetch_metadata = payload.get("_fetch_metadata") if isinstance(payload.get("_fetch_metadata"), dict) else {}
     if url and not raw:
-        raw = fetch_subscription(url)
+        fetched = fetch_subscription_response(url)
+        raw = str(fetched.get("text") or "")
+        fetch_metadata = fetched
     if not raw:
         raise ValueError("需要订阅 URL 或原始订阅内容")
 
@@ -3151,22 +4593,41 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("无法解析 Clash YAML 订阅:缺少 PyYAML 解析器")
         raise ValueError("订阅中没有可用节点，已保留原有订阅状态")
     raw_digest = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
-    subscription_id = stable_id(name, url, str(time.time_ns()), raw_digest)
     imported_at = now_ts()
     node_dicts = [asdict(node) for node in nodes]
     node_ids = [node.id for node in nodes]
-    subscription = {
-        "id": subscription_id,
-        "name": name,
-        "url": url,
-        "last_update": imported_at,
-        "node_count": len(nodes),
-        "node_ids": node_ids,
-    }
     with SUBSCRIPTION_LOCK:
         with SHUTDOWN_LOCK:
             with STATE_LOCK:
                 state = load_state()
+                previous = next((s for s in state["subscriptions"] if url and s.get("url") == url), None)
+                previous = dict(previous) if isinstance(previous, dict) else None
+                subscription_id = str((previous or {}).get("id") or stable_id(name, url, str(time.time_ns()), raw_digest))
+                interval = safe_int(
+                    payload.get("refresh_interval_minutes"),
+                    safe_int((previous or {}).get("refresh_interval_minutes"), 0),
+                )
+                if interval != 0:
+                    interval = min(max(interval, SUBSCRIPTION_REFRESH_MINUTES_MIN), SUBSCRIPTION_REFRESH_MINUTES_MAX)
+                changes = subscription_node_diff(state, previous, node_dicts)
+                subscription = {
+                    "id": subscription_id,
+                    "name": name,
+                    "url": url,
+                    "last_update": imported_at,
+                    "last_attempt": imported_at,
+                    "node_count": len(nodes),
+                    "node_ids": node_ids,
+                    "refresh_interval_minutes": interval,
+                    "refresh_failures": 0,
+                    "next_refresh_at": _subscription_next_refresh(interval, current_time=imported_at),
+                    "etag": str(fetch_metadata.get("etag") or (previous or {}).get("etag") or "")[:512],
+                    "last_modified": str(
+                        fetch_metadata.get("last_modified") or (previous or {}).get("last_modified") or ""
+                    )[:512],
+                    "last_error": "",
+                    "last_changes": changes,
+                }
                 remove_ids = _subscription_replacement_plan(
                     state,
                     url=url,
@@ -3199,6 +4660,7 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
         "removed_node_ids": sorted(remove_ids),
         "killed_browsers": runtime_cleanup["killed_browsers"],
         "removed_profiles": removed_profiles,
+        "changes": subscription["last_changes"],
     }
 
 
@@ -3206,13 +4668,153 @@ def refresh_subscription(subscription_id: str) -> dict[str, Any]:
     with SUBSCRIPTION_LOCK:
         with STATE_LOCK:
             state = load_state()
-            subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+            subscription = next((dict(s) for s in state["subscriptions"] if s.get("id") == subscription_id), None)
         if not subscription:
             raise ValueError("订阅不存在")
-        url = subscription.get("url")
+        url = str(subscription.get("url") or "")
         if not url:
             raise ValueError("这个订阅没有 URL，无法刷新")
-        return import_subscription({"name": subscription.get("name"), "url": url})
+        attempted_at = now_ts()
+        try:
+            fetched = fetch_subscription_response(
+                url,
+                etag=str(subscription.get("etag") or ""),
+                last_modified=str(subscription.get("last_modified") or ""),
+            )
+            if fetched.get("not_modified"):
+                with STATE_LOCK:
+                    state = load_state()
+                    current = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+                    if current is None:
+                        raise ValueError("订阅不存在")
+                    interval = safe_int(current.get("refresh_interval_minutes"), 0)
+                    current.update(
+                        {
+                            "last_attempt": attempted_at,
+                            "refresh_failures": 0,
+                            "next_refresh_at": _subscription_next_refresh(interval, current_time=attempted_at),
+                            "etag": str(fetched.get("etag") or current.get("etag") or "")[:512],
+                            "last_modified": str(
+                                fetched.get("last_modified") or current.get("last_modified") or ""
+                            )[:512],
+                            "last_error": "",
+                            "last_changes": {"added": 0, "removed": 0, "changed": 0},
+                        }
+                    )
+                    save_state(state)
+                    return {"subscription": dict(current), "nodes": [], "not_modified": True, "changes": current["last_changes"]}
+            return import_subscription(
+                {
+                    "name": subscription.get("name"),
+                    "url": url,
+                    "raw": str(fetched.get("text") or ""),
+                    "refresh_interval_minutes": subscription.get("refresh_interval_minutes"),
+                    "_fetch_metadata": fetched,
+                }
+            )
+        except Exception as exc:
+            with STATE_LOCK:
+                state = load_state()
+                current = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+                if current is not None:
+                    failures = max(0, safe_int(current.get("refresh_failures"), 0)) + 1
+                    interval = safe_int(current.get("refresh_interval_minutes"), 0)
+                    current.update(
+                        {
+                            "last_attempt": attempted_at,
+                            "refresh_failures": failures,
+                            "next_refresh_at": _subscription_next_refresh(interval, failures, current_time=attempted_at),
+                            "last_error": str(exc)[:1000],
+                        }
+                    )
+                    save_state(state)
+            raise
+
+
+def update_subscription_schedule(payload: dict[str, Any]) -> dict[str, Any]:
+    subscription_id = str(payload.get("id") or "")
+    if "refresh_interval_minutes" not in payload:
+        raise ValueError("缺少刷新周期")
+    interval = safe_int(payload.get("refresh_interval_minutes"), -1)
+    if interval != 0 and not SUBSCRIPTION_REFRESH_MINUTES_MIN <= interval <= SUBSCRIPTION_REFRESH_MINUTES_MAX:
+        raise ValueError(
+            f"刷新周期只能为 0（关闭）或 {SUBSCRIPTION_REFRESH_MINUTES_MIN}..{SUBSCRIPTION_REFRESH_MINUTES_MAX} 分钟"
+        )
+    with STATE_LOCK:
+        state = load_state()
+        subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+        if subscription is None:
+            raise ValueError("订阅不存在")
+        subscription["refresh_interval_minutes"] = interval
+        subscription["refresh_failures"] = 0
+        subscription["next_refresh_at"] = _subscription_next_refresh(interval)
+        subscription["last_error"] = ""
+        save_state(state)
+        result = dict(subscription)
+    SUBSCRIPTION_SCHEDULER_WAKE.set()
+    return result
+
+
+def due_subscription_ids(current_time: int | None = None) -> list[str]:
+    current = now_ts() if current_time is None else current_time
+    with STATE_LOCK:
+        state = load_state()
+        return [
+            str(subscription.get("id") or "")
+            for subscription in state.get("subscriptions", [])
+            if subscription.get("url")
+            and safe_int(subscription.get("refresh_interval_minutes"), 0) > 0
+            and 0 < safe_int(subscription.get("next_refresh_at"), 0) <= current
+            and subscription.get("id")
+        ]
+
+
+def run_due_subscription_refreshes() -> int:
+    refreshed = 0
+    for subscription_id in due_subscription_ids():
+        if SHUTTING_DOWN.is_set():
+            break
+        try:
+            result = refresh_subscription(subscription_id)
+            changes = result.get("changes") or {}
+            if result.get("not_modified"):
+                message = "订阅自动刷新：远端未变化"
+            else:
+                message = (
+                    "订阅自动刷新完成："
+                    f"新增 {safe_int(changes.get('added'), 0)}、"
+                    f"删除 {safe_int(changes.get('removed'), 0)}、"
+                    f"变更 {safe_int(changes.get('changed'), 0)}"
+                )
+            log_event(message, category="订阅")
+            refreshed += 1
+        except Exception as exc:
+            log_event(f"订阅自动刷新失败，已保留旧节点：{exc}", level="warn", category="订阅")
+    return refreshed
+
+
+def subscription_scheduler_loop() -> None:
+    while not SHUTTING_DOWN.is_set():
+        try:
+            run_due_subscription_refreshes()
+        except Exception as exc:
+            log_event(f"订阅自动刷新调度异常：{exc}", level="warn", category="订阅")
+        SUBSCRIPTION_SCHEDULER_WAKE.wait(timeout=30.0)
+        SUBSCRIPTION_SCHEDULER_WAKE.clear()
+
+
+def start_subscription_scheduler() -> None:
+    global SUBSCRIPTION_SCHEDULER_THREAD
+    with SUBSCRIPTION_SCHEDULER_LOCK:
+        if SUBSCRIPTION_SCHEDULER_THREAD is not None and SUBSCRIPTION_SCHEDULER_THREAD.is_alive():
+            return
+        thread = threading.Thread(
+            target=subscription_scheduler_loop,
+            name="subscription-refresh-scheduler",
+            daemon=True,
+        )
+        SUBSCRIPTION_SCHEDULER_THREAD = thread
+        thread.start()
 
 
 def _purge_browser_resources_for_nodes(state: dict[str, Any], node_ids: set[str]) -> dict[str, Any]:
@@ -3308,6 +4910,30 @@ def find_node(state: dict[str, Any], node_id: str) -> dict[str, Any]:
     if not node:
         raise ValueError("节点不存在")
     return node
+
+
+def update_node_core_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    node_id = str(payload.get("node_id") or payload.get("id") or "")
+    selected = str(payload.get("preferred_core") or "")
+    if selected not in {"sing-box", "xray"}:
+        raise ValueError("首选核心只能是 sing-box 或 xray")
+    if not isinstance(payload.get("fallback_enabled"), bool):
+        raise ValueError("fallback_enabled 必须是布尔值")
+    with STATE_LOCK:
+        state = load_state()
+        node = find_node(state, node_id)
+        options = compatible_cores(node)
+        if selected not in options:
+            raise ValueError(f"当前节点配置不兼容 {selected}")
+        if payload["fallback_enabled"] and len(options) < 2:
+            raise ValueError("当前节点没有兼容的备用核心")
+        node["preferred_core"] = selected
+        node["fallback_enabled"] = payload["fallback_enabled"]
+        normalize_node_core_settings(node)
+        save_state(state)
+        public = public_node(node)
+    mark_sync_local_change()
+    return {"ok": True, "node": public}
 
 
 def active_bridge_for_node(state: dict[str, Any], node_id: str) -> dict[str, Any] | None:
@@ -3537,18 +5163,16 @@ def sing_box_config(node: dict[str, Any], local_port: int) -> dict[str, Any]:
     }
 
 
-def xray_config(node: dict[str, Any], local_port: int) -> dict[str, Any]:
+def xray_stream_settings(node: dict[str, Any]) -> dict[str, Any]:
     settings = node.get("settings") or {}
-    if node["protocol"] != "vless":
-        raise ValueError("第一版只用 xray 处理 VLESS XHTTP fallback")
-    user: dict[str, Any] = {"id": settings.get("uuid", ""), "encryption": "none"}
-    if settings.get("flow"):
-        user["flow"] = settings["flow"]
-    stream: dict[str, Any] = {"network": "xhttp", "security": node.get("security") or "reality"}
+    transport = guess_transport({}, str(node.get("transport") or "")) or "tcp"
+    security = str(node.get("security") or "").lower()
+    stream: dict[str, Any] = {"network": transport, "security": security or "none"}
     if stream["security"] == "reality":
         reality: dict[str, Any] = {}
-        if settings.get("sni"):
-            reality["serverName"] = settings["sni"]
+        server_name = settings.get("sni") or settings.get("host") or node.get("server")
+        if server_name:
+            reality["serverName"] = server_name
         if settings.get("fingerprint"):
             reality["fingerprint"] = settings["fingerprint"]
         if settings.get("public_key"):
@@ -3563,14 +5187,88 @@ def xray_config(node: dict[str, Any], local_port: int) -> dict[str, Any]:
             "serverName": settings.get("sni") or settings.get("host") or node.get("server"),
             "allowInsecure": truthy(settings.get("allow_insecure")),
         }
-    xhttp: dict[str, Any] = {}
-    if settings.get("path"):
-        xhttp["path"] = settings["path"]
-    if settings.get("host"):
-        xhttp["host"] = settings["host"]
-    if settings.get("mode"):
-        xhttp["mode"] = settings["mode"]
-    stream["xhttpSettings"] = xhttp
+        if settings.get("fingerprint"):
+            stream["tlsSettings"]["fingerprint"] = settings["fingerprint"]
+    if transport == "ws":
+        ws: dict[str, Any] = {"path": settings.get("path") or "/"}
+        if settings.get("host"):
+            ws["headers"] = {"Host": settings["host"]}
+        stream["wsSettings"] = ws
+    elif transport == "grpc":
+        stream["grpcSettings"] = {
+            "serviceName": settings.get("serviceName") or settings.get("service_name") or "",
+        }
+    elif transport in {"http", "h2"}:
+        stream["network"] = "http"
+        http: dict[str, Any] = {"path": settings.get("path") or "/"}
+        if settings.get("host"):
+            http["host"] = [settings["host"]]
+        stream["httpSettings"] = http
+    elif transport == "xhttp":
+        xhttp: dict[str, Any] = {}
+        if settings.get("path"):
+            xhttp["path"] = settings["path"]
+        if settings.get("host"):
+            xhttp["host"] = settings["host"]
+        if settings.get("mode"):
+            xhttp["mode"] = settings["mode"]
+        stream["xhttpSettings"] = xhttp
+    return stream
+
+
+def xray_outbound(node: dict[str, Any]) -> dict[str, Any]:
+    settings = node.get("settings") or {}
+    protocol = str(node.get("protocol") or "")
+    if protocol in {"vless", "vmess"}:
+        user: dict[str, Any] = {"id": settings.get("uuid", "")}
+        if protocol == "vless":
+            user["encryption"] = "none"
+            if settings.get("flow"):
+                user["flow"] = settings["flow"]
+        else:
+            user["alterId"] = safe_int(settings.get("alter_id"), 0)
+            user["security"] = settings.get("security") or "auto"
+        outbound_settings = {
+            "vnext": [
+                {
+                    "address": node["server"],
+                    "port": int(node["port"]),
+                    "users": [user],
+                }
+            ]
+        }
+    elif protocol == "trojan":
+        outbound_settings = {
+            "servers": [
+                {
+                    "address": node["server"],
+                    "port": int(node["port"]),
+                    "password": settings.get("password", ""),
+                }
+            ]
+        }
+    elif protocol == "shadowsocks":
+        outbound_settings = {
+            "servers": [
+                {
+                    "address": node["server"],
+                    "port": int(node["port"]),
+                    "method": settings.get("method", ""),
+                    "password": settings.get("password", ""),
+                }
+            ]
+        }
+    else:
+        raise ValueError(f"暂不支持生成 {protocol} 的 xray 配置")
+    outbound = {"protocol": protocol, "settings": outbound_settings}
+    if protocol in {"vless", "vmess", "trojan"}:
+        outbound["streamSettings"] = xray_stream_settings(node)
+    return outbound
+
+
+def xray_config(node: dict[str, Any], local_port: int) -> dict[str, Any]:
+    if "xray" not in compatible_cores(node):
+        raise ValueError("节点配置不兼容 xray")
     return {
         "log": {"loglevel": "warning"},
         "inbounds": [
@@ -3581,21 +5279,7 @@ def xray_config(node: dict[str, Any], local_port: int) -> dict[str, Any]:
                 "settings": {"auth": "noauth", "udp": True},
             }
         ],
-        "outbounds": [
-            {
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": node["server"],
-                            "port": int(node["port"]),
-                            "users": [user],
-                        }
-                    ]
-                },
-                "streamSettings": stream,
-            }
-        ],
+        "outbounds": [xray_outbound(node)],
     }
 
 
@@ -3699,23 +5383,26 @@ def _prepare_bridge_start(payload: dict[str, Any]) -> dict[str, Any]:
             ]
         if residual_bridge_ids:
             raise RuntimeError("该节点仍有未清理的本地代理资源，无法重复启动")
-        core = node.get("preferred_core") if requested_core == "auto" else requested_core
-        if core not in {"sing-box", "xray"}:
-            raise ValueError("核心只能是 sing-box、xray 或 auto")
+        normalize_node_core_settings(node)
+        core_attempts = core_attempt_order(node, requested_core)
+        core = core_attempts[0]
         preferred_port = requested_port or remembered_port_for_node(state, node_id)
         if docker_mode() and preferred_port is not None:
             start, end = docker_proxy_port_range()
             if not start <= preferred_port <= end:
                 preferred_port = None
         listen_host = proxy_listen_host(state)
+        lan_security = normalize_lan_security((state.get("settings") or {}).get("lan_security"))
     return {
         "node_id": node_id,
         "node": node,
         "requested_core": requested_core,
         "requested_port": requested_port,
         "core": core,
+        "core_attempts": core_attempts,
         "preferred_port": preferred_port,
         "listen_host": listen_host,
+        "lan_security": lan_security,
         "initial_upload": initial_upload,
         "initial_download": initial_download,
     }
@@ -3779,14 +5466,17 @@ def _run_prepared_bridge(plan: dict[str, Any], command: list[str]) -> dict[str, 
     config_path = Path(plan["config_path"])
     log_path = Path(plan["log_path"])
     rotate_runtime_log(log_path)
-    process = subprocess.Popen(
-        command,
-        cwd=str(APP_ROOT),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=0,
-        **_popen_kwargs(),
-    )
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(APP_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+            **_popen_kwargs(),
+        )
+    except OSError as exc:
+        raise CoreStartError(f"{core} 进程启动失败: {exc}") from exc
     log_stream = getattr(process, "stdout", None)
     log_pump = (
         threading.Thread(
@@ -3810,15 +5500,16 @@ def _run_prepared_bridge(plan: dict[str, Any], command: list[str]) -> dict[str, 
         core_started = wait_for_port(core_port, timeout=2.5)
         if process.poll() is not None:
             error = read_tail(log_path)
-            raise RuntimeError(error or f"{core} 启动失败")
+            raise CoreStartError(error or f"{core} 启动失败")
         if not core_started:
-            raise RuntimeError("核心内部端口启动超时")
+            raise CoreStartError("核心内部端口启动超时")
         proxy = Socks5LogProxy(
             bridge_id=bridge_id,
             node_id=node_id,
             node_name=str(node.get("name") or ""),
             listen_port=local_port,
             upstream_port=core_port,
+            security=plan.get("lan_security"),
         )
         proxy.listen_host = listen_host
         proxy.start()
@@ -3847,10 +5538,13 @@ def _run_prepared_bridge(plan: dict[str, Any], command: list[str]) -> dict[str, 
             "enabled": True,
             "pid": process.pid,
             "started_at": now_ts(),
+            "pool_health": normalize_pool_health({}),
             "config_path": str(config_path),
             "log_path": str(log_path),
             **traffic,
         }
+        if plan.get("fallback_from"):
+            bridge["fallback_from"] = str(plan["fallback_from"])
         with STATE_LOCK:
             state = load_state()
             current_node = find_node(state, node_id)
@@ -3883,43 +5577,94 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
                 plan = _prepare_bridge_start(payload)
                 if plan.get("active_bridge"):
                     return dict(plan["active_bridge"])
+            expected_attempts = list(plan["core_attempts"])
+            restart_plan = False
+            failures: list[tuple[str, BaseException]] = []
+            for index, core in enumerate(expected_attempts):
+                attempt_plan = dict(plan)
+                attempt_plan["core"] = core
+                try:
+                    # Core discovery/download can take minutes. It intentionally runs outside
+                    # SHUTDOWN_LOCK; no process is created until the lifecycle barrier is reacquired.
+                    command = _prepare_core_command(attempt_plan)
+                except (FileNotFoundError, OSError, ValueError) as error:
+                    failures.append((core, error))
+                    if index + 1 < len(expected_attempts):
+                        log_event(f"{core} 预检失败，尝试备用核心: {error}", level="warn", category="核心")
+                        continue
+                    if len(failures) > 1:
+                        details = "; ".join(f"{name}: {failure}" for name, failure in failures)
+                        raise RuntimeError(f"所有兼容核心均启动失败: {details}") from error
+                    raise
 
-            # Core discovery/download can take minutes. It intentionally runs outside
-            # SHUTDOWN_LOCK; no process is created until the lifecycle barrier is reacquired.
-            command = _prepare_core_command(plan)
-
-            with SHUTDOWN_LOCK:
-                if SHUTTING_DOWN.is_set():
-                    raise RuntimeError("程序正在退出，不能启动新的本地代理")
-                synchronize_process_state()
-                with STATE_LOCK:
-                    state = load_state()
-                    node = dict(find_node(state, str(plan["node_id"])))
-                    active_bridge = active_bridge_for_node(state, str(plan["node_id"]))
-                    if active_bridge:
-                        _validate_active_bridge_request(
-                            active_bridge,
-                            requested_core=str(plan["requested_core"]),
-                            requested_port=plan.get("requested_port"),
+                with SHUTDOWN_LOCK:
+                    if SHUTTING_DOWN.is_set():
+                        raise RuntimeError("程序正在退出，不能启动新的本地代理")
+                    synchronize_process_state()
+                    with STATE_LOCK:
+                        state = load_state()
+                        node = dict(find_node(state, str(plan["node_id"])))
+                        normalize_node_core_settings(node)
+                        active_bridge = active_bridge_for_node(state, str(plan["node_id"]))
+                        if active_bridge:
+                            _validate_active_bridge_request(
+                                active_bridge,
+                                requested_core=str(plan["requested_core"]),
+                                requested_port=plan.get("requested_port"),
+                            )
+                            return active_bridge
+                        with PROCESS_LOCK:
+                            residual = any(
+                                owner_node_id == plan["node_id"]
+                                for owner_node_id in BRIDGE_NODE_TABLE.values()
+                            )
+                        if residual:
+                            raise RuntimeError("该节点仍有未清理的本地代理资源，无法重复启动")
+                        desired_attempts = core_attempt_order(node, str(plan["requested_core"]))
+                        attempt_plan["lan_security"] = normalize_lan_security(
+                            (state.get("settings") or {}).get("lan_security")
                         )
-                        return active_bridge
-                    with PROCESS_LOCK:
-                        residual = any(
-                            owner_node_id == plan["node_id"]
-                            for owner_node_id in BRIDGE_NODE_TABLE.values()
-                        )
-                    if residual:
-                        raise RuntimeError("该节点仍有未清理的本地代理资源，无法重复启动")
-                    desired_core = (
-                        node.get("preferred_core")
-                        if plan["requested_core"] == "auto"
-                        else plan["requested_core"]
-                    )
-                if desired_core != plan["core"]:
-                    continue
-                plan["node"] = node
-                completed_plan, runtime_command = _complete_bridge_plan(plan, command)
-                return _run_prepared_bridge(completed_plan, runtime_command)
+                    if desired_attempts != expected_attempts:
+                        restart_plan = True
+                        break
+                    attempt_plan["node"] = node
+                    try:
+                        completed_plan, runtime_command = _complete_bridge_plan(attempt_plan, command)
+                    except ValueError as error:
+                        failures.append((core, error))
+                        if index + 1 < len(expected_attempts):
+                            log_event(f"{core} 配置生成失败，尝试备用核心: {error}", level="warn", category="核心")
+                            continue
+                        if len(failures) > 1:
+                            details = "; ".join(f"{name}: {failure}" for name, failure in failures)
+                            raise RuntimeError(f"所有兼容核心均启动失败: {details}") from error
+                        raise
+                    if failures:
+                        completed_plan["fallback_from"] = failures[0][0]
+                    try:
+                        bridge = _run_prepared_bridge(completed_plan, runtime_command)
+                    except CoreStartError as error:
+                        with PROCESS_LOCK:
+                            residual = any(
+                                owner_node_id == plan["node_id"]
+                                for owner_node_id in BRIDGE_NODE_TABLE.values()
+                            )
+                        if residual:
+                            raise RuntimeError(f"{error}；资源清理不完整，已停止备用核心回退") from error
+                        failures.append((core, error))
+                        if index + 1 < len(expected_attempts):
+                            log_event(f"{core} 启动失败，尝试备用核心: {error}", level="warn", category="核心")
+                            continue
+                        if len(failures) > 1:
+                            details = "; ".join(f"{name}: {failure}" for name, failure in failures)
+                            raise RuntimeError(f"所有兼容核心均启动失败: {details}") from error
+                        raise
+                    if failures:
+                        bridge.setdefault("fallback_from", failures[0][0])
+                    return bridge
+            if restart_plan:
+                continue
+            raise RuntimeError("没有可用的核心启动方案")
 
 
 def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4564,6 +6309,107 @@ def runtime_log_backup_path(path: Path, index: int) -> Path:
     return path.with_name(f"{path.name}.{index}")
 
 
+def runtime_log_archive_path(path: Path, day: str) -> Path:
+    return path.with_name(f"{path.name}.{day}")
+
+
+def _runtime_log_files() -> list[Path]:
+    try:
+        return [item for item in RUNTIME_ROOT.iterdir() if item.is_file() and ".log" in item.name]
+    except FileNotFoundError:
+        return []
+
+
+def runtime_log_storage_payload() -> dict[str, Any]:
+    files = _runtime_log_files()
+    total = 0
+    for path in files:
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    settings = runtime_log_settings_snapshot()
+    return {
+        "used_bytes": total,
+        "quota_bytes": settings["disk_quota_bytes"],
+        "file_count": len(files),
+    }
+
+
+def cleanup_runtime_logs(settings: dict[str, Any] | None = None, current_time: float | None = None) -> dict[str, Any]:
+    normalized = normalize_log_settings(settings or runtime_log_settings_snapshot())
+    now = time.time() if current_time is None else current_time
+    cutoff = now - normalized["retention_days"] * 24 * 60 * 60
+    with PROCESS_LOCK:
+        active_names = {f"{bridge_id}.log" for bridge_id in PROCESS_TABLE}
+    deleted = 0
+    freed = 0
+    with LOG_ROTATION_LOCK:
+        files: list[tuple[Path, os.stat_result]] = []
+        for path in _runtime_log_files():
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path.name not in active_names and stat.st_mtime < cutoff:
+                try:
+                    path.unlink()
+                    deleted += 1
+                    freed += stat.st_size
+                except OSError:
+                    files.append((path, stat))
+                else:
+                    continue
+                continue
+            files.append((path, stat))
+        total = sum(stat.st_size for _, stat in files)
+        quota = normalized["disk_quota_bytes"]
+        for path, stat in sorted(files, key=lambda item: (item[1].st_mtime, item[0].name)):
+            if total <= quota:
+                break
+            if path.name in active_names:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                continue
+            total -= stat.st_size
+            deleted += 1
+            freed += stat.st_size
+    return {"deleted_files": deleted, "freed_bytes": freed, "used_bytes": max(0, total)}
+
+
+def rotate_runtime_log_daily(path: Path, current_time: float | None = None) -> bool:
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return False
+    now = time.time() if current_time is None else current_time
+    current_day = time.strftime("%Y-%m-%d", time.localtime(now))
+    file_day = time.strftime("%Y-%m-%d", time.localtime(stat.st_mtime))
+    if not stat.st_size or file_day == current_day:
+        return False
+    with LOG_ROTATION_LOCK:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return False
+        file_day = time.strftime("%Y-%m-%d", time.localtime(stat.st_mtime))
+        if not stat.st_size or file_day == current_day:
+            return False
+        archive = runtime_log_archive_path(path, file_day)
+        suffix = 1
+        while archive.exists():
+            archive = runtime_log_archive_path(path, f"{file_day}.{suffix}")
+            suffix += 1
+        path.replace(archive)
+        try:
+            os.chmod(archive, 0o600)
+        except OSError:
+            pass
+        return True
+
+
 def rotate_runtime_log(
     path: Path,
     *,
@@ -4571,7 +6417,7 @@ def rotate_runtime_log(
     backup_count: int | None = None,
     incoming_bytes: int = 0,
 ) -> bool:
-    max_bytes = CORE_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    max_bytes = runtime_log_settings_snapshot()["max_file_bytes"] if max_bytes is None else max_bytes
     backup_count = CORE_LOG_BACKUP_COUNT if backup_count is None else backup_count
     if max_bytes <= 0 or backup_count <= 0:
         return False
@@ -4622,9 +6468,11 @@ def pump_runtime_log(
     backup_count: int | None = None,
     bridge_id: str | None = None,
 ) -> None:
-    max_bytes = CORE_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    settings = runtime_log_settings_snapshot()
+    max_bytes = settings["max_file_bytes"] if max_bytes is None else max_bytes
     backup_count = CORE_LOG_BACKUP_COUNT if backup_count is None else backup_count
     chunk_size = max(1, min(65536, max_bytes))
+    last_cleanup_at = 0.0
     try:
         while True:
             chunk = stream.read(chunk_size)
@@ -4633,6 +6481,7 @@ def pump_runtime_log(
             if isinstance(chunk, str):
                 chunk = chunk.encode("utf-8", errors="replace")
             with LOG_ROTATION_LOCK:
+                rotate_runtime_log_daily(path)
                 rotate_runtime_log(
                     path,
                     max_bytes=max_bytes,
@@ -4647,6 +6496,10 @@ def pump_runtime_log(
                             pass
                     log_file.write(chunk)
                     log_file.flush()
+            monotonic_now = time.monotonic()
+            if monotonic_now - last_cleanup_at >= 60:
+                cleanup_runtime_logs(settings)
+                last_cleanup_at = monotonic_now
     except Exception as error:
         try:
             log_event(f"核心日志写入已停止: {error}", level="error", category="核心")
@@ -4911,6 +6764,7 @@ class Socks5LogProxy:
         max_clients: int = PROXY_MAX_CLIENTS,
         handshake_timeout: float = PROXY_HANDSHAKE_TIMEOUT,
         relay_idle_timeout: float = PROXY_RELAY_IDLE_TIMEOUT,
+        security: dict[str, Any] | None = None,
     ) -> None:
         if listen_host not in {LOCAL_PROXY_LISTEN_HOST, LAN_PROXY_LISTEN_HOST}:
             raise ValueError("本地代理监听地址无效")
@@ -4924,9 +6778,12 @@ class Socks5LogProxy:
         self.listen_port = listen_port
         self.upstream_port = upstream_port
         self.listen_host = listen_host
-        self.max_clients = int(max_clients)
+        self.capacity_limit = int(max_clients)
+        self.max_clients = self.capacity_limit
         self.handshake_timeout = float(handshake_timeout)
         self.relay_idle_timeout = float(relay_idle_timeout)
+        self.security = normalize_lan_security(security)
+        self.max_clients = min(self.capacity_limit, self.security["max_connections"])
         self._stop = threading.Event()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -4934,6 +6791,81 @@ class Socks5LogProxy:
         self._client_sockets: set[socket.socket] = set()
         self._upstream_sockets: set[socket.socket] = set()
         self._client_threads: set[threading.Thread] = set()
+
+    def security_snapshot(self) -> dict[str, Any]:
+        with self._client_lock:
+            return dict(self.security)
+
+    def update_security(self, security: dict[str, Any], *, disconnect_lan: bool = False) -> int:
+        normalized = normalize_lan_security(security)
+        with self._client_lock:
+            self.security = normalized
+            self.max_clients = min(self.capacity_limit, normalized["max_connections"])
+        if not disconnect_lan:
+            return 0
+        with PROXY_CLIENT_LOCK:
+            client_ids = [
+                client_id
+                for client_id, item in ACTIVE_PROXY_CLIENTS.items()
+                if item.get("bridge_id") == self.bridge_id and item.get("is_lan")
+            ]
+        disconnected = 0
+        for client_id in client_ids:
+            try:
+                kick_proxy_client(client_id)
+                disconnected += 1
+            except ValueError:
+                pass
+        return disconnected
+
+    def _client_is_lan(self, address: tuple[str, int]) -> bool:
+        try:
+            return not ipaddress.IPv4Address(address[0]).is_loopback
+        except ipaddress.AddressValueError:
+            return True
+
+    def _client_requires_auth(self, address: tuple[str, int]) -> bool:
+        return self._client_is_lan(address) and self.security_snapshot()["auth_mode"] != "none"
+
+    def _credentials_match(self, username: str, password: str) -> bool:
+        security = self.security_snapshot()
+        if security["auth_mode"] == "basic":
+            expected_username = security["username"]
+            expected_password = security["password"]
+        elif security["auth_mode"] == "token":
+            expected_username = "token"
+            expected_password = security["token"]
+        else:
+            return True
+        return hmac.compare_digest(username, expected_username) and hmac.compare_digest(password, expected_password)
+
+    def _authenticate_socks5(self, client: socket.socket) -> bool:
+        version = read_exact(client, 1)
+        if version != b"\x01":
+            return False
+        username_length = read_exact(client, 1)[0]
+        username = read_exact(client, username_length).decode("utf-8", errors="replace")
+        password_length = read_exact(client, 1)[0]
+        password = read_exact(client, password_length).decode("utf-8", errors="replace")
+        authenticated = self._credentials_match(username, password)
+        client.sendall(b"\x01\x00" if authenticated else b"\x01\x01")
+        return authenticated
+
+    def _http_authenticated(self, request: dict[str, Any]) -> bool:
+        security = self.security_snapshot()
+        if security["auth_mode"] == "none":
+            return True
+        authorization = str(request.get("header_map", {}).get("proxy-authorization") or "").strip()
+        if security["auth_mode"] == "token" and authorization.lower().startswith("bearer "):
+            return hmac.compare_digest(authorization[7:].strip(), security["token"])
+        if not authorization.lower().startswith("basic "):
+            return False
+        try:
+            decoded = base64.b64decode(authorization[6:].strip(), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return False
+        username, separator, password = decoded.partition(":")
+        return bool(separator and self._credentials_match(username, password))
 
     def start(self) -> None:
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -5069,7 +7001,11 @@ class Socks5LogProxy:
                 continue
             except OSError:
                 break
-            if self.listen_host == LAN_PROXY_LISTEN_HOST and not proxy_client_allowed(address[0]):
+            security = self.security_snapshot()
+            is_lan = self._client_is_lan(address)
+            if self.listen_host == LAN_PROXY_LISTEN_HOST and not proxy_client_allowed(
+                address[0], security["allowed_cidrs"]
+            ):
                 client.close()
                 continue
             with self._client_lock:
@@ -5079,9 +7015,26 @@ class Socks5LogProxy:
                 if len(self._client_threads) >= self.max_clients:
                     client.close()
                     continue
+            client_id = register_active_proxy_client(
+                proxy=self,
+                client=client,
+                address=address,
+                is_lan=is_lan,
+                max_connections=security["max_connections"],
+            )
+            if client_id is None:
+                client.close()
+                continue
+            with self._client_lock:
+                if self._stop.is_set() or len(self._client_threads) >= self.max_clients:
+                    unregister_active_proxy_client(client_id)
+                    client.close()
+                    if self._stop.is_set():
+                        break
+                    continue
                 thread = threading.Thread(
                     target=self._run_client_handler,
-                    args=(client, address),
+                    args=(client, address, client_id),
                     daemon=True,
                 )
                 self._client_sockets.add(client)
@@ -5092,14 +7045,16 @@ class Socks5LogProxy:
                 with self._client_lock:
                     self._client_sockets.discard(client)
                     self._client_threads.discard(thread)
+                unregister_active_proxy_client(client_id)
                 client.close()
                 raise
 
-    def _run_client_handler(self, client: socket.socket, address: tuple[str, int]) -> None:
+    def _run_client_handler(self, client: socket.socket, address: tuple[str, int], client_id: str) -> None:
         thread = threading.current_thread()
         try:
             self._handle_client(client, address)
         finally:
+            unregister_active_proxy_client(client_id)
             with self._client_lock:
                 self._client_sockets.discard(client)
                 self._client_threads.discard(thread)
@@ -5108,9 +7063,12 @@ class Socks5LogProxy:
         try:
             client.settimeout(self.handshake_timeout)
             first = read_exact(client, 1)
+            client_id = active_proxy_client_id(client)
             if first == b"\x05":
+                update_active_proxy_client(client_id, protocol="socks5")
                 self._handle_socks5_client(client, address, first)
             elif first.isalpha():
+                update_active_proxy_client(client_id, protocol="http")
                 self._handle_http_proxy_client(client, address, first)
         except Exception:
             pass
@@ -5131,10 +7089,13 @@ class Socks5LogProxy:
             if header[0] != 5:
                 return
             methods = read_exact(client, header[1])
-            if 0 not in methods:
+            required_method = 2 if self._client_requires_auth(address) else 0
+            if required_method not in methods:
                 client.sendall(b"\x05\xff")
                 return
-            client.sendall(b"\x05\x00")
+            client.sendall(bytes((5, required_method)))
+            if required_method == 2 and not self._authenticate_socks5(client):
+                return
 
             request_head = read_exact(client, 4)
             if request_head[0] != 5:
@@ -5226,6 +7187,10 @@ class Socks5LogProxy:
         try:
             header_bytes, body_prefix = self._read_http_request(client, first)
             request = self._parse_http_request(header_bytes)
+            if self._client_requires_auth(address) and not self._http_authenticated(request):
+                self._send_http_auth_required(client)
+                response_started = True
+                return
             target_host, target_port, forward_head, is_connect = self._http_forward_plan(request)
             target = f"{target_host}:{target_port}"
             command = "connect" if is_connect else str(request["method"]).lower()
@@ -5502,6 +7467,19 @@ class Socks5LogProxy:
         ).encode("ascii")
         client.sendall(head + body)
 
+    def _send_http_auth_required(self, client: socket.socket) -> None:
+        security = self.security_snapshot()
+        scheme = "Bearer" if security["auth_mode"] == "token" else 'Basic realm="ProxyBridge"'
+        body = b"Proxy Authentication Required\n"
+        head = (
+            "HTTP/1.1 407 Proxy Authentication Required\r\n"
+            f"Proxy-Authenticate: {scheme}\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        client.sendall(head + body)
+
     def _record_transfer(self, counters: dict[str, int], key: str, byte_count: int) -> None:
         counters[key] += byte_count
         traffic_key = "upload_bytes" if key == "upload" else "download_bytes"
@@ -5573,72 +7551,150 @@ class Socks5LogProxy:
         return counters
 
 
+def choose_speed_test_target(settings: dict[str, Any] | None = None) -> str:
+    global SPEED_TEST_TARGET_COUNTER
+    if settings is None:
+        with STATE_LOCK:
+            state = load_state()
+            settings = normalize_speed_test_settings((state.get("settings") or {}).get("speed_test"))
+    else:
+        settings = normalize_speed_test_settings(settings)
+    targets = list(settings["targets"])
+    if settings["rotation"] == "random":
+        return random.choice(targets)
+    with SPEED_TEST_TARGET_LOCK:
+        target = targets[SPEED_TEST_TARGET_COUNTER % len(targets)]
+        SPEED_TEST_TARGET_COUNTER += 1
+    return target
+
+
 def socks5_http_probe(
     local_port: int,
-    target_host: str = "cp.cloudflare.com",
-    target_port: int = 80,
-    path: str = "/generate_204",
+    target_url: str | None = None,
     timeout: float = 10.0,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
+    normalized_target = normalize_speed_test_target(target_url or choose_speed_test_target())
+    parsed = urllib.parse.urlsplit(normalized_target)
+    target_host = str(parsed.hostname or "")
+    target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    host_header = parsed.netloc
     started = time.monotonic()
+    probe_done = threading.Event()
+    transport_holder: list[socket.socket | None] = [None]
+
+    def cancel_probe() -> None:
+        if cancel_event is None:
+            return
+        while not probe_done.is_set():
+            if cancel_event.wait(timeout=0.1):
+                transport = transport_holder[0]
+                if transport is not None:
+                    try:
+                        transport.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    transport.close()
+                return
+
     with socket.create_connection(("127.0.0.1", local_port), timeout=timeout) as sock:
-        sock.settimeout(timeout)
-        sock.sendall(b"\x05\x01\x00")
-        greeting = read_exact(sock, 2)
-        if greeting != b"\x05\x00":
-            raise RuntimeError("本地 SOCKS5 握手失败")
+        transport_holder[0] = sock
+        watcher: threading.Thread | None = None
+        if cancel_event is not None:
+            watcher = threading.Thread(target=cancel_probe, name="speed-test-cancel", daemon=True)
+            watcher.start()
+        try:
+            sock.settimeout(timeout)
+            sock.sendall(b"\x05\x01\x00")
+            greeting = read_exact(sock, 2)
+            if greeting != b"\x05\x00":
+                raise RuntimeError("本地 SOCKS5 握手失败")
 
-        host_bytes = target_host.encode("idna")
-        if len(host_bytes) > 255:
-            raise RuntimeError("探测域名过长")
-        request = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + target_port.to_bytes(2, "big")
-        sock.sendall(request)
-        reply = read_exact(sock, 4)
-        if reply[0] != 5 or reply[1] != 0:
-            raise RuntimeError(f"节点无法连接探测目标，SOCKS5 状态码 {reply[1]}")
-        atyp = reply[3]
-        if atyp == 1:
-            read_exact(sock, 4)
-        elif atyp == 3:
-            size = read_exact(sock, 1)[0]
-            read_exact(sock, size)
-        elif atyp == 4:
-            read_exact(sock, 16)
-        else:
-            raise RuntimeError("SOCKS5 返回了未知地址类型")
-        read_exact(sock, 2)
+            host_bytes = target_host.encode("idna")
+            if len(host_bytes) > 255:
+                raise RuntimeError("探测域名过长")
+            request = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + target_port.to_bytes(2, "big")
+            sock.sendall(request)
+            reply = read_exact(sock, 4)
+            if reply[0] != 5 or reply[1] != 0:
+                raise RuntimeError(f"节点无法连接探测目标，SOCKS5 状态码 {reply[1]}")
+            atyp = reply[3]
+            if atyp == 1:
+                read_exact(sock, 4)
+            elif atyp == 3:
+                size = read_exact(sock, 1)[0]
+                read_exact(sock, size)
+            elif atyp == 4:
+                read_exact(sock, 16)
+            else:
+                raise RuntimeError("SOCKS5 返回了未知地址类型")
+            read_exact(sock, 2)
 
-        http_request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {target_host}\r\n"
-            "Connection: close\r\n"
-            "User-Agent: ProxyBridge/0.2\r\n"
-            "\r\n"
-        ).encode("ascii")
-        sock.sendall(http_request)
-        response = b""
-        while b"\r\n\r\n" not in response and len(response) < 4096:
-            chunk = sock.recv(1024)
-            if not chunk:
-                break
-            response += chunk
-        status_line = response.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
-        match = re.match(r"HTTP/\d(?:\.\d)?\s+(\d+)", status_line)
-        if not match:
-            raise RuntimeError("探测目标没有返回有效 HTTP 响应")
-        status_code = int(match.group(1))
-        elapsed_ms = int(round((time.monotonic() - started) * 1000))
-        ok = 200 <= status_code < 400
-        return {
-            "ok": ok,
-            "latency_ms": elapsed_ms,
-            "target": f"{target_host}:{target_port}{path}",
-            "status_code": status_code,
-            "message": "通信正常" if ok else f"HTTP {status_code}",
-        }
+            transport: socket.socket = sock
+            if parsed.scheme == "https":
+                transport = ssl.create_default_context().wrap_socket(sock, server_hostname=target_host)
+                transport_holder[0] = transport
+                transport.settimeout(timeout)
+            http_request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host_header}\r\n"
+                "Connection: close\r\n"
+                "User-Agent: ProxyBridge/0.2\r\n"
+                "\r\n"
+            ).encode("ascii")
+            transport.sendall(http_request)
+            response = b""
+            while b"\r\n\r\n" not in response and len(response) < 4096:
+                chunk = transport.recv(1024)
+                if not chunk:
+                    break
+                response += chunk
+            status_line = response.split(b"\r\n", 1)[0].decode("iso-8859-1", errors="replace")
+            match = re.match(r"HTTP/\d(?:\.\d)?\s+(\d+)", status_line)
+            if not match:
+                raise RuntimeError("探测目标没有返回有效 HTTP 响应")
+            status_code = int(match.group(1))
+            elapsed_ms = int(round((time.monotonic() - started) * 1000))
+            ok = 200 <= status_code < 400
+            return {
+                "ok": ok,
+                "latency_ms": elapsed_ms,
+                "target": normalized_target,
+                "status_code": status_code,
+                "message": "通信正常" if ok else f"HTTP {status_code}",
+            }
+        finally:
+            probe_done.set()
+            if watcher is not None:
+                watcher.join(timeout=0.2)
 
 
-def test_node(payload: dict[str, Any]) -> dict[str, Any]:
+def persist_test_result(result: dict[str, Any]) -> dict[str, Any]:
+    node_id = str(result.get("node_id") or "")
+    with STATE_LOCK:
+        state = load_state()
+        previous = state.setdefault("tests", {}).get(node_id)
+        merged = merge_test_result(previous, result)
+        state["tests"][node_id] = merged
+        for bridge in state.get("bridges", []):
+            if str(bridge.get("node_id") or "") == node_id:
+                bridge["pool_health"] = update_pool_health_record(
+                    bridge.get("pool_health"),
+                    ok=bool(result.get("ok")),
+                    latency_ms=result.get("latency_ms"),
+                    error=result.get("message"),
+                )
+        save_state(state)
+    return merged
+
+
+def test_node(
+    payload: dict[str, Any],
+    *,
+    cancel_event: threading.Event | None = None,
+    persist_result: bool = True,
+) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
     requested_core = str(payload.get("core") or "auto")
     if requested_core not in {"auto", "sing-box", "xray"}:
@@ -5648,6 +7704,8 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
     log_path: Path | None = None
     result: dict[str, Any]
     while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("测速已取消")
         with SHUTDOWN_LOCK:
             if SHUTTING_DOWN.is_set():
                 raise RuntimeError("程序正在退出，不能启动新的节点测试")
@@ -5662,6 +7720,8 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
         placeholder = RUNTIME_ROOT / f".{core}-test-preflight.json"
         prepared_command = core_command(core, placeholder)
 
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("测速已取消")
         with SHUTDOWN_LOCK:
             if SHUTTING_DOWN.is_set():
                 raise RuntimeError("程序正在退出，不能启动新的节点测试")
@@ -5704,11 +7764,29 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
             break
 
     try:
-        if not wait_for_port(local_port, timeout=3.0):
+        port_ready = False
+        port_deadline = time.monotonic() + 3.0
+        while time.monotonic() < port_deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("测速已取消")
+            if wait_for_port(local_port, timeout=min(0.25, port_deadline - time.monotonic())):
+                port_ready = True
+                break
+        if not port_ready:
             if process.poll() is not None:
                 raise RuntimeError(read_tail(log_path) or f"{core} 启动失败")
             raise RuntimeError("本地 SOCKS5 测试端口启动超时")
-        probe = socks5_http_probe(local_port)
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("测速已取消")
+        target_url = str(payload.get("target_url") or "").strip()
+        if cancel_event is None:
+            probe = socks5_http_probe(local_port, target_url) if target_url else socks5_http_probe(local_port)
+        else:
+            probe = (
+                socks5_http_probe(local_port, target_url, cancel_event=cancel_event)
+                if target_url
+                else socks5_http_probe(local_port, cancel_event=cancel_event)
+            )
         result = {
             **probe,
             "node_id": node_id,
@@ -5724,7 +7802,7 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
             "core": core,
             "latency_ms": None,
             "status_code": None,
-            "target": "cp.cloudflare.com:80/generate_204",
+            "target": str(payload.get("target_url") or "") or "",
             "message": str(exc),
             "tested_at": now_ts(),
         }
@@ -5743,11 +7821,178 @@ def test_node(payload: dict[str, Any]) -> dict[str, Any]:
     with SHUTDOWN_LOCK:
         if SHUTTING_DOWN.is_set():
             return result
-        with STATE_LOCK:
-            state = load_state()
-            state.setdefault("tests", {})[node_id] = result
-            save_state(state)
+        if cancel_event is not None and cancel_event.is_set():
+            return {**result, "cancelled": True, "message": "测速已取消"}
+        if persist_result:
+            result = persist_test_result(result)
     return result
+
+
+def speed_test_task_payload(task_id: str | None = None) -> dict[str, Any]:
+    with SPEED_TEST_TASK_LOCK:
+        if task_id:
+            task = SPEED_TEST_TASKS.get(task_id)
+            if task is None:
+                raise ValueError("测速任务不存在")
+            return json.loads(json.dumps(task, ensure_ascii=False))
+        tasks = list(SPEED_TEST_TASKS.values())
+        return {"tasks": json.loads(json.dumps(tasks, ensure_ascii=False))}
+
+
+def _update_speed_test_task(task_id: str, **updates: Any) -> None:
+    with SPEED_TEST_TASK_LOCK:
+        task = SPEED_TEST_TASKS.get(task_id)
+        if task is not None:
+            task.update(updates)
+            task["updated_at"] = now_ts()
+
+
+def _run_speed_test_task(task_id: str, node_ids: list[str], concurrency: int, retries: int) -> None:
+    cancel_event = SPEED_TEST_CANCEL_EVENTS[task_id]
+
+    def run_one(index: int, node_id: str) -> dict[str, Any]:
+        attempts = 0
+        result: dict[str, Any] = {"ok": False, "node_id": node_id, "message": "测速未开始"}
+        while attempts <= retries and not cancel_event.is_set():
+            attempts += 1
+            try:
+                result = test_node(
+                    {"node_id": node_id, "core": "auto"},
+                    cancel_event=cancel_event,
+                    persist_result=False,
+                )
+            except Exception as exc:
+                result = {"ok": False, "node_id": node_id, "message": str(exc), "tested_at": now_ts()}
+            if result.get("ok") or cancel_event.is_set():
+                break
+        if not cancel_event.is_set():
+            result = persist_test_result(result)
+        result = dict(result)
+        result["attempts"] = attempts
+        with SPEED_TEST_TASK_LOCK:
+            task = SPEED_TEST_TASKS.get(task_id)
+            if task is not None:
+                task["items"][index] = result
+                task["completed"] = sum(1 for item in task["items"] if item is not None)
+                task["updated_at"] = now_ts()
+        return result
+
+    _update_speed_test_task(
+        task_id,
+        status="cancelling" if cancel_event.is_set() else "running",
+        started_at=now_ts(),
+    )
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="speed-test") as executor:
+            pending: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
+            next_index = 0
+            while next_index < len(node_ids) or pending:
+                while not cancel_event.is_set() and next_index < len(node_ids) and len(pending) < concurrency:
+                    future = executor.submit(run_one, next_index, node_ids[next_index])
+                    pending[future] = next_index
+                    next_index += 1
+                if not pending:
+                    break
+                done, _ = concurrent.futures.wait(
+                    pending,
+                    timeout=0.2,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    pending.pop(future, None)
+                    try:
+                        future.result()
+                    except Exception:
+                        pass
+            if cancel_event.is_set():
+                with SPEED_TEST_TASK_LOCK:
+                    task = SPEED_TEST_TASKS.get(task_id)
+                    if task is not None:
+                        for index, item in enumerate(task["items"]):
+                            if item is None:
+                                task["items"][index] = {
+                                    "ok": False,
+                                    "node_id": node_ids[index],
+                                    "message": "测速已取消",
+                                    "cancelled": True,
+                                }
+                        task["completed"] = len(node_ids)
+        _update_speed_test_task(
+            task_id,
+            status="cancelled" if cancel_event.is_set() else "completed",
+            finished_at=now_ts(),
+        )
+    finally:
+        with SPEED_TEST_TASK_LOCK:
+            SPEED_TEST_CANCEL_EVENTS.pop(task_id, None)
+
+
+def start_speed_test_task(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_node_ids = payload.get("node_ids")
+    if not isinstance(raw_node_ids, list):
+        raise ValueError("node_ids 必须是数组")
+    node_ids = list(dict.fromkeys(str(item or "") for item in raw_node_ids if str(item or "")))
+    if not node_ids:
+        raise ValueError("没有可测试节点")
+    if len(node_ids) > SPEED_TEST_BATCH_NODE_LIMIT:
+        raise ValueError(f"单次最多测试 {SPEED_TEST_BATCH_NODE_LIMIT} 个节点")
+    with STATE_LOCK:
+        state = load_state()
+        known_ids = {str(node.get("id") or "") for node in state.get("nodes", [])}
+        unknown = [node_id for node_id in node_ids if node_id not in known_ids]
+        settings = speed_test_settings_payload(state)
+    if unknown:
+        raise ValueError(f"节点不存在: {unknown[0]}")
+    concurrency = clamp_int(
+        payload.get("concurrency"),
+        settings["batch_concurrency"],
+        SPEED_TEST_BATCH_MIN_CONCURRENCY,
+        SPEED_TEST_BATCH_MAX_CONCURRENCY,
+    )
+    retries = clamp_int(payload.get("retry_failures"), settings["retry_failures"], 0, 2)
+    task_id = stable_id("speed-test-task", str(time.time_ns()), *node_ids)
+    task = {
+        "id": task_id,
+        "status": "queued",
+        "node_ids": node_ids,
+        "total": len(node_ids),
+        "completed": 0,
+        "concurrency": concurrency,
+        "retry_failures": retries,
+        "items": [None] * len(node_ids),
+        "created_at": now_ts(),
+        "updated_at": now_ts(),
+    }
+    cancel_event = threading.Event()
+    with SPEED_TEST_TASK_LOCK:
+        for existing in SPEED_TEST_TASKS.values():
+            if existing.get("status") in {"queued", "running", "cancelling"}:
+                raise RuntimeError("已有批量测速任务正在运行")
+        SPEED_TEST_TASKS[task_id] = task
+        SPEED_TEST_CANCEL_EVENTS[task_id] = cancel_event
+        while len(SPEED_TEST_TASKS) > SPEED_TEST_BATCH_TASK_LIMIT:
+            SPEED_TEST_TASKS.popitem(last=False)
+    threading.Thread(
+        target=_run_speed_test_task,
+        args=(task_id, node_ids, concurrency, retries),
+        name=f"speed-test-task-{task_id[:8]}",
+        daemon=True,
+    ).start()
+    return speed_test_task_payload(task_id)
+
+
+def cancel_speed_test_task(task_id: str) -> dict[str, Any]:
+    with SPEED_TEST_TASK_LOCK:
+        task = SPEED_TEST_TASKS.get(task_id)
+        if task is None:
+            raise ValueError("测速任务不存在")
+        cancel_event = SPEED_TEST_CANCEL_EVENTS.get(task_id)
+        if cancel_event is not None:
+            cancel_event.set()
+        if task.get("status") in {"queued", "running"}:
+            task["status"] = "cancelling"
+            task["updated_at"] = now_ts()
+    return speed_test_task_payload(task_id)
 
 
 def stop_bridge(bridge_id: str) -> dict[str, Any]:
@@ -5865,14 +8110,61 @@ def rebind_running_log_proxies(listen_host: str) -> list[str]:
     return [bridge_id for bridge_id, _proxy, _old_host in changed]
 
 
+def update_running_log_proxy_security(
+    security: dict[str, Any],
+    *,
+    disconnect_lan: bool,
+) -> dict[str, int]:
+    normalized = normalize_lan_security(security)
+    with PROCESS_LOCK:
+        proxies = list(LOG_PROXY_TABLE.items())
+    changed: list[tuple[str, Socks5LogProxy, dict[str, Any]]] = []
+    disconnected = 0
+    try:
+        for bridge_id, proxy in proxies:
+            snapshot_method = getattr(proxy, "security_snapshot", None)
+            update_method = getattr(proxy, "update_security", None)
+            if not callable(snapshot_method) or not callable(update_method):
+                continue
+            previous = normalize_lan_security(snapshot_method())
+            if previous == normalized:
+                continue
+            disconnected += safe_int(update_method(normalized, disconnect_lan=disconnect_lan), 0)
+            changed.append((bridge_id, proxy, previous))
+    except BaseException as update_error:
+        rollback_failures: list[str] = []
+        for bridge_id, proxy, previous in reversed(changed):
+            try:
+                proxy.update_security(previous, disconnect_lan=True)
+            except BaseException as rollback_error:
+                rollback_failures.append(f"{bridge_id}: {rollback_error}")
+        if rollback_failures:
+            raise RuntimeError(
+                "LAN 安全策略更新失败，且部分代理恢复失败：" + "; ".join(rollback_failures)
+            ) from update_error
+        raise RuntimeError(f"LAN 安全策略更新失败：{update_error}") from update_error
+    return {"updated_count": len(changed), "disconnected_count": disconnected}
+
+
 def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
-    if docker_mode():
-        raise ValueError("Docker 模式下代理访问范围由端口映射管理")
     if "allow_lan" not in payload or not isinstance(payload.get("allow_lan"), bool):
         raise ValueError("allow_lan 必须是布尔值")
     desired = bool(payload["allow_lan"])
+    if docker_mode() and not desired:
+        raise ValueError("Docker 模式下代理监听固定开启，访问范围由端口映射管理")
+    if docker_mode():
+        desired = True
     desired_host = LAN_PROXY_LISTEN_HOST if desired else LOCAL_PROXY_LISTEN_HOST
     lan_addresses = lan_ipv4_addresses()
+
+    with STATE_LOCK:
+        current_state = load_state()
+        current_security = normalize_lan_security((current_state.get("settings") or {}).get("lan_security"))
+    desired_security = (
+        validate_lan_security(payload.get("lan_security"), current_security)
+        if "lan_security" in payload
+        else current_security
+    )
 
     # 与 start_bridge 使用相同锁顺序，避免设置切换与新监听器启动交错。
     with BRIDGE_START_LOCK:
@@ -5882,20 +8174,30 @@ def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
             synchronize_process_state()
             rebound_ids = rebind_running_log_proxies(desired_host)
             try:
+                security_result = update_running_log_proxy_security(
+                    desired_security,
+                    disconnect_lan=desired_security != current_security,
+                )
                 with STATE_LOCK:
                     state = load_state()
                     settings = state.setdefault("settings", {})
                     settings["allow_lan"] = desired
+                    settings["lan_security"] = desired_security
                     for bridge in state.get("bridges", []):
                         bridge["listen_host"] = desired_host
                     save_state(state)
                     network = network_settings_payload(state, lan_addresses=lan_addresses)
             except BaseException as save_error:
                 persisted_allow_lan: bool | None = None
+                persisted_security = normalize_lan_security({})
                 state_read_error: BaseException | None = None
                 try:
                     with STATE_LOCK:
-                        persisted_allow_lan = allow_lan_access(load_state())
+                        persisted_state = load_state()
+                        persisted_allow_lan = allow_lan_access(persisted_state)
+                        persisted_security = normalize_lan_security(
+                            (persisted_state.get("settings") or {}).get("lan_security")
+                        )
                 except BaseException as read_error:
                     state_read_error = read_error
                 # save_state may fail after the atomic replace has already committed.
@@ -5908,6 +8210,7 @@ def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 )
                 try:
                     rebind_running_log_proxies(reconciled_host)
+                    update_running_log_proxy_security(persisted_security, disconnect_lan=True)
                 except BaseException as reconcile_error:
                     raise RuntimeError(
                         f"设置保存失败，且代理监听与磁盘状态协调失败：{reconcile_error}"
@@ -5923,6 +8226,8 @@ def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
         "network": network,
         "rebound_count": len(rebound_ids),
         "connections_interrupted": bool(rebound_ids),
+        "security_updated_count": security_result["updated_count"],
+        "disconnected_count": security_result["disconnected_count"],
     }
 
 
@@ -6107,6 +8412,23 @@ def text_response(
         handler.wfile.write(data)
 
 
+def download_response(
+    handler: BaseHTTPRequestHandler,
+    data: bytes,
+    content_type: str,
+    filename: str,
+) -> None:
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", filename)[:160] or "proxybridge-export"
+    handler.send_response(200)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    send_backend_instance_header(handler)
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
 def send_backend_instance_header(handler: BaseHTTPRequestHandler) -> None:
     token = management_api_token()
     headers = getattr(handler, "headers", None)
@@ -6121,15 +8443,21 @@ def error_response(handler: BaseHTTPRequestHandler, exc: Exception, status: int 
     # 统一记录所有 API 错误到系统日志,便于事后排查失败的操作。
     # 脱敏 /pool/{token}/… 防止 token 写入 menubar-backend.log / 系统日志。
     safe_path = _redact_pool_token_in_log_arg(handler.path)
-    log_event(f"{handler.command} {safe_path} 失败:{exc}", level="error", category="接口")
-    json_response(handler, {"error": str(exc)}, status)
+    safe_message = webdav_sync.redact_sensitive_text(exc)
+    log_event(f"{handler.command} {safe_path} 失败:{safe_message}", level="error", category="接口")
+    json_response(handler, {"error": safe_message}, status)
 
 
 class AppHandler(BaseHTTPRequestHandler):
     server_version = "ProxyBridge/0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        safe_args = tuple(_redact_pool_token_in_log_arg(a) for a in args)
+        safe_args = tuple(
+            webdav_sync.redact_sensitive_text(_redact_pool_token_in_log_arg(arg))
+            if isinstance(arg, str)
+            else arg
+            for arg in args
+        )
         sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), fmt % safe_args))
 
     def is_trusted_request(self) -> bool:
@@ -6217,8 +8545,8 @@ class AppHandler(BaseHTTPRequestHandler):
             response_format = (first(params, "format", default="json") or "json").strip().lower()
             include_starting = truthy(first(params, "include_starting", default=""))
             if action == "get":
-                if strategy not in {"random", "round_robin"}:
-                    raise ValueError("strategy 只能是 random 或 round_robin")
+                if strategy not in {"random", "round_robin", "health", "latency"}:
+                    raise ValueError("strategy 只能是 random、round_robin、health 或 latency")
                 if response_format not in {"json", "text"}:
                     raise ValueError("format 只能是 json 或 text")
         except ValueError as exc:
@@ -6241,10 +8569,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         response_body = {"error": "无效的代理池凭证"}
                         response_status = 403
                     elif action == "list.json":
-                        members = [
-                            public_pool_member(m)
-                            for m in pool_members(state, region=region, q=q, ready_only=False)
-                        ]
+                        members = public_pool_members(
+                            state,
+                            pool_members(state, region=region, q=q, ready_only=False),
+                        )
                         payload = {
                             "count": len(members),
                             "updated_at": float(now_ts()),
@@ -6254,23 +8582,27 @@ class AppHandler(BaseHTTPRequestHandler):
                             payload["protocol"] = protocol
                         response_body = payload
                     elif action == "proxies.txt":
-                        members = [
-                            public_pool_member(m)
-                            for m in pool_members(state, region=region, q=q, ready_only=False)
-                        ]
+                        members = public_pool_members(
+                            state,
+                            pool_members(state, region=region, q=q, ready_only=False),
+                        )
                         response_kind = "text"
                         response_body = render_proxies_txt(members, protocol)
                     else:
                         # action == "get"
-                        ready_members = [
-                            public_pool_member(m)
-                            for m in pool_members(state, region=region, q=q, ready_only=True)
-                        ]
+                        ready_members = public_pool_members(
+                            state,
+                            pool_members(state, region=region, q=q, ready_only=True),
+                        )
                         candidates = ready_members
                         if not candidates and include_starting:
                             candidates = [
-                                public_pool_member(m)
-                                for m in pool_members(state, region=region, q=q, ready_only=False)
+                                member
+                                for member in public_pool_members(
+                                    state,
+                                    pool_members(state, region=region, q=q, ready_only=False),
+                                )
+                                if member.get("available")
                             ]
                         if not candidates:
                             response_status = 404
@@ -6281,6 +8613,23 @@ class AppHandler(BaseHTTPRequestHandler):
                                 response_body = {"error": "代理池为空"}
                         else:
                             picked = pick_pool_member(candidates, strategy)
+                            if picked.get("circuit_state") == "half_open":
+                                picked_id = str(picked.get("id") or "")
+                                raw_member = next(
+                                    (
+                                        member
+                                        for member in state.get("bridges", [])
+                                        if str(member.get("id") or "") == picked_id
+                                    ),
+                                    None,
+                                )
+                                if raw_member is not None:
+                                    health = normalize_pool_health(raw_member.get("pool_health"))
+                                    health["half_open_probe_until"] = now_ts() + POOL_HALF_OPEN_PROBE_SECONDS
+                                    raw_member["pool_health"] = health
+                                    picked["available"] = False
+                                    picked["probe_in_progress"] = True
+                                    save_state(state)
                             picked_url = select_proxy_url(picked, protocol)
                             if response_format == "text":
                                 response_kind = "text"
@@ -6321,9 +8670,32 @@ class AppHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 error_response(self, exc, 400)
             return
+        if parsed.path == "/api/network/clients":
+            json_response(self, active_proxy_clients_payload())
+            return
         if parsed.path == "/api/sync/status":
             try:
                 json_response(self, sync_status_payload())
+            except Exception as exc:
+                error_response(self, exc, 400)
+            return
+        if parsed.path == "/api/speed-test/tasks":
+            try:
+                params = urllib.parse.parse_qs(parsed.query)
+                json_response(self, speed_test_task_payload(first(params, "id", default="") or None))
+            except Exception as exc:
+                error_response(self, exc, 400)
+            return
+        if parsed.path == "/api/logs":
+            try:
+                json_response(self, query_logs(urllib.parse.parse_qs(parsed.query)))
+            except Exception as exc:
+                error_response(self, exc, 400)
+            return
+        if parsed.path == "/api/logs/export":
+            try:
+                data, content_type, filename = export_logs(urllib.parse.parse_qs(parsed.query))
+                download_response(self, data, content_type, filename)
             except Exception as exc:
                 error_response(self, exc, 400)
             return
@@ -6384,8 +8756,18 @@ class AppHandler(BaseHTTPRequestHandler):
                 log_event(f"导入订阅「{sub.get('name', '')}」共 {sub.get('node_count', 0)} 个节点", category="订阅")
                 json_response(self, result)
             elif self.path == "/api/subscriptions/refresh":
-                json_response(self, refresh_subscription(str(payload.get("id") or "")))
-                log_event("刷新订阅完成", category="订阅")
+                result = refresh_subscription(str(payload.get("id") or ""))
+                json_response(self, result)
+                changes = result.get("changes") or {}
+                log_event(
+                    "刷新订阅完成："
+                    f"新增 {safe_int(changes.get('added'), 0)}、"
+                    f"删除 {safe_int(changes.get('removed'), 0)}、"
+                    f"变更 {safe_int(changes.get('changed'), 0)}",
+                    category="订阅",
+                )
+            elif self.path == "/api/subscriptions/schedule":
+                json_response(self, {"ok": True, "subscription": update_subscription_schedule(payload)})
             elif self.path == "/api/subscriptions/delete":
                 json_response(self, delete_subscription(str(payload.get("id") or "")))
                 log_event("删除订阅", category="订阅")
@@ -6408,6 +8790,28 @@ class AppHandler(BaseHTTPRequestHandler):
                     log_event(f"测试节点「{node_name}」通信正常 {latency} ms", category="测试")
                 else:
                     log_event(f"测试节点「{node_name}」失败:{result.get('message', '')}", level="warn", category="测试")
+                json_response(self, result)
+            elif self.path == "/api/nodes/test-batch/start":
+                json_response(self, start_speed_test_task(payload), 202)
+            elif self.path == "/api/nodes/test-batch/cancel":
+                json_response(self, cancel_speed_test_task(str(payload.get("id") or "")))
+            elif self.path == "/api/nodes/core":
+                json_response(self, update_node_core_settings(payload))
+            elif self.path == "/api/settings/speed-test":
+                json_response(self, {"ok": True, "settings": update_speed_test_settings(payload)})
+            elif self.path == "/api/settings/logs":
+                json_response(self, {"ok": True, "settings": update_log_settings(payload)})
+            elif self.path == "/api/diagnostics/run":
+                result = run_diagnostics(payload)
+                summary = result.get("summary") or {}
+                log_event(
+                    "诊断完成："
+                    f"正常 {safe_int(summary.get('ok'), 0)}、"
+                    f"警告 {safe_int(summary.get('warn'), 0)}、"
+                    f"错误 {safe_int(summary.get('error'), 0)}、"
+                    f"跳过 {safe_int(summary.get('skipped'), 0)}",
+                    category="诊断",
+                )
                 json_response(self, result)
             elif self.path == "/api/browser/launch":
                 result = launch_browser(payload)
@@ -6439,6 +8843,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 result = rotate_pool_token()
                 log_event("代理池 token 已轮换", category="代理")
                 json_response(self, result)
+            elif self.path == "/api/pool/feedback":
+                json_response(self, update_pool_member_feedback(payload))
+            elif self.path == "/api/pool/exclude":
+                json_response(self, set_pool_member_exclusion(payload))
+            elif self.path == "/api/network/clients/kick":
+                json_response(self, kick_proxy_client(str(payload.get("id") or "")))
             elif self.path == "/api/settings/network":
                 result = update_network_settings(payload)
                 state_label = "开启" if result.get("network", {}).get("allow_lan") else "关闭"
@@ -6509,6 +8919,10 @@ class ProxyBridgeHTTPServer(ThreadingHTTPServer):
 def shutdown() -> None:
     with SHUTDOWN_LOCK:
         SHUTTING_DOWN.set()
+        SUBSCRIPTION_SCHEDULER_WAKE.set()
+        with SPEED_TEST_TASK_LOCK:
+            for cancel_event in SPEED_TEST_CANCEL_EVENTS.values():
+                cancel_event.set()
         # 只在进程表锁内快照句柄;外部进程的退出等待交给独立工作线程。
         with PROCESS_LOCK:
             browser_procs = list(BROWSER_PROCESS_TABLE.values())
@@ -6705,6 +9119,7 @@ def main(argv: list[str] | None = None) -> None:
     os.environ["PROXY_BRIDGE_PORT"] = str(port)
     os.environ["PROXY_BRIDGE_HOST"] = host
     start_parent_monitor()
+    start_subscription_scheduler()
     if not args.no_core_auto_install:
         start_core_auto_install()
     restore_enabled_bridges()

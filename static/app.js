@@ -10,8 +10,12 @@ const appState = {
   nodes: [],
   bridges: [],
   tests: {},
+  speedTest: { settings: null, tasks: [] },
   requestLogs: [],
   systemLogs: [],
+  logCenter: { settings: null, storage: null, request_total: 0, system_total: 0 },
+  requestLogPage: { page: 1, page_count: 1, total: 0, filtered_total: 0, limit: 50, loaded: false },
+  systemLogPage: { page: 1, page_count: 1, total: 0, filtered_total: 0, limit: 50, loaded: false },
   pool: null,
   network: null,
   networkStatus: "loading",
@@ -20,6 +24,7 @@ const appState = {
     protocol: "all",
     region: "all",
     subscription: "all",
+    sort: "name",
     search: "",
   },
   // groupId -> true 表示折叠；缺省为展开。
@@ -36,6 +41,7 @@ const appState = {
   browserRecordNodeId: null,
   sync: null,
   syncOpenssl: null,
+  diagnostics: { result: null, webrtc: null, running: false },
 };
 
 const managementAuth = window.ProxyBridgeAuth;
@@ -55,6 +61,10 @@ let statusAbortController = null;
 let statusPollTimer = null;
 let syncOperationPromise = null;
 let networkSettingsSavePromise = null;
+let logPageRequestGeneration = 0;
+let logFilterTimer = null;
+let logSettingsHydrated = false;
+let logSettingsDirty = false;
 const actionInFlight = new Set();
 const renderSignatures = new Map();
 
@@ -63,7 +73,7 @@ const STATUS_POLL_VISIBLE_MS = 3_500;
 const STATUS_POLL_HIDDEN_MS = 30_000;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
-const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "settings", "sync"];
+const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "settings", "sync", "diagnostics"];
 
 function browserEnabled() {
   return appState.features?.browser !== false;
@@ -86,6 +96,11 @@ function setActiveView(view) {
   });
   renderActiveView({ force: true });
   applyActionInFlightState();
+  if (view === "logs") {
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
+  } else if (view === "system") {
+    loadLogPage("system").catch((error) => showToast(error.message, "error"));
+  }
 }
 
 // 更新单个侧边栏计数徽标;为 0 时通过 data-zero 隐藏,避免视觉噪音。
@@ -101,8 +116,8 @@ function renderNav() {
   setNavCount("navCountNodes", appState.nodes.length);
   setNavCount("navCountSubs", appState.subscriptions.length);
   setNavCount("navCountBridges", runningBridges().length);
-  setNavCount("navCountLogs", (appState.requestLogs || []).length);
-  setNavCount("navCountSystem", (appState.systemLogs || []).length);
+  setNavCount("navCountLogs", Number(appState.logCenter?.request_total ?? appState.requestLogs.length));
+  setNavCount("navCountSystem", Number(appState.logCenter?.system_total ?? appState.systemLogs.length));
 }
 
 function escapeHtml(value) {
@@ -196,6 +211,86 @@ async function api(path, body = null, { signal } = {}) {
   return payload;
 }
 
+function logQueryParams(kind, { includePage = true, format = "" } = {}) {
+  const params = new URLSearchParams({ kind });
+  if (includePage) {
+    const pageState = kind === "request" ? appState.requestLogPage : appState.systemLogPage;
+    params.set("page", String(pageState.page || 1));
+    params.set("limit", String(pageState.limit || 50));
+  }
+  if (kind === "request") {
+    const filters = appState.logFilters;
+    if (filters.search.trim()) params.set("search", filters.search.trim());
+    if (filters.node !== "all") params.set("node", filters.node);
+    if (filters.status !== "all") params.set("status", filters.status);
+  } else {
+    const filters = appState.systemLogFilters;
+    if (filters.search.trim()) params.set("search", filters.search.trim());
+    if (filters.level !== "all") params.set("level", filters.level);
+  }
+  if (format) params.set("format", format);
+  return params;
+}
+
+async function loadLogPage(kind) {
+  const generation = ++logPageRequestGeneration;
+  const payload = await api(`/api/logs?${logQueryParams(kind)}`);
+  if (generation !== logPageRequestGeneration) return;
+  const pageState = {
+    page: Number(payload.page || 1),
+    page_count: Number(payload.page_count || 1),
+    total: Number(payload.total || 0),
+    filtered_total: Number(payload.filtered_total || 0),
+    limit: Number(payload.limit || 50),
+    loaded: true,
+  };
+  if (kind === "request") {
+    appState.requestLogs = payload.items || [];
+    appState.requestLogPage = pageState;
+    renderLogFilters();
+    renderRequestLogs();
+  } else {
+    appState.systemLogs = payload.items || [];
+    appState.systemLogPage = pageState;
+    renderSystemLogs();
+  }
+}
+
+function scheduleLogPageLoad(kind) {
+  window.clearTimeout(logFilterTimer);
+  logFilterTimer = window.setTimeout(() => {
+    const pageState = kind === "request" ? appState.requestLogPage : appState.systemLogPage;
+    pageState.page = 1;
+    loadLogPage(kind).catch((error) => showToast(error.message, "error"));
+  }, 240);
+}
+
+async function downloadLogExport(kind, format) {
+  const headers = {};
+  if (managementToken) headers[managementAuth.headerName] = managementToken;
+  const response = await fetch(`/api/logs/export?${logQueryParams(kind, { includePage: false, format })}`, { headers });
+  const responseToken = response.headers.get(managementAuth.headerName) || "";
+  if (!managementAuth.validateResponseToken(window, managementToken, responseToken)) {
+    managementToken = "";
+    throw new Error("管理 API 凭证已失效，请从启动入口重新打开控制台");
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || `HTTP ${response.status}`);
+  }
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="([A-Za-z0-9._-]+)"/);
+  const filename = match?.[1] || `proxybridge-${kind}-logs.${format}`;
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 function showToast(message, kind = "ok") {
   const toast = $("#toast");
   toast.textContent = message;
@@ -215,9 +310,153 @@ function formatTime(seconds) {
   });
 }
 
+function formatDuration(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (value < 60) return `${Math.round(value)} 秒`;
+  if (value < 3600) return `${Math.round(value / 60)} 分钟`;
+  if (value < 86400) return `${Math.round(value / 3600)} 小时`;
+  return `${Math.round(value / 86400)} 天`;
+}
+
+function diagnosticStatusLabel(status) {
+  return { ok: "正常", warn: "警告", error: "错误", skipped: "跳过" }[status] || "未知";
+}
+
+function diagnosticDetailsText(details) {
+  if (!details || typeof details !== "object" || !Object.keys(details).length) return "";
+  return JSON.stringify(details, null, 2);
+}
+
+function renderDiagnosticBridgeOptions() {
+  const select = $("#diagnosticsBridgeSelect");
+  if (!select) return;
+  const previous = select.value;
+  const bridges = (appState.bridges || []).filter(
+    (bridge) => ["running", "starting"].includes(bridge.status) && Number(bridge.port) > 0
+  );
+  select.innerHTML = [
+    '<option value="">自动选择运行中的代理</option>',
+    ...bridges.map((bridge) => (
+      `<option value="${escapeHtml(bridge.id)}">${escapeHtml(bridge.node_name || "未命名节点")} · ${escapeHtml(bridge.core || "core")} · ${Number(bridge.port)}</option>`
+    )),
+  ].join("");
+  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+  select.disabled = !$("#diagnosticsNetworkEnabled")?.checked || !bridges.length;
+}
+
+function renderDiagnostics() {
+  renderDiagnosticBridgeOptions();
+  const container = $("#diagnosticsResults");
+  const statusLine = $("#diagnosticsStatusLine");
+  if (!container || !statusLine) return;
+  const backendResults = appState.diagnostics.result?.results || [];
+  const webrtc = appState.diagnostics.webrtc
+    ? [{
+        id: "webrtc",
+        label: "WebRTC 泄漏风险",
+        category: "browser",
+        latency_ms: appState.diagnostics.webrtc.latency_ms || 0,
+        ...appState.diagnostics.webrtc,
+      }]
+    : [];
+  const results = [...backendResults, ...webrtc];
+  if (!results.length) {
+    statusLine.textContent = appState.diagnostics.running ? "正在检查" : "尚未运行";
+    container.innerHTML = `<div class="settings-empty">${appState.diagnostics.running ? "正在运行逐项检查…" : "运行诊断后在此显示逐项结果"}</div>`;
+    return;
+  }
+  const counts = { ok: 0, warn: 0, error: 0, skipped: 0 };
+  results.forEach((result) => { counts[result.status] = (counts[result.status] || 0) + 1; });
+  statusLine.textContent = `正常 ${counts.ok} · 警告 ${counts.warn} · 错误 ${counts.error} · 跳过 ${counts.skipped}`;
+  container.innerHTML = results.map((result) => {
+    const detailText = diagnosticDetailsText(result.details);
+    return `
+      <article class="diagnostic-result is-${escapeHtml(result.status)}">
+        <span class="diagnostic-status-mark" aria-hidden="true"></span>
+        <div class="diagnostic-result-copy">
+          <div class="diagnostic-result-head">
+            <strong>${escapeHtml(result.label)}</strong>
+            <span class="diagnostic-status-label">${diagnosticStatusLabel(result.status)}</span>
+            <span class="diagnostic-latency">${Number(result.latency_ms || 0)} ms</span>
+          </div>
+          <p>${escapeHtml(result.message)}</p>
+          ${detailText ? `<details class="diagnostic-details"><summary>查看详情</summary><pre>${escapeHtml(detailText)}</pre></details>` : ""}
+        </div>
+      </article>`;
+  }).join("");
+}
+
+async function runWebrtcDiagnostic() {
+  const started = performance.now();
+  try {
+    const result = await window.ProxyBridgeDiagnostics.collectWebrtcCandidates();
+    return { ...result, latency_ms: Math.max(0, Math.round(performance.now() - started)) };
+  } catch (error) {
+    return {
+      status: "error",
+      message: `WebRTC 检查失败（${error?.name || "Error"}）`,
+      details: {},
+      latency_ms: Math.max(0, Math.round(performance.now() - started)),
+    };
+  }
+}
+
+async function runDiagnostics({ webrtcOnly = false } = {}) {
+  if (appState.diagnostics.running) return;
+  appState.diagnostics.running = true;
+  if (!webrtcOnly) appState.diagnostics.result = null;
+  appState.diagnostics.webrtc = null;
+  renderDiagnostics();
+  const runButton = $("#diagnosticsRunButton");
+  const webrtcButton = $("#diagnosticsWebrtcButton");
+  runButton.disabled = true;
+  webrtcButton.disabled = true;
+  runButton.setAttribute("aria-busy", "true");
+  webrtcButton.setAttribute("aria-busy", "true");
+  runButton.classList.add("is-busy");
+  try {
+    const webrtcPromise = runWebrtcDiagnostic();
+    const backendPromise = webrtcOnly
+      ? Promise.resolve(null)
+      : api("/api/diagnostics/run", {
+          network: Boolean($("#diagnosticsNetworkEnabled")?.checked),
+          bridge_id: $("#diagnosticsBridgeSelect")?.value || "",
+        });
+    const [backendSettlement, webrtcSettlement] = await Promise.allSettled([backendPromise, webrtcPromise]);
+    if (!webrtcOnly) {
+      appState.diagnostics.result = backendSettlement.status === "fulfilled"
+        ? backendSettlement.value
+        : window.ProxyBridgeDiagnostics.failedBackendResult(backendSettlement.reason);
+    }
+    appState.diagnostics.webrtc = webrtcSettlement.status === "fulfilled"
+      ? webrtcSettlement.value
+      : {
+          status: "error",
+          message: `WebRTC 检查失败（${webrtcSettlement.reason?.name || "Error"}）`,
+          details: {},
+          latency_ms: 0,
+        };
+    if (!webrtcOnly && backendSettlement.status === "rejected") {
+      showToast(backendSettlement.reason?.message || "诊断请求失败", "error");
+    } else {
+      showToast(webrtcOnly ? "WebRTC 检查完成" : "诊断完成");
+    }
+  } finally {
+    appState.diagnostics.running = false;
+    runButton.disabled = false;
+    webrtcButton.disabled = false;
+    runButton.removeAttribute("aria-busy");
+    webrtcButton.removeAttribute("aria-busy");
+    runButton.classList.remove("is-busy");
+    renderDiagnostics();
+  }
+}
+
 // 通用网络设置表单：与 WebDAV 表单一样，状态轮询不能覆盖尚未保存的开关。
 let networkFormHydrated = false;
 let networkFormDirty = false;
+let speedTestFormHydrated = false;
+let speedTestFormDirty = false;
 
 function markNetworkFormDirty() {
   networkFormDirty = true;
@@ -228,7 +467,27 @@ function applyNetworkSettingsToForm(network, { force = false } = {}) {
   const allowLan = $("#allowLan");
   if (!allowLan) return;
   allowLan.checked = Boolean(network?.allow_lan);
+  const security = network?.security || {};
+  $("#lanAuthMode").value = security.auth_mode || "none";
+  $("#lanUsername").value = security.username || "";
+  $("#lanPassword").value = "";
+  $("#lanToken").value = "";
+  $("#lanToken").placeholder = security.token_configured
+    ? "已配置，留空保持不变"
+    : "至少 16 个字符";
+  $("#lanAllowedCidrs").value = (security.allowed_cidrs || []).join("\n");
+  $("#lanMaxConnections").value = Number(security.max_connections || 128);
+  syncLanAuthFields();
   networkFormHydrated = true;
+}
+
+function syncLanAuthFields() {
+  const mode = $("#lanAuthMode")?.value || "none";
+  const basic = mode === "basic";
+  const token = mode === "token";
+  $("#lanUsernameField").hidden = !basic;
+  $("#lanPasswordField").hidden = !basic;
+  $("#lanTokenField").hidden = !token;
 }
 
 function networkLanAddresses(network) {
@@ -417,6 +676,29 @@ function renderNetworkProxyList(network, networkStatus) {
     .join("");
 }
 
+function renderNetworkClients(network) {
+  const list = $("#networkClientList");
+  const count = $("#networkClientCount");
+  if (!list || !count) return;
+  const clients = Array.isArray(network?.clients) ? network.clients : [];
+  count.textContent = `${clients.length} 个连接`;
+  if (!clients.length) {
+    list.innerHTML = `<div class="settings-empty">暂无活动连接</div>`;
+    return;
+  }
+  list.innerHTML = clients.map((client) => {
+    const endpoint = `${client.address || "未知"}:${client.port || "-"}`;
+    return `
+      <div class="network-client-row">
+        <div>
+          <strong>${escapeHtml(client.node_name || "本地代理")}</strong>
+          <span>${escapeHtml(endpoint)} · ${escapeHtml(String(client.protocol || "detecting").toUpperCase())} · ${escapeHtml(formatDuration(Math.max(0, Math.floor(Date.now() / 1000) - Number(client.connected_at || 0))))}</span>
+        </div>
+        <button class="row-button danger" type="button" data-action="kick-client" data-id="${escapeHtml(client.id || "")}">踢出</button>
+      </div>`;
+  }).join("");
+}
+
 function networkSettingsRenderSnapshot() {
   const network = appState.network;
   return {
@@ -425,7 +707,11 @@ function networkSettingsRenderSnapshot() {
     listen_host: network?.listen_host || "",
     configurable: network?.configurable ?? true,
     docker_managed: network?.docker_managed === true,
+    security: network?.security || null,
+    clients: network?.clients || [],
     lan_addresses: networkLanAddresses(network),
+    speed_test: appState.speedTest?.settings || null,
+    logs: appState.logCenter || null,
     proxies: networkProxyEntries(network).map((entry) => ({
       bridge_id: entry.bridge_id,
       node_name: entry.node_name,
@@ -438,11 +724,23 @@ function networkSettingsRenderSnapshot() {
 
 function syncNetworkSettingsControlState() {
   const unavailable = !networkFormHydrated || !appState.network;
-  const runtimeManaged = appState.network?.configurable === false;
-  const disabled = unavailable || runtimeManaged || Boolean(networkSettingsSavePromise);
-  [$("#allowLan"), $("#networkSaveButton")].filter(Boolean).forEach((control) => {
+  const disabled = unavailable || Boolean(networkSettingsSavePromise);
+  const controls = [
+    $("#allowLan"),
+    $("#lanAuthMode"),
+    $("#lanUsername"),
+    $("#lanPassword"),
+    $("#lanToken"),
+    $("#lanAllowedCidrs"),
+    $("#lanMaxConnections"),
+    $("#networkSaveButton"),
+  ].filter(Boolean);
+  controls.forEach((control) => {
     control.disabled = disabled;
   });
+  if (appState.network?.range_configurable === false && $("#allowLan")) {
+    $("#allowLan").disabled = true;
+  }
 }
 
 function renderNetworkSettings() {
@@ -477,9 +775,11 @@ function renderNetworkSettings() {
   }
   const shareWarning = $("#networkShareWarning p");
   if (shareWarning) {
+    const authMode = network?.security?.auth_mode || "none";
+    const authLabel = authMode === "basic" ? "用户名和密码" : authMode === "token" ? "Token" : "无认证";
     shareWarning.textContent = dockerManaged
-      ? "请保持管理端口只发布到宿主机 127.0.0.1。代理端口也默认映射到宿主机回环地址；若改成 0.0.0.0，将允许其他设备连接且当前没有用户名或密码。"
-      : "请仅在可信网络开启。代理端口没有用户名或密码，同一局域网或可达本机的私有 IPv4 / VPN 设备可能直接使用你的代理。Proxy Bridge 控制台不会因此对外开放。";
+      ? `请保持管理端口只发布到宿主机 127.0.0.1。代理端口当前使用${authLabel}，并受 IP/CIDR 白名单与连接数上限保护。`
+      : `请仅在可信网络开启。代理端口当前使用${authLabel}，并受 IP/CIDR 白名单与连接数上限保护。Proxy Bridge 控制台不会因此对外开放。`;
   }
 
   const statusLine = $("#settingsStatusLine");
@@ -516,6 +816,65 @@ function renderNetworkSettings() {
   }
 
   renderNetworkProxyList(network, networkStatus);
+  renderNetworkClients(network);
+  const speedSettings = appState.speedTest?.settings;
+  if (speedSettings && (!speedTestFormHydrated || !speedTestFormDirty)) {
+    $("#speedTestTargets").value = (speedSettings.targets || []).join("\n");
+    $("#speedTestRotation").value = speedSettings.rotation || "round_robin";
+    $("#speedTestStaleMinutes").value = Math.max(1, Math.round(Number(speedSettings.stale_after_seconds || 21600) / 60));
+    $("#speedTestConcurrency").value = Number(speedSettings.batch_concurrency || 3);
+    $("#speedTestRetries").value = Number(speedSettings.retry_failures || 0);
+    speedTestFormHydrated = true;
+  }
+  const logSettings = appState.logCenter?.settings;
+  if (logSettings && (!logSettingsHydrated || !logSettingsDirty)) {
+    $("#logRetentionDays").value = Number(logSettings.retention_days || 14);
+    $("#logMaxFileMiB").value = Math.round(Number(logSettings.max_file_bytes || 8388608) / 1048576);
+    $("#logDiskQuotaMiB").value = Math.round(Number(logSettings.disk_quota_bytes || 134217728) / 1048576);
+    logSettingsHydrated = true;
+  }
+  const storage = appState.logCenter?.storage;
+  if ($("#logStorageUsage")) {
+    $("#logStorageUsage").textContent = storage
+      ? `${formatBytes(storage.used_bytes)} / ${formatBytes(storage.quota_bytes)} · ${Number(storage.file_count || 0)} 个文件`
+      : "—";
+  }
+}
+
+async function saveSpeedTestSettings(event) {
+  event.preventDefault();
+  const targets = $("#speedTestTargets").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  const payload = {
+    targets,
+    rotation: $("#speedTestRotation").value,
+    stale_after_seconds: Number($("#speedTestStaleMinutes").value || 360) * 60,
+    batch_concurrency: Number($("#speedTestConcurrency").value || 3),
+    retry_failures: Number($("#speedTestRetries").value || 0),
+  };
+  const result = await api("/api/settings/speed-test", payload);
+  appState.speedTest.settings = result.settings;
+  speedTestFormDirty = false;
+  renderNetworkSettings();
+  showToast("测速设置已保存");
+}
+
+async function saveLogSettings(event) {
+  event.preventDefault();
+  const result = await api("/api/settings/logs", {
+    retention_days: Number($("#logRetentionDays").value),
+    max_file_bytes: Number($("#logMaxFileMiB").value) * 1048576,
+    disk_quota_bytes: Number($("#logDiskQuotaMiB").value) * 1048576,
+  });
+  const saved = result.settings || {};
+  appState.logCenter.settings = {
+    retention_days: saved.retention_days,
+    max_file_bytes: saved.max_file_bytes,
+    disk_quota_bytes: saved.disk_quota_bytes,
+  };
+  if (saved.storage) appState.logCenter.storage = saved.storage;
+  logSettingsDirty = false;
+  renderNetworkSettings();
+  showToast(`日志设置已保存，清理 ${Number(saved.cleanup?.deleted_files || 0)} 个文件`);
 }
 
 function setNetworkSettingsBusy(busy, trigger = null) {
@@ -544,11 +903,20 @@ async function withNetworkSettingsSave(task, trigger = null) {
 
 async function saveNetworkSettings(event) {
   event.preventDefault();
-  if (appState.network?.configurable === false) {
-    throw new Error("Docker 模式下网络范围由端口映射管理");
-  }
-  const allowLan = Boolean($("#allowLan")?.checked);
-  const result = await api("/api/settings/network", { allow_lan: allowLan });
+  const allowLan = appState.network?.range_configurable === false
+    ? true
+    : Boolean($("#allowLan")?.checked);
+  const result = await api("/api/settings/network", {
+    allow_lan: allowLan,
+    lan_security: {
+      auth_mode: $("#lanAuthMode").value,
+      username: $("#lanUsername").value,
+      password: $("#lanPassword").value,
+      token: $("#lanToken").value,
+      allowed_cidrs: $("#lanAllowedCidrs").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+      max_connections: Number($("#lanMaxConnections").value),
+    },
+  });
   appState.network = result.network || { ...(appState.network || {}), allow_lan: allowLan };
   appState.networkStatus = "ready";
   networkFormDirty = false;
@@ -873,6 +1241,7 @@ function renderActiveView({ force = false } = {}) {
           subscriptions: appState.subscriptions,
           bridges: appState.bridges,
           tests: appState.tests,
+          speedTest: appState.speedTest,
           browserEnabled: browserEnabled(),
           activeBrowsers: appState.active_browsers,
           browserInstances: appState.browser_instances,
@@ -903,7 +1272,7 @@ function renderActiveView({ force = false } = {}) {
     case "logs":
       renderWhenChanged(
         "logs",
-        { logs: appState.requestLogs, filters: appState.logFilters },
+        { logs: appState.requestLogs, filters: appState.logFilters, nodes: appState.nodes },
         () => {
           renderLogFilters();
           renderRequestLogs();
@@ -932,6 +1301,14 @@ function renderActiveView({ force = false } = {}) {
         "sync",
         { settings: appState.sync, openssl: appState.syncOpenssl, browserEnabled: browserEnabled() },
         renderSync,
+        force
+      );
+      break;
+    case "diagnostics":
+      renderWhenChanged(
+        "diagnostics",
+        { diagnostics: appState.diagnostics, bridges: appState.bridges },
+        renderDiagnostics,
         force
       );
       break;
@@ -969,8 +1346,14 @@ async function loadStatus({ forceFresh = false } = {}) {
       appState.nodes = status.nodes || [];
       appState.bridges = status.bridges || [];
       appState.tests = status.tests || {};
-      appState.requestLogs = status.request_logs || [];
-      appState.systemLogs = status.system_logs || [];
+      appState.speedTest = status.speed_test || { settings: null, tasks: [] };
+      appState.logCenter = status.logs || appState.logCenter;
+      if (appState.activeView !== "logs" || !appState.requestLogPage.loaded) {
+        appState.requestLogs = status.request_logs || [];
+      }
+      if (appState.activeView !== "system" || !appState.systemLogPage.loaded) {
+        appState.systemLogs = status.system_logs || [];
+      }
       appState.pool = status.pool || null;
       if (status.network && typeof status.network === "object") {
         appState.network = status.network;
@@ -1010,8 +1393,8 @@ function render() {
       nodes: appState.nodes.length,
       subscriptions: appState.subscriptions.length,
       bridges: runningBridges().length,
-      logs: (appState.requestLogs || []).length,
-      system: (appState.systemLogs || []).length,
+      logs: Number(appState.logCenter?.request_total ?? appState.requestLogs.length),
+      system: Number(appState.logCenter?.system_total ?? appState.systemLogs.length),
     },
     renderNav
   );
@@ -1086,11 +1469,24 @@ function renderSubscriptions() {
             <span class="sub-avatar">${escapeHtml(initials(item.name))}</span>
             <div>
               <strong class="subscription-name">${escapeHtml(item.name)}</strong>
-              <div class="subscription-meta">${item.node_count || 0} 个节点 · ${formatTime(item.last_update)}</div>
+              <div class="subscription-meta">${item.node_count || 0} 个节点 · ${formatTime(item.last_update)}${item.last_error ? ` · 上次失败：${escapeHtml(item.last_error)}` : ""}</div>
             </div>
             <span class="sub-status">已启用</span>
           </div>
           <div class="item-actions">
+            <label class="field-inline">
+              <span>自动刷新</span>
+              <select class="subscription-schedule" data-action="schedule-sub" data-id="${escapeHtml(item.id)}">
+                ${[
+                  [0, "关闭"],
+                  [15, "每 15 分钟"],
+                  [30, "每 30 分钟"],
+                  [60, "每小时"],
+                  [360, "每 6 小时"],
+                  [1440, "每天"],
+                ].map(([value, label]) => `<option value="${value}" ${Number(item.refresh_interval_minutes || 0) === value ? "selected" : ""}>${label}</option>`).join("")}
+              </select>
+            </label>
             ${
               item.url
                 ? `<button class="row-button" data-action="refresh-sub" data-id="${escapeHtml(item.id)}">${icon("refresh")}<span>刷新</span></button>`
@@ -1118,6 +1514,8 @@ function renderFilters() {
   const regions = [...new Set(appState.nodes.map((node) => node.region))];
   appState.filters.protocol = setSelectOptions($("#protocolFilter"), protocols, appState.filters.protocol, "全部协议");
   appState.filters.region = setSelectOptions($("#regionFilter"), regions, appState.filters.region, "全部地区");
+  const sortSelect = $("#nodeSort");
+  if (sortSelect) sortSelect.value = appState.filters.sort || "name";
 
   const subSelect = $("#subscriptionFilter");
   if (subSelect) {
@@ -1147,6 +1545,9 @@ function bridgeForNode(nodeId) {
 function renderLogFilters() {
   const select = $("#logNodeFilter");
   const nodeOptions = new Map();
+  for (const node of appState.nodes || []) {
+    if (node.id) nodeOptions.set(node.id, node.name || node.id);
+  }
   for (const entry of appState.requestLogs || []) {
     const id = entry.node_id || entry.node_name || "";
     if (!id) continue;
@@ -1168,28 +1569,7 @@ function renderLogFilters() {
 }
 
 function filteredRequestLogs() {
-  const search = appState.logFilters.search.trim().toLowerCase();
-  return (appState.requestLogs || []).filter((entry) => {
-    if (appState.logFilters.node !== "all") {
-      const id = entry.node_id || entry.node_name || "";
-      if (id !== appState.logFilters.node) return false;
-    }
-    if (appState.logFilters.status !== "all" && entry.status !== appState.logFilters.status) return false;
-    if (!search) return true;
-    const target = entry.target || `${entry.target_host || ""}:${entry.target_port || ""}`;
-    return [
-      target,
-      entry.target_host,
-      entry.target_port,
-      entry.node_name,
-      entry.client,
-      entry.status,
-      statusLabel(entry.status),
-      entry.message,
-      entry.command,
-      entry.proxy_protocol,
-    ].some((value) => String(value || "").toLowerCase().includes(search));
-  });
+  return appState.requestLogs || [];
 }
 
 function testSummary(nodeId) {
@@ -1204,10 +1584,13 @@ function testSummary(nodeId) {
   }
   const ok = Boolean(result.ok);
   const latency = result.latency_ms == null ? "-" : `${result.latency_ms} ms`;
+  const age = result.age_seconds == null ? "未知" : `${formatDuration(result.age_seconds)}前`;
+  const successRate = `${Math.round(Number(result.success_rate || 0) * 100)}%`;
   return `
-    <div class="test-result">
+    <div class="test-result ${result.stale ? "is-stale" : ""}">
       <span class="test-line ${ok ? "ok" : "bad"}">${ok ? latency : "失败"}</span>
       <span class="test-message">${escapeHtml(result.message || "")}</span>
+      <span class="test-result-meta">${result.stale ? "已过期 · " : ""}${escapeHtml(age)} · 成功率 ${successRate} (${Number(result.success_count || 0)}/${Number(result.attempt_count || 0)})</span>
       <button class="row-button" data-action="test" data-node="${escapeHtml(nodeId)}"><span>重测</span></button>
     </div>
   `;
@@ -1217,7 +1600,7 @@ function filteredNodes() {
   const search = appState.filters.search.trim().toLowerCase();
   const subFilter = appState.filters.subscription || "all";
   const byNode = subscriptionIndexByNodeId();
-  return appState.nodes.filter((node) => {
+  const nodes = appState.nodes.filter((node) => {
     if (appState.filters.protocol !== "all" && node.protocol !== appState.filters.protocol) return false;
     if (appState.filters.region !== "all" && node.region !== appState.filters.region) return false;
     if (subFilter !== "all") {
@@ -1233,6 +1616,19 @@ function filteredNodes() {
     return [node.name, node.server, node.source, node.protocol, node.region, subName].some((value) =>
       String(value || "").toLowerCase().includes(search)
     );
+  });
+  const testFor = (node) => appState.tests[node.id] || {};
+  return nodes.sort((left, right) => {
+    if (appState.filters.sort === "latency") {
+      return Number(testFor(left).latency_ms ?? Number.MAX_SAFE_INTEGER) - Number(testFor(right).latency_ms ?? Number.MAX_SAFE_INTEGER);
+    }
+    if (appState.filters.sort === "success_rate") {
+      return Number(testFor(right).success_rate ?? -1) - Number(testFor(left).success_rate ?? -1);
+    }
+    if (appState.filters.sort === "tested_at") {
+      return Number(testFor(right).tested_at || 0) - Number(testFor(left).tested_at || 0);
+    }
+    return String(left.name || "").localeCompare(String(right.name || ""), "zh-CN");
   });
 }
 
@@ -1288,10 +1684,6 @@ function groupNodesBySubscription(nodes) {
     group.nodes.push(node);
   }
 
-  for (const group of groups.values()) {
-    group.nodes.sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh-CN"));
-  }
-
   const ordered = [];
   for (const sub of appState.subscriptions || []) {
     const group = groups.get(`sub:${sub.id}`);
@@ -1314,6 +1706,20 @@ function renderNodeRow(node) {
   const security = node.security || "";
   const server = `${node.server}:${node.port}`;
   const recordLabel = browserInstances.length ? `浏览器记录 ${browserInstances.length}` : "浏览器记录";
+  const coreOptions = Array.isArray(node.core_options) && node.core_options.length
+    ? node.core_options
+    : [node.preferred_core || "sing-box"];
+  const coreControl = coreOptions.length > 1
+    ? `<div class="node-core-control">
+        <select data-core-select="${escapeHtml(node.id)}" aria-label="${escapeHtml(node.name)} 首选核心" ${bridge ? "disabled" : ""}>
+          ${coreOptions.map((core) => `<option value="${escapeHtml(core)}" ${core === node.preferred_core ? "selected" : ""}>${escapeHtml(core)}</option>`).join("")}
+        </select>
+        <label title="首选核心启动失败时尝试备用核心">
+          <input type="checkbox" data-core-fallback="${escapeHtml(node.id)}" ${node.fallback_enabled ? "checked" : ""} ${bridge ? "disabled" : ""}>
+          <span>失败回退</span>
+        </label>
+      </div>`
+    : `<span class="tag core-tag" title="当前节点仅兼容此核心">${escapeHtml(coreOptions[0])}</span>`;
   const browserActions = browserEnabled()
     ? `
           <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开不同指纹浏览器 ${escapeHtml(node.name)}" title="新开不同指纹浏览器：独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
@@ -1336,7 +1742,7 @@ function renderNodeRow(node) {
       <td><span class="tag protocol-tag">${escapeHtml(node.protocol)}</span></td>
       <td><span class="transport-tag"><strong>${escapeHtml(transport)}</strong><em>${escapeHtml(security)}</em></span></td>
       <td><span class="mono server-cell" title="${escapeHtml(server)}">${escapeHtml(server)}</span></td>
-      <td><span class="tag core-tag">${escapeHtml(node.preferred_core || "sing-box")}</span></td>
+      <td>${coreControl}</td>
       <td>${testSummary(node.id)}</td>
       <td>
         <div class="row-actions">
@@ -1383,7 +1789,6 @@ function renderNodeGroupHeader(group, { forceExpand = false } = {}) {
               ${group.nodes.length} 个节点${runningCount ? ` · ${runningCount} 运行中` : ""}${meta ? ` · ${escapeHtml(meta)}` : ""}
             </span>
           </span>
-        </button>
       </td>
     </tr>
   `;
@@ -1394,6 +1799,7 @@ function renderNodes() {
   const empty = $("#emptyNodes");
   const nodes = filteredNodes();
   const groups = groupNodesBySubscription(nodes);
+  renderSpeedTestTaskControls();
   const groupCount = groups.length;
   $("#nodeCount").textContent =
     groupCount > 1
@@ -1425,6 +1831,25 @@ function renderNodes() {
     .join("");
 }
 
+function activeSpeedTestTask() {
+  const tasks = Array.isArray(appState.speedTest?.tasks) ? appState.speedTest.tasks : [];
+  return [...tasks].reverse().find((task) => ["queued", "running", "cancelling"].includes(task.status)) || null;
+}
+
+function renderSpeedTestTaskControls() {
+  const task = activeSpeedTestTask();
+  const startButton = $("#testVisible");
+  const cancelButton = $("#cancelVisibleTest");
+  if (!startButton || !cancelButton) return;
+  startButton.disabled = Boolean(task);
+  startButton.querySelector("span").textContent = task
+    ? `测速中 ${Number(task.completed || 0)}/${Number(task.total || 0)}`
+    : "测试可见节点";
+  cancelButton.hidden = !task;
+  cancelButton.disabled = task?.status === "cancelling";
+  cancelButton.dataset.taskId = task?.id || "";
+}
+
 function renderPool() {
   const pool = appState.pool || {};
   const links = pool.links || {};
@@ -1438,14 +1863,14 @@ function renderPool() {
   const getBtn = $("#poolCopyGet");
   if (listBtn) listBtn.dataset.text = links.list_json || "";
   if (txtBtn) txtBtn.dataset.text = links.proxies_txt || "";
-  if (getBtn) getBtn.dataset.text = links.get_random || "";
+  if (getBtn) getBtn.dataset.text = links.get_health || links.get_random || "";
 
   const rows = $("#poolLinkRows");
   if (!rows) return;
   const items = [
     ["JSON 列表", links.list_json],
     ["文本列表", links.proxies_txt],
-    ["随机获取", links.get_random],
+    ["健康优先", links.get_health || links.get_random],
   ].filter(([, url]) => url);
   if (!items.length) {
     rows.innerHTML = `<div class="pool-link-empty">启动本地代理后，这里会显示可复制的代理池链接。</div>`;
@@ -1460,6 +1885,30 @@ function renderPool() {
       </div>`
     )
     .join("");
+
+  const memberList = $("#poolMemberList");
+  if (!memberList) return;
+  const members = Array.isArray(pool.members) ? pool.members : [];
+  if (!members.length) {
+    memberList.innerHTML = `<div class="pool-link-empty">暂无代理池成员</div>`;
+    return;
+  }
+  memberList.innerHTML = members.map((member) => {
+    const state = member.circuit_state || "closed";
+    const label = state === "excluded" ? "已排除" : state === "open" ? "熔断" : state === "half_open" ? "恢复探测" : "健康";
+    const latency = member.latency_ms == null ? "未测速" : `${Number(member.latency_ms)} ms`;
+    const action = state === "excluded"
+      ? `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="0">恢复</button>`
+      : `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="1800">排除 30 分钟</button>`;
+    return `
+      <div class="pool-member-row is-${escapeHtml(state)}">
+        <div>
+          <strong>${escapeHtml(member.node_name || "未命名节点")}</strong>
+          <span>${escapeHtml(label)} · 健康 ${Number(member.health_score || 0)} · ${escapeHtml(latency)}</span>
+        </div>
+        ${action}
+      </div>`;
+  }).join("");
 }
 
 function renderBridges() {
@@ -1557,7 +2006,13 @@ function renderRequestLogs() {
   const empty = $("#emptyLogs");
   const allLogs = appState.requestLogs || [];
   const logs = filteredRequestLogs();
-  $("#logCount").textContent = allLogs.length === logs.length ? `${logs.length} 条` : `${logs.length} / ${allLogs.length} 条`;
+  const page = appState.requestLogPage;
+  $("#logCount").textContent = page.loaded && page.filtered_total !== page.total
+    ? `${page.filtered_total} / ${page.total} 条`
+    : `${page.loaded ? page.total : allLogs.length} 条`;
+  $("#requestLogPage").textContent = `第 ${page.page} / ${page.page_count} 页`;
+  $("#requestLogPrev").disabled = page.page <= 1;
+  $("#requestLogNext").disabled = page.page >= page.page_count;
   if (!logs.length) {
     rows.innerHTML = "";
     empty.textContent = allLogs.length ? "没有匹配的连接日志" : "暂无连接日志";
@@ -1609,14 +2064,7 @@ function systemLevelLabel(level) {
 
 // 按当前筛选(级别 + 关键词)过滤系统日志。
 function filteredSystemLogs() {
-  const search = appState.systemLogFilters.search.trim().toLowerCase();
-  const level = appState.systemLogFilters.level;
-  return (appState.systemLogs || []).filter((entry) => {
-    if (level !== "all" && entry.level !== level) return false;
-    if (!search) return true;
-    return [entry.message, entry.category, entry.level, systemLevelLabel(entry.level)]
-      .some((value) => String(value || "").toLowerCase().includes(search));
-  });
+  return appState.systemLogs || [];
 }
 
 // 渲染系统日志表格,并同步筛选控件的当前值与计数。
@@ -1632,7 +2080,13 @@ function renderSystemLogs() {
 
   const all = appState.systemLogs || [];
   const logs = filteredSystemLogs();
-  $("#systemCount").textContent = all.length === logs.length ? `${logs.length} 条` : `${logs.length} / ${all.length} 条`;
+  const page = appState.systemLogPage;
+  $("#systemCount").textContent = page.loaded && page.filtered_total !== page.total
+    ? `${page.filtered_total} / ${page.total} 条`
+    : `${page.loaded ? page.total : all.length} 条`;
+  $("#systemLogPage").textContent = `第 ${page.page} / ${page.page_count} 页`;
+  $("#systemLogPrev").disabled = page.page <= 1;
+  $("#systemLogNext").disabled = page.page >= page.page_count;
   if (!logs.length) {
     rows.innerHTML = "";
     empty.textContent = all.length ? "没有匹配的系统日志" : "暂无系统日志";
@@ -1982,6 +2436,28 @@ async function testNode(nodeId) {
   return result;
 }
 
+async function saveNodeCoreSettings(nodeId) {
+  const select = document.querySelector(`select[data-core-select="${CSS.escape(nodeId)}"]`);
+  const fallback = document.querySelector(`input[data-core-fallback="${CSS.escape(nodeId)}"]`);
+  if (!select || !fallback) return;
+  select.disabled = true;
+  fallback.disabled = true;
+  try {
+    const result = await api("/api/nodes/core", {
+      node_id: nodeId,
+      preferred_core: select.value,
+      fallback_enabled: fallback.checked,
+    });
+    const index = appState.nodes.findIndex((node) => node.id === nodeId);
+    if (index >= 0) appState.nodes[index] = result.node;
+    renderNodes();
+    showToast(fallback.checked ? "核心偏好已保存，启动失败将尝试备用核心" : "核心偏好已保存");
+  } catch (error) {
+    await loadStatus({ forceFresh: true }).catch(() => {});
+    throw error;
+  }
+}
+
 async function launchBrowser(nodeId, instanceId = "") {
   if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   const payload = instanceId ? { node_id: nodeId, instance_id: instanceId } : { node_id: nodeId };
@@ -2135,6 +2611,15 @@ async function handleAction(event) {
       await api("/api/pool/token/rotate", {});
       await loadStatus({ forceFresh: true });
       showToast("代理池密钥已轮换，旧链接立即失效");
+    } else if (action === "exclude-pool-member") {
+      const duration = Number(button.dataset.duration || 0);
+      await api("/api/pool/exclude", { id: button.dataset.id, duration_seconds: duration });
+      await loadStatus({ forceFresh: true });
+      showToast(duration ? "节点已暂时排除 30 分钟" : "节点已恢复到代理池");
+    } else if (action === "kick-client") {
+      await api("/api/network/clients/kick", { id: button.dataset.id });
+      await loadStatus({ forceFresh: true });
+      showToast("客户端连接已断开");
     } else if (action === "stop") {
       const result = await api("/api/bridges/stop", { id: button.dataset.id });
       await loadStatus({ forceFresh: true });
@@ -2149,9 +2634,12 @@ async function handleAction(event) {
       await loadStatus({ forceFresh: true });
       showToast(stopped.killed_browsers ? "已重启服务，关联浏览器已关闭" : "已重启服务");
     } else if (action === "refresh-sub") {
-      await api("/api/subscriptions/refresh", { id: button.dataset.id });
+      const result = await api("/api/subscriptions/refresh", { id: button.dataset.id });
       await loadStatus({ forceFresh: true });
-      showToast("订阅已刷新");
+      const changes = result.changes || {};
+      showToast(result.not_modified
+        ? "订阅远端未变化"
+        : `订阅已刷新：新增 ${Number(changes.added || 0)}、删除 ${Number(changes.removed || 0)}、变更 ${Number(changes.changed || 0)}`);
     } else if (action === "delete-sub") {
       const subscription = appState.subscriptions.find((item) => item.id === button.dataset.id);
       const name = subscription?.name || "该订阅";
@@ -2163,17 +2651,25 @@ async function handleAction(event) {
     } else if (action === "clear-logs") {
       await api("/api/logs/clear", {});
       await loadStatus({ forceFresh: true });
+      appState.requestLogPage.page = 1;
+      await loadLogPage("request");
       showToast("连接日志已清空");
     } else if (action === "clear-system-logs") {
       await api("/api/system/logs/clear", {});
       await loadStatus({ forceFresh: true });
+      appState.systemLogPage.page = 1;
+      await loadLogPage("system");
       showToast("系统日志已清空");
+    } else if (action === "export-logs") {
+      await downloadLogExport(button.dataset.kind || "request", button.dataset.format || "json");
+      showToast("日志导出已开始下载");
     } else if (action === "reset-log-filters") {
       appState.logFilters.search = "";
       appState.logFilters.node = "all";
       appState.logFilters.status = "all";
       renderLogFilters();
-      renderRequestLogs();
+      appState.requestLogPage.page = 1;
+      await loadLogPage("request");
       showToast("日志筛选已重置");
     } else if (action === "show-core-log") {
       lastCoreLogTrigger = button;
@@ -2276,6 +2772,7 @@ function bindEvents() {
   if (networkForm) {
     networkForm.addEventListener("input", markNetworkFormDirty);
     networkForm.addEventListener("change", markNetworkFormDirty);
+    $("#lanAuthMode")?.addEventListener("change", syncLanAuthFields);
     networkForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       const submit = $("#networkSaveButton");
@@ -2286,6 +2783,85 @@ function bindEvents() {
       }
     });
   }
+  const speedTestForm = $("#speedTestSettingsForm");
+  if (speedTestForm) {
+    speedTestForm.addEventListener("input", () => { speedTestFormDirty = true; });
+    speedTestForm.addEventListener("change", () => { speedTestFormDirty = true; });
+    speedTestForm.addEventListener("submit", async (event) => {
+      const submit = $("#speedTestSaveButton");
+      submit.disabled = true;
+      submit.classList.add("is-busy");
+      try {
+        await saveSpeedTestSettings(event);
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        submit.disabled = false;
+        submit.classList.remove("is-busy");
+      }
+    });
+  }
+  const logSettingsForm = $("#logSettingsForm");
+  if (logSettingsForm) {
+    logSettingsForm.addEventListener("input", () => { logSettingsDirty = true; });
+    logSettingsForm.addEventListener("change", () => { logSettingsDirty = true; });
+    logSettingsForm.addEventListener("submit", async (event) => {
+      const submit = $("#logSettingsSaveButton");
+      submit.disabled = true;
+      submit.classList.add("is-busy");
+      try {
+        await saveLogSettings(event);
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        submit.disabled = false;
+        submit.classList.remove("is-busy");
+      }
+    });
+  }
+  $("#diagnosticsNetworkEnabled")?.addEventListener("change", renderDiagnosticBridgeOptions);
+  $("#diagnosticsRunButton")?.addEventListener("click", async () => {
+    try {
+      await runDiagnostics();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  $("#diagnosticsWebrtcButton")?.addEventListener("click", async () => {
+    try {
+      await runDiagnostics({ webrtcOnly: true });
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.addEventListener("change", async (event) => {
+    const coreControl = event.target.closest("[data-core-select], [data-core-fallback]");
+    if (coreControl) {
+      const nodeId = coreControl.dataset.coreSelect || coreControl.dataset.coreFallback;
+      try {
+        await saveNodeCoreSettings(nodeId);
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+      return;
+    }
+    const select = event.target.closest('select[data-action="schedule-sub"]');
+    if (!select) return;
+    select.disabled = true;
+    try {
+      await api("/api/subscriptions/schedule", {
+        id: select.dataset.id,
+        refresh_interval_minutes: Number(select.value),
+      });
+      await loadStatus({ forceFresh: true });
+      showToast(Number(select.value) ? "订阅自动刷新周期已更新" : "订阅自动刷新已关闭");
+    } catch (error) {
+      showToast(error.message, "error");
+      await loadStatus({ forceFresh: true }).catch(() => {});
+    } finally {
+      select.disabled = false;
+    }
+  });
   const syncForm = $("#syncForm");
   if (syncForm) {
     // 任意输入/勾选都标记脏数据，避免 3.5s 状态轮询把未保存内容冲掉。
@@ -2352,18 +2928,35 @@ function bindEvents() {
       showToast("没有可测试的节点", "error");
       return;
     }
+    if (nodes.length > 500) {
+      showToast(`当前筛选有 ${nodes.length} 个节点，批量测速上限为 500，请缩小筛选范围`, "error");
+      return;
+    }
     button.disabled = true;
     try {
-      for (const [index, node] of nodes.entries()) {
-        button.querySelector("span").textContent = `测试中 ${index + 1}/${nodes.length}`;
-        await testNode(node.id);
-      }
-      showToast("可见节点测试完成");
+      const task = await api("/api/nodes/test-batch/start", { node_ids: nodes.map((node) => node.id) });
+      appState.speedTest.tasks = [...(appState.speedTest.tasks || []), task];
+      renderSpeedTestTaskControls();
+      showToast(`已启动 ${nodes.length} 个节点的批量测速`);
     } catch (error) {
       showToast(error.message, "error");
     } finally {
-      button.querySelector("span").textContent = "测试可见节点";
-      button.disabled = false;
+      renderSpeedTestTaskControls();
+    }
+  });
+  $("#cancelVisibleTest").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const taskId = button.dataset.taskId;
+    if (!taskId) return;
+    button.disabled = true;
+    try {
+      await api("/api/nodes/test-batch/cancel", { id: taskId });
+      await loadStatus({ forceFresh: true });
+      showToast("正在取消批量测速");
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      renderSpeedTestTaskControls();
     }
   });
   $("#protocolFilter").addEventListener("change", (event) => {
@@ -2372,6 +2965,10 @@ function bindEvents() {
   });
   $("#regionFilter").addEventListener("change", (event) => {
     appState.filters.region = event.target.value;
+    renderNodes();
+  });
+  $("#nodeSort").addEventListener("change", (event) => {
+    appState.filters.sort = event.target.value;
     renderNodes();
   });
   const subscriptionFilter = $("#subscriptionFilter");
@@ -2387,23 +2984,42 @@ function bindEvents() {
   });
   $("#logSearchInput").addEventListener("input", (event) => {
     appState.logFilters.search = event.target.value;
-    renderRequestLogs();
+    scheduleLogPageLoad("request");
   });
   $("#logNodeFilter").addEventListener("change", (event) => {
     appState.logFilters.node = event.target.value;
-    renderRequestLogs();
+    appState.requestLogPage.page = 1;
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
   });
   $("#logStatusFilter").addEventListener("change", (event) => {
     appState.logFilters.status = event.target.value;
-    renderRequestLogs();
+    appState.requestLogPage.page = 1;
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
   });
   $("#systemSearchInput").addEventListener("input", (event) => {
     appState.systemLogFilters.search = event.target.value;
-    renderSystemLogs();
+    scheduleLogPageLoad("system");
   });
   $("#systemLevelFilter").addEventListener("change", (event) => {
     appState.systemLogFilters.level = event.target.value;
-    renderSystemLogs();
+    appState.systemLogPage.page = 1;
+    loadLogPage("system").catch((error) => showToast(error.message, "error"));
+  });
+  $("#requestLogPrev").addEventListener("click", () => {
+    appState.requestLogPage.page = Math.max(1, appState.requestLogPage.page - 1);
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
+  });
+  $("#requestLogNext").addEventListener("click", () => {
+    appState.requestLogPage.page = Math.min(appState.requestLogPage.page_count, appState.requestLogPage.page + 1);
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
+  });
+  $("#systemLogPrev").addEventListener("click", () => {
+    appState.systemLogPage.page = Math.max(1, appState.systemLogPage.page - 1);
+    loadLogPage("system").catch((error) => showToast(error.message, "error"));
+  });
+  $("#systemLogNext").addEventListener("click", () => {
+    appState.systemLogPage.page = Math.min(appState.systemLogPage.page_count, appState.systemLogPage.page + 1);
+    loadLogPage("system").catch((error) => showToast(error.message, "error"));
   });
   $("#coreLogModal").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) {
@@ -2428,6 +3044,7 @@ function bindEvents() {
   });
   window.addEventListener("beforeunload", () => {
     window.clearTimeout(statusPollTimer);
+    window.clearTimeout(logFilterTimer);
     statusAbortController?.abort();
   });
 }

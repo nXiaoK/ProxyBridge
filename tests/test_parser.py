@@ -1414,6 +1414,7 @@ class ParserTests(unittest.TestCase):
                 node_name: str,
                 listen_port: int,
                 upstream_port: int,
+                security=None,
             ) -> None:
                 self.listen_port = listen_port
                 self.started = False

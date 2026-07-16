@@ -3,6 +3,7 @@ import json
 import os
 import tempfile
 import unittest
+import urllib.parse
 from email.message import Message
 from pathlib import Path
 from unittest import mock
@@ -262,7 +263,7 @@ class StateAndParsingTests(unittest.TestCase):
                 super().__init__()
                 self.status = 302
                 self.headers = Message()
-                self.headers["Location"] = "http://127.0.0.1/private"
+                self.headers["Location"] = "https://127.0.0.1/private"
 
         with (
             mock.patch.object(
@@ -274,9 +275,32 @@ class StateAndParsingTests(unittest.TestCase):
         ):
             resolver.side_effect = [
                 [(app.socket.AF_INET, app.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))],
-                [(app.socket.AF_INET, app.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))],
+                [(app.socket.AF_INET, app.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))],
             ]
             with self.assertRaisesRegex(ValueError, "非公网地址"):
+                app.fetch_subscription("https://public.example/sub")
+
+    def test_fetch_subscription_rejects_https_downgrade_redirect(self):
+        class RedirectResponse(io.BytesIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.status = 302
+                self.headers = Message()
+                self.headers["Location"] = "http://public.example/sub"
+
+        with (
+            mock.patch.object(
+                app,
+                "_public_subscription_addresses",
+                return_value=(urllib.parse.urlsplit("https://public.example/sub"), ["8.8.8.8"]),
+            ),
+            mock.patch.object(
+                app,
+                "_open_subscription_response",
+                return_value=(mock.Mock(), RedirectResponse(), mock.Mock()),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "不允许降级"):
                 app.fetch_subscription("https://public.example/sub")
 
     def test_fetch_subscription_enforces_total_deadline(self):

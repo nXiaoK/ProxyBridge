@@ -790,6 +790,105 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertNotIn("encrypt_password", pub)
         self.assertIn("insecure_ssl", pub)
 
+    def test_url_userinfo_is_migrated_and_removed_from_public_settings(self):
+        raw = {
+            "url": "https://alice%40home:p%3Ass@[fd00::20]:8443/dav?folder=one",
+            "username": "",
+            "password": "",
+            "last_error": "failed https://alice%40home:p%3Ass@[fd00::20]:8443/dav",
+        }
+
+        cfg = webdav_sync.normalize_webdav_settings(raw)
+        public = webdav_sync.public_webdav_settings(cfg)
+
+        self.assertEqual(cfg["url"], "https://[fd00::20]:8443/dav?folder=one")
+        self.assertEqual(cfg["username"], "alice@home")
+        self.assertEqual(cfg["password"], "p:ss")
+        self.assertEqual(public["url"], cfg["url"])
+        self.assertNotIn("alice", public["last_error"])
+        self.assertNotIn("p%3Ass", public["last_error"])
+
+    def test_nested_url_userinfo_is_redacted_from_settings_and_errors(self):
+        nested = "https://dav.test/base?next=https://alice:top-secret@evil.test/path"
+        cfg = webdav_sync.normalize_webdav_settings(
+            {"url": nested, "last_error": f"redirect failed: {nested}"}
+        )
+        public = webdav_sync.public_webdav_settings(cfg)
+
+        self.assertNotIn("alice", cfg["url"])
+        self.assertNotIn("top-secret", cfg["url"])
+        self.assertNotIn("alice", public["last_error"])
+        self.assertNotIn("top-secret", public["last_error"])
+        self.assertIn("next=https://evil.test/path", public["url"])
+
+    def test_explicit_webdav_credentials_override_url_userinfo(self):
+        cfg = webdav_sync.normalize_webdav_settings(
+            {
+                "url": "https://url-user:url-pass@dav.test/base",
+                "username": "settings-user",
+                "password": "settings-pass",
+            }
+        )
+
+        self.assertEqual(cfg["url"], "https://dav.test/base")
+        self.assertEqual(cfg["username"], "settings-user")
+        self.assertEqual(cfg["password"], "settings-pass")
+
+    def test_update_settings_can_clear_credentials_from_userinfo_url(self):
+        result = self.engine.update_settings(
+            {
+                "url": "https://url-user:url-pass@dav.test/base",
+                "username": "",
+                "password": "",
+                "clear_password": True,
+            }
+        )
+        stored = self._load()["settings"]["webdav"]
+
+        self.assertEqual(result["url"], "https://dav.test/base")
+        self.assertEqual(result["username"], "")
+        self.assertFalse(result["password_set"])
+        self.assertEqual(stored["url"], "https://dav.test/base")
+        self.assertEqual(stored["username"], "")
+        self.assertEqual(stored["password"], "")
+
+    def test_webdav_client_strips_url_userinfo_and_validates_ports(self):
+        client = webdav_sync.WebDAVClient(
+            "https://alice%40home:p%3Ass@[fd00::20]:8443/dav"
+        )
+        self.assertEqual(client.base, "https://[fd00::20]:8443/dav")
+        self.assertEqual(client.username, "alice@home")
+        self.assertEqual(client.password, "p:ss")
+
+        for url in ("https://dav.test:bad/base", "https://dav.test:70000/base"):
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "端口"):
+                webdav_sync.WebDAVClient(url)
+
+    def test_webdav_request_errors_redact_url_credentials(self):
+        client = webdav_sync.WebDAVClient("https://dav.test/base")
+        secret_url = "https://alice:top,secret;value@dav.test/private"
+        client._opener = mock.Mock()
+        client._opener.open.side_effect = webdav_sync.urllib.error.URLError(
+            f"cannot reach {secret_url}"
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            client.request("GET", secret_url)
+
+        message = str(caught.exception)
+        self.assertNotIn("alice", message)
+        self.assertNotIn("top,secret;value", message)
+        self.assertIn("https://dav.test/private", message)
+
+    def test_sync_failure_state_redacts_url_credentials(self):
+        secret_url = "https://alice:top-secret@dav.test/private"
+
+        cfg = self.engine._record_sync_failure(f"failed {secret_url}", "上传失败")
+
+        self.assertNotIn("alice", cfg["last_error"])
+        self.assertNotIn("top-secret", cfg["last_error"])
+        self.assertNotIn("alice", self._load()["settings"]["webdav"]["last_error"])
+
     def test_insecure_ssl_client_builds(self):
         client = webdav_sync.WebDAVClient(
             "https://example.invalid/dav",

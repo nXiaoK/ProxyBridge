@@ -447,6 +447,27 @@ class SecurityTests(unittest.TestCase):
                 self.assertEqual(headers.get_content_type(), "application/json")
                 self.assertIn("error", json.loads(response_body))
 
+    def test_api_errors_redact_url_credentials_from_response_and_log(self):
+        handler = make_handler(
+            "POST",
+            "/api/sync/test",
+            {"Host": "127.0.0.1:8787"},
+        )
+        secret_url = "https://alice:top-secret@dav.test/private"
+
+        with mock.patch.object(app, "log_event") as log_event:
+            app.error_response(handler, RuntimeError(f"WebDAV failed: {secret_url}"))
+
+        status, _headers, response_body = response_parts(handler)
+        response_text = response_body.decode("utf-8")
+        log_text = str(log_event.call_args)
+        self.assertEqual(status, 400)
+        self.assertNotIn("alice", response_text)
+        self.assertNotIn("top-secret", response_text)
+        self.assertNotIn("alice", log_text)
+        self.assertNotIn("top-secret", log_text)
+        self.assertIn("https://dav.test/private", response_text)
+
 
 if __name__ == "__main__":
     unittest.main()

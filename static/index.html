@@ -74,6 +74,10 @@
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>
             <span class="nav-label">WebDAV 同步</span>
           </button>
+          <button class="nav-item" type="button" data-view="diagnostics" aria-label="诊断中心">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h3l2-5 4 10 2-5h5"/><circle cx="12" cy="12" r="9"/></svg>
+            <span class="nav-label">诊断中心</span>
+          </button>
         </nav>
 
         <!-- 侧边栏底部:代理核心 / 指纹内核状态 + 主题切换 -->
@@ -108,6 +112,15 @@
                 <span>地区</span>
                 <select id="regionFilter"></select>
               </label>
+              <label class="field-inline">
+                <span>排序</span>
+                <select id="nodeSort" aria-label="节点排序">
+                  <option value="name">名称</option>
+                  <option value="latency">延迟</option>
+                  <option value="success_rate">成功率</option>
+                  <option value="tested_at">最近测试</option>
+                </select>
+              </label>
               <div class="search-field">
                 <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
                 <input id="searchInput" type="search" autocomplete="off" placeholder="搜索名称 / 服务器 / 订阅" aria-label="搜索节点">
@@ -115,6 +128,10 @@
               <button class="toolbar-button" id="testVisible" type="button">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
                 <span>测试可见节点</span>
+              </button>
+              <button class="toolbar-button" id="cancelVisibleTest" type="button" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10"/></svg>
+                <span>取消测速</span>
               </button>
               <button class="toolbar-button icon-only" id="refreshList" type="button" aria-label="刷新列表" title="刷新列表">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4M18 3v4h-4M6 21v-4h4"/></svg>
@@ -209,12 +226,13 @@
                 <strong>代理池</strong>
                 <span class="countline" id="poolMemberCount">0 个成员</span>
               </div>
-              <p class="view-hint">自动包含所有运行中/启动中的本地 HTTP / SOCKS5 代理。列表链接可能短暂包含尚未就绪的节点；「随机获取」默认只返回已就绪端口。将链接粘贴到脚本或爬虫即可拉取。</p>
+              <p class="view-hint">自动包含运行中的 HTTP / SOCKS5 代理；健康优先会综合测速、成功率和连续失败，熔断节点恢复后自动重试。</p>
               <div class="pool-link-rows" id="poolLinkRows"></div>
+              <div class="pool-member-list" id="poolMemberList"></div>
               <div class="pool-card-actions">
                 <button type="button" class="toolbar-button" data-action="copy" id="poolCopyListJson" data-text="">复制 JSON 列表链接</button>
                 <button type="button" class="toolbar-button" data-action="copy" id="poolCopyProxiesTxt" data-text="">复制文本列表链接</button>
-                <button type="button" class="toolbar-button" data-action="copy" id="poolCopyGet" data-text="">复制随机获取链接</button>
+                <button type="button" class="toolbar-button" data-action="copy" id="poolCopyGet" data-text="">复制健康优先链接</button>
                 <button type="button" class="toolbar-button danger" data-action="rotate-pool-token" id="poolRotateToken">轮换密钥</button>
               </div>
             </section>
@@ -249,6 +267,8 @@
                 </select>
               </label>
               <button class="toolbar-button" id="resetLogFilters" type="button" data-action="reset-log-filters">重置</button>
+              <button class="toolbar-button" type="button" data-action="export-logs" data-kind="request" data-format="csv">导出 CSV</button>
+              <button class="toolbar-button" type="button" data-action="export-logs" data-kind="request" data-format="json">导出 JSON</button>
               <button class="toolbar-button danger" id="clearLogs" type="button" data-action="clear-logs">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 15h10l1-15"/></svg>
                 <span>清空</span>
@@ -273,6 +293,11 @@
               </table>
               <div class="empty-state visible" id="emptyLogs">暂无连接日志</div>
             </div>
+            <nav class="log-pagination" aria-label="连接日志分页">
+              <button class="row-button" id="requestLogPrev" type="button" aria-label="上一页">上一页</button>
+              <span id="requestLogPage">第 1 / 1 页</span>
+              <button class="row-button" id="requestLogNext" type="button" aria-label="下一页">下一页</button>
+            </nav>
           </div>
         </section>
 
@@ -306,11 +331,105 @@
 
               <div class="network-warning" id="networkShareWarning" role="note">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2.8 20h18.4L12 3z"/><path d="M12 9v5M12 17.5v.1"/></svg>
-                <p><strong>请仅在可信网络开启。</strong>代理端口没有用户名或密码，同一局域网或可达本机的私有 IPv4 / VPN 设备可能直接使用你的代理。Proxy Bridge 控制台不会因此对外开放。</p>
+                <p><strong>请仅在可信网络开启。</strong>建议同时配置用户名密码或 Token、收窄 IP/CIDR 白名单并设置连接上限。Proxy Bridge 控制台不会因此对外开放。</p>
+              </div>
+
+              <div class="form-grid settings-form-grid network-security-grid">
+                <label>
+                  <span>认证方式</span>
+                  <select id="lanAuthMode">
+                    <option value="none">无认证</option>
+                    <option value="basic">用户名和密码</option>
+                    <option value="token">Token</option>
+                  </select>
+                </label>
+                <label>
+                  <span>总连接数上限</span>
+                  <input id="lanMaxConnections" type="number" min="1" max="1024" step="1">
+                </label>
+                <label id="lanUsernameField">
+                  <span>用户名</span>
+                  <input id="lanUsername" type="text" maxlength="128" autocomplete="username">
+                </label>
+                <label id="lanPasswordField">
+                  <span>密码（留空保持不变）</span>
+                  <input id="lanPassword" type="password" maxlength="255" autocomplete="new-password">
+                </label>
+                <label id="lanTokenField" class="sync-span-2" hidden>
+                  <span>Token（首次启用必填；已配置时留空保持不变）</span>
+                  <input id="lanToken" type="text" maxlength="255" autocomplete="off" spellcheck="false">
+                </label>
+                <label class="sync-span-2">
+                  <span>允许的 IP / CIDR（每行一项）</span>
+                  <textarea id="lanAllowedCidrs" rows="3" spellcheck="false"></textarea>
+                </label>
               </div>
 
               <div class="import-card-actions">
                 <button class="primary-button" id="networkSaveButton" type="submit" disabled>保存设置</button>
+              </div>
+            </form>
+
+            <form id="speedTestSettingsForm" class="settings-card">
+              <div class="import-card-title">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 14a8 8 0 1 1 16 0"/><path d="m12 14 4-4"/><circle cx="12" cy="14" r="2"/></svg>
+                <h2>测速设置</h2>
+              </div>
+              <div class="form-grid settings-form-grid">
+                <label class="sync-span-2">
+                  <span>探测目标（每行一个 HTTP/HTTPS URL）</span>
+                  <textarea id="speedTestTargets" rows="4" spellcheck="false"></textarea>
+                </label>
+                <label>
+                  <span>轮换方式</span>
+                  <select id="speedTestRotation">
+                    <option value="round_robin">轮询</option>
+                    <option value="random">随机</option>
+                  </select>
+                </label>
+                <label>
+                  <span>结果过期（分钟）</span>
+                  <input id="speedTestStaleMinutes" type="number" min="1" max="43200" step="1">
+                </label>
+                <label>
+                  <span>批量并发</span>
+                  <input id="speedTestConcurrency" type="number" min="3" max="5" step="1">
+                </label>
+                <label>
+                  <span>失败重试</span>
+                  <input id="speedTestRetries" type="number" min="0" max="2" step="1">
+                </label>
+              </div>
+              <div class="import-card-actions">
+                <button class="primary-button" id="speedTestSaveButton" type="submit">保存测速设置</button>
+              </div>
+            </form>
+
+            <form id="logSettingsForm" class="settings-card">
+              <div class="import-card-title">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h16M4 19h10"/><circle cx="18" cy="19" r="2"/></svg>
+                <h2>日志存储</h2>
+              </div>
+              <div class="form-grid settings-form-grid">
+                <label>
+                  <span>保留天数</span>
+                  <input id="logRetentionDays" type="number" min="1" max="365" step="1">
+                </label>
+                <label>
+                  <span>单文件上限（MiB）</span>
+                  <input id="logMaxFileMiB" type="number" min="1" max="128" step="1">
+                </label>
+                <label>
+                  <span>总磁盘配额（MiB）</span>
+                  <input id="logDiskQuotaMiB" type="number" min="8" max="2048" step="1">
+                </label>
+                <div class="settings-readout">
+                  <span>当前占用</span>
+                  <strong id="logStorageUsage">—</strong>
+                </div>
+              </div>
+              <div class="import-card-actions">
+                <button class="primary-button" id="logSettingsSaveButton" type="submit">保存日志设置</button>
               </div>
             </form>
 
@@ -336,6 +455,16 @@
               </div>
               <div class="network-proxy-list" id="networkProxyList" aria-live="polite">
                 <div class="settings-empty">正在加载网络状态…</div>
+              </div>
+            </section>
+
+            <section class="settings-info-card" aria-labelledby="networkClientsTitle">
+              <div class="settings-info-head">
+                <h2 id="networkClientsTitle">当前客户端</h2>
+                <span class="countline" id="networkClientCount">0 个连接</span>
+              </div>
+              <div class="network-client-list" id="networkClientList" aria-live="polite">
+                <div class="settings-empty">暂无活动连接</div>
               </div>
             </section>
           </div>
@@ -435,6 +564,41 @@
           </div>
         </section>
 
+        <!-- ---------- 诊断中心视图 ---------- -->
+        <section class="view" data-view="diagnostics" aria-labelledby="diagnosticsTitle" hidden>
+          <header class="view-toolbar">
+            <div class="view-heading">
+              <h1 id="diagnosticsTitle">诊断中心</h1>
+              <span class="countline" id="diagnosticsStatusLine" role="status" aria-live="polite">尚未运行</span>
+            </div>
+            <div class="toolbar-controls">
+              <button class="toolbar-button" id="diagnosticsWebrtcButton" type="button">仅检查 WebRTC</button>
+              <button class="toolbar-button primary-button" id="diagnosticsRunButton" type="button">运行诊断</button>
+            </div>
+          </header>
+          <div class="view-body diagnostics-body">
+            <div class="diagnostic-controls">
+              <label class="diagnostic-network-toggle">
+                <input id="diagnosticsNetworkEnabled" type="checkbox">
+                <span>
+                  <strong>包含网络检查</strong>
+                  <small>访问 api.github.com、已配置的 WebDAV，以及经所选代理访问 api.ipify.org；结果不会写入状态文件。</small>
+                </span>
+              </label>
+              <label class="diagnostic-proxy-field">
+                <span>出口检查代理</span>
+                <select id="diagnosticsBridgeSelect" disabled>
+                  <option value="">自动选择运行中的代理</option>
+                </select>
+              </label>
+            </div>
+            <p class="view-hint">本地检查涵盖核心版本、实际端口监听、Docker 映射声明和数据目录权限。WebRTC 仅在当前浏览器采集本地 ICE 候选，不使用第三方 STUN。</p>
+            <div class="diagnostic-results" id="diagnosticsResults" aria-live="polite">
+              <div class="settings-empty">运行诊断后在此显示逐项结果</div>
+            </div>
+          </div>
+        </section>
+
         <!-- ---------- 系统日志视图 ---------- -->
         <section class="view" data-view="system" aria-labelledby="systemTitle" hidden>
           <header class="view-toolbar">
@@ -456,6 +620,8 @@
                   <option value="error">错误</option>
                 </select>
               </label>
+              <button class="toolbar-button" type="button" data-action="export-logs" data-kind="system" data-format="csv">导出 CSV</button>
+              <button class="toolbar-button" type="button" data-action="export-logs" data-kind="system" data-format="json">导出 JSON</button>
               <button class="toolbar-button danger" id="clearSystemLogs" type="button" data-action="clear-system-logs">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 15h10l1-15"/></svg>
                 <span>清空</span>
@@ -478,6 +644,11 @@
               </table>
               <div class="empty-state visible" id="emptySystemLogs">暂无系统日志</div>
             </div>
+            <nav class="log-pagination" aria-label="系统日志分页">
+              <button class="row-button" id="systemLogPrev" type="button" aria-label="上一页">上一页</button>
+              <span id="systemLogPage">第 1 / 1 页</span>
+              <button class="row-button" id="systemLogNext" type="button" aria-label="下一页">下一页</button>
+            </nav>
           </div>
         </section>
       </main>
@@ -549,6 +720,7 @@
       })();
     </script>
     <script src="/static/auth.js"></script>
+    <script src="/static/diagnostics.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

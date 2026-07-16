@@ -757,6 +757,42 @@ select {
 .import-card label input {
   width: 100%;
 }
+.settings-form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.settings-form-grid label > span {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+.settings-form-grid input,
+.settings-form-grid select,
+.settings-form-grid textarea {
+  width: 100%;
+}
+.settings-readout {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  min-height: 48px;
+}
+.settings-readout span {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.settings-readout strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.settings-form-grid textarea {
+  resize: vertical;
+  min-height: 82px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
 .import-card-actions {
   display: flex;
   justify-content: flex-end;
@@ -1043,6 +1079,30 @@ tbody .row-actions .row-button {
   color: var(--text-tertiary);
   margin-left: 3px;
 }
+.node-core-control {
+  display: grid;
+  gap: 3px;
+  min-width: 96px;
+}
+.node-core-control select {
+  width: 100%;
+  min-height: 26px;
+  padding: 2px 22px 2px 6px;
+  font-size: 10px;
+}
+.node-core-control label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-tertiary);
+  font-size: 9px;
+  white-space: nowrap;
+}
+.node-core-control input {
+  width: 12px;
+  height: 12px;
+  margin: 0;
+}
 .region-cell { color: var(--text-secondary); font-size: 12px; }
 .name-cell {
   display: flex;
@@ -1083,6 +1143,17 @@ tbody .row-actions .row-button {
   font-size: 10px;
   color: var(--text-tertiary);
 }
+.test-result-meta {
+  width: 100%;
+  font-size: 10px;
+  color: var(--text-tertiary);
+}
+.test-result.is-stale .test-line {
+  color: var(--warning);
+}
+.subscription-schedule {
+  min-width: 112px;
+}
 
 /* ============================================================
    Bridges view (running SOCKS5 cards)
@@ -1121,11 +1192,129 @@ tbody .row-actions .row-button {
 }
 
 .settings-body,
-.sync-body {
+.sync-body,
+.diagnostics-body {
   max-width: 760px;
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+.diagnostics-body {
+  max-width: 900px;
+}
+.diagnostic-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(220px, 1fr);
+  align-items: end;
+  gap: 14px;
+  padding: 14px 16px;
+  background: var(--bg-panel);
+  border: 0.5px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-panel);
+}
+.diagnostic-network-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  min-width: 0;
+}
+.diagnostic-network-toggle input {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+.diagnostic-network-toggle > span,
+.diagnostic-proxy-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.diagnostic-network-toggle strong,
+.diagnostic-proxy-field > span {
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+.diagnostic-network-toggle small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.5;
+}
+.diagnostic-results {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.diagnostic-result {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--bg-panel);
+  border: 0.5px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.diagnostic-status-mark {
+  width: 8px;
+  height: 8px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+.diagnostic-result.is-ok .diagnostic-status-mark { background: var(--success); }
+.diagnostic-result.is-warn .diagnostic-status-mark { background: var(--warning); }
+.diagnostic-result.is-error .diagnostic-status-mark { background: var(--danger); }
+.diagnostic-result-copy {
+  min-width: 0;
+}
+.diagnostic-result-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.diagnostic-result-head strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+.diagnostic-status-label,
+.diagnostic-latency {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  white-space: nowrap;
+}
+.diagnostic-latency {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+}
+.diagnostic-result-copy > p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.diagnostic-details {
+  margin-top: 7px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+.diagnostic-details summary {
+  cursor: pointer;
+}
+.diagnostic-details pre {
+  max-height: 220px;
+  margin: 7px 0 0;
+  padding: 9px 10px;
+  overflow: auto;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .settings-card,
 .sync-card {
@@ -1350,6 +1539,20 @@ tbody .row-actions .row-button {
   color: var(--text-tertiary);
   font-size: 11px;
 }
+.log-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 12px;
+  min-height: 30px;
+}
+.log-pagination span {
+  min-width: 92px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-align: center;
+}
 .settings-empty {
   padding: 16px;
   border: 1px dashed var(--border-strong);
@@ -1360,6 +1563,52 @@ tbody .row-actions .row-button {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+.network-security-grid {
+  padding-top: 2px;
+}
+.network-security-grid [hidden] {
+  display: none;
+}
+.network-client-list,
+.pool-member-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.network-client-row,
+.pool-member-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 0.5px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+.network-client-row > div,
+.pool-member-row > div {
+  min-width: 0;
+}
+.network-client-row strong,
+.pool-member-row strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.network-client-row span,
+.pool-member-row span {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-tertiary);
+  font-size: 10px;
+}
+.pool-member-row.is-open,
+.pool-member-row.is-excluded {
+  border-color: color-mix(in oklab, var(--warning) 35%, var(--border-subtle));
 }
 .network-stale-note {
   padding: 7px 10px;
@@ -2055,5 +2304,18 @@ tbody .row-actions .row-button {
   .network-proxy-url-row > div {
     grid-template-columns: minmax(0, 1fr);
     gap: 2px;
+  }
+  .network-client-row,
+  .pool-member-row {
+    align-items: flex-start;
+  }
+  .diagnostic-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .diagnostic-result-head {
+    flex-wrap: wrap;
+  }
+  .diagnostic-latency {
+    margin-left: 0;
   }
 }
