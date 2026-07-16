@@ -34,7 +34,7 @@
           </div>
           <div class="brand-text">
             <strong>Proxy Bridge</strong>
-            <span>订阅节点 · 本地代理</span>
+            <span id="brandSubtitle">订阅节点 · 本地代理</span>
           </div>
         </div>
 
@@ -285,12 +285,12 @@
             </div>
           </header>
           <div class="view-body settings-body">
-            <p class="view-hint">管理本地代理的访问范围。设置只影响代理端口，控制台始终仅允许从本机访问。</p>
+            <p class="view-hint" id="networkSettingsHint">管理本地代理的访问范围。设置只影响代理端口，控制台始终仅允许从本机访问。</p>
 
             <form id="networkSettingsForm" class="settings-card">
               <div class="import-card-title">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="5" cy="12" r="2"/><circle cx="19" cy="12" r="2"/><path d="M7 12h2M15 12h2M12 9V5"/><circle cx="12" cy="3" r="2"/></svg>
-                <h2>局域网共享</h2>
+                <h2 id="networkSettingsCardTitle">局域网共享</h2>
               </div>
 
               <div class="settings-toggle-row">
@@ -356,7 +356,7 @@
             </div>
           </header>
           <div class="view-body sync-body">
-            <p class="view-hint">
+            <p class="view-hint" id="syncDescription">
               在多台 Mac 之间同步<strong>订阅 / 节点</strong>与<strong>已停止的指纹浏览器 Profile</strong>（Cookie、LocalStorage 等），实现换机接力。
               删除订阅会清理关联节点的浏览器记录与本地 Profile，并在启用同步时<strong>自动上传</strong>（远端对应数据一并删除）。
               请先在本机关闭目标浏览器再上传；不要两边同时打开同一浏览器实例。
@@ -383,7 +383,7 @@
                   <span>远端目录</span>
                   <input id="syncRemoteRoot" name="remote_root" type="text" autocomplete="off" placeholder="ProxyBridge">
                 </label>
-                <label class="sync-checkbox">
+                <label class="sync-checkbox" id="syncAutoUploadOption">
                   <input id="syncEnabled" name="enabled" type="checkbox">
                   <span>启用同步</span>
                 </label>
@@ -424,6 +424,7 @@
 
             <div class="sync-meta-card" id="syncMetaCard">
               <div class="sync-meta-row"><span>本机设备 ID</span><code id="syncDeviceId">-</code></div>
+              <div class="sync-meta-row"><span>同步范围</span><span id="syncScope">-</span></div>
               <div class="sync-meta-row"><span>上次上传</span><span id="syncLastPush">-</span></div>
               <div class="sync-meta-row"><span>上次拉取</span><span id="syncLastPull">-</span></div>
               <div class="sync-meta-row"><span>远端更新时间</span><span id="syncLastRemote">-</span></div>

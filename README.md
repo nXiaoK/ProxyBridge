@@ -1,6 +1,6 @@
 # Proxy Bridge
 
-本地订阅节点到多协议代理端口的工具。提供 macOS 菜单栏 App，以及可在 macOS / Linux / Windows 运行的无壳 Web 控制台。
+本地订阅节点到多协议代理端口的工具。提供 macOS 菜单栏 App，以及可在 macOS / Linux / Windows 和 Docker 运行的无壳 Web 控制台。
 
 ## 功能
 
@@ -11,7 +11,7 @@
 - HTTP 代理模式支持普通 HTTP 请求和 HTTPS CONNECT,兼容不支持 SOCKS5 的软件。
 - 普通协议走 `sing-box`，`VLESS + XHTTP` 自动走 `xray` fallback。
 - 菜单栏 App 默认不内置 `sing-box` / `xray`，首次运行时会自动下载到用户数据目录;也可构建时选择内置核心。
-- 节点操作列可启动**独立指纹浏览器**(每节点独立指纹 + 独立 Profile),并自动绑定该节点的本地代理。
+- 桌面/普通无壳模式下，节点操作列可启动**独立指纹浏览器**(每节点独立指纹 + 独立 Profile),并自动绑定该节点的本地代理；Docker 模式会完整关闭该能力。
 
 ## 运行要求
 
@@ -26,11 +26,18 @@
 - 首次运行需要能访问 GitHub，用于自动下载 `sing-box` / `xray`
 - 指纹浏览器一键下载依赖上游是否发布对应平台包；也可手动设置 `PROXY_BRIDGE_FP_CHROMIUM`
 
+### Docker
+- Docker Engine 24+ / Docker Compose v2（推荐）
+- 当前支持 `linux/amd64` 与 `linux/arm64`
+- Web 控制台与代理端口通过宿主机回环地址访问
+- 不安装或启用指纹浏览器；WebDAV 仅同步订阅 / 节点
+
 ## Windows / Linux 文档入口
 
 完整安装与使用教程（双击 exe、托盘、无壳控制台、开机自启、systemd、排障）：
 
 - [Windows / Linux 安装与使用教程](docs/windows-linux-install.md)
+- [Docker 运行教程](docs/docker.md)
 
 快速选择：
 
@@ -39,6 +46,7 @@
 | Windows 日常使用 | 构建/获取 `ProxyBridge.exe` 后双击 |
 | Linux 桌面 | `scripts/run_tray.sh` 托盘壳 |
 | Linux 服务器 / 无 GUI | `python3 app.py` 无壳控制台 |
+| Docker / NAS / 长期服务 | `docker compose up -d --build` |
 
 ## 构建机准备
 
@@ -170,6 +178,30 @@ http://127.0.0.1:8787
 - 代理核心会按当前操作系统/架构从 GitHub Releases 自动选择 Linux / Windows / macOS 包。
 - 指纹浏览器若上游未提供当前平台安装包，可手动下载后通过 `PROXY_BRIDGE_FP_CHROMIUM` 指向可执行文件。
 - 管理控制台默认仅本机访问；局域网共享开关只影响本地代理端口，不会把控制台暴露到局域网。
+
+## Docker 运行
+
+Docker 模式直接提供 Web 控制台和本地代理，不包含托盘、系统浏览器调用或指纹浏览器功能。
+
+```bash
+docker compose up -d --build
+```
+
+打开：
+
+```text
+http://127.0.0.1:8787
+```
+
+Compose 默认：
+
+- 使用 `proxybridge-data` 命名卷持久化 `/data`。
+- Web 控制台默认仅发布到宿主机 `127.0.0.1:8787`；可通过 `.env` 中的 `PROXY_BRIDGE_CONSOLE_HOST=<宿主机局域网 IPv4>` 精确开放给局域网。
+- 代理端口范围发布为 `127.0.0.1:21080-21179`，容器内自动分配也限制在相同范围。
+- 首次启动自动下载 Linux 版 `sing-box` / `xray` 到数据卷。
+- WebDAV 页面显示「仅订阅 / 节点」；上传不会删除远端已有浏览器 Profile，拉取也不会处理本地 Profile。
+
+完整的 `docker run`、端口扩容、数据卷、离线核心、SSH 隧道和排障步骤见 [`docs/docker.md`](docs/docker.md)。
 
 ## Windows / Linux 托盘常驻壳
 
@@ -312,7 +344,9 @@ Windows 额外可用快捷方式脚本（桌面 + 开机启动）：
 
 ## WebDAV 同步
 
-支持在多台 Mac 之间同步**订阅 / 节点**与**指纹浏览器 Profile**（Cookie、LocalStorage 等），用于换机接力。
+桌面/普通无壳模式支持同步**订阅 / 节点**与**指纹浏览器 Profile**（Cookie、LocalStorage 等），用于换机接力。
+
+Docker / 禁用浏览器模式会自动切换为**仅订阅 / 节点同步**：不会打包、下载或删除 Profile；如果相同远端目录中已有桌面版浏览器数据，Docker 上传会验证并保留它们。
 
 控制台侧边栏 **「WebDAV 同步」**：
 
@@ -331,6 +365,7 @@ Windows 额外可用快捷方式脚本（桌面 + 开机启动）：
 - 浏览器记录支持 **标签**（如「访问 xx 的浏览器」）；保存标签会标记本地变更并尝试同步。
 - 关闭浏览器窗口或点「停止」（且开启「关闭后自动上传」）会**自动上传**该 Profile（含标签）。
 - 拉取时以远端为权威：本机多出来的订阅/节点/浏览器记录会被移除，对应本地 Profile 目录也会清理。
+- Docker / 禁用浏览器模式下，上述覆盖与清理只适用于订阅和节点，本地浏览器记录/Profile 保持不变。
 - 可选：关闭浏览器后自动上传、启动时检查远端更新、**忽略 SSL 证书**（过期/自签）。
 - 可选：PBENC2 端到端加密（PBKDF2 + OpenSSL AES-256-CBC + HMAC 完整性校验）；本机需有 `openssl`。仍可读取旧 PBENC1 数据，新上传统一使用 PBENC2。
 - 冲突策略为远端后写覆盖（LWW），并记录设备 ID。

@@ -9,6 +9,7 @@ ProxyBridge 在 Windows / Linux 上提供两种形态：
 |---|---|---|---|
 | **托盘常驻壳** | 日常桌面使用 | 源码运行需要；`.exe`/单文件二进制不需要 | 托盘图标 + Web 控制台 |
 | **无壳 Web 控制台** | 服务器、调试、脚本化 | 需要 | `python app.py` 后用浏览器打开 |
+| **Docker** | NAS、服务器、容器化长期运行 | 不需要宿主机 Python | `docker compose up -d --build` |
 
 核心能力相同：
 
@@ -32,6 +33,7 @@ ProxyBridge 在 Windows / Linux 上提供两种形态：
 1. **桌面环境（GNOME / KDE / 等）**：托盘壳
 2. **无桌面 / SSH 服务器**：无壳 Web 控制台
 3. **需要单文件分发**：构建 Linux 二进制
+4. **已经使用 Docker / NAS**：参考 [Docker 运行教程](docker.md)
 
 ---
 
@@ -556,4 +558,3 @@ python3 -m desktop.tray_host --enable-autostart
 - [ ] 节点可启动/停止/测速
 - [ ] 日志目录有 `tray-*.log` 或系统日志可见
 - [ ] 退出后端口释放
-

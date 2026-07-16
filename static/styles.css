@@ -1148,6 +1148,9 @@ tbody .row-actions .row-button {
   gap: 8px !important;
   padding-top: 18px;
 }
+.sync-checkbox[hidden] {
+  display: none !important;
+}
 .sync-checkbox input {
   width: auto;
 }

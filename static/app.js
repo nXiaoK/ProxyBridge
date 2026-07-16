@@ -1,5 +1,8 @@
 const appState = {
   cores: {},
+  features: { browser: true, browser_profile_sync: true, docker: false },
+  runtime: { mode: "headless", docker: false },
+  platform: null,
   fingerprint_chromium: null,
   active_browsers: [],
   browser_instances: [],
@@ -58,6 +61,14 @@ const STATUS_POLL_HIDDEN_MS = 30_000;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
 const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "settings", "sync"];
+
+function browserEnabled() {
+  return appState.features?.browser !== false;
+}
+
+function dockerRuntime() {
+  return appState.runtime?.docker === true || appState.runtime?.mode === "docker";
+}
 
 // 切换当前视图:高亮对应侧边栏项、显示对应内容区,并记住上次选择。
 function setActiveView(view) {
@@ -354,6 +365,7 @@ function renderNetworkProxyList(network, networkStatus) {
     ? `<div class="network-stale-note">状态刷新失败，以下为上次成功获取的结果。</div>`
     : "";
 
+  const dockerManaged = network?.docker_managed === true;
   if (!network?.allow_lan) {
     count.textContent = "0 个";
     list.innerHTML = `${staleNotice}<div class="settings-empty">局域网共享已关闭，代理仅可在本机使用。</div>`;
@@ -363,7 +375,7 @@ function renderNetworkProxyList(network, networkStatus) {
   const entries = networkProxyEntries(network);
   count.textContent = `${entries.length} 个`;
   if (!entries.length) {
-    list.innerHTML = `${staleNotice}<div class="settings-empty">暂无运行中的本地代理。启动节点后，这里会显示可供局域网设备使用的地址。</div>`;
+    list.innerHTML = `${staleNotice}<div class="settings-empty">暂无运行中的本地代理。启动节点后，这里会显示${dockerManaged ? "已映射到宿主机" : "可供局域网设备使用"}的地址。</div>`;
     return;
   }
 
@@ -371,7 +383,7 @@ function renderNetworkProxyList(network, networkStatus) {
   if (!hasShareableUrl) {
     const reason = networkLanAddresses(network).length
       ? "后端尚未生成可用的共享地址"
-      : "未检测到可用的局域网 IP";
+      : dockerManaged ? "Docker 端口范围尚未正确发布" : "未检测到可用的局域网 IP";
     list.innerHTML = `${staleNotice}<div class="settings-empty">检测到 ${entries.length} 个运行中的本地代理，但${reason}，暂时无法供局域网设备连接。</div>`;
     return;
   }
@@ -402,6 +414,8 @@ function networkSettingsRenderSnapshot() {
     status: appState.networkStatus,
     allow_lan: network?.allow_lan ?? null,
     listen_host: network?.listen_host || "",
+    configurable: network?.configurable ?? true,
+    docker_managed: network?.docker_managed === true,
     lan_addresses: networkLanAddresses(network),
     proxies: networkProxyEntries(network).map((entry) => ({
       bridge_id: entry.bridge_id,
@@ -415,7 +429,8 @@ function networkSettingsRenderSnapshot() {
 
 function syncNetworkSettingsControlState() {
   const unavailable = !networkFormHydrated || !appState.network;
-  const disabled = unavailable || Boolean(networkSettingsSavePromise);
+  const runtimeManaged = appState.network?.configurable === false;
+  const disabled = unavailable || runtimeManaged || Boolean(networkSettingsSavePromise);
   [$("#allowLan"), $("#networkSaveButton")].filter(Boolean).forEach((control) => {
     control.disabled = disabled;
   });
@@ -435,19 +450,41 @@ function renderNetworkSettings() {
   const isUnavailable = networkStatus === "error" && !hasSnapshot;
   const isStale = networkStatus === "error" && hasSnapshot;
   const enabled = Boolean(network?.allow_lan);
+  const dockerManaged = network?.docker_managed === true;
+
+  const settingsHint = $("#networkSettingsHint");
+  if (settingsHint) {
+    settingsHint.textContent = dockerManaged
+      ? "Docker 模式下，容器内代理固定监听 0.0.0.0；宿主机可访问范围由 docker run / Compose 的端口映射决定。管理控制台仍建议仅映射到 127.0.0.1。"
+      : "管理本地代理的访问范围。设置只影响代理端口，控制台始终仅允许从本机访问。";
+  }
+  const cardTitle = $("#networkSettingsCardTitle");
+  if (cardTitle) cardTitle.textContent = dockerManaged ? "Docker 端口映射" : "局域网共享";
+  const shareDescription = $("#networkShareDescription");
+  if (shareDescription) {
+    shareDescription.textContent = dockerManaged
+      ? "容器内监听已启用且不可在控制台修改。请通过 Compose / docker run 决定哪些代理端口发布到宿主机。"
+      : "默认关闭。开启后，运行中的 SOCKS5 和 HTTP / HTTPS 代理会接受私有 IPv4 网络连接。";
+  }
+  const shareWarning = $("#networkShareWarning p");
+  if (shareWarning) {
+    shareWarning.textContent = dockerManaged
+      ? "请保持管理端口只发布到宿主机 127.0.0.1。代理端口也默认映射到宿主机回环地址；若改成 0.0.0.0，将允许其他设备连接且当前没有用户名或密码。"
+      : "请仅在可信网络开启。代理端口没有用户名或密码，同一局域网或可达本机的私有 IPv4 / VPN 设备可能直接使用你的代理。Proxy Bridge 控制台不会因此对外开放。";
+  }
 
   const statusLine = $("#settingsStatusLine");
   if (statusLine) {
     if (isLoading) statusLine.textContent = "网络状态正在加载";
     else if (isUnavailable) statusLine.textContent = "网络状态暂时不可用";
-    else statusLine.textContent = `${enabled ? "局域网共享已开启" : "局域网共享已关闭"}${isStale ? "（状态可能已过期）" : ""}`;
+    else statusLine.textContent = `${dockerManaged ? "Docker 端口映射托管" : enabled ? "局域网共享已开启" : "局域网共享已关闭"}${isStale ? "（状态可能已过期）" : ""}`;
   }
 
   const effectiveStatus = $("#networkEffectiveStatus");
   if (effectiveStatus) {
     if (isLoading) effectiveStatus.textContent = "正在加载";
     else if (isUnavailable) effectiveStatus.textContent = "不可用";
-    else effectiveStatus.textContent = `${enabled ? "已共享" : "仅本机"}${isStale ? " · 状态过期" : ""}`;
+    else effectiveStatus.textContent = `${dockerManaged ? "容器监听已启用" : enabled ? "已共享" : "仅本机"}${isStale ? " · 状态过期" : ""}`;
     effectiveStatus.classList.toggle("is-enabled", enabled && !isStale);
     effectiveStatus.classList.toggle("is-stale", isStale || isUnavailable);
   }
@@ -465,7 +502,7 @@ function renderNetworkSettings() {
     addressList.innerHTML = addresses.length
       ? addresses.map((address) => `<code class="network-address-pill">${escapeHtml(address)}</code>`).join("")
       : `<span class="settings-empty-inline">${
-          isLoading ? "正在检测…" : isUnavailable ? "暂时无法读取网络信息" : "未检测到可用的局域网 IP"
+          isLoading ? "正在检测…" : isUnavailable ? "暂时无法读取网络信息" : dockerManaged ? "由宿主机端口映射决定" : "未检测到可用的局域网 IP"
         }</span>`;
   }
 
@@ -498,6 +535,9 @@ async function withNetworkSettingsSave(task, trigger = null) {
 
 async function saveNetworkSettings(event) {
   event.preventDefault();
+  if (appState.network?.configurable === false) {
+    throw new Error("Docker 模式下网络范围由端口映射管理");
+  }
   const allowLan = Boolean($("#allowLan")?.checked);
   const result = await api("/api/settings/network", { allow_lan: allowLan });
   appState.network = result.network || { ...(appState.network || {}), allow_lan: allowLan };
@@ -541,7 +581,9 @@ function applySyncSettingsToForm(settings, { force = false } = {}) {
   $("#syncPassword").placeholder = settings.password_set ? "已保存，留空不改" : "WebDAV 密码";
   $("#syncRemoteRoot").value = settings.remote_root || "ProxyBridge";
   $("#syncEnabled").checked = Boolean(settings.enabled);
-  $("#syncAutoUpload").checked = Boolean(settings.auto_upload_on_browser_stop);
+  $("#syncAutoUpload").checked = Boolean(
+    settings.browser_sync_enabled !== false && settings.auto_upload_on_browser_stop
+  );
   $("#syncCheckStartup").checked = Boolean(settings.check_on_startup);
   const insecure = $("#syncInsecureSsl");
   if (insecure) insecure.checked = Boolean(settings.insecure_ssl);
@@ -563,6 +605,10 @@ function renderSyncMeta(settings) {
     if (el) el.textContent = value;
   };
   setText("syncDeviceId", settings.device_id || "—");
+  setText(
+    "syncScope",
+    settings.sync_scope === "subscriptions" ? "仅订阅 / 节点" : "订阅 / 节点 + 浏览器 Profile"
+  );
   setText("syncLastPush", formatTime(settings.last_push_at));
   setText("syncLastPull", formatTime(settings.last_pull_at));
   setText("syncLastRemote", formatTime(settings.last_remote_updated_at));
@@ -580,6 +626,17 @@ function renderSync() {
   if (!syncFormHydrated || !syncFormDirty) {
     applySyncSettingsToForm(settings);
   }
+  const browserSyncEnabled = settings.browser_sync_enabled !== false && browserEnabled();
+  const description = $("#syncDescription");
+  if (description) {
+    description.innerHTML = browserSyncEnabled
+      ? "在多台设备之间同步<strong>订阅 / 节点</strong>与<strong>已停止的指纹浏览器 Profile</strong>（Cookie、LocalStorage 等），实现换机接力。删除订阅会清理关联浏览器数据；上传前请先关闭目标浏览器。"
+      : "当前为 Docker / 无浏览器模式，WebDAV 仅同步<strong>订阅与节点</strong>。上传不会打包、覆盖或删除远端已有的浏览器 Profile；拉取也会保留本地浏览器数据。";
+  }
+  const autoUploadOption = $("#syncAutoUploadOption");
+  if (autoUploadOption) autoUploadOption.hidden = !browserSyncEnabled;
+  const autoUpload = $("#syncAutoUpload");
+  if (autoUpload) autoUpload.disabled = !browserSyncEnabled;
   renderSyncMeta(settings);
 }
 
@@ -598,7 +655,11 @@ async function saveSyncSettings(event) {
     username: $("#syncUsername").value.trim(),
     remote_root: $("#syncRemoteRoot").value.trim() || "ProxyBridge",
     enabled: $("#syncEnabled").checked,
-    auto_upload_on_browser_stop: $("#syncAutoUpload").checked,
+    auto_upload_on_browser_stop: Boolean(
+      appState.sync?.browser_sync_enabled !== false
+      && browserEnabled()
+      && $("#syncAutoUpload").checked
+    ),
     check_on_startup: $("#syncCheckStartup").checked,
     insecure_ssl: Boolean($("#syncInsecureSsl")?.checked),
     encrypt: $("#syncEncrypt").checked,
@@ -644,6 +705,7 @@ async function runSyncAction(kind) {
     const n = (result.uploaded_profiles || []).length;
     const skip = (result.skipped_unchanged || []).length;
     if (result.ok === false) showToast((result.errors || []).join("; ") || "上传有错误", "error");
+    else if (result.settings?.sync_scope === "subscriptions") showToast("订阅与节点上传完成");
     else showToast(`上传完成：${n} 个 Profile，跳过未变 ${skip}`);
   } else if (kind === "pull") {
     if (result.skipped && result.reason === "already_latest") showToast("已是最新，跳过拉取");
@@ -802,6 +864,7 @@ function renderActiveView({ force = false } = {}) {
           subscriptions: appState.subscriptions,
           bridges: appState.bridges,
           tests: appState.tests,
+          browserEnabled: browserEnabled(),
           activeBrowsers: appState.active_browsers,
           browserInstances: appState.browser_instances,
           filters: appState.filters,
@@ -858,7 +921,7 @@ function renderActiveView({ force = false } = {}) {
     case "sync":
       renderWhenChanged(
         "sync",
-        { settings: appState.sync, openssl: appState.syncOpenssl },
+        { settings: appState.sync, openssl: appState.syncOpenssl, browserEnabled: browserEnabled() },
         renderSync,
         force
       );
@@ -886,6 +949,9 @@ async function loadStatus({ forceFresh = false } = {}) {
   const request = (async () => {
     try {
       const status = await api("/api/status", null, { signal: controller.signal });
+      appState.features = status.features || { browser: true, browser_profile_sync: true, docker: false };
+      appState.runtime = status.runtime || { mode: status.platform?.shell_mode || "headless", docker: false };
+      appState.platform = status.platform || null;
       appState.cores = status.cores || {};
       appState.fingerprint_chromium = status.fingerprint_chromium || null;
       appState.active_browsers = status.active_browsers || [];
@@ -942,9 +1008,21 @@ function render() {
   );
   renderWhenChanged(
     "cores",
-    { cores: appState.cores, fingerprint: appState.fingerprint_chromium, busy: Boolean(kernelDownloadPromise) },
+    {
+      cores: appState.cores,
+      fingerprint: appState.fingerprint_chromium,
+      busy: Boolean(kernelDownloadPromise),
+      browserEnabled: browserEnabled(),
+    },
     renderCores
   );
+  const brandSubtitle = $("#brandSubtitle");
+  if (brandSubtitle) {
+    brandSubtitle.textContent = dockerRuntime() ? "Docker 控制台 · 订阅节点" : "订阅节点 · 本地代理";
+  }
+  if (!browserEnabled() && !$("#browserRecordModal").hidden) {
+    closeBrowserRecordModal();
+  }
   renderActiveView();
   if (appState.browserRecordNodeId && !$("#browserRecordModal").hidden) {
     // 正在输入标签时只刷新标题元信息，避免整表重建打断输入。
@@ -971,9 +1049,11 @@ function renderCores() {
   const kernelBusyClass = kernelDownloadPromise ? " is-busy" : "";
   const kernelBusyAttributes = kernelDownloadPromise ? ' disabled aria-busy="true"' : "";
   // 指纹内核状态:已安装显示 ready,缺失显示可点击的「下载指纹内核」按钮。
-  const fpPill = fpKernel
-    ? `<button class="pill core-pill ok${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}"${kernelBusyAttributes}>指纹内核 ready</button>`
-    : `<button class="pill core-pill warn${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium"${kernelBusyAttributes}>下载指纹内核</button>`;
+  const fpPill = !browserEnabled()
+    ? ""
+    : fpKernel
+      ? `<button class="pill core-pill ok${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}"${kernelBusyAttributes}>指纹内核 ready</button>`
+      : `<button class="pill core-pill warn${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium"${kernelBusyAttributes}>下载指纹内核</button>`;
   coreStrip.innerHTML = `
     <button class="pill core-pill ${singBox ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="sing-box" aria-label="查看 sing-box 运行日志" title="查看 sing-box 运行日志">sing-box ${singBox ? "ready" : "missing"}</button>
     <button class="pill core-pill ${xray ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="xray" aria-label="查看 xray 运行日志" title="查看 xray 运行日志">xray ${xray ? "ready" : "missing"}</button>
@@ -1217,13 +1297,25 @@ function groupNodesBySubscription(nodes) {
 
 function renderNodeRow(node) {
   const bridge = bridgeForNode(node.id);
-  const browserInstances = browserInstancesForNode(node.id);
-  const runningBrowserCount = runningBrowserInstancesForNode(node.id).length;
-  const browserActive = runningBrowserCount > 0 || appState.active_browsers.includes(node.id);
+  const browserInstances = browserEnabled() ? browserInstancesForNode(node.id) : [];
+  const runningBrowserCount = browserEnabled() ? runningBrowserInstancesForNode(node.id).length : 0;
+  const browserActive = browserEnabled()
+    && (runningBrowserCount > 0 || appState.active_browsers.includes(node.id));
   const transport = node.transport || "-";
   const security = node.security || "";
   const server = `${node.server}:${node.port}`;
   const recordLabel = browserInstances.length ? `浏览器记录 ${browserInstances.length}` : "浏览器记录";
+  const browserActions = browserEnabled()
+    ? `
+          <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开不同指纹浏览器 ${escapeHtml(node.name)}" title="新开不同指纹浏览器：独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
+          <button class="row-button" data-action="browser-records" data-node="${escapeHtml(node.id)}" aria-label="查看 ${escapeHtml(node.name)} 的浏览器记录" title="浏览器记录">${icon("list")}<span>${escapeHtml(recordLabel)}</span></button>
+          ${
+            browserActive
+              ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
+              : ""
+          }
+        `
+    : "";
   return `
     <tr class="node-row ${bridge ? "is-running" : ""}" data-node-id="${escapeHtml(node.id)}">
       <td>
@@ -1245,13 +1337,7 @@ function renderNodeRow(node) {
                 <button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.http_url || bridge.socks_url)}">${icon("copy")}<span>HTTP</span></button>`
               : `<button class="row-button primary-row" data-action="start" data-node="${escapeHtml(node.id)}">${icon("play")}<span>启动并复制</span></button>`
           }
-          <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开不同指纹浏览器 ${escapeHtml(node.name)}" title="新开不同指纹浏览器：独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
-          <button class="row-button" data-action="browser-records" data-node="${escapeHtml(node.id)}" aria-label="查看 ${escapeHtml(node.name)} 的浏览器记录" title="浏览器记录">${icon("list")}<span>${escapeHtml(recordLabel)}</span></button>
-          ${
-            browserActive
-              ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
-              : ""
-          }
+          ${browserActions}
         </div>
       </td>
     </tr>
@@ -1796,6 +1882,7 @@ function renderBrowserRecords(nodeId) {
 }
 
 async function saveBrowserLabel(instanceId) {
+  if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   if (!instanceId) return;
   const input = document.querySelector(`.browser-label-input[data-instance="${instanceId}"]`);
   const label = String(input?.value || "").trim();
@@ -1808,6 +1895,7 @@ async function saveBrowserLabel(instanceId) {
 }
 
 function showBrowserRecords(nodeId, trigger = null) {
+  if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   if (!nodeId) return;
   appState.browserRecordNodeId = nodeId;
   lastBrowserRecordTrigger = trigger;
@@ -1820,6 +1908,7 @@ function showBrowserRecords(nodeId, trigger = null) {
 
 /** Open browser records after an optional WebDAV pull so profiles are up to date. */
 async function openBrowserRecordsWithSync(nodeId, trigger = null) {
+  if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   if (!nodeId) return;
   const sync = appState.sync || {};
   if (sync.enabled && sync.url) {
@@ -1885,6 +1974,7 @@ async function testNode(nodeId) {
 }
 
 async function launchBrowser(nodeId, instanceId = "") {
+  if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   const payload = instanceId ? { node_id: nodeId, instance_id: instanceId } : { node_id: nodeId };
   const result = await api("/api/browser/launch", payload);
   await loadStatus({ forceFresh: true });
@@ -1894,6 +1984,7 @@ async function launchBrowser(nodeId, instanceId = "") {
 
 // 停止某节点的指纹浏览器进程,保留其本地代理。
 async function stopBrowser(nodeId, instanceId = "") {
+  if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   const payload = instanceId ? { instance_id: instanceId } : { node_id: nodeId };
   const result = await api("/api/browser/stop", payload);
   await loadStatus({ forceFresh: true });
@@ -1903,6 +1994,7 @@ async function stopBrowser(nodeId, instanceId = "") {
 
 // 一键下载并安装指纹内核。下载体积较大(约 150-250MB),提示用户耐心等待。
 function downloadKernel() {
+  if (!browserEnabled()) return Promise.reject(new Error("当前运行模式不提供浏览器功能"));
   if (kernelDownloadPromise) return kernelDownloadPromise;
 
   showToast("正在下载指纹内核，约 150-250MB，请耐心等待…");

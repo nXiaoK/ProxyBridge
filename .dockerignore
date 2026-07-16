@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+.worktrees
+.superpowers
+__pycache__
+*.py[cod]
+work
+outputs
+tests
+docs
+desktop
+macos
+scripts

@@ -86,17 +86,22 @@ class WebDAVSyncUnitTests(unittest.TestCase):
                 return self.profiles / "nodehash"
             return self.profiles / "nodehash" / instance_id
 
-        self.engine = webdav_sync.SyncEngine(
+        self.profile_path = profile_path
+        self.engine = self._new_engine()
+
+    def _new_engine(self, *, sync_browser_data: bool = True) -> webdav_sync.SyncEngine:
+        return webdav_sync.SyncEngine(
             work_root=self.work,
             state_path=self.state_path,
             browser_profiles_root=self.profiles,
             load_state=self._load,
             save_state=self._save,
             state_lock=self.lock,
-            browser_instance_profile_path=profile_path,
+            browser_instance_profile_path=self.profile_path,
             browser_runtime_is_active=lambda _iid: False,
             log=lambda *a, **k: None,
             client_factory=self.store.client,
+            sync_browser_data=sync_browser_data,
         )
 
     def tearDown(self):
@@ -434,6 +439,166 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         man = json.loads(self.store.files[store_client.url_for("ProxyBridge", "manifest.json")].decode("utf-8"))
         self.assertNotIn("inst1", man.get("profile_hashes") or {})
 
+    def test_subscription_only_push_preserves_remote_browser_snapshot(self):
+        first = self.engine.push()
+        self.assertTrue(first["ok"])
+        client, before_manifest = self._remote_manifest()
+        before_profile_url = self._remote_profile_url(client, before_manifest, "inst1")
+        before_profile = self.store.files[before_profile_url]
+
+        with self.lock:
+            state = self._load()
+            state["subscriptions"] = [
+                {
+                    "id": "sub2",
+                    "name": "机场B",
+                    "url": "https://b.test/sub",
+                    "node_ids": ["n2"],
+                    "node_count": 1,
+                }
+            ]
+            state["nodes"] = [
+                {
+                    "id": "n2",
+                    "name": "新加坡",
+                    "protocol": "trojan",
+                    "server": "2.3.4.5",
+                    "port": 443,
+                    "region": "新加坡",
+                    "source": "机场B",
+                    "settings": {"password": "p"},
+                }
+            ]
+            state["browser_instances"] = []
+            self._save(state)
+
+        engine = self._new_engine(sync_browser_data=False)
+        result = engine.push()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["uploaded_profiles"], [])
+        self.assertEqual(result["deleted_remote_profiles"], [])
+        self.assertEqual(result["settings"]["sync_scope"], "subscriptions")
+
+        client, manifest = self._remote_manifest()
+        remote_state = json.loads(self.store.files[self._remote_state_url(client, manifest)].decode("utf-8"))
+        self.assertEqual([item["id"] for item in remote_state["subscriptions"]], ["sub2"])
+        self.assertEqual({item["id"] for item in remote_state["nodes"]}, {"n1", "n2"})
+        self.assertEqual(remote_state["preserved_browser_node_ids"], ["n1"])
+        self.assertEqual([item["id"] for item in remote_state["browser_instances"]], ["inst1"])
+        self.assertEqual(manifest["profile_hashes"], before_manifest["profile_hashes"])
+        self.assertEqual(manifest["profile_files"], before_manifest["profile_files"])
+        self.assertEqual(self.store.files[before_profile_url], before_profile)
+
+    def test_subscription_only_pull_preserves_local_browser_data(self):
+        self.engine.push()
+        with self.lock:
+            state = self._load()
+            state["subscriptions"] = [
+                {"id": "sub2", "name": "机场B", "url": "https://b.test/sub", "node_ids": ["n2"], "node_count": 1}
+            ]
+            state["nodes"] = [
+                {
+                    "id": "n2",
+                    "name": "新加坡",
+                    "protocol": "trojan",
+                    "server": "2.3.4.5",
+                    "port": 443,
+                    "region": "新加坡",
+                    "source": "机场B",
+                    "settings": {"password": "p"},
+                }
+            ]
+            state["browser_instances"] = []
+            self._save(state)
+        subscription_engine = self._new_engine(sync_browser_data=False)
+        subscription_engine.push()
+
+        local_profile = self.profiles / "nodehash" / "local-browser"
+        local_profile.mkdir(parents=True)
+        (local_profile / "keep.txt").write_text("keep", encoding="utf-8")
+        with self.lock:
+            state = self._load()
+            state["subscriptions"] = [{"id": "local-sub", "name": "本地旧订阅", "node_ids": ["local-node"]}]
+            state["nodes"] = [{"id": "local-node", "name": "本地旧节点"}]
+            state["browser_instances"] = [
+                {
+                    "id": "local-browser",
+                    "node_id": "local-node",
+                    "name": "本地浏览器",
+                    "status": "stopped",
+                    "legacy": False,
+                }
+            ]
+            self._save(state)
+        subscription_engine.mark_local_change()
+
+        result = subscription_engine.pull(force=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["downloaded_profiles"], [])
+        self.assertEqual(result["purged_local_profiles"], [])
+        state = self._load()
+        self.assertEqual([item["id"] for item in state["subscriptions"]], ["sub2"])
+        self.assertEqual({item["id"] for item in state["nodes"]}, {"n2", "local-node"})
+        preserved_local_node = next(item for item in state["nodes"] if item["id"] == "local-node")
+        self.assertTrue(preserved_local_node[webdav_sync.LOCAL_BROWSER_NODE_MARKER])
+        self.assertEqual([item["id"] for item in state["browser_instances"]], ["local-browser"])
+        self.assertEqual((local_profile / "keep.txt").read_text(encoding="utf-8"), "keep")
+
+        subscription_engine.push()
+        client, manifest = self._remote_manifest()
+        remote_state = json.loads(self.store.files[self._remote_state_url(client, manifest)].decode("utf-8"))
+        self.assertNotIn("local-node", {item["id"] for item in remote_state["nodes"]})
+
+    def test_subscription_only_push_rejects_tampered_remote_state(self):
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        state_url = self._remote_state_url(client, manifest)
+        original_manifest = self.store.files[manifest_url]
+        remote_state = json.loads(self.store.files[state_url].decode("utf-8"))
+        remote_state["subscriptions"][0]["name"] = "tampered"
+        self.store.files[state_url] = json.dumps(remote_state, ensure_ascii=False, indent=2).encode("utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "哈希与 manifest 不一致"):
+            self._new_engine(sync_browser_data=False).push()
+        self.assertEqual(self.store.files[manifest_url], original_manifest)
+
+    def test_subscription_only_push_fails_when_preserved_profile_is_missing(self):
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        original_manifest = self.store.files[manifest_url]
+        self.store.files.pop(self._remote_profile_url(client, manifest, "inst1"))
+
+        with self.assertRaisesRegex(RuntimeError, "缺少需保留的 Profile"):
+            self._new_engine(sync_browser_data=False).push()
+        self.assertEqual(self.store.files[manifest_url], original_manifest)
+
+    def test_encrypted_subscription_only_push_preserves_profile(self):
+        if not webdav_sync.openssl_available():
+            self.skipTest("openssl not available")
+        self.engine.update_settings({"encrypt": True, "encrypt_password": "secret"})
+        self.engine.push()
+        client = self.store.client(self._load()["settings"]["webdav"])
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        before_manifest = json.loads(
+            webdav_sync.decrypt_payload(self.store.files[manifest_url], "secret").decode("utf-8")
+        )
+        profile_url = self._remote_profile_url(client, before_manifest, "inst1")
+        before_profile = self.store.files[profile_url]
+        self.assertTrue(before_profile.startswith(webdav_sync.PBENC2_MAGIC))
+
+        with self.lock:
+            state = self._load()
+            state["subscriptions"] = []
+            state["nodes"] = []
+            state["browser_instances"] = []
+            self._save(state)
+        result = self._new_engine(sync_browser_data=False).push()
+        self.assertTrue(result["ok"])
+        self.assertTrue(self.store.files[manifest_url].startswith(webdav_sync.PBENC2_MAGIC))
+        self.assertEqual(self.store.files[profile_url], before_profile)
+
     def test_apply_remote_state_removes_local_only_subscription(self):
         local = {
             "subscriptions": [{"id": "sub1", "name": "keep"}, {"id": "sub-gone", "name": "delete-me"}],
@@ -565,6 +730,36 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertEqual(len(local["subscriptions"]), 2)
         self.assertEqual(local["browser_instances"][0]["status"], "stopped")
         self.assertIn("profile_path", local["browser_instances"][0])
+
+    def test_apply_remote_state_subscription_only_preserves_browsers(self):
+        local = {
+            "subscriptions": [{"id": "old-sub", "name": "old"}],
+            "nodes": [{"id": "old-node", "name": "old"}],
+            "browser_instances": [
+                {"id": "local-browser", "node_id": "old-node", "name": "local", "status": "stopped"}
+            ],
+        }
+        remote = {
+            "subscriptions": [{"id": "sub2", "name": "new", "node_ids": ["n2"]}],
+            "nodes": [{"id": "n2", "name": "new"}, {"id": "preserved", "name": "browser-only"}],
+            "browser_instances": [
+                {"id": "remote-browser", "node_id": "preserved", "name": "remote", "status": "stopped"}
+            ],
+        }
+        applied = webdav_sync.apply_remote_state(
+            local,
+            remote,
+            profile_path_builder=lambda n, i, legacy=False: Path(f"/tmp/{n}/{i}"),
+            include_browser_data=False,
+            excluded_node_ids={"preserved"},
+        )
+        self.assertEqual([item["id"] for item in local["subscriptions"]], ["sub2"])
+        self.assertEqual({item["id"] for item in local["nodes"]}, {"n2", "old-node"})
+        preserved = next(item for item in local["nodes"] if item["id"] == "old-node")
+        self.assertTrue(preserved[webdav_sync.LOCAL_BROWSER_NODE_MARKER])
+        self.assertEqual([item["id"] for item in local["browser_instances"]], ["local-browser"])
+        self.assertEqual(applied["browser_instances"], 0)
+        self.assertEqual(applied["removed_browsers"], [])
 
     def test_encrypt_roundtrip_if_openssl(self):
         if not webdav_sync.openssl_available():

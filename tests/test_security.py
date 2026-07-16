@@ -180,6 +180,60 @@ class SecurityTests(unittest.TestCase):
                 handler = make_handler("GET", "/", headers)
                 self.assertTrue(handler.is_trusted_request())
 
+    def test_handler_accepts_only_configured_docker_lan_ip(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PROXY_BRIDGE_DOCKER": "1",
+                "PROXY_BRIDGE_CONSOLE_HOST": "192.168.1.20",
+            },
+            clear=False,
+        ):
+            for headers in (
+                {"Host": "192.168.1.20:8787"},
+                {
+                    "Host": "192.168.1.20:8787",
+                    "Origin": "http://192.168.1.20:8787",
+                },
+            ):
+                with self.subTest(headers=headers):
+                    handler = make_handler("GET", "/", headers)
+                    self.assertTrue(handler.is_trusted_request())
+
+            for headers in (
+                {"Host": "192.168.1.21:8787"},
+                {"Host": "8.8.8.8:8787"},
+                {"Host": "nas.local:8787"},
+                {
+                    "Host": "192.168.1.20:8787",
+                    "Origin": "http://192.168.1.21:8787",
+                },
+                {
+                    "Host": "192.168.1.20:8787",
+                    "Origin": "http://127.0.0.1:8787",
+                },
+                {
+                    "Host": "192.168.1.20:8787",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+            ):
+                with self.subTest(headers=headers):
+                    handler = make_handler("GET", "/", headers)
+                    self.assertFalse(handler.is_trusted_request())
+
+    def test_handler_ignores_console_host_outside_docker_or_private_ipv4(self):
+        for environment in (
+            {"PROXY_BRIDGE_DOCKER": "0", "PROXY_BRIDGE_CONSOLE_HOST": "192.168.1.20"},
+            {"PROXY_BRIDGE_DOCKER": "1", "PROXY_BRIDGE_CONSOLE_HOST": "0.0.0.0"},
+            {"PROXY_BRIDGE_DOCKER": "1", "PROXY_BRIDGE_CONSOLE_HOST": "8.8.8.8"},
+            {"PROXY_BRIDGE_DOCKER": "1", "PROXY_BRIDGE_CONSOLE_HOST": "nas.local"},
+        ):
+            with self.subTest(environment=environment), mock.patch.dict(
+                os.environ, environment, clear=False
+            ):
+                handler = make_handler("GET", "/", {"Host": "192.168.1.20:8787"})
+                self.assertFalse(handler.is_trusted_request())
+
     def test_handler_rejects_remote_host_origin_and_cross_site_fetch(self):
         for headers in (
             {"Host": "evil.example"},

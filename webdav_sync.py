@@ -37,6 +37,8 @@ MANIFEST_NAME = "manifest.json"
 STATE_SYNC_NAME = "state.sync.json"
 PROFILES_DIR_NAME = "profiles"
 DEFAULT_REMOTE_ROOT = "ProxyBridge"
+PRESERVED_BROWSER_NODE_IDS_FIELD = "preserved_browser_node_ids"
+LOCAL_BROWSER_NODE_MARKER = "_webdav_browser_preserved"
 PROFILE_SYNC_MARKER = ".pb-sync-sha256"
 SAFE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 SAFE_FILENAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
@@ -171,7 +173,11 @@ def normalize_webdav_settings(raw: Any) -> dict[str, Any]:
     return base
 
 
-def public_webdav_settings(settings: dict[str, Any]) -> dict[str, Any]:
+def public_webdav_settings(
+    settings: dict[str, Any],
+    *,
+    sync_browser_data: bool = True,
+) -> dict[str, Any]:
     """Settings safe for console JSON (mask secrets)."""
     cfg = normalize_webdav_settings(settings)
     return {
@@ -180,7 +186,9 @@ def public_webdav_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "password_set": bool(cfg["password"]),
         "remote_root": cfg["remote_root"],
         "enabled": cfg["enabled"],
-        "auto_upload_on_browser_stop": cfg["auto_upload_on_browser_stop"],
+        "auto_upload_on_browser_stop": (
+            cfg["auto_upload_on_browser_stop"] if sync_browser_data else False
+        ),
         "check_on_startup": cfg["check_on_startup"],
         "insecure_ssl": cfg["insecure_ssl"],
         "encrypt": cfg["encrypt"],
@@ -193,6 +201,8 @@ def public_webdav_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "last_applied_state_sha256": cfg["last_applied_state_sha256"],
         "last_error": cfg["last_error"],
         "last_status": cfg["last_status"],
+        "sync_scope": "full" if sync_browser_data else "subscriptions",
+        "browser_sync_enabled": bool(sync_browser_data),
     }
 
 
@@ -607,12 +617,19 @@ def build_sync_state(state: dict[str, Any], *, device_id: str, profile_hashes: d
         for item in state.get("browser_instances", [])
         if isinstance(item, dict)
     ]
+    nodes: list[dict[str, Any]] = []
+    for item in state.get("nodes") or []:
+        if not isinstance(item, dict):
+            continue
+        record = dict(item)
+        record.pop(LOCAL_BROWSER_NODE_MARKER, None)
+        nodes.append(record)
     return {
         "schema_version": SYNC_SCHEMA_VERSION,
         "device_id": device_id,
         "updated_at": int(time.time()),
         "subscriptions": list(state.get("subscriptions") or []),
-        "nodes": list(state.get("nodes") or []),
+        "nodes": nodes,
         "browser_instances": instances,
         "profile_hashes": profile_hashes,
     }
@@ -672,10 +689,13 @@ def validate_sync_state(remote_state: Any) -> dict[str, Any]:
     if unknown_profiles:
         raise RuntimeError(f"远端 Profile 引用了未知浏览器实例: {sorted(unknown_profiles)[0]}")
 
+    browser_node_ids: set[str] = set()
     for index, browser in enumerate(browsers):
         node_id = _validate_sync_id(browser.get("node_id"), f"browser_instances[{index}].node_id")
         if node_id not in node_ids:
             raise RuntimeError(f"远端浏览器实例引用了未知节点: {node_id}")
+        browser_node_ids.add(node_id)
+    subscription_node_ids: set[str] = set()
     for index, subscription in enumerate(subscriptions):
         referenced = subscription.get("node_ids")
         if referenced is None:
@@ -686,6 +706,23 @@ def validate_sync_state(remote_state: Any) -> dict[str, Any]:
             node_id = _validate_sync_id(raw_node_id, f"subscriptions[{index}].node_ids")
             if node_id not in node_ids:
                 raise RuntimeError(f"远端订阅引用了未知节点: {node_id}")
+            subscription_node_ids.add(node_id)
+
+    raw_preserved = remote_state.get(PRESERVED_BROWSER_NODE_IDS_FIELD, [])
+    if not isinstance(raw_preserved, list) or len(raw_preserved) > MAX_SYNC_ITEMS:
+        raise RuntimeError(f"远端 {PRESERVED_BROWSER_NODE_IDS_FIELD} 必须是数组")
+    preserved_browser_node_ids: set[str] = set()
+    for raw_node_id in raw_preserved:
+        node_id = _validate_sync_id(raw_node_id, PRESERVED_BROWSER_NODE_IDS_FIELD)
+        if node_id in preserved_browser_node_ids:
+            raise RuntimeError(f"远端 {PRESERVED_BROWSER_NODE_IDS_FIELD} 包含重复 ID")
+        if node_id not in node_ids:
+            raise RuntimeError(f"远端保留浏览器节点不存在: {node_id}")
+        if node_id not in browser_node_ids:
+            raise RuntimeError(f"远端保留节点未被浏览器实例引用: {node_id}")
+        if node_id in subscription_node_ids:
+            raise RuntimeError(f"远端保留节点仍被订阅引用: {node_id}")
+        preserved_browser_node_ids.add(node_id)
 
     return {
         "subscriptions": subscriptions,
@@ -695,6 +732,7 @@ def validate_sync_state(remote_state: Any) -> dict[str, Any]:
         "browsers": browsers,
         "browser_ids": browser_ids,
         "profile_hashes": profile_hashes,
+        "preserved_browser_node_ids": preserved_browser_node_ids,
     }
 
 
@@ -775,7 +813,10 @@ def validate_remote_snapshot(
     for field, expected in expected_counts.items():
         if manifest.get(field) != expected:
             raise RuntimeError(f"远端 manifest.{field} 与 state 不一致")
-    return manifest_meta
+    return {
+        **manifest_meta,
+        "preserved_browser_node_ids": state_meta["preserved_browser_node_ids"],
+    }
 
 
 def _serialized_sync_operation(method: Callable[..., Any]) -> Callable[..., Any]:
@@ -1018,6 +1059,7 @@ class SyncEngine:
         browser_runtime_is_active: Callable[[str], bool],
         log: LogFn | None = None,
         client_factory: Callable[[dict[str, Any]], WebDAVClient] | None = None,
+        sync_browser_data: bool = True,
     ) -> None:
         self.work_root = work_root
         self.state_path = state_path
@@ -1027,6 +1069,7 @@ class SyncEngine:
         self.state_lock = state_lock
         self.browser_instance_profile_path = browser_instance_profile_path
         self.browser_runtime_is_active = browser_runtime_is_active
+        self.sync_browser_data = bool(sync_browser_data)
         self.log = log or _default_log
         self.client_factory = client_factory or self._default_client
         self._operation_lock = threading.RLock()
@@ -1052,6 +1095,9 @@ class SyncEngine:
         settings["webdav"] = cfg
         return cfg
 
+    def public_settings(self, cfg: dict[str, Any]) -> dict[str, Any]:
+        return public_webdav_settings(cfg, sync_browser_data=self.sync_browser_data)
+
     @_serialized_sync_operation
     def update_settings(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.state_lock:
@@ -1072,13 +1118,14 @@ class SyncEngine:
                 cfg["remote_root"] = _normalize_remote_root(payload.get("remote_root"))
             for key in (
                 "enabled",
-                "auto_upload_on_browser_stop",
                 "check_on_startup",
                 "insecure_ssl",
                 "encrypt",
             ):
                 if key in payload:
                     cfg[key] = bool(payload.get(key))
+            if self.sync_browser_data and "auto_upload_on_browser_stop" in payload:
+                cfg["auto_upload_on_browser_stop"] = bool(payload.get("auto_upload_on_browser_stop"))
             if "encrypt_password" in payload:
                 enc = payload.get("encrypt_password")
                 if enc is not None and str(enc) != "":
@@ -1089,7 +1136,7 @@ class SyncEngine:
             self._validate_encryption_cfg(cfg)
             state.setdefault("settings", {})["webdav"] = cfg
             self.save_state(state)
-            return public_webdav_settings(cfg)
+            return self.public_settings(cfg)
 
     def _require_cfg(self, cfg: dict[str, Any]) -> None:
         if not cfg.get("url"):
@@ -1137,6 +1184,48 @@ class SyncEngine:
             raise RuntimeError("当前已启用加密，但远端数据是未加密格式")
         return data
 
+    def _read_remote_snapshot(
+        self,
+        client: WebDAVClient,
+        cfg: dict[str, Any],
+        urls: dict[str, str],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        raw_manifest = self._decode_blob(
+            client.get_bytes(urls["manifest"], max_bytes=MAX_MANIFEST_BYTES + 1024), cfg
+        )
+        if len(raw_manifest) > MAX_MANIFEST_BYTES:
+            raise RuntimeError("远端 manifest.json 超过允许大小")
+        manifest = json.loads(raw_manifest.decode("utf-8"))
+        manifest_meta = validate_manifest(manifest)
+        raw_state = self._decode_blob(
+            client.get_bytes(
+                client.url_for(cfg["remote_root"], manifest_meta["state_file"]),
+                max_bytes=MAX_STATE_BYTES + 1024 * 1024,
+            ),
+            cfg,
+        )
+        if len(raw_state) > MAX_STATE_BYTES:
+            raise RuntimeError("远端 state.sync.json 超过允许大小")
+        remote_state = json.loads(raw_state.decode("utf-8"))
+        snapshot_meta = validate_remote_snapshot(manifest, remote_state, raw_state)
+        return manifest, snapshot_meta, remote_state
+
+    def _local_state_fingerprint(self, state: dict[str, Any]) -> str:
+        payload: dict[str, Any] = {
+            "subscriptions": state.get("subscriptions") or [],
+            "nodes": state.get("nodes") or [],
+        }
+        if self.sync_browser_data:
+            payload["browser_instances"] = state.get("browser_instances") or []
+        return sha256_bytes(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
     @_serialized_sync_operation
     def test(self) -> dict[str, Any]:
         with self.state_lock:
@@ -1156,7 +1245,7 @@ class SyncEngine:
             state["settings"]["webdav"] = cfg
             self.save_state(state)
         self.log("WebDAV 连接测试成功", category="同步")
-        return {"ok": True, **result, "settings": public_webdav_settings(cfg)}
+        return {"ok": True, **result, "settings": self.public_settings(cfg)}
 
     def _safe_profile_path(self, node_id: str, instance_id: str, legacy: bool = False) -> Path:
         _validate_sync_id(instance_id, "浏览器实例 ID")
@@ -1212,25 +1301,29 @@ class SyncEngine:
             if not cfg.get("enabled") and not cfg.get("url"):
                 raise ValueError("请先启用并配置 WebDAV")
 
-            local_instance_ids = {
-                _validate_sync_id(item.get("id"), "本地浏览器实例 ID")
-                for item in state.get("browser_instances", [])
-                if isinstance(item, dict) and item.get("id")
-            }
-            instances = self._collect_pushable_profiles(state)
-            if instance_ids is not None:
-                wanted = {_validate_sync_id(item, "浏览器实例 ID") for item in instance_ids}
-                instances = [item for item in instances if str(item.get("id") or "") in wanted]
+            local_instance_ids: set[str] = set()
+            instances: list[dict[str, Any]] = []
+            skipped_running: list[str] = []
+            if self.sync_browser_data:
+                local_instance_ids = {
+                    _validate_sync_id(item.get("id"), "本地浏览器实例 ID")
+                    for item in state.get("browser_instances", [])
+                    if isinstance(item, dict) and item.get("id")
+                }
+                instances = self._collect_pushable_profiles(state)
+                if instance_ids is not None:
+                    wanted = {_validate_sync_id(item, "浏览器实例 ID") for item in instance_ids}
+                    instances = [item for item in instances if str(item.get("id") or "") in wanted]
 
-            skipped_running = [
-                str(item.get("id") or "")
-                for item in state.get("browser_instances", [])
-                if isinstance(item, dict)
-                and (
-                    item.get("status") in {"running", "starting"}
-                    or self.browser_runtime_is_active(str(item.get("id") or ""))
-                )
-            ]
+                skipped_running = [
+                    str(item.get("id") or "")
+                    for item in state.get("browser_instances", [])
+                    if isinstance(item, dict)
+                    and (
+                        item.get("status") in {"running", "starting"}
+                        or self.browser_runtime_is_active(str(item.get("id") or ""))
+                    )
+                ]
 
         client = self.client_factory(cfg)
         urls = self._remote_urls(client, cfg)
@@ -1239,21 +1332,34 @@ class SyncEngine:
         snapshot_id = f"{int(time.time())}-{cfg['device_id']}-{secrets.token_hex(4)}"
         remote_hashes: dict[str, str] = {}
         remote_profile_files: dict[str, str] = {}
+        remote_state: dict[str, Any] | None = None
         if client.exists(urls["manifest"]):
-            raw_manifest = self._decode_blob(
-                client.get_bytes(urls["manifest"], max_bytes=MAX_MANIFEST_BYTES + 1024), cfg
-            )
-            if len(raw_manifest) > MAX_MANIFEST_BYTES:
-                raise RuntimeError("远端 manifest.json 超过允许大小")
-            remote_manifest = json.loads(raw_manifest.decode("utf-8"))
-            remote_manifest_meta = validate_manifest(remote_manifest)
-            remote_hashes = remote_manifest_meta["profile_hashes"]
-            remote_profile_files = remote_manifest_meta["profile_files"]
+            if self.sync_browser_data:
+                raw_manifest = self._decode_blob(
+                    client.get_bytes(urls["manifest"], max_bytes=MAX_MANIFEST_BYTES + 1024), cfg
+                )
+                if len(raw_manifest) > MAX_MANIFEST_BYTES:
+                    raise RuntimeError("远端 manifest.json 超过允许大小")
+                remote_manifest = json.loads(raw_manifest.decode("utf-8"))
+                remote_manifest_meta = validate_manifest(remote_manifest)
+            else:
+                _remote_manifest, remote_manifest_meta, remote_state = self._read_remote_snapshot(
+                    client, cfg, urls
+                )
+            remote_hashes = dict(remote_manifest_meta["profile_hashes"])
+            remote_profile_files = dict(remote_manifest_meta["profile_files"])
+            if not self.sync_browser_data:
+                for instance_id, filename in remote_profile_files.items():
+                    profile_url = client.url_for(cfg["remote_root"], PROFILES_DIR_NAME, filename)
+                    if not client.exists(profile_url):
+                        raise RuntimeError(f"远端缺少需保留的 Profile 包: {instance_id}")
 
         # Rebuild from local only so deletions propagate; seed with still-local remote hashes.
-        profile_hashes: dict[str, str] = {
-            iid: digest for iid, digest in remote_hashes.items() if iid in local_instance_ids
-        }
+        profile_hashes: dict[str, str] = (
+            {iid: digest for iid, digest in remote_hashes.items() if iid in local_instance_ids}
+            if self.sync_browser_data
+            else dict(remote_hashes)
+        )
         profile_files: dict[str, str] = {
             iid: remote_profile_files.get(iid, f"{iid}.tar.gz")
             for iid in profile_hashes
@@ -1307,20 +1413,63 @@ class SyncEngine:
                 "deleted_remote_profiles": [],
                 "errors": errors,
                 "manifest": None,
-                "settings": public_webdav_settings(cfg),
+                "settings": self.public_settings(cfg),
             }
 
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
-            local_ids_now = {
-                str(item.get("id") or "")
-                for item in state.get("browser_instances", [])
-                if isinstance(item, dict) and item.get("id")
-            }
-            profile_hashes = {k: v for k, v in profile_hashes.items() if k in local_ids_now}
-            profile_files = {k: v for k, v in profile_files.items() if k in profile_hashes}
-            sync_state = build_sync_state(state, device_id=str(cfg["device_id"]), profile_hashes=profile_hashes)
+            if self.sync_browser_data:
+                local_ids_now = {
+                    str(item.get("id") or "")
+                    for item in state.get("browser_instances", [])
+                    if isinstance(item, dict) and item.get("id")
+                }
+                profile_hashes = {k: v for k, v in profile_hashes.items() if k in local_ids_now}
+                profile_files = {k: v for k, v in profile_files.items() if k in profile_hashes}
+                sync_state = build_sync_state(
+                    state,
+                    device_id=str(cfg["device_id"]),
+                    profile_hashes=profile_hashes,
+                )
+            else:
+                remote_snapshot = remote_state or {}
+                remote_browsers = [
+                    dict(item)
+                    for item in remote_snapshot.get("browser_instances") or []
+                    if isinstance(item, dict)
+                ]
+                local_nodes = [
+                    {key: value for key, value in item.items() if key != LOCAL_BROWSER_NODE_MARKER}
+                    for item in state.get("nodes") or []
+                    if isinstance(item, dict)
+                    and item.get("id")
+                    and item.get(LOCAL_BROWSER_NODE_MARKER) is not True
+                ]
+                local_node_ids = {str(item.get("id") or "") for item in local_nodes}
+                remote_node_by_id = {
+                    str(item.get("id") or ""): dict(item)
+                    for item in remote_snapshot.get("nodes") or []
+                    if isinstance(item, dict) and item.get("id")
+                }
+                preserved_node_ids = sorted(
+                    {
+                        str(item.get("node_id") or "")
+                        for item in remote_browsers
+                        if item.get("node_id") and str(item.get("node_id") or "") not in local_node_ids
+                    }
+                )
+                preserved_nodes = [remote_node_by_id[node_id] for node_id in preserved_node_ids]
+                sync_state = build_sync_state(
+                    state,
+                    device_id=str(cfg["device_id"]),
+                    profile_hashes=dict(remote_hashes),
+                )
+                sync_state["nodes"] = local_nodes + preserved_nodes
+                sync_state["browser_instances"] = remote_browsers
+                sync_state["profile_hashes"] = dict(remote_hashes)
+                if preserved_node_ids:
+                    sync_state[PRESERVED_BROWSER_NODE_IDS_FIELD] = preserved_node_ids
             validate_sync_state(sync_state)
             sync_bytes = json.dumps(sync_state, ensure_ascii=False, indent=2).encode("utf-8")
             if len(sync_bytes) > MAX_STATE_BYTES:
@@ -1382,20 +1531,22 @@ class SyncEngine:
             except Exception as exc:
                 errors.append(f"更新兼容 Profile {instance_id} 失败: {exc}")
 
-        # Garbage collection happens only after the new manifest is published.
-        for rid in list(remote_hashes.keys()):
-            if rid in local_instance_ids:
-                continue
-            try:
-                filenames = {
-                    remote_profile_files.get(rid, f"{rid}.tar.gz"),
-                    f"{rid}.tar.gz",
-                }
-                for filename in filenames:
-                    client.delete(client.url_for(cfg["remote_root"], PROFILES_DIR_NAME, filename))
-                deleted_remote.append(rid)
-            except Exception as exc:
-                errors.append(f"删除远端 Profile {rid}: {exc}")
+        # Garbage collection happens only for full browser-aware snapshots. A
+        # subscription-only client must never delete browser data it cannot manage.
+        if self.sync_browser_data:
+            for rid in list(remote_hashes.keys()):
+                if rid in local_instance_ids:
+                    continue
+                try:
+                    filenames = {
+                        remote_profile_files.get(rid, f"{rid}.tar.gz"),
+                        f"{rid}.tar.gz",
+                    }
+                    for filename in filenames:
+                        client.delete(client.url_for(cfg["remote_root"], PROFILES_DIR_NAME, filename))
+                    deleted_remote.append(rid)
+                except Exception as exc:
+                    errors.append(f"删除远端 Profile {rid}: {exc}")
 
         now = int(time.time())
         with self.state_lock:
@@ -1405,10 +1556,16 @@ class SyncEngine:
             cfg["last_remote_updated_at"] = int(manifest["updated_at"])
             cfg["last_applied_state_sha256"] = str(manifest.get("state_sha256") or "")
             cfg["last_error"] = "; ".join(errors) if errors else ""
-            cfg["last_status"] = (
-                f"已上传：{len(uploaded)} 个 Profile，跳过未变 {len(skipped_unchanged)}，"
-                f"删除远端 {len(deleted_remote)}，跳过运行中 {len(skipped_running)}"
-            )
+            if self.sync_browser_data:
+                cfg["last_status"] = (
+                    f"已上传：{len(uploaded)} 个 Profile，跳过未变 {len(skipped_unchanged)}，"
+                    f"删除远端 {len(deleted_remote)}，跳过运行中 {len(skipped_running)}"
+                )
+            else:
+                cfg["last_status"] = (
+                    f"已上传订阅快照：订阅 {manifest['subscription_count']}，"
+                    f"节点 {manifest['node_count']}；远端浏览器数据保持不变"
+                )
             state["settings"]["webdav"] = cfg
             self.save_state(state)
 
@@ -1421,7 +1578,7 @@ class SyncEngine:
             "deleted_remote_profiles": deleted_remote,
             "errors": errors,
             "manifest": manifest,
-            "settings": public_webdav_settings(cfg),
+            "settings": self.public_settings(cfg),
         }
 
     @_serialized_sync_operation
@@ -1432,18 +1589,7 @@ class SyncEngine:
             self._require_cfg(cfg)
             local_last_change = cfg.get("last_local_change_at")
             local_device = cfg.get("device_id")
-            local_state_fingerprint = sha256_bytes(
-                json.dumps(
-                    {
-                        "subscriptions": state.get("subscriptions") or [],
-                        "nodes": state.get("nodes") or [],
-                        "browser_instances": state.get("browser_instances") or [],
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
+            local_state_fingerprint = self._local_state_fingerprint(state)
 
         client = self.client_factory(cfg)
         urls = self._remote_urls(client, cfg)
@@ -1499,7 +1645,7 @@ class SyncEngine:
                 "conflict_warning": "",
                 "manifest": manifest,
                 "applied": {"subscriptions": 0, "nodes": 0, "browser_instances": 0},
-                "settings": public_webdav_settings(cfg),
+                "settings": self.public_settings(cfg),
             }
 
         raw_state = self._decode_blob(
@@ -1533,83 +1679,85 @@ class SyncEngine:
         skipped_unchanged: list[str] = []
         errors: list[str] = []
 
-        with self.state_lock:
-            state = self.load_state()
-            local_instances = {
-                str(item.get("id") or ""): item
-                for item in state.get("browser_instances", [])
-                if isinstance(item, dict) and item.get("id")
+        if self.sync_browser_data:
+            with self.state_lock:
+                state = self.load_state()
+                local_instances = {
+                    str(item.get("id") or ""): item
+                    for item in state.get("browser_instances", [])
+                    if isinstance(item, dict) and item.get("id")
+                }
+
+            remote_instances = {
+                _validate_sync_id(item.get("id"), "远端浏览器实例 ID"): item
+                for item in remote_state.get("browser_instances") or []
+                if isinstance(item, dict)
             }
-
-        remote_instances = {
-            _validate_sync_id(item.get("id"), "远端浏览器实例 ID"): item
-            for item in remote_state.get("browser_instances") or []
-            if isinstance(item, dict)
-        }
-        for instance_id, local in local_instances.items():
-            if local.get("status") in {"running", "starting"} or self.browser_runtime_is_active(instance_id):
-                skipped_running.append(instance_id)
-
-        for instance_id, expected_hash in profile_hashes.items():
-            instance_id = _validate_sync_id(instance_id, "Profile 实例 ID")
-            expected_hash = _validate_sha256(expected_hash, f"Profile {instance_id} SHA-256")
-            local = local_instances.get(instance_id)
-            if local and (
-                local.get("status") in {"running", "starting"} or self.browser_runtime_is_active(instance_id)
-            ):
-                if instance_id not in skipped_running:
+            for instance_id, local in local_instances.items():
+                if local.get("status") in {"running", "starting"} or self.browser_runtime_is_active(instance_id):
                     skipped_running.append(instance_id)
-                continue
-            try:
-                meta = remote_instances[instance_id]
-                dest = self._safe_profile_path(
-                    str(meta.get("node_id") or ""),
-                    instance_id,
-                    bool(meta.get("legacy")),
-                )
-                if dest.exists():
-                    try:
-                        # Cheap skip: if a marker hash file matches.
-                        marker = dest / PROFILE_SYNC_MARKER
-                        if (
-                            not force
-                            and marker.exists()
-                            and marker.read_text(encoding="utf-8").strip() == expected_hash
-                        ):
-                            skipped_unchanged.append(instance_id)
-                            continue
-                    except OSError:
-                        pass
-                url = client.url_for(
-                    cfg["remote_root"], PROFILES_DIR_NAME, profile_files[instance_id]
-                )
-                if not client.exists(url):
-                    errors.append(f"{instance_id}: 远端缺少 Profile 包")
-                    continue
-                blob = self._decode_blob(
-                    client.get_bytes(url, max_bytes=MAX_PROFILE_ARCHIVE_BYTES + 1024 * 1024), cfg
-                )
-                if len(blob) > MAX_PROFILE_ARCHIVE_BYTES:
-                    raise RuntimeError("远端 Profile 包超过允许大小")
-                actual_hash = sha256_bytes(blob)
-                if actual_hash != expected_hash:
-                    raise RuntimeError(
-                        f"Profile 哈希不匹配（期望 {expected_hash[:12]}，实际 {actual_hash[:12]}）"
-                    )
-                unpack_profile_dir(blob, dest)
-                marker = dest / PROFILE_SYNC_MARKER
-                marker_tmp = dest / f"{PROFILE_SYNC_MARKER}.tmp"
-                marker_tmp.write_text(expected_hash, encoding="utf-8")
-                marker_tmp.replace(marker)
-                downloaded.append(instance_id)
-            except Exception as exc:
-                errors.append(f"{instance_id}: {exc}")
 
-        if skipped_running:
-            errors.extend(
-                f"{instance_id}: 浏览器正在运行，未应用远端快照"
-                for instance_id in skipped_running
-            )
+            for instance_id, expected_hash in profile_hashes.items():
+                instance_id = _validate_sync_id(instance_id, "Profile 实例 ID")
+                expected_hash = _validate_sha256(expected_hash, f"Profile {instance_id} SHA-256")
+                local = local_instances.get(instance_id)
+                if local and (
+                    local.get("status") in {"running", "starting"}
+                    or self.browser_runtime_is_active(instance_id)
+                ):
+                    if instance_id not in skipped_running:
+                        skipped_running.append(instance_id)
+                    continue
+                try:
+                    meta = remote_instances[instance_id]
+                    dest = self._safe_profile_path(
+                        str(meta.get("node_id") or ""),
+                        instance_id,
+                        bool(meta.get("legacy")),
+                    )
+                    if dest.exists():
+                        try:
+                            # Cheap skip: if a marker hash file matches.
+                            marker = dest / PROFILE_SYNC_MARKER
+                            if (
+                                not force
+                                and marker.exists()
+                                and marker.read_text(encoding="utf-8").strip() == expected_hash
+                            ):
+                                skipped_unchanged.append(instance_id)
+                                continue
+                        except OSError:
+                            pass
+                    url = client.url_for(
+                        cfg["remote_root"], PROFILES_DIR_NAME, profile_files[instance_id]
+                    )
+                    if not client.exists(url):
+                        errors.append(f"{instance_id}: 远端缺少 Profile 包")
+                        continue
+                    blob = self._decode_blob(
+                        client.get_bytes(url, max_bytes=MAX_PROFILE_ARCHIVE_BYTES + 1024 * 1024), cfg
+                    )
+                    if len(blob) > MAX_PROFILE_ARCHIVE_BYTES:
+                        raise RuntimeError("远端 Profile 包超过允许大小")
+                    actual_hash = sha256_bytes(blob)
+                    if actual_hash != expected_hash:
+                        raise RuntimeError(
+                            f"Profile 哈希不匹配（期望 {expected_hash[:12]}，实际 {actual_hash[:12]}）"
+                        )
+                    unpack_profile_dir(blob, dest)
+                    marker = dest / PROFILE_SYNC_MARKER
+                    marker_tmp = dest / f"{PROFILE_SYNC_MARKER}.tmp"
+                    marker_tmp.write_text(expected_hash, encoding="utf-8")
+                    marker_tmp.replace(marker)
+                    downloaded.append(instance_id)
+                except Exception as exc:
+                    errors.append(f"{instance_id}: {exc}")
+
+            if skipped_running:
+                errors.extend(
+                    f"{instance_id}: 浏览器正在运行，未应用远端快照"
+                    for instance_id in skipped_running
+                )
         if errors:
             message = "; ".join(errors)
             cfg = self._record_sync_failure(message, "拉取未完成，未应用远端状态")
@@ -1625,37 +1773,28 @@ class SyncEngine:
                 "conflict_warning": conflict_warning,
                 "manifest": manifest,
                 "applied": {"subscriptions": 0, "nodes": 0, "browser_instances": 0},
-                "settings": public_webdav_settings(cfg),
+                "settings": self.public_settings(cfg),
             }
 
         purged_profiles: list[str] = []
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
-            current_fingerprint = sha256_bytes(
-                json.dumps(
-                    {
-                        "subscriptions": state.get("subscriptions") or [],
-                        "nodes": state.get("nodes") or [],
-                        "browser_instances": state.get("browser_instances") or [],
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
+            current_fingerprint = self._local_state_fingerprint(state)
             if current_fingerprint != local_state_fingerprint:
                 raise RuntimeError("拉取期间本地状态发生变化，已取消应用远端快照")
-            active_now = [
-                str(item.get("id") or "")
-                for item in state.get("browser_instances") or []
-                if isinstance(item, dict)
-                and item.get("id")
-                and (
-                    item.get("status") in {"running", "starting"}
-                    or self.browser_runtime_is_active(str(item.get("id") or ""))
-                )
-            ]
+            active_now = []
+            if self.sync_browser_data:
+                active_now = [
+                    str(item.get("id") or "")
+                    for item in state.get("browser_instances") or []
+                    if isinstance(item, dict)
+                    and item.get("id")
+                    and (
+                        item.get("status") in {"running", "starting"}
+                        or self.browser_runtime_is_active(str(item.get("id") or ""))
+                    )
+                ]
             if active_now:
                 raise RuntimeError(f"浏览器正在运行，已取消应用远端快照: {active_now[0]}")
             applied = apply_remote_state(
@@ -1664,9 +1803,17 @@ class SyncEngine:
                 profile_path_builder=lambda node_id, instance_id, legacy=False: self._safe_profile_path(
                     node_id, instance_id, legacy
                 ),
+                include_browser_data=self.sync_browser_data,
+                excluded_node_ids=(
+                    set(snapshot_meta.get("preserved_browser_node_ids") or set())
+                    if not self.sync_browser_data
+                    else set()
+                ),
             )
             # Drop local browser profiles for records deleted on the remote side.
-            for record in applied.get("removed_browsers") or []:
+            for record in (
+                (applied.get("removed_browsers") or []) if self.sync_browser_data else []
+            ):
                 if not isinstance(record, dict):
                     continue
                 iid = str(record.get("id") or "")
@@ -1702,12 +1849,19 @@ class SyncEngine:
             )
             cfg["last_error"] = ""
             removed_subs = len(applied.get("removed_subscription_ids") or [])
-            cfg["last_status"] = (
-                f"已拉取：订阅 {applied['subscriptions']}，节点 {applied['nodes']}，"
-                f"浏览器记录 {applied['browser_instances']}，Profile {len(downloaded)}，"
-                f"删除本地 Profile {len(purged_profiles)}"
-                + (f"，移除订阅 {removed_subs}" if removed_subs else "")
-            )
+            if self.sync_browser_data:
+                cfg["last_status"] = (
+                    f"已拉取：订阅 {applied['subscriptions']}，节点 {applied['nodes']}，"
+                    f"浏览器记录 {applied['browser_instances']}，Profile {len(downloaded)}，"
+                    f"删除本地 Profile {len(purged_profiles)}"
+                    + (f"，移除订阅 {removed_subs}" if removed_subs else "")
+                )
+            else:
+                cfg["last_status"] = (
+                    f"已拉取订阅：订阅 {applied['subscriptions']}，节点 {applied['nodes']}，"
+                    "本地浏览器数据保持不变"
+                    + (f"，移除订阅 {removed_subs}" if removed_subs else "")
+                )
             if conflict_warning:
                 cfg["last_status"] += f"；{conflict_warning}"
             state["settings"]["webdav"] = cfg
@@ -1725,7 +1879,7 @@ class SyncEngine:
             "conflict_warning": conflict_warning,
             "manifest": manifest,
             "applied": applied,
-            "settings": public_webdav_settings(cfg),
+            "settings": self.public_settings(cfg),
         }
 
     @_serialized_sync_operation
@@ -1744,7 +1898,7 @@ class SyncEngine:
                 "remote_newer": False,
                 "already_latest": False,
                 "manifest_url": urls["manifest"],
-                "settings": public_webdav_settings(cfg),
+                "settings": self.public_settings(cfg),
             }
         raw = self._decode_blob(
             client.get_bytes(urls["manifest"], max_bytes=MAX_MANIFEST_BYTES + 1024), cfg
@@ -1773,7 +1927,7 @@ class SyncEngine:
                 "browser_instance_count": manifest.get("browser_instance_count"),
                 "profile_count": manifest.get("profile_count"),
             },
-            "settings": public_webdav_settings(cfg),
+            "settings": self.public_settings(cfg),
         }
 
     def mark_local_change(self) -> None:
@@ -1793,7 +1947,7 @@ class SyncEngine:
         Covers both explicit「停止」and user closing the Chromium window (process exit
         detected on next status poll).
         """
-        if not instance_id:
+        if not self.sync_browser_data or not instance_id:
             return
         if not self._bg_lock.acquire(blocking=False):
             return
@@ -1869,14 +2023,21 @@ def apply_remote_state(
     remote_state: dict[str, Any],
     *,
     profile_path_builder: Callable[..., Path],
+    include_browser_data: bool = True,
+    excluded_node_ids: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Apply remote subscriptions/nodes/browser_instances as LWW source of truth.
+    """Apply remote state as LWW source of truth for the enabled sections.
 
-    Local-only subscriptions/nodes/browser records are **removed** so deletions
-    on the source machine propagate after pull.
+    Local-only subscriptions/nodes are removed. Browser records are replaced only
+    when ``include_browser_data`` is true; subscription-only runtimes preserve them.
     """
     remote_subs = [item for item in remote_state.get("subscriptions") or [] if isinstance(item, dict)]
-    remote_nodes = [item for item in remote_state.get("nodes") or [] if isinstance(item, dict)]
+    excluded_node_ids = {str(item) for item in (excluded_node_ids or set()) if item}
+    remote_nodes = [
+        dict(item)
+        for item in remote_state.get("nodes") or []
+        if isinstance(item, dict) and str(item.get("id") or "") not in excluded_node_ids
+    ]
     remote_browsers = [item for item in remote_state.get("browser_instances") or [] if isinstance(item, dict)]
 
     old_browser_by_id = {
@@ -1898,26 +2059,50 @@ def apply_remote_state(
 
     # Full replace from remote (deletions included).
     local_state["subscriptions"] = [dict(item) for item in remote_subs if item.get("id")]
-    local_state["nodes"] = [dict(item) for item in remote_nodes if item.get("id")]
+    new_nodes = [dict(item) for item in remote_nodes if item.get("id")]
+    if not include_browser_data:
+        remote_node_ids = {str(item.get("id") or "") for item in new_nodes}
+        local_node_by_id = {
+            str(item.get("id") or ""): dict(item)
+            for item in local_state.get("nodes") or []
+            if isinstance(item, dict) and item.get("id")
+        }
+        required_local_node_ids = {
+            str(item.get("node_id") or "")
+            for item in local_state.get("browser_instances") or []
+            if isinstance(item, dict) and item.get("node_id")
+        }
+        for node_id in sorted(required_local_node_ids - remote_node_ids):
+            local_node = local_node_by_id.get(node_id)
+            if not local_node:
+                continue
+            local_node[LOCAL_BROWSER_NODE_MARKER] = True
+            new_nodes.append(local_node)
+    local_state["nodes"] = new_nodes
 
-    new_browsers: list[dict[str, Any]] = []
-    new_browser_ids: set[str] = set()
-    for item in remote_browsers:
-        iid = _validate_sync_id(item.get("id"), "远端浏览器实例 ID")
-        record = sanitize_browser_instance_for_sync(item)
-        node_id = str(record.get("node_id") or "")
-        _validate_sync_id(node_id, "远端浏览器实例 node_id")
-        legacy = bool(record.get("legacy"))
-        record["profile_path"] = str(profile_path_builder(node_id, iid, legacy))
-        local = old_browser_by_id.get(iid)
-        if local:
-            try:
-                record["launch_count"] = max(int(local.get("launch_count") or 0), int(record.get("launch_count") or 0))
-            except (TypeError, ValueError):
-                pass
-        new_browsers.append(record)
-        new_browser_ids.add(iid)
-    local_state["browser_instances"] = new_browsers
+    new_browser_ids: set[str] = set(old_browser_ids)
+    if include_browser_data:
+        new_browsers: list[dict[str, Any]] = []
+        new_browser_ids = set()
+        for item in remote_browsers:
+            iid = _validate_sync_id(item.get("id"), "远端浏览器实例 ID")
+            record = sanitize_browser_instance_for_sync(item)
+            node_id = str(record.get("node_id") or "")
+            _validate_sync_id(node_id, "远端浏览器实例 node_id")
+            legacy = bool(record.get("legacy"))
+            record["profile_path"] = str(profile_path_builder(node_id, iid, legacy))
+            local = old_browser_by_id.get(iid)
+            if local:
+                try:
+                    record["launch_count"] = max(
+                        int(local.get("launch_count") or 0),
+                        int(record.get("launch_count") or 0),
+                    )
+                except (TypeError, ValueError):
+                    pass
+            new_browsers.append(record)
+            new_browser_ids.add(iid)
+        local_state["browser_instances"] = new_browsers
 
     new_node_ids = {
         str(item.get("id") or "")
@@ -1933,7 +2118,7 @@ def apply_remote_state(
     return {
         "subscriptions": len(remote_subs),
         "nodes": len(remote_nodes),
-        "browser_instances": len(remote_browsers),
+        "browser_instances": len(remote_browsers) if include_browser_data else 0,
         "removed_subscription_ids": sorted(old_sub_ids - new_sub_ids),
         "removed_node_ids": sorted(old_node_ids - new_node_ids),
         "removed_browser_ids": sorted(old_browser_ids - new_browser_ids),

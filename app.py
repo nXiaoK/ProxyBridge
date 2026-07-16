@@ -104,6 +104,7 @@ RUNTIME_ROOT = WORK_ROOT / "runtime"
 STATE_PATH = WORK_ROOT / "state.json"
 DEFAULT_SERVER_PORT = 8787
 DEFAULT_SOCKS_PORT = 21080
+DEFAULT_DOCKER_PROXY_PORT_END = 21179
 DEFAULT_BROWSER_START_URL = "https://ip.skk.moe/"
 LOCAL_PROXY_LISTEN_HOST = "127.0.0.1"
 LAN_PROXY_LISTEN_HOST = "0.0.0.0"
@@ -190,6 +191,44 @@ def _is_loopback_host(value: str) -> bool:
     return len(normalized_port) <= 5 and int(normalized_port) <= 65535
 
 
+def _host_ipv4_literal(value: str) -> ipaddress.IPv4Address | None:
+    match = re.fullmatch(r"([0-9]{1,3}(?:\.[0-9]{1,3}){3})(?::([0-9]+))?", value)
+    if match is None:
+        return None
+    port = match.group(2)
+    if port is not None:
+        normalized_port = port.lstrip("0") or "0"
+        if len(normalized_port) > 5 or int(normalized_port) > 65535:
+            return None
+    try:
+        return ipaddress.IPv4Address(match.group(1))
+    except ipaddress.AddressValueError:
+        return None
+
+
+def _configured_docker_console_ip() -> ipaddress.IPv4Address | None:
+    if not docker_mode():
+        return None
+    raw = os.environ.get("PROXY_BRIDGE_CONSOLE_HOST", "")
+    if not raw or raw != raw.strip():
+        return None
+    try:
+        address = ipaddress.IPv4Address(raw)
+    except ipaddress.AddressValueError:
+        return None
+    if address.is_loopback or any(address in network for network in PRIVATE_IPV4_NETWORKS):
+        return address
+    return None
+
+
+def _is_trusted_console_host(value: str) -> bool:
+    if _is_loopback_host(value):
+        return True
+    request_ip = _host_ipv4_literal(value)
+    configured_ip = _configured_docker_console_ip()
+    return request_ip is not None and configured_ip is not None and request_ip == configured_ip
+
+
 def backend_instance_token() -> str | None:
     token = os.environ.get("PROXY_BRIDGE_INSTANCE_TOKEN", "")
     if not 1 <= len(token) <= BACKEND_INSTANCE_TOKEN_MAX_LENGTH:
@@ -263,14 +302,15 @@ def proxy_core_bin_dir() -> Path:
 
 
 def ensure_dirs() -> None:
-    for path in (
+    paths = [
         WORK_ROOT,
         RUNTIME_ROOT,
         proxy_core_root(),
         proxy_core_bin_dir(),
-        browser_profiles_root(),
-        browser_extensions_root(),
-    ):
+    ]
+    if browser_feature_enabled():
+        paths.extend((browser_profiles_root(), browser_extensions_root()))
+    for path in paths:
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             path.chmod(0o700)
@@ -308,6 +348,27 @@ def truthy(value: Any) -> bool:
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def docker_mode() -> bool:
+    """Return whether this process is running with Docker-specific capabilities."""
+    return truthy(os.environ.get("PROXY_BRIDGE_DOCKER"))
+
+
+def browser_feature_enabled() -> bool:
+    """Browser automation is intentionally excluded from Docker deployments."""
+    if docker_mode():
+        return False
+    return not truthy(os.environ.get("PROXY_BRIDGE_DISABLE_BROWSER"))
+
+
+def require_browser_feature() -> None:
+    if not browser_feature_enabled():
+        raise RuntimeError("当前运行模式不提供浏览器功能")
+
+
+def runtime_mode() -> str:
+    return "docker" if docker_mode() else str(os.environ.get("PROXY_BRIDGE_SHELL_MODE") or "headless")
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -619,6 +680,7 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
 
 def update_browser_instance(payload: dict[str, Any]) -> dict[str, Any]:
     """Update editable fields on a browser instance (currently: label)."""
+    require_browser_feature()
     instance_id = str(payload.get("instance_id") or payload.get("id") or "")
     if not instance_id:
         raise ValueError("缺少浏览器实例 ID")
@@ -1847,6 +1909,10 @@ def fingerprint_chromium_path(force_refresh: bool = False) -> str | None:
 
 
 def allow_lan_access(state: dict[str, Any]) -> bool:
+    if docker_mode():
+        # Published Docker ports arrive through the container bridge, so the outer
+        # proxy listener must accept RFC1918 clients inside the container.
+        return True
     settings = state.get("settings")
     return bool(isinstance(settings, dict) and settings.get("allow_lan") is True)
 
@@ -1973,10 +2039,29 @@ def network_settings_payload(
     if state is None:
         with STATE_LOCK:
             state = load_state()
+    docker_managed = docker_mode()
     allow_lan = allow_lan_access(state)
-    addresses = list(lan_addresses) if lan_addresses is not None else lan_ipv4_addresses()
+    addresses = [] if docker_managed else (
+        list(lan_addresses) if lan_addresses is not None else lan_ipv4_addresses()
+    )
     proxy_urls: list[dict[str, Any]] = []
-    if allow_lan:
+    if docker_managed:
+        for bridge in state.get("bridges", []):
+            port = safe_int(bridge.get("port"), 0)
+            if bridge.get("status") not in ACTIVE_BRIDGE_STATUSES or port <= 0:
+                continue
+            proxy_urls.append(
+                {
+                    "bridge_id": str(bridge.get("id") or ""),
+                    "node_name": str(bridge.get("node_name") or ""),
+                    "port": port,
+                    "socks_url": str(bridge.get("socks_url") or f"socks5://127.0.0.1:{port}"),
+                    "http_url": str(bridge.get("http_url") or f"http://127.0.0.1:{port}"),
+                    "socks_urls": [str(bridge.get("socks_url") or f"socks5://127.0.0.1:{port}")],
+                    "http_urls": [str(bridge.get("http_url") or f"http://127.0.0.1:{port}")],
+                }
+            )
+    elif allow_lan:
         for bridge in state.get("bridges", []):
             port = safe_int(bridge.get("port"), 0)
             if bridge.get("status") not in ACTIVE_BRIDGE_STATUSES or port <= 0:
@@ -1998,7 +2083,9 @@ def network_settings_payload(
         "lan_addresses": addresses,
         "primary_lan_address": addresses[0] if addresses else "",
         "console_shared": False,
-        "client_scope": "loopback_and_private_ipv4",
+        "client_scope": "docker_published_ports" if docker_managed else "loopback_and_private_ipv4",
+        "configurable": not docker_managed,
+        "docker_managed": docker_managed,
         "proxy_urls": proxy_urls,
     }
 
@@ -2010,11 +2097,14 @@ def status_payload() -> dict[str, Any]:
 
 def _status_payload() -> dict[str, Any]:
     synchronize_process_state()
-    lan_addresses = lan_ipv4_addresses()
+    browser_enabled = browser_feature_enabled()
+    docker_enabled = docker_mode()
+    lan_addresses = [] if docker_enabled else lan_ipv4_addresses()
     with STATE_LOCK:
         state = load_state()
         changed = sync_process_status(state)
-        changed |= sync_browser_instance_status(state)
+        if browser_enabled:
+            changed |= sync_browser_instance_status(state)
         token, token_changed = ensure_pool_token(state)
         members = pool_members(state, ready_only=False)
         if changed or token_changed:
@@ -2032,17 +2122,32 @@ def _status_payload() -> dict[str, Any]:
             "platform": {
                 "os": host_os_token(),
                 "arch": host_arch_token(),
-                "fingerprint_platform": fingerprint_platform_token(),
+                "fingerprint_platform": fingerprint_platform_token() if browser_enabled else None,
                 "work_root": str(WORK_ROOT),
-                "shell_mode": os.environ.get("PROXY_BRIDGE_SHELL_MODE", "headless"),
+                "shell_mode": runtime_mode(),
+            },
+            "runtime": {
+                "mode": runtime_mode(),
+                "docker": docker_enabled,
+                "proxy_port_range": list(docker_proxy_port_range()) if docker_enabled else None,
+            },
+            "features": {
+                "browser": browser_enabled,
+                "browser_profile_sync": browser_enabled,
+                "docker": docker_enabled,
             },
             "cores": core_paths(),
-            "chrome": chrome_path(),
-            "fingerprint_chromium": fingerprint_chromium_path(),
-            "active_browsers": active_browser_node_ids_from_state(state),
-            "browser_instances": state.get("browser_instances", []),
+            "chrome": chrome_path() if browser_enabled else None,
+            "fingerprint_chromium": fingerprint_chromium_path() if browser_enabled else None,
+            "active_browsers": active_browser_node_ids_from_state(state) if browser_enabled else [],
+            "browser_instances": state.get("browser_instances", []) if browser_enabled else [],
             "subscriptions": state["subscriptions"],
-            "nodes": [public_node(node) for node in state["nodes"]],
+            "nodes": [
+                public_node(node)
+                for node in state["nodes"]
+                if browser_enabled
+                or node.get(webdav_sync.LOCAL_BROWSER_NODE_MARKER) is not True
+            ],
             "bridges": bridges,
             "tests": state.get("tests", {}),
             "request_logs": state.get("request_logs", [])[:200],
@@ -2053,7 +2158,8 @@ def _status_payload() -> dict[str, Any]:
                 "links": pool_links(token),
             },
             "sync": webdav_sync.public_webdav_settings(
-                webdav_sync.normalize_webdav_settings((state.get("settings") or {}).get("webdav"))
+                webdav_sync.normalize_webdav_settings((state.get("settings") or {}).get("webdav")),
+                sync_browser_data=browser_enabled,
             ),
             "sync_openssl": webdav_sync.openssl_available(),
             "network": network,
@@ -2105,6 +2211,7 @@ def get_sync_engine() -> webdav_sync.SyncEngine:
             browser_instance_profile_path=browser_instance_profile_path,
             browser_runtime_is_active=browser_process_is_active,
             log=log_event,
+            sync_browser_data=browser_feature_enabled(),
         )
     return SYNC_ENGINE
 
@@ -2117,7 +2224,7 @@ def sync_status_payload() -> dict[str, Any]:
         state.setdefault("settings", {})["webdav"] = cfg
         save_state(state)
     return {
-        "settings": webdav_sync.public_webdav_settings(cfg),
+        "settings": engine.public_settings(cfg),
         "openssl": webdav_sync.openssl_available(),
     }
 
@@ -2446,13 +2553,33 @@ def _apply_subscription_replacement(
             subscription=subscription,
             node_dicts=node_dicts,
         )
+    preserved_browser_node_ids = _browser_node_ids_to_preserve(state, set(remove_ids))
     state["subscriptions"] = [s for s in state["subscriptions"] if s.get("url") != url or not url]
     state["subscriptions"].append(subscription)
-    existing = {node["id"]: node for node in state["nodes"] if node.get("id") not in remove_ids}
+    existing: dict[str, dict[str, Any]] = {}
+    for node in state["nodes"]:
+        node_id = str(node.get("id") or "")
+        if node_id in remove_ids and node_id not in preserved_browser_node_ids:
+            continue
+        record = dict(node)
+        if node_id in preserved_browser_node_ids:
+            record[webdav_sync.LOCAL_BROWSER_NODE_MARKER] = True
+        existing[node_id] = record
     for node in node_dicts:
         existing[node["id"]] = node
     state["nodes"] = list(existing.values())
     return set(remove_ids)
+
+
+def _browser_node_ids_to_preserve(state: dict[str, Any], node_ids: set[str]) -> set[str]:
+    if browser_feature_enabled():
+        return set()
+    candidates = {str(node_id) for node_id in node_ids if node_id}
+    return {
+        str(instance.get("node_id") or "")
+        for instance in state.get("browser_instances", [])
+        if isinstance(instance, dict) and str(instance.get("node_id") or "") in candidates
+    }
 
 
 def _runtime_snapshot_for_nodes(state: dict[str, Any], node_ids: set[str]) -> dict[str, Any]:
@@ -2469,11 +2596,13 @@ def _runtime_snapshot_for_nodes(state: dict[str, Any], node_ids: set[str]) -> di
         if isinstance(bridge, dict) and str(bridge.get("node_id") or "") in node_ids
     ]
     bridge_ids.update(str(bridge.get("id") or "") for bridge in bridges if bridge.get("id"))
-    instances = [
-        dict(instance)
-        for instance in state.get("browser_instances", [])
-        if isinstance(instance, dict) and str(instance.get("node_id") or "") in node_ids
-    ]
+    instances = []
+    if browser_feature_enabled():
+        instances = [
+            dict(instance)
+            for instance in state.get("browser_instances", [])
+            if isinstance(instance, dict) and str(instance.get("node_id") or "") in node_ids
+        ]
     return {
         "node_ids": node_ids,
         "bridges": bridges,
@@ -2496,11 +2625,12 @@ def _stop_runtime_for_nodes(snapshot: dict[str, Any]) -> dict[str, Any]:
             killed_browsers += stop_browser_instance_process(instance_id)
         except BaseException as error:
             failures.append((f"浏览器 {instance_id}", error))
-    for node_id in snapshot.get("node_ids") or set():
-        try:
-            killed_browsers += stop_untracked_browser_processes_for_node(str(node_id))
-        except BaseException as error:
-            failures.append((f"节点 {node_id} 浏览器", error))
+    if browser_feature_enabled():
+        for node_id in snapshot.get("node_ids") or set():
+            try:
+                killed_browsers += stop_untracked_browser_processes_for_node(str(node_id))
+            except BaseException as error:
+                failures.append((f"节点 {node_id} 浏览器", error))
 
     for bridge_id in sorted(snapshot.get("bridge_ids") or set()):
         try:
@@ -2522,11 +2652,12 @@ def _stop_runtime_for_nodes(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 def _mark_removed_nodes_stopped(state: dict[str, Any], node_ids: set[str], traffic_by_bridge: dict[str, dict[str, int]]) -> None:
     node_ids = {str(node_id) for node_id in node_ids if node_id}
-    state["browser_instances"] = [
-        item
-        for item in state.get("browser_instances", [])
-        if not (isinstance(item, dict) and str(item.get("node_id") or "") in node_ids)
-    ]
+    if browser_feature_enabled():
+        state["browser_instances"] = [
+            item
+            for item in state.get("browser_instances", [])
+            if not (isinstance(item, dict) and str(item.get("node_id") or "") in node_ids)
+        ]
     stopped_at = now_ts()
     for bridge in state.get("bridges", []):
         if not isinstance(bridge, dict) or str(bridge.get("node_id") or "") not in node_ids:
@@ -2611,7 +2742,7 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
                 _mark_removed_nodes_stopped(state, remove_ids, runtime_cleanup["traffic_by_bridge"])
                 save_state(state)
             release_persisted_bridge_traffic(runtime_cleanup["traffic_by_bridge"])
-        removed_profiles = _remove_profiles_for_nodes(remove_ids) if remove_ids else 0
+        removed_profiles = _remove_profiles_for_nodes(remove_ids) if remove_ids and browser_feature_enabled() else 0
     mark_sync_local_change()
     return {
         "subscription": subscription,
@@ -2683,7 +2814,17 @@ def delete_subscription(subscription_id: str) -> dict[str, Any]:
                     for node_id in (set(subscription.get("node_ids") or []) - referenced_node_ids(state["subscriptions"]))
                     if node_id
                 }
-                state["nodes"] = [n for n in state["nodes"] if n.get("id") not in current_remove_ids]
+                preserved_browser_node_ids = _browser_node_ids_to_preserve(state, current_remove_ids)
+                retained_nodes: list[dict[str, Any]] = []
+                for node in state["nodes"]:
+                    node_id = str(node.get("id") or "")
+                    if node_id in current_remove_ids and node_id not in preserved_browser_node_ids:
+                        continue
+                    record = dict(node)
+                    if node_id in preserved_browser_node_ids:
+                        record[webdav_sync.LOCAL_BROWSER_NODE_MARKER] = True
+                    retained_nodes.append(record)
+                state["nodes"] = retained_nodes
                 _mark_removed_nodes_stopped(state, current_remove_ids, runtime_cleanup["traffic_by_bridge"])
                 save_state(state)
             release_persisted_bridge_traffic(runtime_cleanup["traffic_by_bridge"])
@@ -2696,7 +2837,9 @@ def delete_subscription(subscription_id: str) -> dict[str, Any]:
                 "killed_browsers": runtime_cleanup["killed_browsers"],
                 "removed_profiles": 0,
             }
-        purge_summary["removed_profiles"] = _remove_profiles_for_nodes(remove_ids)
+        purge_summary["removed_profiles"] = (
+            _remove_profiles_for_nodes(remove_ids) if browser_feature_enabled() else 0
+        )
 
     mark_sync_local_change()
     # WebDAV enabled → push deletion (subscriptions + remote Profile packages).
@@ -2769,6 +2912,29 @@ def next_free_port(
         if free:
             return port
     raise RuntimeError("没有可用的本地端口")
+
+
+def docker_proxy_port_range() -> tuple[int, int]:
+    start = safe_int(os.environ.get("PROXY_BRIDGE_PROXY_PORT_START"), DEFAULT_SOCKS_PORT)
+    end = safe_int(os.environ.get("PROXY_BRIDGE_PROXY_PORT_END"), DEFAULT_DOCKER_PROXY_PORT_END)
+    # Public ports reserve +1000 for the loopback-only core inbound.
+    if not 1 <= start <= 64535 or not start <= end <= 64535:
+        raise RuntimeError("Docker 代理端口范围无效")
+    return start, end
+
+
+def next_free_public_proxy_port(
+    preferred: int | None = None,
+    listen_host: str = LAN_PROXY_LISTEN_HOST,
+) -> int:
+    """Pick a public proxy port from the range published by Docker."""
+    start, end = docker_proxy_port_range()
+    candidate = preferred if preferred is not None and start <= preferred <= end else start
+    ports = list(range(candidate, end + 1)) + list(range(start, candidate))
+    for port in ports:
+        if is_port_free(port, listen_host):
+            return port
+    raise RuntimeError(f"Docker 已发布范围 {start}-{end} 内没有可用的代理端口")
 
 
 def wait_for_port(port: int, timeout: float = 2.0) -> bool:
@@ -3052,6 +3218,10 @@ def _prepare_bridge_start(payload: dict[str, Any]) -> dict[str, Any]:
     requested_port = safe_int(payload.get("port"), 0) or None
     if requested_port is not None and not 1 <= requested_port <= 65535:
         raise ValueError("本地代理端口必须在 1..65535 之间")
+    if docker_mode() and requested_port is not None:
+        start, end = docker_proxy_port_range()
+        if not start <= requested_port <= end:
+            raise ValueError(f"Docker 模式下本地代理端口必须在已发布范围 {start}..{end} 内")
     requested_core = str(payload.get("core") or "auto")
     if requested_core not in {"auto", "sing-box", "xray"}:
         raise ValueError("核心只能是 sing-box、xray 或 auto")
@@ -3084,6 +3254,10 @@ def _prepare_bridge_start(payload: dict[str, Any]) -> dict[str, Any]:
         if core not in {"sing-box", "xray"}:
             raise ValueError("核心只能是 sing-box、xray 或 auto")
         preferred_port = requested_port or remembered_port_for_node(state, node_id)
+        if docker_mode() and preferred_port is not None:
+            start, end = docker_proxy_port_range()
+            if not start <= preferred_port <= end:
+                preferred_port = None
         listen_host = proxy_listen_host(state)
     return {
         "node_id": node_id,
@@ -3113,11 +3287,14 @@ def _retarget_core_command(command: list[str], core: str, config_path: Path) -> 
 
 def _complete_bridge_plan(plan: dict[str, Any], command: list[str]) -> tuple[dict[str, Any], list[str]]:
     listen_host = str(plan.get("listen_host") or LOCAL_PROXY_LISTEN_HOST)
-    local_port = (
-        next_free_port(plan.get("preferred_port"), listen_host)
-        if listen_host != LOCAL_PROXY_LISTEN_HOST
-        else next_free_port(plan.get("preferred_port"))
-    )
+    if docker_mode():
+        local_port = next_free_public_proxy_port(plan.get("preferred_port"), listen_host)
+    else:
+        local_port = (
+            next_free_port(plan.get("preferred_port"), listen_host)
+            if listen_host != LOCAL_PROXY_LISTEN_HOST
+            else next_free_port(plan.get("preferred_port"))
+        )
     core_port = next_free_port(max(local_port + 1000, 23080))
     bridge_id = stable_id(str(plan["node_id"]), str(local_port), str(plan["core"]))
     config = generate_config(str(plan["core"]), dict(plan["node"]), core_port)
@@ -3289,6 +3466,7 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    require_browser_feature()
     with BROWSER_LAUNCH_LOCK:
         return _launch_browser(payload)
 
@@ -3614,6 +3792,7 @@ def stop_browser_processes_for_node(node_id: str, state: dict[str, Any] | None =
 
 
 def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    require_browser_feature()
     with SHUTDOWN_LOCK:
         return _stop_browser(payload)
 
@@ -3808,6 +3987,7 @@ def _install_fingerprint_from_archive(archive_path: Path, dest_root: Path) -> Pa
 
 
 def download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
+    require_browser_feature()
     with FINGERPRINT_INSTALL_LOCK:
         return _download_fingerprint_chromium(payload)
 
@@ -4981,7 +5161,11 @@ def _stop_bridge(bridge_id: str) -> dict[str, Any]:
                 bridge_node_id = str(bridge.get("node_id") or "")
                 break
 
-    killed_browsers = stop_browser_processes_for_node(bridge_node_id) if bridge_node_id else 0
+    killed_browsers = (
+        stop_browser_processes_for_node(bridge_node_id)
+        if bridge_node_id and browser_feature_enabled()
+        else 0
+    )
     traffic = stop_process(bridge_id, pop_traffic=False)
     persisted_traffic = persist_stopped_bridges({bridge_id: traffic}, disable=True)
     release_persisted_bridge_traffic(persisted_traffic)
@@ -5010,7 +5194,11 @@ def _stop_all_bridges() -> dict[str, Any]:
 
     with PROCESS_LOCK:
         browser_node_ids.update(BROWSER_TABLE.keys())
-    killed_browsers = sum(stop_browser_processes_for_node(node_id) for node_id in browser_node_ids)
+    killed_browsers = (
+        sum(stop_browser_processes_for_node(node_id) for node_id in browser_node_ids)
+        if browser_feature_enabled()
+        else 0
+    )
     with PROCESS_LOCK:
         bridge_ids = active_bridge_ids | set(PROCESS_TABLE) | set(LOG_PROXY_TABLE)
     with TRAFFIC_LOCK:
@@ -5075,6 +5263,8 @@ def rebind_running_log_proxies(listen_host: str) -> list[str]:
 
 
 def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if docker_mode():
+        raise ValueError("Docker 模式下代理访问范围由端口映射管理")
     if "allow_lan" not in payload or not isinstance(payload.get("allow_lan"), bool):
         raise ValueError("allow_lan 必须是布尔值")
     desired = bool(payload["allow_lan"])
@@ -5336,7 +5526,8 @@ class AppHandler(BaseHTTPRequestHandler):
         sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), fmt % safe_args))
 
     def is_trusted_request(self) -> bool:
-        if not _is_loopback_host(self.headers.get("Host") or ""):
+        request_host = self.headers.get("Host") or ""
+        if not _is_trusted_console_host(request_host):
             return False
         if (self.headers.get("Sec-Fetch-Site") or "").strip().lower() == "cross-site":
             return False
@@ -5353,7 +5544,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return False
         if parsed.path or parsed.query or parsed.fragment:
             return False
-        return _is_loopback_host(parsed.netloc)
+        if not _is_trusted_console_host(parsed.netloc):
+            return False
+        if not _is_loopback_host(request_host) or not _is_loopback_host(parsed.netloc):
+            return _host_ipv4_literal(request_host) == _host_ipv4_literal(parsed.netloc)
+        return True
 
     def _send_request_error(self, status: int, message: str) -> None:
         path = urllib.parse.urlsplit(self.path).path
@@ -5890,6 +6085,9 @@ def main(argv: list[str] | None = None) -> None:
     if port <= 0 or port > 65535:
         raise SystemExit(f"无效端口: {port}")
     host = str(args.host or "127.0.0.1").strip() or "127.0.0.1"
+    # Keep derived URLs (proxy pool links, status payloads) aligned with CLI overrides.
+    os.environ["PROXY_BRIDGE_PORT"] = str(port)
+    os.environ["PROXY_BRIDGE_HOST"] = host
     start_parent_monitor()
     if not args.no_core_auto_install:
         start_core_auto_install()
@@ -5906,7 +6104,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     print(f"Proxy Bridge console: {console_url}", flush=True)
     print(f"Work dir: {WORK_ROOT}", flush=True)
-    if args.open:
+    if args.open and not docker_mode():
         try:
             import webbrowser
 
