@@ -154,11 +154,13 @@ python3 app.py --port 8790 --workdir ~/.proxybridge --open
 python app.py --port 8790 --workdir $env:APPDATA\ProxyBridge --open
 ```
 
-打开：
+启动后使用终端打印的完整认证地址，例如：
 
 ```text
-http://127.0.0.1:8787
+Proxy Bridge console: http://127.0.0.1:8787/#token=...
 ```
+
+`--open` 会直接打开这个地址。页面接收令牌后会立即清除地址栏中的 fragment，并将令牌仅保存在当前标签页的会话状态中；刷新当前标签页仍可使用，另开标签页时需重新使用启动输出中的完整地址。
 
 常用环境变量 / 参数：
 
@@ -178,6 +180,19 @@ http://127.0.0.1:8787
 - 代理核心会按当前操作系统/架构从 GitHub Releases 自动选择 Linux / Windows / macOS 包。
 - 指纹浏览器若上游未提供当前平台安装包，可手动下载后通过 `PROXY_BRIDGE_FP_CHROMIUM` 指向可执行文件。
 - 管理控制台默认仅本机访问；局域网共享开关只影响本地代理端口，不会把控制台暴露到局域网。
+- 除 Docker 健康检查使用的 `HEAD /api/status` 外，管理 API 都需要当前后端实例令牌；直接打开不含 `#token=...` 的裸地址无法执行管理操作。
+
+脚本调用管理 API 时，可在启动后端前设置自选的高强度 `PROXY_BRIDGE_INSTANCE_TOKEN`，并在每个请求中发送同一个令牌：
+
+```bash
+export PROXY_BRIDGE_INSTANCE_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python3 app.py &
+curl --retry 10 --retry-connrefused \
+  -H "X-ProxyBridge-Instance: ${PROXY_BRIDGE_INSTANCE_TOKEN}" \
+  http://127.0.0.1:8787/api/status
+```
+
+上述命令在 shell 中生成随机值，实际令牌不会写入命令历史。令牌应按密码保护，不要放入 URL query、公开日志或代码仓库。未显式设置时，后端每次启动都会生成新令牌，并只通过启动时打印的 URL fragment 交付。
 
 ## Docker 运行
 
@@ -185,12 +200,13 @@ Docker 模式直接提供 Web 控制台和本地代理，不包含托盘、系�
 
 ```bash
 docker compose up -d --build
+docker compose logs --tail=50 proxybridge
 ```
 
-打开：
+从最新启动日志中复制完整的 `Proxy Bridge console:` 地址，不要只打开裸端口地址：
 
 ```text
-http://127.0.0.1:8787
+Proxy Bridge console: http://127.0.0.1:8787/#token=...
 ```
 
 Compose 默认：

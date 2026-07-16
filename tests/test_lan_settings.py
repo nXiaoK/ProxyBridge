@@ -24,6 +24,8 @@ def make_handler(method: str, path: str, headers: dict[str, str], body: bytes = 
     handler.headers = Message()
     for name, value in headers.items():
         handler.headers[name] = value
+    if app.BACKEND_INSTANCE_HEADER not in handler.headers:
+        handler.headers[app.BACKEND_INSTANCE_HEADER] = app.management_api_token()
     handler.rfile = io.BytesIO(body)
     handler.wfile = io.BytesIO()
     return handler

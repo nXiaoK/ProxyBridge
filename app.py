@@ -8,6 +8,7 @@ import concurrent.futures
 import errno
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import mimetypes
@@ -19,6 +20,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -114,10 +116,14 @@ PRIVATE_IPV4_NETWORKS = tuple(
 REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
 HTTP_PROXY_HEADER_LIMIT = 65536
+PROXY_MAX_CLIENTS = 128
+PROXY_HANDSHAKE_TIMEOUT = 2.0
+PROXY_RELAY_IDLE_TIMEOUT = 300.0
 API_JSON_BODY_LIMIT = 1_048_576
 BACKEND_INSTANCE_HEADER = "X-ProxyBridge-Instance"
 BACKEND_INSTANCE_TOKEN_MAX_LENGTH = 128
 BACKEND_INSTANCE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
+GENERATED_BACKEND_INSTANCE_TOKEN = secrets.token_urlsafe(32)
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
 ACTIVE_BROWSER_STATUSES = {"running", "starting"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
@@ -126,6 +132,13 @@ CORE_LOG_ENTRY_LIMIT = 30
 CORE_LOG_MAX_BYTES = 8 * 1024 * 1024
 CORE_LOG_BACKUP_COUNT = 3
 SUBSCRIPTION_RESPONSE_LIMIT = 8 * 1024 * 1024
+SUBSCRIPTION_REDIRECT_LIMIT = 5
+SUBSCRIPTION_FETCH_TIMEOUT = 120.0
+SUBSCRIPTION_IO_TIMEOUT = 20.0
+DOWNLOAD_RETRY_COUNT = 3
+DOWNLOAD_RETRY_BACKOFF = 0.25
+DOWNLOAD_RESPONSE_LIMIT = 2 * 1024 * 1024 * 1024
+GITHUB_JSON_RESPONSE_LIMIT = 8 * 1024 * 1024
 POOL_TOKEN_MIN_LEN = 16
 POOL_TOKEN_MAX_LEN = 128
 # 字符集与 BACKEND_INSTANCE_TOKEN_PATTERN 对齐；长度策略刻意更严（min 16）。
@@ -136,6 +149,7 @@ _POOL_PATH_REDACT = re.compile(r"(^|[\s\"'])(/pool/)([^/\s]+)(/[^\s]*)?")
 ALLOWED_PROXY_PROTOCOLS = frozenset({"socks5", "http"})
 PROCESS_TABLE: dict[str, subprocess.Popen] = {}
 BRIDGE_NODE_TABLE: dict[str, str] = {}
+RUNTIME_LOG_PUMP_TABLE: dict[str, threading.Thread] = {}
 # 兼容旧的节点级浏览器进程表;新的多开浏览器以 BROWSER_PROCESS_TABLE 按实例记录。
 BROWSER_TABLE: dict[str, list[subprocess.Popen]] = {}
 BROWSER_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
@@ -236,6 +250,28 @@ def backend_instance_token() -> str | None:
     if BACKEND_INSTANCE_TOKEN_PATTERN.fullmatch(token) is None:
         return None
     return token
+
+
+def management_api_token() -> str:
+    return backend_instance_token() or GENERATED_BACKEND_INSTANCE_TOKEN
+
+
+def management_tokens_equal(provided: str, expected: str | None = None) -> bool:
+    token = expected or management_api_token()
+    if (
+        not 1 <= len(provided) <= BACKEND_INSTANCE_TOKEN_MAX_LENGTH
+        or BACKEND_INSTANCE_TOKEN_PATTERN.fullmatch(provided) is None
+        or not 1 <= len(token) <= BACKEND_INSTANCE_TOKEN_MAX_LENGTH
+        or BACKEND_INSTANCE_TOKEN_PATTERN.fullmatch(token) is None
+    ):
+        return False
+    return hmac.compare_digest(provided, token)
+
+
+def console_access_url(base_url: str, token: str | None = None) -> str:
+    access_token = token or management_api_token()
+    fragment = urllib.parse.urlencode({"token": access_token})
+    return f"{base_url.rstrip('/')}/#{fragment}"
 
 
 def log_event(message: str, level: str = "info", category: str = "") -> None:
@@ -1472,13 +1508,91 @@ SING_BOX_RELEASES_API = "https://api.github.com/repos/SagerNet/sing-box/releases
 XRAY_RELEASES_API = "https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 
 
-def _github_json(url: str) -> Any:
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "ProxyBridge/0.1", "Accept": "application/vnd.github+json"},
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8", errors="replace"))
+def _require_https_url(url: str, label: str) -> urllib.parse.SplitResult:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        parsed.port
+    except ValueError as error:
+        raise RuntimeError(f"{label} URL 格式无效") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise RuntimeError(f"{label}必须使用不含凭据的 HTTPS URL")
+    return parsed
+
+
+class _HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        _require_https_url(newurl, "重定向目标")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _open_https_url(request: urllib.request.Request, *, timeout: float) -> Any:
+    _require_https_url(str(request.full_url), "请求")
+    opener = urllib.request.build_opener(_HTTPSOnlyRedirectHandler())
+    return opener.open(request, timeout=timeout)
+
+
+def _response_https_url(response: Any, fallback: str) -> str:
+    geturl = getattr(response, "geturl", None)
+    final_url = str(geturl() if callable(geturl) else fallback)
+    _require_https_url(final_url, "响应")
+    return final_url
+
+
+def _optional_nonnegative_int(value: Any, label: str) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{label}无效") from error
+    if parsed < 0:
+        raise RuntimeError(f"{label}无效")
+    return parsed
+
+
+def _github_json(
+    url: str,
+    *,
+    retry_count: int = DOWNLOAD_RETRY_COUNT,
+    retry_backoff: float = DOWNLOAD_RETRY_BACKOFF,
+) -> Any:
+    _require_https_url(url, "GitHub API ")
+    attempts = max(1, retry_count)
+    last_error: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            request = urllib.request.Request(
+                url,
+                headers={"User-Agent": "ProxyBridge/0.1", "Accept": "application/vnd.github+json"},
+            )
+            with _open_https_url(request, timeout=30) as response:
+                _response_https_url(response, url)
+                headers = getattr(response, "headers", {})
+                declared_size = _optional_nonnegative_int(headers.get("Content-Length"), "GitHub API 响应长度")
+                if declared_size is not None and declared_size > GITHUB_JSON_RESPONSE_LIMIT:
+                    raise RuntimeError("GitHub API 响应过大")
+                data = response.read(GITHUB_JSON_RESPONSE_LIMIT + 1)
+                if len(data) > GITHUB_JSON_RESPONSE_LIMIT:
+                    raise RuntimeError("GitHub API 响应过大")
+                if declared_size is not None and len(data) != declared_size:
+                    raise RuntimeError(
+                        f"GitHub API 响应长度不匹配:期望 {declared_size}，实际 {len(data)}"
+                    )
+                return json.loads(data.decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as error:
+            last_error = error
+            if error.code not in {408, 429, 500, 502, 503, 504}:
+                raise
+        except (urllib.error.URLError, OSError, RuntimeError, json.JSONDecodeError) as error:
+            last_error = error
+        if attempt + 1 < attempts and retry_backoff > 0:
+            time.sleep(retry_backoff * (2**attempt))
+    raise RuntimeError(f"GitHub API 请求失败（已重试 {attempts} 次）: {last_error}") from last_error
 
 
 def _asset_url(asset: dict[str, Any]) -> str:
@@ -1487,6 +1601,13 @@ def _asset_url(asset: dict[str, Any]) -> str:
 
 def _asset_name(asset: dict[str, Any]) -> str:
     return str(asset.get("name") or "")
+
+
+def _safe_asset_name(asset: dict[str, Any]) -> str:
+    name = _asset_name(asset)
+    if not name or name in {".", ".."} or Path(name).name != name or "/" in name or "\\" in name:
+        raise RuntimeError("GitHub release 资源名称不安全")
+    return name
 
 
 def _sing_box_os_terms(host_os: str) -> tuple[str, ...]:
@@ -1598,13 +1719,90 @@ def _pick_xray_asset(
     return candidates[0][1] if candidates else None
 
 
-def _download_asset(asset: dict[str, Any], target: Path) -> None:
+def _asset_sha256(asset: dict[str, Any]) -> str | None:
+    digest = str(asset.get("digest") or "").strip().lower()
+    if not digest:
+        return None
+    algorithm, separator, value = digest.partition(":")
+    if separator != ":" or algorithm != "sha256" or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise RuntimeError("GitHub release 资源摘要格式无效")
+    return value
+
+
+def _download_asset(
+    asset: dict[str, Any],
+    target: Path,
+    *,
+    retry_count: int = DOWNLOAD_RETRY_COUNT,
+    retry_backoff: float = DOWNLOAD_RETRY_BACKOFF,
+) -> None:
     url = _asset_url(asset)
     if not url:
         raise RuntimeError("GitHub release 资源缺少下载地址")
-    request = urllib.request.Request(url, headers={"User-Agent": "ProxyBridge/0.1"})
-    with urllib.request.urlopen(request, timeout=600) as response, target.open("wb") as out:
-        shutil.copyfileobj(response, out)
+    _require_https_url(url, "GitHub release 资源")
+    expected_sha256 = _asset_sha256(asset)
+    expected_size = _optional_nonnegative_int(asset.get("size"), "GitHub release 资源大小")
+    if expected_size is not None and expected_size > DOWNLOAD_RESPONSE_LIMIT:
+        raise RuntimeError(f"资源超过 {DOWNLOAD_RESPONSE_LIMIT} 字节限制")
+    attempts = max(1, retry_count)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    last_error: BaseException | None = None
+
+    for attempt in range(attempts):
+        part_path = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(4)}.part")
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "ProxyBridge/0.1"})
+            with _open_https_url(request, timeout=600) as response:
+                _response_https_url(response, url)
+                headers = getattr(response, "headers", {})
+                declared_size = _optional_nonnegative_int(headers.get("Content-Length"), "下载响应长度")
+                if declared_size is not None and declared_size > DOWNLOAD_RESPONSE_LIMIT:
+                    raise RuntimeError(f"下载超过 {DOWNLOAD_RESPONSE_LIMIT} 字节限制")
+                digest = hashlib.sha256()
+                downloaded = 0
+                with part_path.open("wb") as out:
+                    if hasattr(os, "fchmod"):
+                        try:
+                            os.fchmod(out.fileno(), 0o600)
+                        except OSError:
+                            pass
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        digest.update(chunk)
+                        downloaded += len(chunk)
+                        if downloaded > DOWNLOAD_RESPONSE_LIMIT:
+                            raise RuntimeError(f"下载超过 {DOWNLOAD_RESPONSE_LIMIT} 字节限制")
+                    out.flush()
+                    os.fsync(out.fileno())
+            if declared_size is not None and downloaded != declared_size:
+                raise RuntimeError(f"下载长度不匹配: 期望 {declared_size}，实际 {downloaded}")
+            if expected_size is not None and downloaded != expected_size:
+                raise RuntimeError(f"资源长度不匹配: 期望 {expected_size}，实际 {downloaded}")
+            actual_sha256 = digest.hexdigest()
+            if expected_sha256 and not hmac.compare_digest(actual_sha256, expected_sha256):
+                raise RuntimeError("资源 SHA-256 校验失败")
+            part_path.replace(target)
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+            _fsync_directory(target.parent)
+            return
+        except urllib.error.HTTPError as error:
+            last_error = error
+            if error.code not in {408, 429, 500, 502, 503, 504}:
+                raise
+        except (urllib.error.URLError, OSError, RuntimeError) as error:
+            last_error = error
+        finally:
+            part_path.unlink(missing_ok=True)
+        if attempt + 1 < attempts and retry_backoff > 0:
+            time.sleep(retry_backoff * (2**attempt))
+
+    raise RuntimeError(f"下载资源失败（已重试 {attempts} 次）: {last_error}") from last_error
 
 
 def _safe_extract_zip(archive_path: Path, dest: Path) -> None:
@@ -1646,30 +1844,124 @@ def _find_extracted_file(root: Path, names: set[str]) -> Path | None:
     return None
 
 
+def _stage_install_copy(source: Path, dest: Path, mode: int) -> Path:
+    dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp_path = dest.with_name(f".{dest.name}.install-{secrets.token_hex(6)}")
+    try:
+        shutil.copy2(source, temp_path)
+        temp_path.chmod(mode)
+        with temp_path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        return temp_path
+    except BaseException:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _stage_install_bytes(data: bytes, dest: Path, mode: int) -> Path:
+    dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp_path = dest.with_name(f".{dest.name}.install-{secrets.token_hex(6)}")
+    _write_private_atomic(
+        temp_path,
+        data,
+        temp_path=temp_path.with_name(f"{temp_path.name}.tmp"),
+        mode=mode,
+    )
+    return temp_path
+
+
+def _replace_install_files(staged_targets: list[tuple[Path, Path]]) -> None:
+    targets = [target for _, target in staged_targets]
+    if len(set(targets)) != len(targets):
+        raise ValueError("核心安装目标不能重复")
+    backup_token = secrets.token_hex(6)
+    backups: dict[Path, Path | None] = {}
+    installed: set[Path] = set()
+    parents = {target.parent for _, target in staged_targets}
+    try:
+        for staged, target in staged_targets:
+            backup: Path | None = None
+            if target.exists() or target.is_symlink():
+                backup = target.with_name(f".{target.name}.backup-{backup_token}")
+                target.replace(backup)
+            backups[target] = backup
+            staged.replace(target)
+            installed.add(target)
+        for parent in parents:
+            _fsync_directory(parent)
+    except BaseException as error:
+        rollback_errors: list[BaseException] = []
+        for target, backup in reversed(list(backups.items())):
+            try:
+                if target in installed and (target.exists() or target.is_symlink()):
+                    target.unlink()
+                if backup is not None and (backup.exists() or backup.is_symlink()):
+                    backup.replace(target)
+            except BaseException as rollback_error:
+                rollback_errors.append(rollback_error)
+        for parent in parents:
+            _fsync_directory(parent)
+        if rollback_errors:
+            details = "; ".join(str(item) for item in rollback_errors)
+            raise RuntimeError(f"核心安装失败且旧版本恢复不完整: {details}") from error
+        raise
+    else:
+        for backup in backups.values():
+            if backup is None:
+                continue
+            try:
+                backup.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for parent in parents:
+            _fsync_directory(parent)
+    finally:
+        for staged, _ in staged_targets:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _install_files_atomically(
+    copies: list[tuple[Path, Path, int]],
+    generated: list[tuple[Path, bytes, int]],
+) -> None:
+    staged_targets: list[tuple[Path, Path]] = []
+    try:
+        for source, target, mode in copies:
+            staged_targets.append((_stage_install_copy(source, target, mode), target))
+        for target, data, mode in generated:
+            staged_targets.append((_stage_install_bytes(data, target, mode), target))
+        _replace_install_files(staged_targets)
+    finally:
+        for staged, _ in staged_targets:
+            try:
+                staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _install_executable(source: Path, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source, dest)
-    dest.chmod(0o755)
+    _install_files_atomically([(source, dest, 0o755)], [])
 
 
-def _write_xray_wrapper() -> None:
-    if os.name == "nt":
-        return
-    wrapper = proxy_core_bin_dir() / "xray"
-    wrapper.write_text(
+def _xray_wrapper_data() -> bytes:
+    return (
         '#!/bin/sh\n'
         'HERE="$(cd "$(dirname "$0")" && pwd)"\n'
-        'exec "$HERE/xray-core" "$@"\n',
-        encoding="utf-8",
-    )
-    wrapper.chmod(0o755)
+        'exec "$HERE/xray-core" "$@"\n'
+    ).encode("utf-8")
 
 
 def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
     ensure_dirs()
     with tempfile.TemporaryDirectory(prefix=f"proxybridge-{core}-", dir=str(proxy_core_root())) as temp_dir:
         temp_root = Path(temp_dir)
-        archive_path = temp_root / _asset_name(asset)
+        archive_path = temp_root / _safe_asset_name(asset)
         extract_root = temp_root / "extract"
         extract_root.mkdir()
         _download_asset(asset, archive_path)
@@ -1679,9 +1971,12 @@ def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
             if not binary:
                 raise RuntimeError("sing-box 压缩包中未找到 sing-box 可执行文件")
             target = proxy_core_bin_dir() / ("sing-box.exe" if os.name == "nt" else "sing-box")
-            _install_executable(binary, target)
             version_path = proxy_core_root() / "sing-box.version"
-            version_path.write_text(f"{tag}\n{_asset_name(asset)}\n", encoding="utf-8")
+            version_data = f"{tag}\n{_asset_name(asset)}\n".encode("utf-8")
+            _install_files_atomically(
+                [(binary, target, 0o755)],
+                [(version_path, version_data, 0o600)],
+            )
             return str(target)
 
         binary = _find_extracted_file(
@@ -1692,16 +1987,26 @@ def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
             raise RuntimeError("Xray 压缩包中未找到 xray 可执行文件")
         if os.name == "nt":
             target = proxy_core_bin_dir() / "xray.exe"
-            _install_executable(binary, target)
             version_path = proxy_core_root() / "xray.version"
-            version_path.write_text(f"{tag}\n{_asset_name(asset)}\n", encoding="utf-8")
+            version_data = f"{tag}\n{_asset_name(asset)}\n".encode("utf-8")
+            _install_files_atomically(
+                [(binary, target, 0o755)],
+                [(version_path, version_data, 0o600)],
+            )
             return str(target)
 
-        _install_executable(binary, proxy_core_bin_dir() / "xray-core")
-        _write_xray_wrapper()
+        core_target = proxy_core_bin_dir() / "xray-core"
+        wrapper_target = proxy_core_bin_dir() / "xray"
         version_path = proxy_core_root() / "xray.version"
-        version_path.write_text(f"{tag}\n{_asset_name(asset)}\n", encoding="utf-8")
-        return str(proxy_core_bin_dir() / "xray")
+        version_data = f"{tag}\n{_asset_name(asset)}\n".encode("utf-8")
+        _install_files_atomically(
+            [(binary, core_target, 0o755)],
+            [
+                (wrapper_target, _xray_wrapper_data(), 0o755),
+                (version_path, version_data, 0o600),
+            ],
+        )
+        return str(wrapper_target)
 
 
 def ensure_core_installed(core: str) -> str:
@@ -2477,40 +2782,184 @@ def parse_pool_path(path: str) -> tuple[str | None, str | None, str | None]:
     return token, action, None
 
 
-def fetch_subscription(url: str) -> str:
-    parsed_url = urllib.parse.urlsplit(url)
-    if parsed_url.scheme.lower() not in {"http", "https"} or not parsed_url.netloc:
+def _public_subscription_addresses(url: str) -> tuple[urllib.parse.SplitResult, list[str]]:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("订阅 URL 格式无效") from exc
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
         raise ValueError("订阅 URL 必须是 http(s)://host/path")
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "ProxyBridge/0.1 (+https://localhost)",
-            "Accept": "*/*",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        final_url = urllib.parse.urlsplit(response.geturl())
-        if final_url.scheme.lower() not in {"http", "https"} or not final_url.netloc:
-            raise ValueError("订阅重定向目标必须是 HTTP(S) URL")
-        declared_length = safe_int(response.headers.get("Content-Length"), 0)
-        if declared_length > SUBSCRIPTION_RESPONSE_LIMIT:
-            raise ValueError(f"订阅响应超过 {SUBSCRIPTION_RESPONSE_LIMIT} 字节限制")
-        chunks: list[bytes] = []
-        total = 0
-        while True:
-            chunk = response.read(min(65536, SUBSCRIPTION_RESPONSE_LIMIT - total + 1))
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > SUBSCRIPTION_RESPONSE_LIMIT:
-                raise ValueError(f"订阅响应超过 {SUBSCRIPTION_RESPONSE_LIMIT} 字节限制")
-            chunks.append(chunk)
-        data = b"".join(chunks)
-        charset = response.headers.get_content_charset() or "utf-8"
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("订阅 URL 不能包含用户名或密码")
+    service_port = port or (443 if parsed.scheme.lower() == "https" else 80)
+    try:
+        resolved = socket.getaddrinfo(parsed.hostname, service_port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"订阅 URL 域名解析失败: {parsed.hostname}") from exc
+    addresses = sorted({str(item[4][0]).split("%", 1)[0] for item in resolved if item[4]})
+    if not addresses:
+        raise ValueError(f"订阅 URL 域名没有可用地址: {parsed.hostname}")
+    for value in addresses:
         try:
-            return data.decode(charset, errors="replace")
-        except LookupError:
-            return data.decode("utf-8", errors="replace")
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError(f"订阅 URL 解析地址无效: {value}") from exc
+        if not address.is_global:
+            raise ValueError(f"订阅 URL 不允许访问非公网地址: {value}")
+    return parsed, addresses
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host: str, port: int, *, pinned_address: str, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout)
+        self.pinned_address = pinned_address
+
+    def connect(self) -> None:
+        self.sock = self._create_connection(
+            (self.pinned_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, *, pinned_address: str, timeout: float) -> None:
+        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        self.pinned_address = pinned_address
+
+    def connect(self) -> None:
+        self.sock = self._create_connection(
+            (self.pinned_address, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+
+
+def _open_subscription_response(
+    parsed: urllib.parse.SplitResult,
+    addresses: list[str],
+    *,
+    deadline: float,
+) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse, threading.Timer]:
+    scheme = parsed.scheme.lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    target = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    errors: list[BaseException] = []
+    for address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("订阅下载超时")
+        timeout = min(SUBSCRIPTION_IO_TIMEOUT, remaining)
+        connection: http.client.HTTPConnection
+        if scheme == "https":
+            connection = _PinnedHTTPSConnection(
+                str(parsed.hostname),
+                port,
+                pinned_address=address,
+                timeout=timeout,
+            )
+        else:
+            connection = _PinnedHTTPConnection(
+                str(parsed.hostname),
+                port,
+                pinned_address=address,
+                timeout=timeout,
+            )
+        try:
+            connection.request(
+                "GET",
+                target,
+                headers={
+                    "Host": parsed.netloc,
+                    "User-Agent": "ProxyBridge/0.1 (+https://localhost)",
+                    "Accept": "*/*",
+                    "Connection": "close",
+                },
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or connection.sock is None:
+                raise TimeoutError("订阅下载超时")
+            transport = connection.sock
+
+            def close_on_deadline() -> None:
+                try:
+                    transport.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                transport.close()
+
+            deadline_timer = threading.Timer(remaining, close_on_deadline)
+            deadline_timer.daemon = True
+            deadline_timer.start()
+            try:
+                response = connection.getresponse()
+            except BaseException:
+                deadline_timer.cancel()
+                raise
+            return connection, response, deadline_timer
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            errors.append(exc)
+            connection.close()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("订阅下载超时") from exc
+    detail = str(errors[-1]) if errors else "没有可用地址"
+    raise RuntimeError(f"订阅 URL 连接失败: {detail}") from (errors[-1] if errors else None)
+
+
+def fetch_subscription(url: str) -> str:
+    current_url = url
+    deadline = time.monotonic() + SUBSCRIPTION_FETCH_TIMEOUT
+    for redirect_count in range(SUBSCRIPTION_REDIRECT_LIMIT + 1):
+        if time.monotonic() >= deadline:
+            raise TimeoutError("订阅下载超时")
+        parsed, addresses = _public_subscription_addresses(current_url)
+        connection, response, deadline_timer = _open_subscription_response(parsed, addresses, deadline=deadline)
+        try:
+            if response.status in {301, 302, 303, 307, 308}:
+                location = response.headers.get("Location")
+                if not location:
+                    raise ValueError("订阅重定向缺少 Location")
+                if redirect_count >= SUBSCRIPTION_REDIRECT_LIMIT:
+                    raise ValueError("订阅重定向次数过多")
+                current_url = urllib.parse.urljoin(current_url, location)
+                continue
+            if not 200 <= response.status < 300:
+                raise RuntimeError(f"订阅 URL 返回 HTTP {response.status}")
+            declared_length = safe_int(response.headers.get("Content-Length"), 0)
+            if declared_length > SUBSCRIPTION_RESPONSE_LIMIT:
+                raise ValueError(f"订阅响应超过 {SUBSCRIPTION_RESPONSE_LIMIT} 字节限制")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("订阅下载超时")
+                try:
+                    chunk = response.read1(min(65536, SUBSCRIPTION_RESPONSE_LIMIT - total + 1))
+                except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("订阅下载超时") from exc
+                    raise
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > SUBSCRIPTION_RESPONSE_LIMIT:
+                    raise ValueError(f"订阅响应超过 {SUBSCRIPTION_RESPONSE_LIMIT} 字节限制")
+                chunks.append(chunk)
+            data = b"".join(chunks)
+            charset = response.headers.get_content_charset() or "utf-8"
+            try:
+                return data.decode(charset, errors="replace")
+            except LookupError:
+                return data.decode("utf-8", errors="replace")
+        finally:
+            deadline_timer.cancel()
+            response.close()
+            connection.close()
+    raise ValueError("订阅重定向次数过多")
 
 
 def referenced_node_ids(subscriptions: list[dict[str, Any]]) -> set[str]:
@@ -3330,26 +3779,34 @@ def _run_prepared_bridge(plan: dict[str, Any], command: list[str]) -> dict[str, 
     config_path = Path(plan["config_path"])
     log_path = Path(plan["log_path"])
     rotate_runtime_log(log_path)
-    log_file = log_path.open("ab")
-    try:
-        if hasattr(os, "fchmod"):
-            try:
-                os.fchmod(log_file.fileno(), 0o600)
-            except OSError:
-                pass
-        process = subprocess.Popen(
-            command,
-            cwd=str(APP_ROOT),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            **_popen_kwargs(),
+    process = subprocess.Popen(
+        command,
+        cwd=str(APP_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        **_popen_kwargs(),
+    )
+    log_stream = getattr(process, "stdout", None)
+    log_pump = (
+        threading.Thread(
+            target=pump_runtime_log,
+            args=(log_stream, log_path),
+            kwargs={"bridge_id": bridge_id},
+            name=f"core-log-{bridge_id[:12]}",
+            daemon=True,
         )
-    finally:
-        log_file.close()
+        if log_stream is not None
+        else None
+    )
     with PROCESS_LOCK:
         PROCESS_TABLE[bridge_id] = process
         BRIDGE_NODE_TABLE[bridge_id] = node_id
+        if log_pump is not None:
+            RUNTIME_LOG_PUMP_TABLE[bridge_id] = log_pump
     try:
+        if log_pump is not None:
+            log_pump.start()
         core_started = wait_for_port(core_port, timeout=2.5)
         if process.poll() is not None:
             error = read_tail(log_path)
@@ -3843,7 +4300,7 @@ def _macos_arch_token() -> str:
     return host_arch_token()
 
 
-def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None = None) -> dict[str, str] | None:
+def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None = None) -> dict[str, Any] | None:
     """Pick the newest fingerprint-chromium package for the current OS.
 
     macOS packages are typically `*_macos.dmg` and often omit arch tokens.
@@ -3857,7 +4314,7 @@ def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None 
     def asset_score(name: str) -> int:
         lowered = name.lower()
         if os_token == "darwin":
-            if not (lowered.endswith(".dmg") and "macos" in lowered):
+            if not (lowered.endswith(".dmg") and any(term in lowered for term in ("macos", "darwin"))):
                 return -1
             return 100
         if os_token == "windows":
@@ -3881,9 +4338,17 @@ def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None 
             value += 5
         return value
 
-    best: dict[str, str] | None = None
+    best: dict[str, Any] | None = None
     best_score = -1
-    for release in releases:
+    ordered_releases = sorted(
+        enumerate(releases),
+        key=lambda item: (
+            str(item[1].get("published_at") or item[1].get("created_at") or ""),
+            -item[0],
+        ),
+        reverse=True,
+    )
+    for _, release in ordered_releases:
         if release.get("draft") or release.get("prerelease"):
             continue
         for asset in release.get("assets") or []:
@@ -3896,14 +4361,20 @@ def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None 
                 continue
             if score > best_score:
                 best_score = score
-                best = {"name": name, "url": str(url), "tag": str(release.get("tag_name") or "")}
+                best = {
+                    **asset,
+                    "name": name,
+                    "url": str(url),
+                    "browser_download_url": str(url),
+                    "tag": str(release.get("tag_name") or ""),
+                }
         if best is not None and os_token == "darwin":
             # Preserve previous behavior: first non-prerelease macOS dmg wins.
             return best
     return best
 
 
-def _pick_macos_asset(releases: list[dict[str, Any]]) -> dict[str, str] | None:
+def _pick_macos_asset(releases: list[dict[str, Any]]) -> dict[str, Any] | None:
     # Backward-compatible wrapper around the multi-platform picker.
     return _pick_fingerprint_asset(releases, host_os="darwin")
 
@@ -3920,6 +4391,31 @@ def _verify_macos_binary_arch(app_path: Path) -> str | None:
     if "x86_64" in text:
         return "x86_64"
     return None
+
+
+def _replace_installed_path(staged: Path, target: Path) -> None:
+    backup = target.with_name(f".{target.name}.backup-{secrets.token_hex(6)}")
+    moved_existing = False
+    try:
+        if target.exists():
+            target.replace(backup)
+            moved_existing = True
+        staged.replace(target)
+    except BaseException:
+        if moved_existing and not target.exists() and backup.exists():
+            backup.replace(target)
+        raise
+    finally:
+        if staged.exists():
+            if staged.is_dir():
+                shutil.rmtree(staged, ignore_errors=True)
+            else:
+                staged.unlink(missing_ok=True)
+    if backup.exists():
+        if backup.is_dir():
+            shutil.rmtree(backup, ignore_errors=True)
+        else:
+            backup.unlink(missing_ok=True)
 
 
 def _install_from_dmg(dmg_path: Path, dest_root: Path) -> Path:
@@ -3944,9 +4440,12 @@ def _install_from_dmg(dmg_path: Path, dest_root: Path) -> Path:
         if not source_app:
             raise RuntimeError("dmg 中未找到 Chromium.app")
         target_app = dest_root / "Chromium.app"
-        if target_app.exists():
-            shutil.rmtree(target_app, ignore_errors=True)
-        shutil.copytree(source_app, target_app, symlinks=True)
+        staged_app = dest_root / f".Chromium.app.install-{secrets.token_hex(6)}"
+        try:
+            shutil.copytree(source_app, staged_app, symlinks=True)
+            _replace_installed_path(staged_app, target_app)
+        finally:
+            shutil.rmtree(staged_app, ignore_errors=True)
     finally:
         subprocess.run(["hdiutil", "detach", str(mount_point), "-force"], capture_output=True)
         shutil.rmtree(mount_point, ignore_errors=True)
@@ -3970,17 +4469,23 @@ def _install_fingerprint_from_archive(archive_path: Path, dest_root: Path) -> Pa
         app_root = next((parent for parent in resolved_path.parents if parent.name.endswith(".app")), None)
         if app_root is not None:
             target_app = dest_root / app_root.name
-            if target_app.exists():
-                shutil.rmtree(target_app, ignore_errors=True)
-            shutil.copytree(app_root, target_app, symlinks=True)
+            staged_app = dest_root / f".{app_root.name}.install-{secrets.token_hex(6)}"
+            try:
+                shutil.copytree(app_root, staged_app, symlinks=True)
+                _replace_installed_path(staged_app, target_app)
+            finally:
+                shutil.rmtree(staged_app, ignore_errors=True)
             return target_app
 
         target_dir = dest_root / "chromium"
-        if target_dir.exists():
-            shutil.rmtree(target_dir, ignore_errors=True)
         # Copy the directory that contains the executable so shared libs remain nearby.
         source_dir = resolved_path.parent
-        shutil.copytree(source_dir, target_dir, symlinks=True)
+        staged_dir = dest_root / f".chromium.install-{secrets.token_hex(6)}"
+        try:
+            shutil.copytree(source_dir, staged_dir, symlinks=True)
+            _replace_installed_path(staged_dir, target_dir)
+        finally:
+            shutil.rmtree(staged_dir, ignore_errors=True)
         return target_dir / resolved_path.name
     finally:
         shutil.rmtree(extract_root, ignore_errors=True)
@@ -4000,13 +4505,8 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
 
     host_os = host_os_token()
     host_arch = host_arch_token()
-    request = urllib.request.Request(
-        f"{FP_CHROMIUM_RELEASES_API}?per_page=20",
-        headers={"User-Agent": "ProxyBridge/0.1", "Accept": "application/vnd.github+json"},
-    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            releases = json.loads(response.read().decode("utf-8", errors="replace"))
+        releases = _github_json(f"{FP_CHROMIUM_RELEASES_API}?per_page=20")
     except Exception as error:
         raise RuntimeError(f"获取指纹内核版本列表失败:{error}") from error
 
@@ -4020,13 +4520,9 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
 
     dest_root = fingerprint_chromium_root()
     dest_root.mkdir(parents=True, exist_ok=True)
-    package_path = dest_root / asset["name"]
+    package_path = dest_root / _safe_asset_name(asset)
     try:
-        with urllib.request.urlopen(
-            urllib.request.Request(asset["url"], headers={"User-Agent": "ProxyBridge/0.1"}),
-            timeout=600,
-        ) as response, package_path.open("wb") as out:
-            shutil.copyfileobj(response, out)
+        _download_asset(asset, package_path)
     except Exception as error:
         package_path.unlink(missing_ok=True)
         raise RuntimeError(f"下载指纹内核失败:{error}") from error
@@ -4073,13 +4569,14 @@ def rotate_runtime_log(
     *,
     max_bytes: int | None = None,
     backup_count: int | None = None,
+    incoming_bytes: int = 0,
 ) -> bool:
     max_bytes = CORE_LOG_MAX_BYTES if max_bytes is None else max_bytes
     backup_count = CORE_LOG_BACKUP_COUNT if backup_count is None else backup_count
     if max_bytes <= 0 or backup_count <= 0:
         return False
     try:
-        if path.stat().st_size <= max_bytes:
+        if path.stat().st_size + max(0, incoming_bytes) <= max_bytes:
             return False
     except FileNotFoundError:
         return False
@@ -4088,7 +4585,7 @@ def rotate_runtime_log(
             size = path.stat().st_size
         except FileNotFoundError:
             return False
-        if size <= max_bytes:
+        if size + max(0, incoming_bytes) <= max_bytes:
             return False
         oldest = runtime_log_backup_path(path, backup_count)
         oldest.unlink(missing_ok=True)
@@ -4117,15 +4614,66 @@ def rotate_runtime_log(
         return True
 
 
+def pump_runtime_log(
+    stream: Any,
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    backup_count: int | None = None,
+    bridge_id: str | None = None,
+) -> None:
+    max_bytes = CORE_LOG_MAX_BYTES if max_bytes is None else max_bytes
+    backup_count = CORE_LOG_BACKUP_COUNT if backup_count is None else backup_count
+    chunk_size = max(1, min(65536, max_bytes))
+    try:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", errors="replace")
+            with LOG_ROTATION_LOCK:
+                rotate_runtime_log(
+                    path,
+                    max_bytes=max_bytes,
+                    backup_count=backup_count,
+                    incoming_bytes=len(chunk),
+                )
+                with path.open("ab") as log_file:
+                    if hasattr(os, "fchmod"):
+                        try:
+                            os.fchmod(log_file.fileno(), 0o600)
+                        except OSError:
+                            pass
+                    log_file.write(chunk)
+                    log_file.flush()
+    except Exception as error:
+        try:
+            log_event(f"核心日志写入已停止: {error}", level="error", category="核心")
+        except Exception:
+            pass
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
+        if bridge_id:
+            current_thread = threading.current_thread()
+            with PROCESS_LOCK:
+                if RUNTIME_LOG_PUMP_TABLE.get(bridge_id) is current_thread:
+                    RUNTIME_LOG_PUMP_TABLE.pop(bridge_id, None)
+
+
 def read_tail(path: Path, limit: int = 6000) -> str:
     try:
-        with path.open("rb") as f:
-            f.seek(0, os.SEEK_END)
-            size = f.tell()
-            f.seek(max(0, size - max(0, limit)), os.SEEK_SET)
-            data = f.read(max(0, limit))
-        if size > CORE_LOG_MAX_BYTES:
-            rotate_runtime_log(path)
+        with LOG_ROTATION_LOCK:
+            with path.open("rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - max(0, limit)), os.SEEK_SET)
+                data = f.read(max(0, limit))
+            if size > CORE_LOG_MAX_BYTES:
+                rotate_runtime_log(path)
         return data.decode("utf-8", errors="replace").strip()
     except Exception:
         return ""
@@ -4194,6 +4742,7 @@ def stop_process(bridge_id: str, *, pop_traffic: bool = True) -> dict[str, int]:
     with PROCESS_LOCK:
         proxy = LOG_PROXY_TABLE.get(bridge_id)
         process = PROCESS_TABLE.get(bridge_id)
+        log_pump = RUNTIME_LOG_PUMP_TABLE.get(bridge_id)
         owner_node_id = BRIDGE_NODE_TABLE.get(bridge_id)
     if proxy:
         proxy.stop()
@@ -4201,10 +4750,36 @@ def stop_process(bridge_id: str, *, pop_traffic: bool = True) -> dict[str, int]:
             if LOG_PROXY_TABLE.get(bridge_id) is proxy:
                 LOG_PROXY_TABLE.pop(bridge_id, None)
     if process:
-        terminate_process(process)
+        termination_error: BaseException | None = None
+        terminated = False
+        try:
+            terminate_process(process)
+            terminated = True
+        except BaseException as error:
+            termination_error = error
+            terminated = process.poll() is not None
+        if terminated:
+            if log_pump is not None and log_pump.is_alive():
+                log_pump.join(timeout=3)
+            with PROCESS_LOCK:
+                if PROCESS_TABLE.get(bridge_id) is process:
+                    PROCESS_TABLE.pop(bridge_id, None)
+                if (
+                    log_pump is not None
+                    and RUNTIME_LOG_PUMP_TABLE.get(bridge_id) is log_pump
+                    and not log_pump.is_alive()
+                ):
+                    RUNTIME_LOG_PUMP_TABLE.pop(bridge_id, None)
+        elif log_pump is not None and not log_pump.is_alive():
+            with PROCESS_LOCK:
+                if RUNTIME_LOG_PUMP_TABLE.get(bridge_id) is log_pump:
+                    RUNTIME_LOG_PUMP_TABLE.pop(bridge_id, None)
+        if termination_error is not None and not terminated:
+            raise termination_error
+    elif log_pump is not None and not log_pump.is_alive():
         with PROCESS_LOCK:
-            if PROCESS_TABLE.get(bridge_id) is process:
-                PROCESS_TABLE.pop(bridge_id, None)
+            if RUNTIME_LOG_PUMP_TABLE.get(bridge_id) is log_pump:
+                RUNTIME_LOG_PUMP_TABLE.pop(bridge_id, None)
     with PROCESS_LOCK:
         if (
             bridge_id not in PROCESS_TABLE
@@ -4333,15 +4908,25 @@ class Socks5LogProxy:
         listen_port: int,
         upstream_port: int,
         listen_host: str = LOCAL_PROXY_LISTEN_HOST,
+        max_clients: int = PROXY_MAX_CLIENTS,
+        handshake_timeout: float = PROXY_HANDSHAKE_TIMEOUT,
+        relay_idle_timeout: float = PROXY_RELAY_IDLE_TIMEOUT,
     ) -> None:
         if listen_host not in {LOCAL_PROXY_LISTEN_HOST, LAN_PROXY_LISTEN_HOST}:
             raise ValueError("本地代理监听地址无效")
+        if max_clients <= 0:
+            raise ValueError("本地代理最大连接数必须大于 0")
+        if handshake_timeout <= 0 or relay_idle_timeout <= 0:
+            raise ValueError("本地代理超时必须大于 0")
         self.bridge_id = bridge_id
         self.node_id = node_id
         self.node_name = node_name
         self.listen_port = listen_port
         self.upstream_port = upstream_port
         self.listen_host = listen_host
+        self.max_clients = int(max_clients)
+        self.handshake_timeout = float(handshake_timeout)
+        self.relay_idle_timeout = float(relay_idle_timeout)
         self._stop = threading.Event()
         self._server: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -4487,15 +5072,18 @@ class Socks5LogProxy:
             if self.listen_host == LAN_PROXY_LISTEN_HOST and not proxy_client_allowed(address[0]):
                 client.close()
                 continue
-            thread = threading.Thread(
-                target=self._run_client_handler,
-                args=(client, address),
-                daemon=True,
-            )
             with self._client_lock:
                 if self._stop.is_set():
                     client.close()
                     break
+                if len(self._client_threads) >= self.max_clients:
+                    client.close()
+                    continue
+                thread = threading.Thread(
+                    target=self._run_client_handler,
+                    args=(client, address),
+                    daemon=True,
+                )
                 self._client_sockets.add(client)
                 self._client_threads.add(thread)
             try:
@@ -4518,7 +5106,7 @@ class Socks5LogProxy:
 
     def _handle_client(self, client: socket.socket, address: tuple[str, int]) -> None:
         try:
-            client.settimeout(2.0)
+            client.settimeout(self.handshake_timeout)
             first = read_exact(client, 1)
             if first == b"\x05":
                 self._handle_socks5_client(client, address, first)
@@ -4924,6 +5512,8 @@ class Socks5LogProxy:
         relay_aborted = threading.Event()
         errors: list[Exception] = []
         errors_lock = threading.Lock()
+        activity_lock = threading.Lock()
+        last_activity = time.monotonic()
 
         def shutdown_pair() -> None:
             for sock in (client, upstream):
@@ -4936,9 +5526,18 @@ class Socks5LogProxy:
             relay_aborted.set()
             shutdown_pair()
 
+        def record_activity() -> None:
+            nonlocal last_activity
+            with activity_lock:
+                last_activity = time.monotonic()
+
+        def idle_expired() -> bool:
+            with activity_lock:
+                return time.monotonic() - last_activity >= self.relay_idle_timeout
+
         def pump(src: socket.socket, dst: socket.socket, key: str) -> None:
             try:
-                src.settimeout(1.0)
+                src.settimeout(min(1.0, self.relay_idle_timeout))
                 while not relay_aborted.is_set():
                     if self._stop.is_set():
                         abort_relay()
@@ -4946,10 +5545,14 @@ class Socks5LogProxy:
                     try:
                         data = src.recv(65536)
                     except socket.timeout:
+                        if idle_expired():
+                            abort_relay()
+                            return
                         continue
                     if not data:
                         dst.shutdown(socket.SHUT_WR)
                         return
+                    record_activity()
                     dst.sendall(data)
                     self._record_transfer(counters, key, len(data))
             except OSError:
@@ -5505,8 +6108,12 @@ def text_response(
 
 
 def send_backend_instance_header(handler: BaseHTTPRequestHandler) -> None:
-    token = backend_instance_token()
-    if token is not None:
+    token = management_api_token()
+    headers = getattr(handler, "headers", None)
+    values = headers.get_all(BACKEND_INSTANCE_HEADER, []) if headers is not None else []
+    trusted_check = getattr(handler, "is_trusted_request", None)
+    trusted = not callable(trusted_check) or bool(trusted_check())
+    if trusted and len(values) == 1 and management_tokens_equal(str(values[0]), token):
         handler.send_header(BACKEND_INSTANCE_HEADER, token)
 
 
@@ -5549,6 +6156,16 @@ class AppHandler(BaseHTTPRequestHandler):
         if not _is_loopback_host(request_host) or not _is_loopback_host(parsed.netloc):
             return _host_ipv4_literal(request_host) == _host_ipv4_literal(parsed.netloc)
         return True
+
+    def is_authenticated_request(self) -> bool:
+        values = self.headers.get_all(BACKEND_INSTANCE_HEADER, [])
+        return len(values) == 1 and management_tokens_equal(str(values[0]))
+
+    def require_api_authentication(self) -> bool:
+        if self.is_authenticated_request():
+            return True
+        self._send_request_error(403, "管理 API 凭证无效，请从启动入口重新打开控制台")
+        return False
 
     def _send_request_error(self, status: int, message: str) -> None:
         path = urllib.parse.urlsplit(self.path).path
@@ -5690,6 +6307,8 @@ class AppHandler(BaseHTTPRequestHandler):
         if not self.is_trusted_request():
             self._send_request_error(403, "不可信请求来源")
             return
+        if parsed.path.startswith("/api/") and not self.require_api_authentication():
+            return
         if parsed.path == "/api/status":
             try:
                 json_response(self, status_payload())
@@ -5725,14 +6344,7 @@ class AppHandler(BaseHTTPRequestHandler):
             json_response(self, {"log": read_tail(path)})
             return
         if parsed.path.startswith("/api/config/"):
-            bridge_id = parsed.path.rsplit("/", 1)[-1]
-            path = RUNTIME_ROOT / f"{bridge_id}.json"
-            try:
-                with path.open("r", encoding="utf-8") as f:
-                    data = json.load(f)
-                json_response(self, data)
-            except Exception as exc:
-                error_response(self, exc, 404)
+            error_response(self, ValueError("运行配置包含代理凭据，不提供 HTTP 读取"), 404)
             return
         self.serve_static()
 
@@ -5751,11 +6363,15 @@ class AppHandler(BaseHTTPRequestHandler):
             send_backend_instance_header(self)
             self.end_headers()
             return
+        if parsed.path.startswith("/api/") and not self.require_api_authentication():
+            return
         self.serve_static(head_only=True)
 
     def do_POST(self) -> None:
         if not self.is_trusted_request():
             self._send_request_error(403, "不可信请求来源")
+            return
+        if not self.require_api_authentication():
             return
         if self.headers.get_content_type() != "application/json":
             self._send_request_error(415, "仅支持 application/json")
@@ -6097,18 +6713,24 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:
         log_event(f"启动同步检查调度失败: {exc}", level="warn", category="同步")
     server = ProxyBridgeHTTPServer((host, port), AppHandler)
-    console_url = f"http://{host}:{port}"
+    public_host = str(_configured_docker_console_ip() or "127.0.0.1")
+    console_url = f"http://{public_host}:{port}"
+    authenticated_console_url = console_access_url(console_url)
     log_event(
         f"Proxy Bridge 已启动({host_os_token()}/{host_arch_token()}),监听 {console_url}",
         category="系统",
     )
-    print(f"Proxy Bridge console: {console_url}", flush=True)
+    managed_by_parent = safe_int(os.environ.get("PROXY_BRIDGE_PARENT_PID"), 0) > 0 and backend_instance_token() is not None
+    print(
+        f"Proxy Bridge console: {console_url if managed_by_parent else authenticated_console_url}",
+        flush=True,
+    )
     print(f"Work dir: {WORK_ROOT}", flush=True)
     if args.open and not docker_mode():
         try:
             import webbrowser
 
-            webbrowser.open(console_url)
+            webbrowser.open(authenticated_console_url)
         except Exception as exc:
             log_event(f"自动打开浏览器失败: {exc}", level="warn", category="系统")
     try:

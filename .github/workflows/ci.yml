@@ -1,0 +1,161 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-tests:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install runtime dependencies
+        run: python -m pip install -r docker/requirements.txt -r desktop/requirements.txt
+      - name: Verify runtime dependencies
+        run: >-
+          python -c "import importlib.util, yaml; assert importlib.util.find_spec('PIL'); assert importlib.util.find_spec('pystray'); assert yaml.safe_load('ok: true') == {'ok': True}"
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Compile Python sources
+        run: python -m compileall -q app.py webdav_sync.py desktop tests
+
+  frontend-and-shell:
+    name: Frontend and shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check JavaScript syntax
+        run: node --check static/auth.js && node --check static/app.js
+      - name: Test frontend authentication state
+        run: node --test tests/test_frontend_auth.js
+      - name: Check shell syntax
+        run: bash -n scripts/*.sh
+
+  docker-smoke:
+    name: Docker build and authentication smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build image
+        run: docker build -t proxybridge-ci .
+      - name: Start hardened container
+        run: >-
+          docker run -d --name proxybridge-ci --init --read-only
+          --tmpfs /tmp:size=256m,mode=1777 --cap-drop ALL
+          --security-opt no-new-privileges
+          --health-interval=1s --health-start-period=1s
+          --health-timeout=3s --health-retries=10
+          -p 127.0.0.1::8787 proxybridge-ci
+          python app.py --no-core-auto-install
+      - name: Verify health check and instance authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          health=""
+          for attempt in {1..20}; do
+            health="$(docker inspect --format '{{.State.Health.Status}}' proxybridge-ci)"
+            if [[ "$health" == "healthy" ]]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$health" = "healthy"
+
+          host_port="$(docker port proxybridge-ci 8787/tcp | sed -n 's/.*://p' | head -n 1)"
+          test -n "$host_port"
+          base_url="http://127.0.0.1:${host_port}"
+
+          unauthenticated_status="$(curl -sS -o /tmp/proxybridge-unauthenticated.json -w '%{http_code}' "$base_url/api/status")"
+          test "$unauthenticated_status" = "403"
+
+          token="$(docker logs proxybridge-ci 2>&1 | sed -n 's/.*#token=\([A-Za-z0-9._~-][A-Za-z0-9._~-]*\).*/\1/p' | tail -n 1)"
+          test -n "$token"
+          curl -fsS -D /tmp/proxybridge-headers \
+            -H "X-ProxyBridge-Instance: $token" \
+            "$base_url/api/status" \
+            -o /tmp/proxybridge-status.json
+          python3 -c "import json; assert json.load(open('/tmp/proxybridge-status.json', encoding='utf-8'))['ok'] is True"
+          tr -d '\r' < /tmp/proxybridge-headers | grep -Fx "X-ProxyBridge-Instance: $token"
+      - name: Show container logs
+        if: always()
+        continue-on-error: true
+        run: docker logs proxybridge-ci
+      - name: Remove container
+        if: always()
+        continue-on-error: true
+        run: docker rm -f proxybridge-ci
+
+  powershell-syntax:
+    name: PowerShell syntax
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          Get-ChildItem scripts -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref] $tokens,
+              [ref] $errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $messages = ($errors | ForEach-Object { $_.Message }) -join "; "
+              throw "$($_.Name): $messages"
+            }
+          }
+
+  macos-static:
+    name: macOS metadata and Swift
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate plist
+        run: plutil -lint macos/ProxyBridgeMenuBar/Info.plist
+      - name: Parse Swift sources
+        run: |
+          xcrun swiftc -frontend -parse macos/ProxyBridgeMenuBar/main.swift
+          xcrun swiftc -frontend -parse scripts/generate_app_icon.swift
+          xcrun swiftc -frontend -parse scripts/atomic_replace_app.swift
+      - name: Type-check menu bar app
+        run: |
+          xcrun swiftc -typecheck \
+            -target arm64-apple-macos13.0 \
+            -module-cache-path "$RUNNER_TEMP/proxybridge-swift-cache" \
+            -framework AppKit \
+            -framework Foundation \
+            -framework WebKit \
+            macos/ProxyBridgeMenuBar/main.swift
+      - name: Type-check Swift build helpers
+        run: |
+          xcrun swiftc -typecheck \
+            -target arm64-apple-macos13.0 \
+            -module-cache-path "$RUNNER_TEMP/proxybridge-swift-cache" \
+            scripts/generate_app_icon.swift
+          xcrun swiftc -typecheck \
+            -target arm64-apple-macos13.0 \
+            -module-cache-path "$RUNNER_TEMP/proxybridge-swift-cache" \
+            scripts/atomic_replace_app.swift

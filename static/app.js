@@ -38,6 +38,9 @@ const appState = {
   syncOpenssl: null,
 };
 
+const managementAuth = window.ProxyBridgeAuth;
+let managementToken = managementAuth.loadManagementToken(window);
+
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
 let lastBrowserRecordTrigger = null;
@@ -171,15 +174,21 @@ function subscriptionIndexByNodeId() {
 }
 
 async function api(path, body = null, { signal } = {}) {
-  const options = body
-    ? {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }
-    : {};
+  const headers = {};
+  if (managementToken) headers[managementAuth.headerName] = managementToken;
+  const options = { headers };
+  if (body) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
   if (signal) options.signal = signal;
   const response = await fetch(path, options);
+  const responseToken = response.headers.get(managementAuth.headerName) || "";
+  if (!managementAuth.validateResponseToken(window, managementToken, responseToken)) {
+    managementToken = "";
+    throw new Error("管理 API 凭证已失效，请从启动入口重新打开控制台");
+  }
   const payload = await response.json();
   if (!response.ok || payload.error) {
     throw new Error(payload.error || `HTTP ${response.status}`);

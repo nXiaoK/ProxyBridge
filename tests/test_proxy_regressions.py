@@ -1,6 +1,7 @@
 import socket
 import threading
 import unittest
+from unittest import mock
 
 import app
 from app import Socks5LogProxy, read_exact
@@ -112,6 +113,61 @@ class ProxyRegressionTests(unittest.TestCase):
         finally:
             proxy_side.close()
             peer_side.close()
+
+    def test_proxy_rejects_clients_at_capacity(self):
+        proxy = Socks5LogProxy(
+            bridge_id="bridge-capacity",
+            node_id="node-test",
+            node_name="测试节点",
+            listen_port=1,
+            upstream_port=2,
+            max_clients=1,
+        )
+        existing = threading.Thread()
+        client = mock.Mock()
+        server = mock.Mock()
+        server.accept.side_effect = [(client, ("127.0.0.1", 50000)), OSError("closed")]
+        proxy._server = server
+        proxy._client_threads.add(existing)
+
+        proxy._serve()
+
+        client.close.assert_called_once_with()
+        self.assertEqual(proxy._client_threads, {existing})
+        self.assertEqual(proxy._client_sockets, set())
+
+    def test_relay_closes_connection_after_idle_timeout(self):
+        proxy = Socks5LogProxy(
+            bridge_id="bridge-idle-timeout",
+            node_id="node-test",
+            node_name="测试节点",
+            listen_port=1,
+            upstream_port=2,
+            relay_idle_timeout=0.05,
+        )
+        client_proxy, client_peer = socket.socketpair()
+        upstream_proxy, upstream_peer = socket.socketpair()
+        result: dict[str, dict[str, int]] = {}
+
+        relay_thread = threading.Thread(
+            target=lambda: result.setdefault("counters", proxy._relay(client_proxy, upstream_proxy)),
+            daemon=True,
+        )
+        relay_thread.start()
+        try:
+            relay_thread.join(timeout=1.0)
+            self.assertFalse(relay_thread.is_alive())
+            self.assertEqual(result["counters"], {"upload": 0, "download": 0})
+        finally:
+            proxy._stop.set()
+            for sock in (client_proxy, client_peer, upstream_proxy, upstream_peer):
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            relay_thread.join(timeout=1.0)
+            with app.TRAFFIC_LOCK:
+                app.TRAFFIC_TABLE.pop(proxy.bridge_id, None)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import os
 import tarfile
 import tempfile
 import unittest
+import urllib.parse
 from email.message import Message
 from pathlib import Path
 from unittest import mock
@@ -16,6 +17,8 @@ def make_handler(
     path: str,
     headers: dict[str, str],
     body: bytes = b"",
+    *,
+    authenticated: bool = True,
 ) -> app.AppHandler:
     handler = object.__new__(app.AppHandler)
     handler.command = method
@@ -25,6 +28,8 @@ def make_handler(
     handler.headers = Message()
     for name, value in headers.items():
         handler.headers[name] = value
+    if authenticated and app.BACKEND_INSTANCE_HEADER not in handler.headers:
+        handler.headers[app.BACKEND_INSTANCE_HEADER] = app.management_api_token()
     handler.rfile = io.BytesIO(body)
     handler.wfile = io.BytesIO()
     return handler
@@ -42,22 +47,35 @@ def response_parts(handler: app.AppHandler) -> tuple[int, Message, bytes]:
 
 
 class SecurityTests(unittest.TestCase):
-    def test_json_response_echoes_valid_backend_instance_token(self):
-        handler = make_handler("GET", "/api/status", {"Host": "127.0.0.1:8787"})
+    def test_console_access_url_places_token_only_in_fragment(self):
+        token = "01234567-89AB-CDEF-0123-456789ABCDEF"
+        access_url = app.console_access_url("http://127.0.0.1:8787/", token)
+        parsed = urllib.parse.urlsplit(access_url)
 
+        self.assertEqual(parsed.path, "/")
+        self.assertEqual(parsed.query, "")
+        self.assertEqual(urllib.parse.parse_qs(parsed.fragment), {"token": [token]})
+
+    def test_json_response_echoes_valid_backend_instance_token(self):
+        token = "01234567-89AB-CDEF-0123-456789ABCDEF"
         with mock.patch.dict(
             os.environ,
-            {"PROXY_BRIDGE_INSTANCE_TOKEN": "01234567-89AB-CDEF-0123-456789ABCDEF"},
+            {"PROXY_BRIDGE_INSTANCE_TOKEN": token},
         ):
+            handler = make_handler(
+                "GET",
+                "/api/status",
+                {"Host": "127.0.0.1:8787", app.BACKEND_INSTANCE_HEADER: token},
+            )
             app.json_response(handler, {"ok": True})
 
         _status, headers, _body = response_parts(handler)
         self.assertEqual(
             headers["X-ProxyBridge-Instance"],
-            "01234567-89AB-CDEF-0123-456789ABCDEF",
+            token,
         )
 
-    def test_json_response_omits_invalid_backend_instance_tokens(self):
+    def test_json_response_never_discloses_token_to_unauthenticated_requests(self):
         invalid_tokens = (
             "",
             "contains space",
@@ -67,15 +85,73 @@ class SecurityTests(unittest.TestCase):
         )
         for token in invalid_tokens:
             with self.subTest(token=token):
-                handler = make_handler("GET", "/api/status", {"Host": "127.0.0.1:8787"})
                 with mock.patch.dict(
                     os.environ,
                     {"PROXY_BRIDGE_INSTANCE_TOKEN": token},
                 ):
+                    handler = make_handler(
+                        "GET",
+                        "/api/status",
+                        {"Host": "127.0.0.1:8787", app.BACKEND_INSTANCE_HEADER: token},
+                        authenticated=False,
+                    )
                     app.json_response(handler, {"ok": True})
 
                 _status, headers, _body = response_parts(handler)
                 self.assertIsNone(headers["X-ProxyBridge-Instance"])
+
+    def test_management_api_rejects_missing_wrong_and_duplicate_tokens(self):
+        cases = []
+        missing = make_handler(
+            "GET",
+            "/api/status",
+            {"Host": "127.0.0.1:8787"},
+            authenticated=False,
+        )
+        cases.append(missing)
+        wrong = make_handler(
+            "GET",
+            "/api/status",
+            {"Host": "127.0.0.1:8787", app.BACKEND_INSTANCE_HEADER: "wrong-token"},
+            authenticated=False,
+        )
+        cases.append(wrong)
+        duplicate = make_handler(
+            "GET",
+            "/api/status",
+            {"Host": "127.0.0.1:8787", app.BACKEND_INSTANCE_HEADER: app.management_api_token()},
+            authenticated=False,
+        )
+        duplicate.headers[app.BACKEND_INSTANCE_HEADER] = app.management_api_token()
+        cases.append(duplicate)
+
+        for handler in cases:
+            with self.subTest(values=handler.headers.get_all(app.BACKEND_INSTANCE_HEADER, [])):
+                handler.do_GET()
+                status, headers, body = response_parts(handler)
+                self.assertEqual(status, 403)
+                self.assertIsNone(headers[app.BACKEND_INSTANCE_HEADER])
+                self.assertIn("凭证无效", json.loads(body)["error"])
+
+    def test_health_head_and_static_assets_do_not_require_or_disclose_token(self):
+        health = make_handler(
+            "HEAD",
+            "/api/status",
+            {"Host": "127.0.0.1:8787"},
+            authenticated=False,
+        )
+        health.do_HEAD()
+        status, headers, body = response_parts(health)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"")
+        self.assertIsNone(headers[app.BACKEND_INSTANCE_HEADER])
+
+        static = make_handler("GET", "/", {"Host": "127.0.0.1:8787"}, authenticated=False)
+        static.do_GET()
+        status, headers, body = response_parts(static)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get_content_type(), "text/html")
+        self.assertNotEqual(body, b"")
 
     def test_tar_rejects_symlink_pivot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -319,6 +395,25 @@ class SecurityTests(unittest.TestCase):
                     self.assertEqual(response_body, b"")
                 elif path.startswith("/api/"):
                     self.assertIn("error", json.loads(response_body))
+
+    def test_runtime_config_endpoint_never_returns_proxy_credentials(self):
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app, "RUNTIME_ROOT", Path(temp_dir)):
+            (Path(temp_dir) / "bridge-secret.json").write_text(
+                json.dumps({"password": "top-secret", "uuid": "private-id"}),
+                encoding="utf-8",
+            )
+            handler = make_handler(
+                "GET",
+                "/api/config/bridge-secret",
+                {"Host": "127.0.0.1:8787"},
+            )
+
+            handler.do_GET()
+
+        status, _headers, body = response_parts(handler)
+        self.assertEqual(status, 404)
+        self.assertNotIn(b"top-secret", body)
+        self.assertNotIn(b"private-id", body)
 
     def test_api_head_error_declares_unsent_json_entity_length(self):
         handler = make_handler("HEAD", "/api/status", {"Host": "evil.example"})

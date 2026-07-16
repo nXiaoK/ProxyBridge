@@ -329,9 +329,17 @@ enum ProxyBridgeError: LocalizedError {
 final class BridgeAPI {
     private static let instanceHeader = "X-ProxyBridge-Instance"
     let baseURL: URL
+    let instanceToken: String
 
-    init(port: Int) {
+    init(port: Int, instanceToken: String) {
         self.baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        self.instanceToken = instanceToken
+    }
+
+    var consoleURL: URL {
+        var components = URLComponents(url: baseURL.appendingPathComponent("/"), resolvingAgainstBaseURL: false)!
+        components.fragment = "token=\(instanceToken)"
+        return components.url!
     }
 
     func getStatus(completion: @escaping (Result<StatusPayload, Error>) -> Void) {
@@ -414,6 +422,7 @@ final class BridgeAPI {
         var request = URLRequest(url: baseURL.appendingPathComponent(cleanPath))
         request.httpMethod = method
         request.timeoutInterval = timeout
+        request.addValue(instanceToken, forHTTPHeaderField: Self.instanceHeader)
         if let body {
             request.addValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -428,16 +437,15 @@ final class BridgeAPI {
                 completion(.failure(NSError(domain: "ProxyBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "没有收到后端响应"])))
                 return
             }
-            if let expectedInstanceToken {
-                guard let http = response as? HTTPURLResponse,
-                      http.value(forHTTPHeaderField: Self.instanceHeader) == expectedInstanceToken else {
-                    completion(.failure(NSError(
-                        domain: "ProxyBridge",
-                        code: -2,
-                        userInfo: [NSLocalizedDescriptionKey: "后端实例校验失败"]
-                    )))
-                    return
-                }
+            let responseToken = expectedInstanceToken ?? self.instanceToken
+            guard let http = response as? HTTPURLResponse,
+                  http.value(forHTTPHeaderField: Self.instanceHeader) == responseToken else {
+                completion(.failure(NSError(
+                    domain: "ProxyBridge",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "后端实例校验失败"]
+                )))
+                return
             }
             if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                 if let apiError = try? JSONDecoder().decode(APIError.self, from: data) {
@@ -711,8 +719,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.popUpMenu(statusMenu)
             return
         }
-        if consoleWindowController == nil {
-            consoleWindowController = ConsoleWindowController(backendURL: URL(string: "http://127.0.0.1:\(backendPort)")!)
+        if consoleWindowController == nil, let api {
+            consoleWindowController = ConsoleWindowController(backendURL: api.consoleURL)
         }
         consoleWindowController?.showAndReloadIfNeeded()
     }
@@ -1278,8 +1286,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 rebuildMenu()
                 return
             }
-            let candidateAPI = BridgeAPI(port: backendPort)
             let instanceToken = UUID().uuidString
+            let candidateAPI = BridgeAPI(port: backendPort, instanceToken: instanceToken)
 
             let process = Process()
             process.executableURL = pythonExecutable

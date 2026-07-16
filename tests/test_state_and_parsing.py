@@ -227,17 +227,109 @@ class StateAndParsingTests(unittest.TestCase):
             def __init__(self, payload: bytes) -> None:
                 super().__init__(payload)
                 self.headers = Message()
-
-            def geturl(self) -> str:
-                return "https://example.test/sub"
+                self.status = 200
 
         response = FakeResponse(b"123456789")
+        timer = mock.Mock()
         with (
             mock.patch.object(app, "SUBSCRIPTION_RESPONSE_LIMIT", 8),
-            mock.patch.object(app.urllib.request, "urlopen", return_value=response),
+            mock.patch.object(app, "_public_subscription_addresses", return_value=(mock.Mock(), ["203.0.113.10"])),
+            mock.patch.object(app, "_open_subscription_response", return_value=(mock.Mock(), response, timer)),
         ):
             with self.assertRaisesRegex(ValueError, "超过 8 字节"):
                 app.fetch_subscription("https://example.test/sub")
+        timer.cancel.assert_called_once_with()
+
+    def test_subscription_url_rejects_non_public_resolved_addresses(self):
+        cases = (
+            ("http://127.0.0.1/sub", "127.0.0.1"),
+            ("http://[::1]/sub", "::1"),
+            ("https://example.test/sub", "10.0.0.8"),
+            ("https://example.test/sub", "169.254.169.254"),
+        )
+        for url, address in cases:
+            with self.subTest(url=url, address=address), mock.patch.object(
+                app.socket,
+                "getaddrinfo",
+                return_value=[(app.socket.AF_INET6 if ":" in address else app.socket.AF_INET, app.socket.SOCK_STREAM, 6, "", (address, 443))],
+            ):
+                with self.assertRaisesRegex(ValueError, "非公网地址"):
+                    app._public_subscription_addresses(url)
+
+    def test_fetch_subscription_revalidates_redirect_target(self):
+        class RedirectResponse(io.BytesIO):
+            def __init__(self) -> None:
+                super().__init__()
+                self.status = 302
+                self.headers = Message()
+                self.headers["Location"] = "http://127.0.0.1/private"
+
+        with (
+            mock.patch.object(
+                app,
+                "_open_subscription_response",
+                return_value=(mock.Mock(), RedirectResponse(), mock.Mock()),
+            ),
+            mock.patch.object(app.socket, "getaddrinfo") as resolver,
+        ):
+            resolver.side_effect = [
+                [(app.socket.AF_INET, app.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))],
+                [(app.socket.AF_INET, app.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))],
+            ]
+            with self.assertRaisesRegex(ValueError, "非公网地址"):
+                app.fetch_subscription("https://public.example/sub")
+
+    def test_fetch_subscription_enforces_total_deadline(self):
+        class SlowResponse:
+            def __init__(self) -> None:
+                self.status = 200
+                self.headers = Message()
+                self.closed = False
+
+            def read1(self, _size: int) -> bytes:
+                return b"x"
+
+            def close(self) -> None:
+                self.closed = True
+
+        connection = mock.Mock()
+        response = SlowResponse()
+        timer = mock.Mock()
+        with (
+            mock.patch.object(app, "SUBSCRIPTION_FETCH_TIMEOUT", 2),
+            mock.patch.object(app.time, "monotonic", side_effect=[10, 10, 10, 13]),
+            mock.patch.object(
+                app,
+                "_public_subscription_addresses",
+                return_value=(mock.Mock(), ["203.0.113.10"]),
+            ),
+            mock.patch.object(
+                app,
+                "_open_subscription_response",
+                return_value=(connection, response, timer),
+            ) as opener,
+        ):
+            with self.assertRaisesRegex(TimeoutError, "订阅下载超时"):
+                app.fetch_subscription("https://example.test/sub")
+
+        self.assertTrue(response.closed)
+        timer.cancel.assert_called_once_with()
+        connection.close.assert_called_once_with()
+        self.assertEqual(opener.call_args.kwargs["deadline"], 12)
+
+    def test_pinned_subscription_connection_uses_validated_address(self):
+        connection = app._PinnedHTTPConnection(
+            "public.example",
+            80,
+            pinned_address="8.8.8.8",
+            timeout=7,
+        )
+        sock = mock.Mock()
+        connection._create_connection = mock.Mock(return_value=sock)
+
+        connection.connect()
+
+        connection._create_connection.assert_called_once_with(("8.8.8.8", 80), 7, None)
 
     def test_connected_request_log_update_is_coalesced_until_final_state(self):
         original_save = app.save_state

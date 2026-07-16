@@ -190,6 +190,18 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertEqual(state["browser_instances"][0]["status"], "stopped")
         self.assertTrue((self.profiles / "nodehash" / "inst1" / "Default" / "Cookies").exists())
 
+    def test_push_rejects_disabled_sync_without_touching_remote(self):
+        state = self._load()
+        state["settings"]["webdav"]["enabled"] = False
+        self._save(state)
+        client_factory = mock.Mock(side_effect=AssertionError("remote client must not be created"))
+        self.engine.client_factory = client_factory
+
+        with self.assertRaisesRegex(ValueError, "请先启用并配置 WebDAV"):
+            self.engine.push()
+
+        client_factory.assert_not_called()
+
     def test_pull_rejects_tampered_profile_hash(self):
         self.engine.push()
         client, manifest = self._remote_manifest()
@@ -324,6 +336,86 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertTrue(all(result["ok"] for result in results))
         self.assertEqual(max_active, 1)
+
+    def test_auto_push_queued_while_worker_is_busy(self):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls: list[list[str] | None] = []
+
+        def push(*, instance_ids=None):
+            calls.append(instance_ids)
+            if len(calls) == 1:
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+            if len(calls) == 2:
+                finished.set()
+            return {"ok": True}
+
+        with mock.patch.object(self.engine, "push", side_effect=push):
+            self.engine.maybe_auto_push(reason="first")
+            self.assertTrue(started.wait(timeout=1))
+            self.engine.maybe_auto_push(reason="second")
+            release.set()
+            self.assertTrue(finished.wait(timeout=2))
+
+        self.assertEqual(calls, [None, None])
+
+    def test_auto_profile_uploads_merge_while_worker_is_busy(self):
+        state = self._load()
+        state["settings"]["webdav"]["auto_upload_on_browser_stop"] = True
+        self._save(state)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls: list[list[str] | None] = []
+
+        def push(*, instance_ids=None):
+            calls.append(instance_ids)
+            if len(calls) == 1:
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+            if len(calls) == 2:
+                finished.set()
+            return {"ok": True}
+
+        with mock.patch.object(self.engine, "push", side_effect=push):
+            self.engine.maybe_auto_upload_instance("inst1")
+            self.assertTrue(started.wait(timeout=1))
+            self.engine.maybe_auto_upload_instance("inst2")
+            self.engine.maybe_auto_upload_instance("inst3")
+            release.set()
+            self.assertTrue(finished.wait(timeout=2))
+
+        self.assertEqual(calls, [["inst1"], ["inst2", "inst3"]])
+
+    def test_full_auto_push_supersedes_queued_profile_uploads(self):
+        state = self._load()
+        state["settings"]["webdav"]["auto_upload_on_browser_stop"] = True
+        self._save(state)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls: list[list[str] | None] = []
+
+        def push(*, instance_ids=None):
+            calls.append(instance_ids)
+            if len(calls) == 1:
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+            if len(calls) == 2:
+                finished.set()
+            return {"ok": True}
+
+        with mock.patch.object(self.engine, "push", side_effect=push):
+            self.engine.maybe_auto_upload_instance("inst1")
+            self.assertTrue(started.wait(timeout=1))
+            self.engine.maybe_auto_upload_instance("inst2")
+            self.engine.maybe_auto_push(reason="state changed")
+            release.set()
+            self.assertTrue(finished.wait(timeout=2))
+
+        self.assertEqual(calls, [["inst1"], None])
 
     def test_push_fails_closed_when_manifest_cannot_be_read(self):
         self.engine.push()
@@ -707,6 +799,36 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         )
         self.assertTrue(client.insecure_ssl)
         self.assertIsNotNone(client._opener)
+
+    def test_webdav_redirects_stay_on_same_origin(self):
+        handler = webdav_sync._WebDAVRedirectHandler()
+        request = webdav_sync.urllib.request.Request(
+            "https://nas.local:8443/dav/a",
+            headers={"Authorization": "Basic secret"},
+        )
+
+        redirected = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://nas.local:8443/dav/b",
+        )
+        self.assertEqual(redirected.full_url, "https://nas.local:8443/dav/b")
+
+        for target in ("https://other.local:8443/dav/b", "http://nas.local:8443/dav/b"):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                webdav_sync.urllib.error.HTTPError,
+                "跨源|降级",
+            ):
+                handler.redirect_request(request, None, 302, "Found", {}, target)
+
+    def test_webdav_keeps_private_nas_urls_supported(self):
+        for url in ("https://192.168.1.20/dav", "http://[fd00::20]/dav"):
+            with self.subTest(url=url):
+                client = webdav_sync.WebDAVClient(url)
+                self.assertEqual(client.base, url)
 
     def test_apply_remote_state_lww(self):
         local = {

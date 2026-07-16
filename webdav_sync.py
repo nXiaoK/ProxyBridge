@@ -50,6 +50,7 @@ MAX_STATE_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_SYNC_ITEMS = 100_000
 MAX_HTTP_ERROR_BYTES = 64 * 1024
+WEBDAV_REDIRECT_LIMIT = 5
 PBENC1_MAGIC = b"PBENC1"
 PBENC2_MAGIC = b"PBENC2"
 PBENC2_SALT_BYTES = 16
@@ -828,6 +829,34 @@ def _serialized_sync_operation(method: Callable[..., Any]) -> Callable[..., Any]
     return wrapped
 
 
+class _WebDAVRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = WEBDAV_REDIRECT_LIMIT
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int]:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise urllib.error.HTTPError(url, 403, "WebDAV 重定向目标必须是 HTTP(S) URL", {}, None)
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise urllib.error.HTTPError(url, 403, "WebDAV 重定向端口无效", {}, None) from exc
+        return parsed.scheme, parsed.hostname.lower(), port
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        old_origin = self._origin(req.full_url)
+        new_origin = self._origin(newurl)
+        if old_origin != new_origin:
+            raise urllib.error.HTTPError(
+                newurl,
+                403,
+                "WebDAV 拒绝跨源或协议降级重定向",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class WebDAVClient:
     """Minimal WebDAV client (Basic auth) using urllib."""
 
@@ -856,9 +885,17 @@ class WebDAVClient:
         if self.insecure_ssl:
             # Allow expired / self-signed certificates (user opt-in).
             ctx = ssl._create_unverified_context()
-            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+            self._opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(context=ctx),
+                _WebDAVRedirectHandler(),
+            )
         else:
-            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler())
+            self._opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(),
+                _WebDAVRedirectHandler(),
+            )
 
     def _auth_header(self) -> str | None:
         if not self.username and not self.password:
@@ -1073,7 +1110,11 @@ class SyncEngine:
         self.log = log or _default_log
         self.client_factory = client_factory or self._default_client
         self._operation_lock = threading.RLock()
-        self._bg_lock = threading.Lock()
+        self._auto_queue_lock = threading.Lock()
+        self._auto_worker_running = False
+        self._auto_full_push_pending = False
+        self._auto_instance_ids: set[str] = set()
+        self._auto_reasons: list[str] = []
 
     def _default_client(self, cfg: dict[str, Any]) -> WebDAVClient:
         return WebDAVClient(
@@ -1298,7 +1339,7 @@ class SyncEngine:
             state = self.load_state()
             cfg = self.get_settings(state)
             self._require_cfg(cfg)
-            if not cfg.get("enabled") and not cfg.get("url"):
+            if not cfg.get("enabled") or not cfg.get("url"):
                 raise ValueError("请先启用并配置 WebDAV")
 
             local_instance_ids: set[str] = set()
@@ -1949,52 +1990,72 @@ class SyncEngine:
         """
         if not self.sync_browser_data or not instance_id:
             return
-        if not self._bg_lock.acquire(blocking=False):
-            return
-
-        def worker() -> None:
-            try:
-                with self.state_lock:
-                    state = self.load_state()
-                    cfg = self.get_settings(state)
-                    if (
-                        not cfg.get("enabled")
-                        or not cfg.get("url")
-                        or not cfg.get("auto_upload_on_browser_stop")
-                    ):
-                        return
-                self.log(f"浏览器已关闭，自动上传 Profile {instance_id[:12]}…", category="同步")
-                self.push(instance_ids=[instance_id])
-            except Exception as exc:
-                self.log(f"自动上传浏览器 Profile 失败: {exc}", level="warn", category="同步")
-            finally:
-                self._bg_lock.release()
-
-        threading.Thread(target=worker, name="webdav-auto-upload", daemon=True).start()
+        self._enqueue_auto_sync(instance_id=instance_id)
 
     def maybe_auto_push(self, *, reason: str = "") -> None:
         """Fire-and-forget full push when WebDAV is enabled (e.g. after subscription delete)."""
-        if not self._bg_lock.acquire(blocking=False):
-            # Another sync is running; still mark dirty via last_local_change already done.
-            self.log("自动同步跳过：已有同步任务进行中", level="warn", category="同步")
-            return
+        self._enqueue_auto_sync(full_push=True, reason=reason)
 
-        def worker() -> None:
+    def _enqueue_auto_sync(
+        self,
+        *,
+        full_push: bool = False,
+        instance_id: str = "",
+        reason: str = "",
+    ) -> None:
+        start_worker = False
+        with self._auto_queue_lock:
+            if full_push:
+                self._auto_full_push_pending = True
+                self._auto_instance_ids.clear()
+            elif instance_id and not self._auto_full_push_pending:
+                self._auto_instance_ids.add(instance_id)
+            if reason and reason not in self._auto_reasons:
+                self._auto_reasons.append(reason)
+            if not self._auto_worker_running:
+                self._auto_worker_running = True
+                start_worker = True
+        if start_worker:
+            threading.Thread(target=self._drain_auto_sync_queue, name="webdav-auto-sync", daemon=True).start()
+
+    def _take_auto_sync_job(self) -> tuple[bool, list[str], list[str]] | None:
+        with self._auto_queue_lock:
+            if not self._auto_full_push_pending and not self._auto_instance_ids:
+                self._auto_worker_running = False
+                return None
+            full_push = self._auto_full_push_pending
+            instance_ids = [] if full_push else sorted(self._auto_instance_ids)
+            reasons = list(self._auto_reasons)
+            self._auto_full_push_pending = False
+            self._auto_instance_ids.clear()
+            self._auto_reasons.clear()
+            return full_push, instance_ids, reasons
+
+    def _drain_auto_sync_queue(self) -> None:
+        while True:
+            job = self._take_auto_sync_job()
+            if job is None:
+                return
+            full_push, instance_ids, reasons = job
             try:
                 with self.state_lock:
                     state = self.load_state()
                     cfg = self.get_settings(state)
                     if not cfg.get("enabled") or not cfg.get("url"):
-                        return
-                label = f"（{reason}）" if reason else ""
-                self.log(f"自动上传到 WebDAV{label}", category="同步")
-                self.push()
+                        continue
+                    if not full_push and not cfg.get("auto_upload_on_browser_stop"):
+                        continue
+                if full_push:
+                    label = f"（{'、'.join(reasons)}）" if reasons else ""
+                    self.log(f"自动上传到 WebDAV{label}", category="同步")
+                    self.push()
+                else:
+                    preview = "、".join(item[:12] for item in instance_ids[:3])
+                    suffix = "…" if len(instance_ids) > 3 else ""
+                    self.log(f"浏览器已关闭，自动上传 Profile {preview}{suffix}", category="同步")
+                    self.push(instance_ids=instance_ids)
             except Exception as exc:
                 self.log(f"自动上传失败: {exc}", level="warn", category="同步")
-            finally:
-                self._bg_lock.release()
-
-        threading.Thread(target=worker, name="webdav-auto-push", daemon=True).start()
 
     def maybe_check_on_startup(self) -> None:
         def worker() -> None:

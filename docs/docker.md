@@ -24,14 +24,18 @@ docker compose up -d --build
 
 ```bash
 docker compose ps
-docker compose logs -f proxybridge
+docker compose logs --tail=50 proxybridge
 ```
 
-浏览器打开：
+需要持续跟踪日志时再使用 `docker compose logs -f proxybridge`。
+
+从最新启动日志中找到 `Proxy Bridge console:`，在浏览器打开其完整地址：
 
 ```text
-http://127.0.0.1:8787
+Proxy Bridge console: http://127.0.0.1:8787/#token=...
 ```
+
+`#token=...` 是当前容器进程的管理令牌。页面接收后会清除地址栏 fragment，并将令牌仅保存在当前标签页的会话状态中。容器重启后令牌会更新，请重新查看最新日志；不要只打开不带 fragment 的裸地址。
 
 停止或重新启动：
 
@@ -82,7 +86,7 @@ docker run -d \
 查看日志：
 
 ```bash
-docker logs -f proxybridge
+docker logs --tail=50 proxybridge
 ```
 
 ## 3. 端口说明
@@ -191,7 +195,7 @@ environment:
 ssh -L 8787:127.0.0.1:8787 user@server
 ```
 
-然后在本机打开 `http://127.0.0.1:8787`。
+然后在本机打开容器启动日志打印的完整认证地址。该地址仍以 `http://127.0.0.1:8787/` 开头，因此可以直接通过上述隧道使用。
 
 如果确认局域网可信，也可以让控制台只绑定 Docker 宿主机的具体局域网 IPv4。先在仓库根目录创建 `.env`：
 
@@ -205,7 +209,7 @@ PROXY_BRIDGE_CONSOLE_HOST=192.168.1.20
 docker compose up -d --build --force-recreate
 ```
 
-局域网设备即可访问 `http://192.168.1.20:8787`。ProxyBridge 只信任 `.env` 中这个精确的 RFC1918 IPv4，不接受 `0.0.0.0`、其他局域网 IP、任意主机名或公网地址。
+重新查看容器日志，局域网设备使用其中以 `http://192.168.1.20:8787/#token=...` 开头的完整认证地址。ProxyBridge 只信任 `.env` 中这个精确的 RFC1918 IPv4，不接受 `0.0.0.0`、其他局域网 IP、任意主机名或公网地址。
 
 上述设置只开放 Web 控制台。若还需要让局域网设备连接代理端口，可在 `.env` 中额外设置：
 
@@ -213,7 +217,9 @@ docker compose up -d --build --force-recreate
 PROXY_BRIDGE_PROXY_HOST=192.168.1.20
 ```
 
-项目当前没有远程登录认证，控制台和代理端口都不应暴露到公网。建议给宿主机设置 DHCP 静态租约，并用防火墙限制只允许可信局域网网段访问；安全要求更高时仍优先使用 SSH 隧道或带认证的反向代理。
+管理 API 使用每次启动生成的实例令牌，主要用于阻止本机其他网页或进程误调用；它不是多用户远程登录系统。代理端口也没有用户名密码认证，因此控制台和代理端口都不应暴露到公网。建议给宿主机设置 DHCP 静态租约，并用防火墙限制只允许可信局域网网段访问；安全要求更高时仍优先使用 SSH 隧道或带认证的反向代理。
+
+自动化调用 `/api/*` 时，必须从启动 URL 取得令牌，并作为 `X-ProxyBridge-Instance` 请求头发送。唯一例外是供 Docker 使用的无响应体健康检查 `HEAD /api/status`。令牌应按密码保护，尤其不要把包含 fragment 的启动日志公开。
 
 ## 8. 更新镜像
 
@@ -235,13 +241,13 @@ docker compose ps
 docker compose logs --tail=200 proxybridge
 ```
 
-确认端口映射仍为 `127.0.0.1:8787:8787`，并从同一台宿主机访问 `http://127.0.0.1:8787`。
+确认端口映射仍为 `127.0.0.1:8787:8787`，然后执行 `docker compose logs --tail=50 proxybridge`，从同一台宿主机打开最新的完整认证地址。
 
 ### 访问 8787 返回 403 Forbidden
 
-控制台会校验请求的 `Host` 和 `Origin`。默认请打开 `http://127.0.0.1:8787` 或 `http://localhost:8787`，不要使用 `http://0.0.0.0:8787` 或未经配置的反向代理域名。
+控制台会同时校验实例令牌、请求 `Host` 和 `Origin`。默认使用日志中以 `http://127.0.0.1:8787/` 开头的完整认证地址，不要使用 `http://0.0.0.0:8787` 或未经配置的反向代理域名。
 
-若使用服务器局域网 IP，请确认 `.env` 中 `PROXY_BRIDGE_CONSOLE_HOST` 与浏览器地址完全一致，并执行过 `docker compose up -d --force-recreate`。若 IP 已变化，更新 `.env` 后重新创建容器。
+若页面能打开但提示管理 API 凭证无效，请关闭该标签页，并重新使用最新启动日志中的完整地址。若使用服务器局域网 IP，请确认 `.env` 中 `PROXY_BRIDGE_CONSOLE_HOST` 与浏览器地址完全一致，并执行过 `docker compose up -d --force-recreate`；IP 变化后也要更新 `.env` 并重新创建容器。
 
 ### 节点启动了但代理连不上
 

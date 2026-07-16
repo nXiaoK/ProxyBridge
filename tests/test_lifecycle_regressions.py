@@ -45,6 +45,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         self._old_browser_table = {key: list(value) for key, value in app.BROWSER_TABLE.items()}
         self._old_browser_process_table = dict(app.BROWSER_PROCESS_TABLE)
         self._old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
+        self._old_runtime_log_pump_table = dict(app.RUNTIME_LOG_PUMP_TABLE)
         self._old_traffic_table = {key: dict(value) for key, value in app.TRAFFIC_TABLE.items()}
         self._old_test_process_table = dict(app.TEST_PROCESS_TABLE)
         self._old_fingerprint_cache = dict(app.FINGERPRINT_CHROMIUM_CACHE)
@@ -63,6 +64,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.BROWSER_TABLE.clear()
         app.BROWSER_PROCESS_TABLE.clear()
         app.LOG_PROXY_TABLE.clear()
+        app.RUNTIME_LOG_PUMP_TABLE.clear()
         app.TRAFFIC_TABLE.clear()
         app.TEST_PROCESS_TABLE.clear()
         app.SHUTTING_DOWN.clear()
@@ -85,6 +87,8 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.BROWSER_PROCESS_TABLE.update(self._old_browser_process_table)
         app.LOG_PROXY_TABLE.clear()
         app.LOG_PROXY_TABLE.update(self._old_log_proxy_table)
+        app.RUNTIME_LOG_PUMP_TABLE.clear()
+        app.RUNTIME_LOG_PUMP_TABLE.update(self._old_runtime_log_pump_table)
         app.TRAFFIC_TABLE.clear()
         app.TRAFFIC_TABLE.update(self._old_traffic_table)
         app.TEST_PROCESS_TABLE.clear()
@@ -785,6 +789,109 @@ class LifecycleRegressionTests(unittest.TestCase):
             [app.signal.SIGTERM, ("wait", 3), app.signal.SIGKILL, ("wait", 3)],
         )
 
+    def test_runtime_log_pump_reports_failure_and_unregisters_itself(self) -> None:
+        bridge_id = "bridge-log-pump-failure"
+
+        class FailingStream:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def read(self, _size: int) -> bytes:
+                raise OSError("broken core log pipe")
+
+            def close(self) -> None:
+                self.closed = True
+
+        stream = FailingStream()
+        log_path = app.RUNTIME_ROOT / f"{bridge_id}.log"
+        thread = threading.Thread(
+            target=app.pump_runtime_log,
+            args=(stream, log_path),
+            kwargs={"bridge_id": bridge_id},
+        )
+        app.RUNTIME_LOG_PUMP_TABLE[bridge_id] = thread
+
+        with mock.patch.object(app, "log_event") as logger:
+            thread.start()
+            thread.join(timeout=2)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(stream.closed)
+        self.assertNotIn(bridge_id, app.RUNTIME_LOG_PUMP_TABLE)
+        logger.assert_called_once()
+        self.assertIn("broken core log pipe", logger.call_args.args[0])
+
+    def test_stop_process_keeps_live_process_but_removes_dead_log_pump_on_failure(self) -> None:
+        bridge_id = "bridge-stop-dead-log-pump"
+        node_id = "node-stop-dead-log-pump"
+        process = FakeProcess(4825)
+        log_pump = mock.Mock()
+        log_pump.is_alive.return_value = False
+        app.PROCESS_TABLE[bridge_id] = process
+        app.BRIDGE_NODE_TABLE[bridge_id] = node_id
+        app.RUNTIME_LOG_PUMP_TABLE[bridge_id] = log_pump
+
+        with mock.patch.object(app, "terminate_process", side_effect=RuntimeError("terminate failed")):
+            with self.assertRaisesRegex(RuntimeError, "terminate failed"):
+                app.stop_process(bridge_id)
+
+        self.assertIs(app.PROCESS_TABLE.get(bridge_id), process)
+        self.assertEqual(app.BRIDGE_NODE_TABLE.get(bridge_id), node_id)
+        self.assertNotIn(bridge_id, app.RUNTIME_LOG_PUMP_TABLE)
+
+    def test_stop_process_finishes_cleanup_when_process_exits_during_termination_error(self) -> None:
+        bridge_id = "bridge-stop-exit-race"
+        node_id = "node-stop-exit-race"
+
+        class ExitedProcess(FakeProcess):
+            def poll(self) -> int:
+                return 0
+
+        process = ExitedProcess(4827)
+        app.PROCESS_TABLE[bridge_id] = process
+        app.BRIDGE_NODE_TABLE[bridge_id] = node_id
+
+        with mock.patch.object(app, "terminate_process", side_effect=OSError("wait raced with exit")):
+            result = app.stop_process(bridge_id)
+
+        self.assertEqual(result, {"upload_bytes": 0, "download_bytes": 0, "total_bytes": 0})
+        self.assertNotIn(bridge_id, app.PROCESS_TABLE)
+        self.assertNotIn(bridge_id, app.BRIDGE_NODE_TABLE)
+
+    def test_bridge_log_thread_start_failure_leaves_no_runtime_entries(self) -> None:
+        node_id = "node-log-thread-start-failure"
+        self._write_state(node_id)
+        terminated: list[int] = []
+
+        class FakeStream:
+            def close(self) -> None:
+                return None
+
+        class FakePopen:
+            def __init__(self, _command: list[str], **_kwargs: object) -> None:
+                self.pid = 4826
+                self.stdout = FakeStream()
+
+            def poll(self) -> None:
+                return None
+
+        ports = iter([24536, 25536])
+        with (
+            mock.patch.object(app, "generate_config", return_value={"test": True}),
+            mock.patch.object(app, "core_command", return_value=["fake-core"]),
+            mock.patch.object(app, "next_free_port", side_effect=lambda _preferred=None: next(ports)),
+            mock.patch.object(app.subprocess, "Popen", FakePopen),
+            mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("thread start failed")),
+            mock.patch.object(app, "terminate_process", side_effect=lambda process: terminated.append(process.pid)),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                app.start_bridge({"node_id": node_id, "core": "auto"})
+
+        self.assertEqual(terminated, [4826])
+        self.assertEqual(app.PROCESS_TABLE, {})
+        self.assertEqual(app.RUNTIME_LOG_PUMP_TABLE, {})
+        self.assertEqual(app.BRIDGE_NODE_TABLE, {})
+
     def test_stop_browser_instance_keeps_handle_when_force_kill_wait_fails(self) -> None:
         node_id = "node-browser-force-kill-retry"
         instance_id = "browser-force-kill-retry"
@@ -1177,7 +1284,7 @@ class LifecycleRegressionTests(unittest.TestCase):
             }
         ]
 
-        def fake_urlopen(request: object, timeout: int) -> io.BytesIO:
+        def fake_open_https(request: object, *, timeout: int) -> io.BytesIO:
             del timeout
             url = str(getattr(request, "full_url", request))
             if url.startswith(app.FP_CHROMIUM_RELEASES_API):
@@ -1214,7 +1321,7 @@ class LifecycleRegressionTests(unittest.TestCase):
                     errors.append(error)
 
         with (
-            mock.patch.object(app.urllib.request, "urlopen", side_effect=fake_urlopen),
+            mock.patch.object(app, "_open_https_url", side_effect=fake_open_https),
             mock.patch.object(app, "fingerprint_chromium_path", side_effect=fake_fingerprint_path),
             mock.patch.object(app, "_install_from_dmg", side_effect=fake_install),
             mock.patch.object(app, "_verify_macos_binary_arch", return_value=None),
