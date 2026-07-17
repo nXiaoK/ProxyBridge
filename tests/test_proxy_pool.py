@@ -497,6 +497,36 @@ class ProxyPoolTests(unittest.TestCase):
         self.assertEqual(payload["pool"]["member_count"], 1)
         self.assertIn(token, payload["pool"]["links"]["list_json"])
 
+    def test_status_endpoint_serializes_first_fingerprint_app_discovery(self):
+        app_bundle = app.WORK_ROOT / "Fingerprint Chromium.app"
+        executable = app_bundle / "Contents" / "MacOS" / "Chromium"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(b"binary")
+        executable.chmod(0o755)
+        with (
+            mock.patch.object(app, "synchronize_process_state", return_value=None),
+            mock.patch.object(app, "core_paths", return_value={}),
+            mock.patch.object(app, "chrome_path", return_value=None),
+            mock.patch.object(
+                app,
+                "_resolve_fingerprint_chromium_path",
+                side_effect=lambda: app._resolve_fingerprint_executable_in_root(app_bundle),
+            ),
+        ):
+            app.invalidate_fingerprint_chromium_cache()
+            for _request_number in range(2):
+                handler = make_handler(
+                    "GET",
+                    "/api/status",
+                    {"Host": "127.0.0.1:8787"},
+                )
+                handler.do_GET()
+                status, _headers, body = response_parts(handler)
+                payload = json.loads(body)
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["fingerprint_chromium"], str(executable))
+                self.assertIsInstance(payload["fingerprint_chromium"], str)
+
     def test_invalid_protocol_returns_400(self):
         token = "valid-pool-token-001"
         self._save_bridges([self._bridge()], token=token)

@@ -2747,7 +2747,7 @@ def _resolve_fingerprint_executable_in_root(root: Path) -> str | None:
     if root.suffix == ".app" and root.is_dir():
         exe = _bundle_executable(root)
         if exe:
-            return exe
+            return str(exe)
     if root.is_dir():
         direct_app = root / "Chromium.app"
         app_candidates = [direct_app] if direct_app.is_dir() else []
@@ -2755,7 +2755,7 @@ def _resolve_fingerprint_executable_in_root(root: Path) -> str | None:
         for app_dir in app_candidates:
             exe = _bundle_executable(app_dir)
             if exe:
-                return exe
+                return str(exe)
         for name in _fingerprint_binary_names():
             direct = root / name
             if _is_executable_file(direct):
@@ -2787,7 +2787,7 @@ def _resolve_fingerprint_chromium_path() -> str | None:
         for app_dir in (Path("/Applications/Chromium.app"), Path.home() / "Applications/Chromium.app"):
             exe = _bundle_executable(app_dir)
             if exe:
-                return exe
+                return str(exe)
     return None
 
 
@@ -2805,8 +2805,9 @@ def fingerprint_chromium_path(force_refresh: bool = False) -> str | None:
             return str(cached_path) if cached_path else None
 
         resolved = _resolve_fingerprint_chromium_path()
-        FINGERPRINT_CHROMIUM_CACHE.update({"key": key, "path": resolved, "checked_at": now})
-        return resolved
+        normalized = str(resolved) if resolved else None
+        FINGERPRINT_CHROMIUM_CACHE.update({"key": key, "path": normalized, "checked_at": now})
+        return normalized
 
 
 def allow_lan_access(state: dict[str, Any]) -> bool:
