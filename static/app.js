@@ -11,6 +11,8 @@ const appState = {
   bridges: [],
   tests: {},
   speedTest: { settings: null, tasks: [] },
+  subscriptionRefresh: { tasks: [] },
+  smartGateway: null,
   requestLogs: [],
   systemLogs: [],
   logCenter: { settings: null, storage: null, request_total: 0, system_total: 0 },
@@ -1256,12 +1258,22 @@ function renderActiveView({ force = false } = {}) {
       );
       break;
     case "subscriptions":
-      renderWhenChanged("subscriptions", appState.subscriptions, renderSubscriptions, force);
+      renderWhenChanged(
+        "subscriptions",
+        { subscriptions: appState.subscriptions, refresh: appState.subscriptionRefresh },
+        renderSubscriptions,
+        force
+      );
       break;
     case "bridges":
       renderWhenChanged(
         "bridges",
-        { bridges: appState.bridges, pool: appState.pool },
+        {
+          bridges: appState.bridges,
+          pool: appState.pool,
+          smartGateway: appState.smartGateway,
+          docker: dockerRuntime(),
+        },
         () => {
           renderPool();
           renderBridges();
@@ -1347,6 +1359,8 @@ async function loadStatus({ forceFresh = false } = {}) {
       appState.bridges = status.bridges || [];
       appState.tests = status.tests || {};
       appState.speedTest = status.speed_test || { settings: null, tasks: [] };
+      appState.subscriptionRefresh = status.subscription_refresh || { tasks: [] };
+      appState.smartGateway = status.smart_gateway || null;
       appState.logCenter = status.logs || appState.logCenter;
       if (appState.activeView !== "logs" || !appState.requestLogPage.loaded) {
         appState.requestLogs = status.request_logs || [];
@@ -1457,6 +1471,7 @@ function renderSubscriptions() {
   const list = $("#subscriptionList");
   const count = $("#subsCount");
   if (count) count.textContent = `${appState.subscriptions.length} 个订阅`;
+  renderSubscriptionRefreshTask();
   if (!appState.subscriptions.length) {
     list.innerHTML = '<div class="subscription-empty">暂无订阅，粘贴订阅 URL 或原始链接后即可导入。</div>';
     return;
@@ -1471,7 +1486,7 @@ function renderSubscriptions() {
               <strong class="subscription-name">${escapeHtml(item.name)}</strong>
               <div class="subscription-meta">${item.node_count || 0} 个节点 · ${formatTime(item.last_update)}${item.last_error ? ` · 上次失败：${escapeHtml(item.last_error)}` : ""}</div>
             </div>
-            <span class="sub-status">已启用</span>
+            <span class="sub-status">${item.last_error ? "需检查" : "已启用"}</span>
           </div>
           <div class="item-actions">
             <label class="field-inline">
@@ -1494,10 +1509,98 @@ function renderSubscriptions() {
             }
             <button class="row-button danger" data-action="delete-sub" data-id="${escapeHtml(item.id)}">${icon("trash")}<span>删除</span></button>
           </div>
+          ${renderSubscriptionHistory(item)}
         </article>
       `
     )
     .join("");
+}
+
+function renderSubscriptionHistory(item) {
+  const history = Array.isArray(item.refresh_history) ? item.refresh_history.slice(-3).reverse() : [];
+  if (!history.length) return "";
+  const labels = { updated: "已更新", not_modified: "无变化", failed: "失败", cancelled: "已取消" };
+  return `<div class="subscription-history">${history.map((entry) => {
+    const changes = entry.changes || {};
+    const detail = entry.status === "updated"
+      ? `+${Number(changes.added || 0)} / -${Number(changes.removed || 0)} / ~${Number(changes.changed || 0)}`
+      : entry.error ? escapeHtml(entry.error) : `${Number(entry.duration_ms || 0)} ms`;
+    return `<span class="history-${escapeHtml(entry.status)}">${escapeHtml(labels[entry.status] || entry.status)} · ${formatTime(entry.at)} · ${detail}</span>`;
+  }).join("")}</div>`;
+}
+
+function activeSubscriptionRefreshTask() {
+  const tasks = Array.isArray(appState.subscriptionRefresh?.tasks) ? appState.subscriptionRefresh.tasks : [];
+  return [...tasks].reverse().find((task) => ["queued", "running", "cancelling"].includes(task.status)) || null;
+}
+
+function subscriptionRefreshItemDetail(item) {
+  if (!item) return "等待执行";
+  if (item.status === "updated") {
+    const changes = item.changes || {};
+    return `+${Number(changes.added || 0)} / -${Number(changes.removed || 0)} / ~${Number(changes.changed || 0)}`;
+  }
+  if (item.error) return item.error;
+  return `${Number(item.duration_ms || 0)} ms`;
+}
+
+function renderSubscriptionRefreshTask() {
+  const container = $("#subscriptionRefreshTask");
+  const button = $("#refreshAllSubscriptions");
+  if (!container || !button) return;
+  const tasks = Array.isArray(appState.subscriptionRefresh?.tasks) ? appState.subscriptionRefresh.tasks : [];
+  const activeTask = activeSubscriptionRefreshTask();
+  const task = activeTask || tasks[tasks.length - 1] || null;
+  if (!task) {
+    container.hidden = true;
+    button.disabled = false;
+    button.querySelector("span").textContent = "刷新全部";
+    return;
+  }
+  container.hidden = false;
+  const completed = Number(task.completed || 0);
+  const total = Number(task.total || 0);
+  const taskLabels = {
+    queued: "等待开始",
+    running: "进行中",
+    cancelling: "正在取消",
+    completed: "已完成",
+    cancelled: "已取消",
+  };
+  const itemLabels = {
+    updated: "已更新",
+    not_modified: "无变化",
+    failed: "失败",
+    cancelled: "已取消",
+    running: "刷新中",
+    queued: "等待",
+  };
+  const subscriptionNames = new Map(appState.subscriptions.map((item) => [item.id, item.name]));
+  const subscriptionIds = Array.isArray(task.subscription_ids) ? task.subscription_ids : [];
+  const items = Array.isArray(task.items) ? task.items : [];
+  const itemRows = subscriptionIds.map((subscriptionId, index) => {
+    const item = items[index];
+    const pendingStatus = task.active_index === index ? "running" : "queued";
+    const status = item?.status || pendingStatus;
+    const statusClass = Object.prototype.hasOwnProperty.call(itemLabels, status) ? status : "queued";
+    const name = subscriptionNames.get(subscriptionId) || `订阅 ${index + 1}`;
+    return `
+      <div class="subscription-task-item is-${statusClass}">
+        <strong>${escapeHtml(name)}</strong>
+        <span class="subscription-task-result">${escapeHtml(itemLabels[status] || status)} · ${escapeHtml(subscriptionRefreshItemDetail(item))}</span>
+      </div>`;
+  }).join("");
+  const cancelButton = activeTask
+    ? `<button type="button" class="row-button" data-action="cancel-refresh-all" data-id="${escapeHtml(task.id)}"${task.status === "cancelling" ? " disabled" : ""}>${task.status === "cancelling" ? "正在取消" : "取消后续刷新"}</button>`
+    : "";
+  container.innerHTML = `
+    <div class="subscription-task-head">
+      <span>批量刷新 ${completed}/${total} · ${escapeHtml(taskLabels[task.status] || task.status)}</span>
+      ${cancelButton}
+    </div>
+    <div class="subscription-task-items">${itemRows}</div>`;
+  button.disabled = Boolean(activeTask);
+  button.querySelector("span").textContent = activeTask ? `刷新中 ${completed}/${total}` : "再次刷新全部";
 }
 
 function setSelectOptions(select, values, current, allLabel) {
@@ -1874,9 +1977,7 @@ function renderPool() {
   ].filter(([, url]) => url);
   if (!items.length) {
     rows.innerHTML = `<div class="pool-link-empty">启动本地代理后，这里会显示可复制的代理池链接。</div>`;
-    return;
-  }
-  rows.innerHTML = items
+  } else rows.innerHTML = items
     .map(
       ([label, url]) => `
       <div class="pool-link-row">
@@ -1891,24 +1992,64 @@ function renderPool() {
   const members = Array.isArray(pool.members) ? pool.members : [];
   if (!members.length) {
     memberList.innerHTML = `<div class="pool-link-empty">暂无代理池成员</div>`;
+  } else {
+    memberList.innerHTML = members.map((member) => {
+      const state = member.circuit_state || "closed";
+      const label = state === "excluded" ? "已排除" : state === "open" ? "熔断" : state === "half_open" ? "恢复探测" : "健康";
+      const latency = member.latency_ms == null ? "未测速" : `${Number(member.latency_ms)} ms`;
+      const action = state === "excluded"
+        ? `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="0">恢复</button>`
+        : `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="1800">排除 30 分钟</button>`;
+      return `
+        <div class="pool-member-row is-${escapeHtml(state)}">
+          <div>
+            <strong>${escapeHtml(member.node_name || "未命名节点")}</strong>
+            <span>${escapeHtml(label)} · 健康 ${Number(member.health_score || 0)} · ${escapeHtml(latency)}</span>
+          </div>
+          ${action}
+        </div>`;
+    }).join("");
+  }
+  renderSmartGateway();
+}
+
+function renderSmartGateway() {
+  const gateway = appState.smartGateway || {};
+  const card = $("#smartGatewayCard");
+  const status = $("#smartGatewayStatus");
+  const strategy = $("#smartGatewayStrategy");
+  const port = $("#smartGatewayPort");
+  const region = $("#smartGatewayRegion");
+  const query = $("#smartGatewayQuery");
+  const save = $("#smartGatewaySave");
+  const stop = $("#smartGatewayStop");
+  if (!status || !strategy || !port || !region || !query || !save || !stop) return;
+  strategy.value = gateway.strategy || "health";
+  if (document.activeElement !== port) port.value = Number(gateway.port || 21000);
+  if (document.activeElement !== region) region.value = gateway.region || "";
+  if (document.activeElement !== query) query.value = gateway.query || "";
+  const links = $("#smartGatewayLinks");
+  const unavailable = dockerRuntime();
+  card?.classList.toggle("is-unavailable", unavailable);
+  card?.setAttribute("aria-disabled", unavailable ? "true" : "false");
+  [strategy, port, region, query].forEach((control) => { control.disabled = unavailable; });
+  if (unavailable) {
+    status.textContent = "Docker 模式不可用";
+    save.textContent = "Docker 不可用";
+    save.disabled = true;
+    stop.disabled = true;
+    if (links) links.innerHTML = '<div class="pool-link-empty">Docker 未发布智能网关固定端口，请在宿主机模式使用。</div>';
     return;
   }
-  memberList.innerHTML = members.map((member) => {
-    const state = member.circuit_state || "closed";
-    const label = state === "excluded" ? "已排除" : state === "open" ? "熔断" : state === "half_open" ? "恢复探测" : "健康";
-    const latency = member.latency_ms == null ? "未测速" : `${Number(member.latency_ms)} ms`;
-    const action = state === "excluded"
-      ? `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="0">恢复</button>`
-      : `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="1800">排除 30 分钟</button>`;
-    return `
-      <div class="pool-member-row is-${escapeHtml(state)}">
-        <div>
-          <strong>${escapeHtml(member.node_name || "未命名节点")}</strong>
-          <span>${escapeHtml(label)} · 健康 ${Number(member.health_score || 0)} · ${escapeHtml(latency)}</span>
-        </div>
-        ${action}
-      </div>`;
-  }).join("");
+  status.textContent = gateway.running ? `运行中 · ${Number(gateway.available_members || 0)} 个节点` : (gateway.last_error || "未运行");
+  save.textContent = gateway.running ? "保存设置" : "保存并启动";
+  save.disabled = false;
+  stop.disabled = !gateway.running;
+  if (links) {
+    links.innerHTML = gateway.running
+      ? `<div class="pool-link-row"><span class="pool-link-label">SOCKS5</span><code class="pool-link-url">${escapeHtml(gateway.socks_url || "")}</code></div><div class="pool-link-row"><span class="pool-link-label">HTTP</span><code class="pool-link-url">${escapeHtml(gateway.http_url || "")}</code></div>`
+      : `<div class="pool-link-empty">保存设置后启动固定入口。</div>`;
+  }
 }
 
 function renderBridges() {
@@ -1916,7 +2057,7 @@ function renderBridges() {
   const bridges = runningBridges();
   const count = $("#bridgesCount");
   if (count) count.textContent = `${bridges.length} 个运行中`;
-  $("#stopAll").disabled = bridges.length === 0;
+  $("#stopAll").disabled = bridges.length === 0 && !appState.smartGateway?.running;
 
   if (!bridges.length) {
     list.innerHTML = `
@@ -2514,6 +2655,12 @@ function actionLockKey(button) {
     case "refresh-sub":
     case "delete-sub":
       return `subscription:${button.dataset.id || ""}`;
+    case "refresh-all-subs":
+    case "cancel-refresh-all":
+      return "subscription-batch";
+    case "save-smart-gateway":
+    case "stop-smart-gateway":
+      return "smart-gateway";
     case "launch-browser":
     case "stop-browser":
       return `browser-node:${button.dataset.node || ""}`;
@@ -2627,7 +2774,7 @@ async function handleAction(event) {
     } else if (action === "stop-all") {
       const result = await api("/api/bridges/stop-all", {});
       await loadStatus({ forceFresh: true });
-      showToast(result.killed_browsers ? "已停止全部端口，关联浏览器已关闭" : "已停止全部端口");
+      showToast(result.killed_browsers ? "已停止全部代理，关联浏览器已关闭" : "已停止全部代理");
     } else if (action === "restart") {
       const stopped = await api("/api/bridges/stop", { id: button.dataset.id });
       await api("/api/bridges/start", { node_id: button.dataset.node, core: "auto" });
@@ -2640,6 +2787,34 @@ async function handleAction(event) {
       showToast(result.not_modified
         ? "订阅远端未变化"
         : `订阅已刷新：新增 ${Number(changes.added || 0)}、删除 ${Number(changes.removed || 0)}、变更 ${Number(changes.changed || 0)}`);
+    } else if (action === "refresh-all-subs") {
+      const ids = appState.subscriptions.filter((item) => item.url).map((item) => item.id);
+      if (!ids.length) {
+        showToast("没有可刷新的 URL 订阅", "error");
+      } else {
+        const task = await api("/api/subscriptions/refresh-batch/start", { subscription_ids: ids });
+        appState.subscriptionRefresh.tasks = [...(appState.subscriptionRefresh.tasks || []), task];
+        renderActiveView({ force: true });
+        showToast(`已开始刷新 ${ids.length} 个订阅`);
+      }
+    } else if (action === "cancel-refresh-all") {
+      await api("/api/subscriptions/refresh-batch/cancel", { id: button.dataset.id });
+      await loadStatus({ forceFresh: true });
+      showToast("正在取消批量刷新");
+    } else if (action === "save-smart-gateway") {
+      await api("/api/smart-gateway/settings", {
+        enabled: true,
+        strategy: $("#smartGatewayStrategy").value,
+        port: Number($("#smartGatewayPort").value),
+        region: $("#smartGatewayRegion").value,
+        query: $("#smartGatewayQuery").value,
+      });
+      await loadStatus({ forceFresh: true });
+      showToast("智能网关设置已保存");
+    } else if (action === "stop-smart-gateway") {
+      await api("/api/smart-gateway/stop", {});
+      await loadStatus({ forceFresh: true });
+      showToast("智能网关已停止");
     } else if (action === "delete-sub") {
       const subscription = appState.subscriptions.find((item) => item.id === button.dataset.id);
       const name = subscription?.name || "该订阅";

@@ -107,6 +107,8 @@ http://127.0.0.1:21080
 
 Docker 模式会把自动分配限制在已发布的 `21080-21179` 范围内。默认最多可同时映射 100 个不同代理端口；需要更多时，同时修改：
 
+> 智能网关固定入口当前不在 Compose 的发布范围内。Docker 模式会拒绝启用智能网关，避免出现容器内显示运行但宿主机无法连接的假状态。
+
 1. `PROXY_BRIDGE_PROXY_PORT_START` / `PROXY_BRIDGE_PROXY_PORT_END`
 2. Compose 或 `docker run -p` 的端口范围
 

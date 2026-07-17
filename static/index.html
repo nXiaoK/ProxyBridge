@@ -168,6 +168,10 @@
               <span class="countline" id="subsCount">0 个订阅</span>
             </div>
             <div class="toolbar-controls">
+              <button class="toolbar-button" id="refreshAllSubscriptions" type="button" data-action="refresh-all-subs">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4M18 3v4h-4M6 21v-4h4"/></svg>
+                <span>刷新全部</span>
+              </button>
               <button class="toolbar-button icon-only" id="refreshStatus" type="button" aria-label="刷新状态" title="刷新状态">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4M18 3v4h-4M6 21v-4h4"/></svg>
               </button>
@@ -202,6 +206,7 @@
             </form>
 
             <div class="section-divider"><span>已导入</span></div>
+            <div class="subscription-task" id="subscriptionRefreshTask" hidden></div>
             <div class="subscription-list" id="subscriptionList"></div>
           </div>
         </section>
@@ -235,6 +240,22 @@
                 <button type="button" class="toolbar-button" data-action="copy" id="poolCopyGet" data-text="">复制健康优先链接</button>
                 <button type="button" class="toolbar-button danger" data-action="rotate-pool-token" id="poolRotateToken">轮换密钥</button>
               </div>
+            </section>
+            <section class="pool-card smart-gateway-card" id="smartGatewayCard" aria-label="智能网关">
+              <div class="pool-card-head">
+                <strong>智能网关</strong>
+                <span class="countline" id="smartGatewayStatus">未运行</span>
+              </div>
+              <p class="view-hint">一个固定入口按健康策略选择代理池节点；连接建立后保持当前节点。</p>
+              <div class="smart-gateway-controls">
+                <label class="field-inline"><span>策略</span><select id="smartGatewayStrategy"><option value="health">健康优先</option><option value="latency">延迟优先</option><option value="round_robin">轮询</option><option value="random">随机</option></select></label>
+                <label class="field-inline"><span>端口</span><input id="smartGatewayPort" type="number" min="1" max="65535" inputmode="numeric"></label>
+                <label class="field-inline"><span>地区</span><input id="smartGatewayRegion" type="text" maxlength="128" placeholder="全部"></label>
+                <label class="field-inline"><span>筛选</span><input id="smartGatewayQuery" type="text" maxlength="128" placeholder="名称包含"></label>
+                <button class="toolbar-button" type="button" data-action="save-smart-gateway" id="smartGatewaySave">保存并启动</button>
+                <button class="toolbar-button danger" type="button" data-action="stop-smart-gateway" id="smartGatewayStop">停止</button>
+              </div>
+              <div class="pool-link-rows" id="smartGatewayLinks"></div>
             </section>
             <div class="bridge-list" id="bridgeList"></div>
           </div>

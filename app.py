@@ -152,6 +152,9 @@ SUBSCRIPTION_IO_TIMEOUT = 20.0
 SUBSCRIPTION_REFRESH_MINUTES_MIN = 5
 SUBSCRIPTION_REFRESH_MINUTES_MAX = 7 * 24 * 60
 SUBSCRIPTION_BACKOFF_MAX_SECONDS = 24 * 60 * 60
+SUBSCRIPTION_REFRESH_HISTORY_LIMIT = 20
+SUBSCRIPTION_BATCH_LIMIT = 50
+SUBSCRIPTION_REFRESH_TASK_LIMIT = 20
 DEFAULT_SPEED_TEST_TARGETS = (
     "http://cp.cloudflare.com/generate_204",
     "http://connectivitycheck.gstatic.com/generate_204",
@@ -176,6 +179,10 @@ POOL_CIRCUIT_BASE_SECONDS = 60
 POOL_CIRCUIT_MAX_SECONDS = 60 * 60
 POOL_HALF_OPEN_PROBE_SECONDS = 30
 POOL_MANUAL_EXCLUDE_MAX_SECONDS = 7 * 24 * 60 * 60
+SMART_GATEWAY_ID = "smart-gateway"
+SMART_GATEWAY_DEFAULT_PORT = 21000
+SMART_GATEWAY_STRATEGIES = frozenset({"random", "round_robin", "health", "latency"})
+SMART_GATEWAY_MAX_CLIENTS = 128
 DOWNLOAD_RETRY_COUNT = 3
 DOWNLOAD_RETRY_BACKOFF = 0.25
 DOWNLOAD_RESPONSE_LIMIT = 2 * 1024 * 1024 * 1024
@@ -201,7 +208,10 @@ REQUEST_LOG_TERMINAL_STATUSES = frozenset({"closed", "failed"})
 TEST_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
 SPEED_TEST_TASKS: "collections.OrderedDict[str, dict[str, Any]]" = collections.OrderedDict()
 SPEED_TEST_CANCEL_EVENTS: dict[str, threading.Event] = {}
+SUBSCRIPTION_REFRESH_TASKS: "collections.OrderedDict[str, dict[str, Any]]" = collections.OrderedDict()
+SUBSCRIPTION_REFRESH_CANCEL_EVENTS: dict[str, threading.Event] = {}
 ACTIVE_PROXY_CLIENTS: dict[str, dict[str, Any]] = {}
+SMART_GATEWAY_TABLE: dict[str, "SmartGatewayProxy"] = {}
 STATE_LOCK = threading.RLock()
 PROCESS_LOCK = threading.RLock()
 TRAFFIC_LOCK = threading.RLock()
@@ -220,12 +230,14 @@ SUBSCRIPTION_LOCK = threading.RLock()
 LOG_ROTATION_LOCK = threading.RLock()
 POOL_RR_LOCK = threading.Lock()
 SPEED_TEST_TASK_LOCK = threading.RLock()
+SUBSCRIPTION_REFRESH_TASK_LOCK = threading.RLock()
 PROXY_CLIENT_LOCK = threading.RLock()
 SPEED_TEST_TARGET_LOCK = threading.Lock()
 DIAGNOSTIC_RUN_SEMAPHORE = threading.BoundedSemaphore(DIAGNOSTIC_MAX_CONCURRENT_RUNS)
 SUBSCRIPTION_SCHEDULER_LOCK = threading.Lock()
 SUBSCRIPTION_SCHEDULER_WAKE = threading.Event()
 SUBSCRIPTION_SCHEDULER_THREAD: threading.Thread | None = None
+SMART_GATEWAY_LOCK = threading.RLock()
 POOL_RR_COUNTER = 0
 SPEED_TEST_TARGET_COUNTER = 0
 CORE_AUTO_INSTALL_STARTED = threading.Event()
@@ -589,6 +601,54 @@ def normalize_subscription_schedule(subscription: dict[str, Any]) -> None:
     subscription["last_error"] = str(subscription.get("last_error") or "")[:1000]
     changes = subscription.get("last_changes")
     subscription["last_changes"] = changes if isinstance(changes, dict) else {}
+    history = subscription.get("refresh_history")
+    normalized_history: list[dict[str, Any]] = []
+    if isinstance(history, list):
+        for item in history[-SUBSCRIPTION_REFRESH_HISTORY_LIMIT:]:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status") or "")
+            if status not in {"updated", "not_modified", "failed", "cancelled"}:
+                continue
+            changes = item.get("changes")
+            normalized_changes = {
+                key: max(0, safe_int(changes.get(key), 0))
+                for key in ("added", "removed", "changed")
+            } if isinstance(changes, dict) else {"added": 0, "removed": 0, "changed": 0}
+            normalized_history.append(
+                {
+                    "at": max(0, safe_int(item.get("at"), 0)),
+                    "status": status,
+                    "duration_ms": max(0, safe_int(item.get("duration_ms"), 0)),
+                    "changes": normalized_changes,
+                    "error": str(item.get("error") or "")[:1000],
+                }
+            )
+    subscription["refresh_history"] = normalized_history[-SUBSCRIPTION_REFRESH_HISTORY_LIMIT:]
+
+
+def normalize_smart_gateway_settings(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    strategy = str(raw.get("strategy") or "health").strip().lower()
+    if strategy not in SMART_GATEWAY_STRATEGIES:
+        strategy = "health"
+    port = safe_int(raw.get("port"), SMART_GATEWAY_DEFAULT_PORT)
+    if not 1 <= port <= 65535:
+        port = SMART_GATEWAY_DEFAULT_PORT
+    return {
+        "enabled": raw.get("enabled") is True,
+        "port": port,
+        "strategy": strategy,
+        "region": str(raw.get("region") or "")[:128],
+        "query": str(raw.get("query") or "")[:128],
+        "max_connections": clamp_int(
+            raw.get("max_connections"),
+            SMART_GATEWAY_MAX_CLIENTS,
+            1,
+            min(SMART_GATEWAY_MAX_CLIENTS, PROXY_MAX_CLIENTS_LIMIT),
+        ),
+        "last_error": str(raw.get("last_error") or "")[:1000],
+    }
 
 
 def normalize_lan_cidrs(value: Any, *, strict: bool = False) -> list[str]:
@@ -1550,6 +1610,7 @@ def empty_state() -> dict[str, Any]:
             "lan_security": normalize_lan_security({}),
             "speed_test": normalize_speed_test_settings({}),
             "logs": normalize_log_settings({}),
+            "smart_gateway": normalize_smart_gateway_settings({}),
         },
     }
 
@@ -1584,6 +1645,9 @@ def _normalize_loaded_state(state: Any, *, reset_running: bool = False) -> dict[
     state["settings"]["lan_security"] = normalize_lan_security(state["settings"].get("lan_security"))
     state["settings"]["speed_test"] = normalize_speed_test_settings(state["settings"].get("speed_test"))
     state["settings"]["logs"] = cache_log_settings(state["settings"].get("logs"))
+    state["settings"]["smart_gateway"] = normalize_smart_gateway_settings(
+        state["settings"].get("smart_gateway")
+    )
     for node in state["nodes"]:
         normalize_node_core_settings(node)
     for subscription in state["subscriptions"]:
@@ -3151,6 +3215,7 @@ def _status_payload() -> dict[str, Any]:
                 "settings": speed_test_settings_payload(state),
                 **speed_test_task_payload(),
             },
+            "subscription_refresh": subscription_refresh_task_payload(),
             "logs": {
                 "settings": log_settings_payload(state),
                 "storage": runtime_log_storage_payload(),
@@ -3172,6 +3237,7 @@ def _status_payload() -> dict[str, Any]:
             ),
             "sync_openssl": webdav_sync.openssl_available(),
             "network": network,
+            "smart_gateway": smart_gateway_status_payload(state, lan_addresses=lan_addresses),
             "version": "0.1.0",
         }
 
@@ -4574,6 +4640,48 @@ def _subscription_next_refresh(interval_minutes: int, failures: int = 0, *, curr
     return (now_ts() if current_time is None else current_time) + delay
 
 
+def _ensure_subscription_refresh_allowed() -> None:
+    if SHUTTING_DOWN.is_set():
+        raise RuntimeError("程序正在退出，订阅刷新已取消")
+
+
+def _append_subscription_refresh_history(
+    subscription_id: str,
+    *,
+    status: str,
+    duration_ms: int = 0,
+    changes: dict[str, Any] | None = None,
+    error: Any = "",
+) -> dict[str, Any] | None:
+    if status not in {"updated", "not_modified", "failed", "cancelled"}:
+        raise ValueError("订阅刷新历史状态无效")
+    raw_changes = changes if isinstance(changes, dict) else {}
+    entry = {
+        "at": now_ts(),
+        "status": status,
+        "duration_ms": max(0, safe_int(duration_ms, 0)),
+        "changes": {
+            key: max(0, safe_int(raw_changes.get(key), 0))
+            for key in ("added", "removed", "changed")
+        },
+        "error": str(error or "")[:1000],
+    }
+    with STATE_LOCK:
+        state = load_state()
+        subscription = next(
+            (item for item in state.get("subscriptions", []) if str(item.get("id") or "") == subscription_id),
+            None,
+        )
+        if subscription is None:
+            return None
+        history = subscription.get("refresh_history")
+        history = list(history) if isinstance(history, list) else []
+        history.append(entry)
+        subscription["refresh_history"] = history[-SUBSCRIPTION_REFRESH_HISTORY_LIMIT:]
+        save_state(state)
+    return entry
+
+
 def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
     name = clean_name(str(payload.get("name") or ""), "未命名订阅")
     url = str(payload.get("url") or "").strip()
@@ -4599,6 +4707,7 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
     node_ids = [node.id for node in nodes]
     with SUBSCRIPTION_LOCK:
         with SHUTDOWN_LOCK:
+            _ensure_subscription_refresh_allowed()
             with STATE_LOCK:
                 state = load_state()
                 previous = next((s for s in state["subscriptions"] if url and s.get("url") == url), None)
@@ -4628,6 +4737,7 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
                     )[:512],
                     "last_error": "",
                     "last_changes": changes,
+                    "refresh_history": list((previous or {}).get("refresh_history") or [])[-SUBSCRIPTION_REFRESH_HISTORY_LIMIT:],
                 }
                 remove_ids = _subscription_replacement_plan(
                     state,
@@ -4675,7 +4785,10 @@ def refresh_subscription(subscription_id: str) -> dict[str, Any]:
         url = str(subscription.get("url") or "")
         if not url:
             raise ValueError("这个订阅没有 URL，无法刷新")
+        with SHUTDOWN_LOCK:
+            _ensure_subscription_refresh_allowed()
         attempted_at = now_ts()
+        started_at = time.monotonic()
         try:
             fetched = fetch_subscription_response(
                 url,
@@ -4683,53 +4796,302 @@ def refresh_subscription(subscription_id: str) -> dict[str, Any]:
                 last_modified=str(subscription.get("last_modified") or ""),
             )
             if fetched.get("not_modified"):
+                with SHUTDOWN_LOCK:
+                    _ensure_subscription_refresh_allowed()
+                    with STATE_LOCK:
+                        state = load_state()
+                        current = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+                        if current is None:
+                            raise ValueError("订阅不存在")
+                        interval = safe_int(current.get("refresh_interval_minutes"), 0)
+                        current.update(
+                            {
+                                "last_attempt": attempted_at,
+                                "refresh_failures": 0,
+                                "next_refresh_at": _subscription_next_refresh(interval, current_time=attempted_at),
+                                "etag": str(fetched.get("etag") or current.get("etag") or "")[:512],
+                                "last_modified": str(
+                                    fetched.get("last_modified") or current.get("last_modified") or ""
+                                )[:512],
+                                "last_error": "",
+                                "last_changes": {"added": 0, "removed": 0, "changed": 0},
+                            }
+                        )
+                        save_state(state)
+                        result = {
+                            "subscription": dict(current),
+                            "nodes": [],
+                            "not_modified": True,
+                            "changes": current["last_changes"],
+                        }
+            else:
+                result = import_subscription(
+                    {
+                        "name": subscription.get("name"),
+                        "url": url,
+                        "raw": str(fetched.get("text") or ""),
+                        "refresh_interval_minutes": subscription.get("refresh_interval_minutes"),
+                        "_fetch_metadata": fetched,
+                    }
+                )
+            with SHUTDOWN_LOCK:
+                _ensure_subscription_refresh_allowed()
+                _append_subscription_refresh_history(
+                    subscription_id,
+                    status="not_modified" if result.get("not_modified") else "updated",
+                    duration_ms=int(round((time.monotonic() - started_at) * 1000)),
+                    changes=result.get("changes"),
+                )
+            return result
+        except Exception as exc:
+            with SHUTDOWN_LOCK:
+                _ensure_subscription_refresh_allowed()
                 with STATE_LOCK:
                     state = load_state()
                     current = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
-                    if current is None:
-                        raise ValueError("订阅不存在")
-                    interval = safe_int(current.get("refresh_interval_minutes"), 0)
-                    current.update(
-                        {
-                            "last_attempt": attempted_at,
-                            "refresh_failures": 0,
-                            "next_refresh_at": _subscription_next_refresh(interval, current_time=attempted_at),
-                            "etag": str(fetched.get("etag") or current.get("etag") or "")[:512],
-                            "last_modified": str(
-                                fetched.get("last_modified") or current.get("last_modified") or ""
-                            )[:512],
-                            "last_error": "",
-                            "last_changes": {"added": 0, "removed": 0, "changed": 0},
-                        }
+                    if current is not None:
+                        failures = max(0, safe_int(current.get("refresh_failures"), 0)) + 1
+                        interval = safe_int(current.get("refresh_interval_minutes"), 0)
+                        current.update(
+                            {
+                                "last_attempt": attempted_at,
+                                "refresh_failures": failures,
+                                "next_refresh_at": _subscription_next_refresh(interval, failures, current_time=attempted_at),
+                                "last_error": str(exc)[:1000],
+                            }
+                        )
+                        save_state(state)
+                try:
+                    _append_subscription_refresh_history(
+                        subscription_id,
+                        status="failed",
+                        duration_ms=int(round((time.monotonic() - started_at) * 1000)),
+                        error=exc,
                     )
-                    save_state(state)
-                    return {"subscription": dict(current), "nodes": [], "not_modified": True, "changes": current["last_changes"]}
-            return import_subscription(
-                {
-                    "name": subscription.get("name"),
-                    "url": url,
-                    "raw": str(fetched.get("text") or ""),
-                    "refresh_interval_minutes": subscription.get("refresh_interval_minutes"),
-                    "_fetch_metadata": fetched,
-                }
-            )
-        except Exception as exc:
-            with STATE_LOCK:
-                state = load_state()
-                current = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
-                if current is not None:
-                    failures = max(0, safe_int(current.get("refresh_failures"), 0)) + 1
-                    interval = safe_int(current.get("refresh_interval_minutes"), 0)
-                    current.update(
-                        {
-                            "last_attempt": attempted_at,
-                            "refresh_failures": failures,
-                            "next_refresh_at": _subscription_next_refresh(interval, failures, current_time=attempted_at),
-                            "last_error": str(exc)[:1000],
-                        }
-                    )
-                    save_state(state)
+                except Exception as history_error:
+                    log_event(f"记录订阅刷新历史失败：{history_error}", level="warn", category="订阅")
             raise
+
+
+def subscription_refresh_task_payload(task_id: str | None = None) -> dict[str, Any]:
+    with SUBSCRIPTION_REFRESH_TASK_LOCK:
+        if task_id:
+            task = SUBSCRIPTION_REFRESH_TASKS.get(task_id)
+            if task is None:
+                raise ValueError("订阅刷新任务不存在")
+            return json.loads(json.dumps(task, ensure_ascii=False))
+        return {
+            "tasks": json.loads(json.dumps(list(SUBSCRIPTION_REFRESH_TASKS.values()), ensure_ascii=False))
+        }
+
+
+def _update_subscription_refresh_task(task_id: str, **updates: Any) -> None:
+    with SUBSCRIPTION_REFRESH_TASK_LOCK:
+        task = SUBSCRIPTION_REFRESH_TASKS.get(task_id)
+        if task is not None:
+            task.update(updates)
+            task["updated_at"] = now_ts()
+
+
+def _cancel_pending_subscription_refresh_items(
+    task_id: str,
+    subscription_ids: list[str],
+    *,
+    start_index: int = 0,
+    include_active: bool = False,
+    error: str,
+) -> list[str]:
+    pending_history_ids: list[str] = []
+    with SUBSCRIPTION_REFRESH_TASK_LOCK:
+        task = SUBSCRIPTION_REFRESH_TASKS.get(task_id)
+        if task is None:
+            return pending_history_ids
+        active_index = task.get("active_index")
+        active_index = active_index if isinstance(active_index, int) else -1
+        items = task.get("items")
+        if not isinstance(items, list):
+            items = []
+            task["items"] = items
+        for index in range(max(0, start_index), len(subscription_ids)):
+            subscription_id = subscription_ids[index]
+            if not include_active and index == active_index:
+                continue
+            if index >= len(items):
+                items.extend([None] * (index + 1 - len(items)))
+            if items[index] is not None:
+                continue
+            items[index] = {
+                "subscription_id": subscription_id,
+                "status": "cancelled",
+                "error": error,
+            }
+            pending_history_ids.append(subscription_id)
+        task["completed"] = sum(1 for item in items if item is not None)
+        task["updated_at"] = now_ts()
+    return pending_history_ids
+
+
+def _record_subscription_refresh_cancellations(subscription_ids: list[str], error: str) -> None:
+    for subscription_id in subscription_ids:
+        try:
+            _append_subscription_refresh_history(
+                subscription_id,
+                status="cancelled",
+                error=error,
+            )
+        except Exception as history_error:
+            log_event(f"记录订阅取消历史失败：{history_error}", level="warn", category="订阅")
+
+
+def _run_subscription_refresh_task(task_id: str, subscription_ids: list[str]) -> None:
+    cancel_event = SUBSCRIPTION_REFRESH_CANCEL_EVENTS[task_id]
+    cancelled_before_completion = False
+    _update_subscription_refresh_task(
+        task_id,
+        status=(
+            "cancelled"
+            if cancel_event.is_set() and SHUTTING_DOWN.is_set()
+            else "cancelling"
+            if cancel_event.is_set()
+            else "running"
+        ),
+        started_at=now_ts(),
+    )
+    try:
+        for index, subscription_id in enumerate(subscription_ids):
+            if cancel_event.is_set() or SHUTTING_DOWN.is_set():
+                cancelled_before_completion = True
+                pending_history_ids = _cancel_pending_subscription_refresh_items(
+                    task_id,
+                    subscription_ids,
+                    start_index=index,
+                    include_active=False,
+                    error="订阅刷新已取消",
+                )
+                _record_subscription_refresh_cancellations(pending_history_ids, "订阅刷新已取消")
+                break
+            with SUBSCRIPTION_REFRESH_TASK_LOCK:
+                task = SUBSCRIPTION_REFRESH_TASKS.get(task_id)
+                if task is None:
+                    break
+                if index < len(task.get("items") or []) and task["items"][index] is not None:
+                    continue
+                task["active_index"] = index
+                task["updated_at"] = now_ts()
+            started = time.monotonic()
+            try:
+                result = refresh_subscription(subscription_id)
+                changes = result.get("changes") or {}
+                item = {
+                    "subscription_id": subscription_id,
+                    "status": "not_modified" if result.get("not_modified") else "updated",
+                    "duration_ms": int(round((time.monotonic() - started) * 1000)),
+                    "changes": {
+                        key: max(0, safe_int(changes.get(key), 0))
+                        for key in ("added", "removed", "changed")
+                    },
+                }
+            except Exception as exc:
+                item = {
+                    "subscription_id": subscription_id,
+                    "status": "failed",
+                    "duration_ms": int(round((time.monotonic() - started) * 1000)),
+                    "error": str(exc)[:1000],
+                }
+            with SHUTDOWN_LOCK:
+                with SUBSCRIPTION_REFRESH_TASK_LOCK:
+                    task = SUBSCRIPTION_REFRESH_TASKS.get(task_id)
+                    if task is not None:
+                        task["active_index"] = None
+                        if index >= len(task["items"]):
+                            task["items"].extend([None] * (index + 1 - len(task["items"])))
+                        if task["items"][index] is None:
+                            task["items"][index] = item
+                        task["completed"] = sum(1 for entry in task["items"] if entry is not None)
+                        task["updated_at"] = now_ts()
+        with SUBSCRIPTION_REFRESH_TASK_LOCK:
+            task = SUBSCRIPTION_REFRESH_TASKS.get(task_id)
+            if task is not None:
+                task["active_index"] = None
+                task["status"] = (
+                    "cancelled"
+                    if task.get("status") == "cancelled"
+                    or cancelled_before_completion
+                    or cancel_event.is_set()
+                    or SHUTTING_DOWN.is_set()
+                    else "completed"
+                )
+                task["finished_at"] = now_ts()
+                task["updated_at"] = now_ts()
+    finally:
+        with SUBSCRIPTION_REFRESH_TASK_LOCK:
+            SUBSCRIPTION_REFRESH_CANCEL_EVENTS.pop(task_id, None)
+
+
+def start_subscription_refresh_task(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_ids = payload.get("subscription_ids")
+    if raw_ids is None and payload.get("ids") is not None:
+        raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list):
+        raise ValueError("subscription_ids 必须是数组")
+    subscription_ids = list(dict.fromkeys(str(item or "") for item in raw_ids if str(item or "")))
+    if not subscription_ids:
+        raise ValueError("没有可刷新的订阅")
+    if len(subscription_ids) > SUBSCRIPTION_BATCH_LIMIT:
+        raise ValueError(f"单次最多刷新 {SUBSCRIPTION_BATCH_LIMIT} 个订阅")
+    with SHUTDOWN_LOCK:
+        _ensure_subscription_refresh_allowed()
+        with STATE_LOCK:
+            state = load_state()
+            known_ids = {str(item.get("id") or "") for item in state.get("subscriptions", [])}
+        unknown = [item for item in subscription_ids if item not in known_ids]
+        if unknown:
+            raise ValueError(f"订阅不存在: {unknown[0]}")
+        task_id = stable_id("subscription-refresh-task", str(time.time_ns()), *subscription_ids)
+        now = now_ts()
+        task = {
+            "id": task_id,
+            "status": "queued",
+            "subscription_ids": subscription_ids,
+            "total": len(subscription_ids),
+            "completed": 0,
+            "items": [None] * len(subscription_ids),
+            "active_index": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        cancel_event = threading.Event()
+        with SUBSCRIPTION_REFRESH_TASK_LOCK:
+            if any(
+                item.get("status") in {"queued", "running", "cancelling"}
+                for item in SUBSCRIPTION_REFRESH_TASKS.values()
+            ):
+                raise RuntimeError("已有批量订阅刷新任务正在运行")
+            SUBSCRIPTION_REFRESH_TASKS[task_id] = task
+            SUBSCRIPTION_REFRESH_CANCEL_EVENTS[task_id] = cancel_event
+            while len(SUBSCRIPTION_REFRESH_TASKS) > SUBSCRIPTION_REFRESH_TASK_LIMIT:
+                SUBSCRIPTION_REFRESH_TASKS.popitem(last=False)
+    threading.Thread(
+        target=_run_subscription_refresh_task,
+        args=(task_id, subscription_ids),
+        name=f"subscription-refresh-task-{task_id[:8]}",
+        daemon=True,
+    ).start()
+    return subscription_refresh_task_payload(task_id)
+
+
+def cancel_subscription_refresh_task(task_id: str) -> dict[str, Any]:
+    with SUBSCRIPTION_REFRESH_TASK_LOCK:
+        task = SUBSCRIPTION_REFRESH_TASKS.get(task_id)
+        if task is None:
+            raise ValueError("订阅刷新任务不存在")
+        cancel_event = SUBSCRIPTION_REFRESH_CANCEL_EVENTS.get(task_id)
+        if cancel_event is not None:
+            cancel_event.set()
+        if task.get("status") in {"queued", "running"}:
+            task["status"] = "cancelling"
+            task["updated_at"] = now_ts()
+    return subscription_refresh_task_payload(task_id)
 
 
 def update_subscription_schedule(payload: dict[str, Any]) -> dict[str, Any]:
@@ -6740,6 +7102,33 @@ def restore_enabled_bridges() -> None:
             log_event(f"恢复本地代理失败:{previous.get('node_name') or node_id}:{exc}", level="error", category="代理")
 
 
+def restore_enabled_smart_gateway() -> None:
+    with STATE_LOCK:
+        state = load_state()
+        settings = normalize_smart_gateway_settings((state.get("settings") or {}).get("smart_gateway"))
+    if not settings.get("enabled"):
+        return
+    if docker_mode():
+        settings["enabled"] = False
+        settings["last_error"] = "Docker 模式未发布智能网关固定端口"
+        with STATE_LOCK:
+            state = load_state()
+            state.setdefault("settings", {})["smart_gateway"] = settings
+            save_state(state)
+        log_event("智能网关恢复跳过：Docker 模式未发布固定端口", level="warn", category="代理")
+        return
+    try:
+        start_smart_gateway(settings)
+        log_event("已恢复智能网关", category="代理")
+    except Exception as exc:
+        settings["last_error"] = str(exc)[:1000]
+        with STATE_LOCK:
+            state = load_state()
+            state.setdefault("settings", {})["smart_gateway"] = settings
+            save_state(state)
+        log_event(f"恢复智能网关失败：{exc}", level="error", category="代理")
+
+
 def read_exact(sock: socket.socket, length: int) -> bytes:
     chunks = []
     remaining = length
@@ -7552,6 +7941,541 @@ class Socks5LogProxy:
         return counters
 
 
+class SmartGatewayProxy(Socks5LogProxy):
+    def __init__(
+        self,
+        *,
+        listen_port: int,
+        listen_host: str = LOCAL_PROXY_LISTEN_HOST,
+        max_clients: int = SMART_GATEWAY_MAX_CLIENTS,
+        strategy: str = "health",
+        region: str = "",
+        query: str = "",
+        security: dict[str, Any] | None = None,
+    ) -> None:
+        if strategy not in SMART_GATEWAY_STRATEGIES:
+            raise ValueError("智能网关策略无效")
+        super().__init__(
+            bridge_id=SMART_GATEWAY_ID,
+            node_id="",
+            node_name="智能网关",
+            listen_port=listen_port,
+            upstream_port=0,
+            listen_host=listen_host,
+            max_clients=max_clients,
+            security=security,
+        )
+        self.strategy = strategy
+        self.region = str(region or "")[:128]
+        self.query = str(query or "")[:128]
+
+    def settings_snapshot(self) -> dict[str, Any]:
+        return {
+            "strategy": self.strategy,
+            "region": self.region,
+            "query": self.query,
+            "listen_host": self.listen_host,
+            "listen_port": self.listen_port,
+        }
+
+    def update_gateway_settings(
+        self,
+        *,
+        strategy: str,
+        region: str,
+        query: str,
+    ) -> None:
+        if strategy not in SMART_GATEWAY_STRATEGIES:
+            raise ValueError("智能网关策略无效")
+        self.strategy = strategy
+        self.region = str(region or "")[:128]
+        self.query = str(query or "")[:128]
+
+    def _gateway_candidates(self) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        with STATE_LOCK:
+            state = load_state()
+            raw_members = pool_members(
+                state,
+                region=self.region,
+                q=self.query,
+                ready_only=True,
+            )
+            public_members = public_pool_members(state, raw_members)
+        raw_by_id = {str(item.get("id") or ""): item for item in raw_members}
+        return [
+            (raw_by_id[str(public.get("id") or "")], public)
+            for public in public_members
+            if str(public.get("id") or "") in raw_by_id
+        ]
+
+    def _record_gateway_health(
+        self,
+        bridge_id: str,
+        *,
+        ok: bool,
+        latency_ms: int | None = None,
+        error: Any = "",
+    ) -> None:
+        try:
+            with STATE_LOCK:
+                state = load_state()
+                bridge = next(
+                    (item for item in state.get("bridges", []) if str(item.get("id") or "") == bridge_id),
+                    None,
+                )
+                if bridge is None:
+                    return
+                bridge["pool_health"] = update_pool_health_record(
+                    bridge.get("pool_health"),
+                    ok=ok,
+                    latency_ms=latency_ms,
+                    error=error,
+                )
+                save_state(state)
+        except Exception as exc:
+            log_event(f"智能网关更新节点健康状态失败：{exc}", level="warn", category="代理")
+
+    def _connect_to_gateway_member(
+        self,
+        bridge: dict[str, Any],
+        request: bytes,
+    ) -> tuple[socket.socket, bytes]:
+        bridge_id = str(bridge.get("id") or "")
+        core_port = safe_int(bridge.get("core_port"), 0)
+        if core_port <= 0:
+            raise RuntimeError("代理池成员缺少核心端口")
+        started = time.monotonic()
+        upstream: socket.socket | None = None
+        try:
+            upstream = socket.create_connection(("127.0.0.1", core_port), timeout=12.0)
+            self._track_upstream(upstream)
+            upstream.settimeout(12.0)
+            upstream.sendall(b"\x05\x01\x00")
+            if read_exact(upstream, 2) != b"\x05\x00":
+                raise RuntimeError("代理池成员 SOCKS5 握手失败")
+            upstream.sendall(request)
+            reply = self._read_socks_reply(upstream)
+            if len(reply) < 2 or reply[1] != 0:
+                raise RuntimeError(f"代理池成员返回 SOCKS5 状态码 {reply[1] if len(reply) > 1 else '-'}")
+            self._record_gateway_health(
+                bridge_id,
+                ok=True,
+                latency_ms=int(round((time.monotonic() - started) * 1000)),
+            )
+            return upstream, reply
+        except Exception as exc:
+            self._record_gateway_health(bridge_id, ok=False, error=exc)
+            if upstream is not None:
+                self._close_upstream(upstream)
+            raise
+
+    def _connect_upstream_for_socks_request(self, request: bytes) -> tuple[socket.socket, bytes]:
+        candidates = self._gateway_candidates()
+        if not candidates:
+            raise RuntimeError("智能网关没有可用代理")
+        remaining = list(candidates)
+        last_error: BaseException | None = None
+        while remaining:
+            public_candidates = [public for _raw, public in remaining]
+            picked = pick_pool_member(public_candidates, self.strategy)
+            picked_id = str(picked.get("id") or "")
+            selected = next(
+                ((raw, public) for raw, public in remaining if str(public.get("id") or "") == picked_id),
+                None,
+            )
+            if selected is None:
+                break
+            remaining.remove(selected)
+            try:
+                return self._connect_to_gateway_member(selected[0], request)
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"智能网关所有代理节点均连接失败：{last_error}") from last_error
+
+    def _record_transfer(self, counters: dict[str, int], key: str, byte_count: int) -> None:
+        counters[key] += byte_count
+
+
+def _smart_gateway_settings_from_payload(
+    payload: dict[str, Any] | None,
+    current: dict[str, Any],
+    *,
+    enabled_default: bool | None = None,
+) -> dict[str, Any]:
+    raw = payload if isinstance(payload, dict) else {}
+    nested = raw.get("settings") if isinstance(raw.get("settings"), dict) else {}
+    merged = {**current, **nested, **{key: value for key, value in raw.items() if key in {
+        "enabled", "port", "strategy", "region", "query", "max_connections"
+    }}}
+    if enabled_default is not None and "enabled" not in merged:
+        merged["enabled"] = enabled_default
+    if "enabled" in merged and not isinstance(merged.get("enabled"), bool):
+        raise ValueError("智能网关 enabled 必须是布尔值")
+    port = safe_int(merged.get("port"), SMART_GATEWAY_DEFAULT_PORT)
+    if not 1 <= port <= 65535:
+        raise ValueError("智能网关端口必须在 1..65535 之间")
+    strategy = str(merged.get("strategy") or "health").strip().lower()
+    if strategy not in SMART_GATEWAY_STRATEGIES:
+        raise ValueError("智能网关策略只能是 random、round_robin、health 或 latency")
+    max_connections = safe_int(merged.get("max_connections"), SMART_GATEWAY_MAX_CLIENTS)
+    if not 1 <= max_connections <= SMART_GATEWAY_MAX_CLIENTS:
+        raise ValueError(f"智能网关连接数上限必须在 1..{SMART_GATEWAY_MAX_CLIENTS} 之间")
+    return {
+        "enabled": merged.get("enabled") is True,
+        "port": port,
+        "strategy": strategy,
+        "region": str(merged.get("region") or "")[:128],
+        "query": str(merged.get("query") or "")[:128],
+        "max_connections": max_connections,
+        "last_error": str(current.get("last_error") or "")[:1000],
+    }
+
+
+def _smart_gateway_port_conflict(
+    state: dict[str, Any],
+    port: int,
+    listen_host: str,
+    *,
+    current_proxy: SmartGatewayProxy | None = None,
+) -> str | None:
+    for bridge in state.get("bridges", []):
+        if not isinstance(bridge, dict) or bridge.get("status") not in ACTIVE_BRIDGE_STATUSES:
+            continue
+        if safe_int(bridge.get("port"), 0) == port:
+            return f"端口 {port} 已被本地代理占用"
+    with SMART_GATEWAY_LOCK:
+        existing = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID)
+    if existing is not None and existing is not current_proxy and existing.is_alive():
+        if safe_int(existing.listen_port, 0) == port:
+            return f"端口 {port} 已被智能网关占用"
+    hosts = {listen_host}
+    if listen_host == LOCAL_PROXY_LISTEN_HOST:
+        hosts.add(LAN_PROXY_LISTEN_HOST)
+    if any(not is_port_free(port, host) for host in hosts):
+        return f"端口 {port} 已被其他进程占用"
+    return None
+
+
+def smart_gateway_status_payload(
+    state: dict[str, Any] | None = None,
+    *,
+    lan_addresses: list[str] | None = None,
+) -> dict[str, Any]:
+    if state is None:
+        with STATE_LOCK:
+            state = load_state()
+    settings = normalize_smart_gateway_settings((state.get("settings") or {}).get("smart_gateway"))
+    with SMART_GATEWAY_LOCK:
+        proxy = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID)
+    running = bool(proxy and proxy.is_alive())
+    if running and proxy is not None:
+        runtime_settings = proxy.settings_snapshot()
+        listen_host = str(runtime_settings.get("listen_host") or LOCAL_PROXY_LISTEN_HOST)
+        port = safe_int(runtime_settings.get("listen_port"), settings["port"])
+    else:
+        listen_host = proxy_listen_host(state)
+        port = settings["port"]
+    gateway_addresses = [LOCAL_PROXY_LISTEN_HOST]
+    if listen_host == LAN_PROXY_LISTEN_HOST:
+        gateway_addresses = list(lan_addresses) if lan_addresses is not None else lan_ipv4_addresses()
+        if not gateway_addresses:
+            gateway_addresses = [LOCAL_PROXY_LISTEN_HOST]
+    raw_members = pool_members(
+        state,
+        region=settings["region"],
+        q=settings["query"],
+        ready_only=True,
+    )
+    with PROXY_CLIENT_LOCK:
+        clients = [
+            {key: value for key, value in item.items() if key != "socket"}
+            for item in ACTIVE_PROXY_CLIENTS.values()
+            if item.get("bridge_id") == SMART_GATEWAY_ID
+        ]
+    public_settings = {
+        key: settings[key]
+        for key in ("enabled", "port", "strategy", "region", "query", "max_connections", "last_error")
+    }
+    public_settings.update({"listen_host": listen_host, "running": running})
+    return {
+        "settings": public_settings,
+        "enabled": bool(settings["enabled"]),
+        "running": running,
+        "port": port,
+        "listen_host": listen_host,
+        "strategy": settings["strategy"],
+        "region": settings["region"],
+        "query": settings["query"],
+        "max_connections": settings["max_connections"],
+        "last_error": settings["last_error"],
+        "available_members": len(raw_members),
+        "client_count": len(clients),
+        "clients": clients,
+        "socks_url": f"socks5://{gateway_addresses[0]}:{port}",
+        "http_url": f"http://{gateway_addresses[0]}:{port}",
+        "socks_urls": [f"socks5://{address}:{port}" for address in gateway_addresses],
+        "http_urls": [f"http://{address}:{port}" for address in gateway_addresses],
+    }
+
+
+def _persist_smart_gateway_settings(settings: dict[str, Any]) -> None:
+    with STATE_LOCK:
+        state = load_state()
+        state.setdefault("settings", {})["smart_gateway"] = normalize_smart_gateway_settings(settings)
+        save_state(state)
+
+
+def _running_smart_gateway_settings(proxy: SmartGatewayProxy) -> dict[str, Any]:
+    snapshot = proxy.settings_snapshot()
+    return {
+        "enabled": True,
+        "port": safe_int(snapshot.get("listen_port"), SMART_GATEWAY_DEFAULT_PORT),
+        "strategy": str(snapshot.get("strategy") or "health"),
+        "region": str(snapshot.get("region") or "")[:128],
+        "query": str(snapshot.get("query") or "")[:128],
+        "max_connections": clamp_int(
+            getattr(proxy, "capacity_limit", SMART_GATEWAY_MAX_CLIENTS),
+            SMART_GATEWAY_MAX_CLIENTS,
+            1,
+            SMART_GATEWAY_MAX_CLIENTS,
+        ),
+        "last_error": "",
+    }
+
+
+def _apply_running_smart_gateway_settings(
+    proxy: SmartGatewayProxy,
+    settings: dict[str, Any],
+) -> None:
+    normalized = normalize_smart_gateway_settings(settings)
+    target_port = normalized["port"]
+    port_changed = safe_int(proxy.listen_port, 0) != target_port
+    if proxy.is_alive() and port_changed:
+        proxy.stop()
+    proxy.listen_port = target_port
+    proxy.update_gateway_settings(
+        strategy=normalized["strategy"],
+        region=normalized["region"],
+        query=normalized["query"],
+    )
+    proxy.capacity_limit = normalized["max_connections"]
+    proxy.max_clients = min(
+        normalized["max_connections"],
+        proxy.security_snapshot()["max_connections"],
+    )
+    if not proxy.is_alive():
+        proxy._stop = threading.Event()
+        proxy._start_after_rebind()
+
+
+def _reconcile_smart_gateway_after_persist_error(
+    proxy: SmartGatewayProxy | None,
+    fallback: dict[str, Any],
+    persist_error: BaseException,
+) -> None:
+    state_read_error: BaseException | None = None
+    try:
+        with STATE_LOCK:
+            state = load_state()
+            persisted = normalize_smart_gateway_settings(
+                (state.get("settings") or {}).get("smart_gateway")
+            )
+    except BaseException as read_error:
+        persisted = normalize_smart_gateway_settings(fallback)
+        state_read_error = read_error
+
+    try:
+        if persisted["enabled"]:
+            if proxy is None:
+                raise RuntimeError("缺少可恢复的智能网关实例")
+            _apply_running_smart_gateway_settings(proxy, persisted)
+            with SMART_GATEWAY_LOCK:
+                SMART_GATEWAY_TABLE[SMART_GATEWAY_ID] = proxy
+        else:
+            if proxy is not None and proxy.is_alive():
+                proxy.stop()
+            with SMART_GATEWAY_LOCK:
+                if proxy is None or SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID) is proxy:
+                    SMART_GATEWAY_TABLE.pop(SMART_GATEWAY_ID, None)
+    except BaseException as reconcile_error:
+        raise RuntimeError(
+            f"智能网关设置保存失败，且运行状态协调失败：{reconcile_error}"
+        ) from persist_error
+    if state_read_error is not None:
+        raise RuntimeError(
+            f"智能网关设置保存失败，状态文件不可读，已恢复调用前配置：{state_read_error}"
+        ) from persist_error
+
+
+def _update_running_smart_gateway(
+    proxy: SmartGatewayProxy,
+    desired: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    previous = _running_smart_gateway_settings(proxy)
+    if desired["port"] != previous["port"]:
+        conflict = _smart_gateway_port_conflict(
+            state,
+            desired["port"],
+            proxy_listen_host(state),
+            current_proxy=proxy,
+        )
+        if conflict:
+            raise RuntimeError(conflict)
+    try:
+        _apply_running_smart_gateway_settings(proxy, desired)
+    except BaseException as update_error:
+        try:
+            _apply_running_smart_gateway_settings(proxy, previous)
+        except BaseException as rollback_error:
+            raise RuntimeError(
+                f"智能网关设置更新失败，且旧监听恢复失败：{rollback_error}"
+            ) from update_error
+        raise
+    try:
+        _persist_smart_gateway_settings(desired)
+    except BaseException as persist_error:
+        _reconcile_smart_gateway_after_persist_error(proxy, previous, persist_error)
+        raise
+
+
+def start_smart_gateway(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    if docker_mode():
+        raise RuntimeError("Docker 模式未发布智能网关固定端口，请在宿主机模式下启用")
+    raw_payload = payload if isinstance(payload, dict) else {}
+    with BRIDGE_START_LOCK:
+        with SHUTDOWN_LOCK:
+            if SHUTTING_DOWN.is_set():
+                raise RuntimeError("程序正在退出，不能启动智能网关")
+            synchronize_process_state()
+            with STATE_LOCK:
+                state = load_state()
+                previous = normalize_smart_gateway_settings(
+                    (state.get("settings") or {}).get("smart_gateway")
+                )
+                desired = _smart_gateway_settings_from_payload(raw_payload, previous, enabled_default=True)
+                desired["enabled"] = True
+                listen_host = proxy_listen_host(state)
+            with SMART_GATEWAY_LOCK:
+                existing = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID)
+            if existing is not None and existing.is_alive():
+                if safe_int(existing.listen_port, 0) != desired["port"]:
+                    raise RuntimeError("智能网关已运行，请先停止后再修改端口")
+                _update_running_smart_gateway(existing, desired, state)
+                return smart_gateway_status_payload()
+            conflict = _smart_gateway_port_conflict(state, desired["port"], listen_host)
+            if conflict:
+                raise RuntimeError(conflict)
+            proxy = SmartGatewayProxy(
+                listen_port=desired["port"],
+                listen_host=listen_host,
+                max_clients=desired["max_connections"],
+                strategy=desired["strategy"],
+                region=desired["region"],
+                query=desired["query"],
+                security=normalize_lan_security((state.get("settings") or {}).get("lan_security")),
+            )
+            proxy.start()
+            with SMART_GATEWAY_LOCK:
+                SMART_GATEWAY_TABLE[SMART_GATEWAY_ID] = proxy
+            try:
+                _persist_smart_gateway_settings(desired)
+            except BaseException as persist_error:
+                _reconcile_smart_gateway_after_persist_error(proxy, previous, persist_error)
+                raise
+            mark_sync_local_change()
+            return smart_gateway_status_payload()
+
+
+def _stop_smart_gateway_locked(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    with STATE_LOCK:
+        state = load_state()
+        current = normalize_smart_gateway_settings(
+            (state.get("settings") or {}).get("smart_gateway")
+        )
+    desired = normalize_smart_gateway_settings(settings if settings is not None else current)
+    desired["enabled"] = False
+    desired["last_error"] = ""
+    with SMART_GATEWAY_LOCK:
+        proxy = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID)
+    fallback = _running_smart_gateway_settings(proxy) if proxy is not None and proxy.is_alive() else current
+    if proxy is not None:
+        proxy.stop()
+        with SMART_GATEWAY_LOCK:
+            if SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID) is proxy:
+                SMART_GATEWAY_TABLE.pop(SMART_GATEWAY_ID, None)
+    try:
+        _persist_smart_gateway_settings(desired)
+    except BaseException as persist_error:
+        _reconcile_smart_gateway_after_persist_error(proxy, fallback, persist_error)
+        raise
+    mark_sync_local_change()
+    return smart_gateway_status_payload()
+
+
+def stop_smart_gateway() -> dict[str, Any]:
+    with BRIDGE_START_LOCK:
+        with SHUTDOWN_LOCK:
+            return _stop_smart_gateway_locked()
+
+
+def rebind_running_smart_gateway(listen_host: str) -> list[str]:
+    with SMART_GATEWAY_LOCK:
+        proxy = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID)
+    if proxy is None or not proxy.is_alive():
+        return []
+    old_host = str(proxy.listen_host)
+    if old_host == listen_host and proxy.is_alive():
+        return []
+    proxy.rebind(listen_host)
+    return [SMART_GATEWAY_ID]
+
+
+def update_running_smart_gateway_security(
+    security: dict[str, Any],
+    *,
+    disconnect_lan: bool,
+) -> dict[str, int]:
+    with SMART_GATEWAY_LOCK:
+        proxy = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID)
+    if proxy is None:
+        return {"updated_count": 0, "disconnected_count": 0}
+    previous = normalize_lan_security(proxy.security_snapshot())
+    normalized = normalize_lan_security(security)
+    if previous == normalized:
+        return {"updated_count": 0, "disconnected_count": 0}
+    disconnected = proxy.update_security(normalized, disconnect_lan=disconnect_lan)
+    return {"updated_count": 1, "disconnected_count": safe_int(disconnected, 0)}
+
+
+def update_smart_gateway_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("智能网关设置必须是对象")
+    with STATE_LOCK:
+        state = load_state()
+        current = normalize_smart_gateway_settings((state.get("settings") or {}).get("smart_gateway"))
+    desired = _smart_gateway_settings_from_payload(payload, current)
+    enabled = desired["enabled"] if "enabled" in payload or isinstance(payload.get("settings"), dict) and "enabled" in payload.get("settings", {}) else current["enabled"]
+    desired["enabled"] = enabled
+    with SMART_GATEWAY_LOCK:
+        running = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID)
+    if enabled and not (running and running.is_alive()):
+        return start_smart_gateway(desired)
+    if not enabled and running and running.is_alive():
+        with BRIDGE_START_LOCK:
+            with SHUTDOWN_LOCK:
+                return _stop_smart_gateway_locked(desired)
+    if running and running.is_alive():
+        with BRIDGE_START_LOCK:
+            with SHUTDOWN_LOCK:
+                with STATE_LOCK:
+                    state = load_state()
+                _update_running_smart_gateway(running, desired, state)
+        return smart_gateway_status_payload()
+    _persist_smart_gateway_settings(desired)
+    return smart_gateway_status_payload()
+
+
 def choose_speed_test_target(settings: dict[str, Any] | None = None) -> str:
     global SPEED_TEST_TARGET_COUNTER
     if settings is None:
@@ -8022,8 +8946,9 @@ def _stop_bridge(bridge_id: str) -> dict[str, Any]:
 
 
 def stop_all_bridges() -> dict[str, Any]:
-    with SHUTDOWN_LOCK:
-        return _stop_all_bridges()
+    with BRIDGE_START_LOCK:
+        with SHUTDOWN_LOCK:
+            return _stop_all_bridges()
 
 
 def _stop_all_bridges() -> dict[str, Any]:
@@ -8040,6 +8965,12 @@ def _stop_all_bridges() -> dict[str, Any]:
             for instance in state.get("browser_instances", [])
             if str(instance.get("node_id") or "")
         }
+        gateway_enabled = normalize_smart_gateway_settings(
+            (state.get("settings") or {}).get("smart_gateway")
+        )["enabled"]
+
+    with SMART_GATEWAY_LOCK:
+        gateway_present = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID) is not None
 
     with PROCESS_LOCK:
         browser_node_ids.update(BROWSER_TABLE.keys())
@@ -8053,6 +8984,13 @@ def _stop_all_bridges() -> dict[str, Any]:
     with TRAFFIC_LOCK:
         bridge_ids.update(TRAFFIC_TABLE)
     failures: list[tuple[str, BaseException]] = []
+    gateway_stopped = False
+    if gateway_enabled or gateway_present:
+        try:
+            _stop_smart_gateway_locked()
+            gateway_stopped = True
+        except BaseException as error:
+            failures.append(("智能网关", error))
     traffic_by_bridge: dict[str, dict[str, int]] = {}
     for bridge_id in sorted(bridge_ids):
         try:
@@ -8072,7 +9010,11 @@ def _stop_all_bridges() -> dict[str, Any]:
     if failures:
         details = "; ".join(f"{label}: {error}" for label, error in failures)
         raise RuntimeError(f"停止部分本地代理失败（{len(failures)} 项）: {details}") from failures[0][1]
-    return {"ok": True, "killed_browsers": killed_browsers}
+    return {
+        "ok": True,
+        "killed_browsers": killed_browsers,
+        "gateway_stopped": gateway_stopped,
+    }
 
 
 def rebind_running_log_proxies(listen_host: str) -> list[str]:
@@ -8173,9 +9115,16 @@ def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
             if SHUTTING_DOWN.is_set():
                 raise RuntimeError("程序正在退出，不能修改局域网共享设置")
             synchronize_process_state()
-            rebound_ids = rebind_running_log_proxies(desired_host)
+            rebound_ids: list[str] = []
+            rebound_gateway_ids: list[str] = []
             try:
+                rebound_ids = rebind_running_log_proxies(desired_host)
+                rebound_gateway_ids = rebind_running_smart_gateway(desired_host)
                 security_result = update_running_log_proxy_security(
+                    desired_security,
+                    disconnect_lan=desired_security != current_security,
+                )
+                gateway_security_result = update_running_smart_gateway_security(
                     desired_security,
                     disconnect_lan=desired_security != current_security,
                 )
@@ -8188,7 +9137,7 @@ def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
                         bridge["listen_host"] = desired_host
                     save_state(state)
                     network = network_settings_payload(state, lan_addresses=lan_addresses)
-            except BaseException as save_error:
+            except BaseException as update_error:
                 persisted_allow_lan: bool | None = None
                 persisted_security = normalize_lan_security({})
                 state_read_error: BaseException | None = None
@@ -8211,24 +9160,26 @@ def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
                 )
                 try:
                     rebind_running_log_proxies(reconciled_host)
+                    rebind_running_smart_gateway(reconciled_host)
                     update_running_log_proxy_security(persisted_security, disconnect_lan=True)
+                    update_running_smart_gateway_security(persisted_security, disconnect_lan=True)
                 except BaseException as reconcile_error:
                     raise RuntimeError(
-                        f"设置保存失败，且代理监听与磁盘状态协调失败：{reconcile_error}"
-                    ) from save_error
+                        f"设置更新失败，且代理监听与磁盘状态协调失败：{reconcile_error}"
+                    ) from update_error
                 if state_read_error is not None:
                     raise RuntimeError(
-                        f"设置保存失败，状态文件不可读，代理已收紧为仅本机：{state_read_error}"
-                    ) from save_error
+                        f"设置更新失败，状态文件不可读，代理已收紧为仅本机：{state_read_error}"
+                    ) from update_error
                 raise
 
     return {
         "ok": True,
         "network": network,
-        "rebound_count": len(rebound_ids),
-        "connections_interrupted": bool(rebound_ids),
-        "security_updated_count": security_result["updated_count"],
-        "disconnected_count": security_result["disconnected_count"],
+        "rebound_count": len(rebound_ids) + len(rebound_gateway_ids),
+        "connections_interrupted": bool(rebound_ids or rebound_gateway_ids),
+        "security_updated_count": security_result["updated_count"] + gateway_security_result["updated_count"],
+        "disconnected_count": security_result["disconnected_count"] + gateway_security_result["disconnected_count"],
     }
 
 
@@ -8687,6 +9638,13 @@ class AppHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 error_response(self, exc, 400)
             return
+        if parsed.path == "/api/subscriptions/refresh-tasks":
+            try:
+                params = urllib.parse.parse_qs(parsed.query)
+                json_response(self, subscription_refresh_task_payload(first(params, "id", default="") or None))
+            except Exception as exc:
+                error_response(self, exc, 400)
+            return
         if parsed.path == "/api/logs":
             try:
                 json_response(self, query_logs(urllib.parse.parse_qs(parsed.query)))
@@ -8767,6 +9725,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     f"变更 {safe_int(changes.get('changed'), 0)}",
                     category="订阅",
                 )
+            elif self.path == "/api/subscriptions/refresh-batch/start":
+                json_response(self, start_subscription_refresh_task(payload), 202)
+            elif self.path == "/api/subscriptions/refresh-batch/cancel":
+                json_response(self, cancel_subscription_refresh_task(str(payload.get("id") or "")))
             elif self.path == "/api/subscriptions/schedule":
                 json_response(self, {"ok": True, "subscription": update_subscription_schedule(payload)})
             elif self.path == "/api/subscriptions/delete":
@@ -8850,6 +9812,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, set_pool_member_exclusion(payload))
             elif self.path == "/api/network/clients/kick":
                 json_response(self, kick_proxy_client(str(payload.get("id") or "")))
+            elif self.path == "/api/smart-gateway/start":
+                json_response(self, start_smart_gateway(payload))
+                log_event("智能网关已启动", category="代理")
+            elif self.path == "/api/smart-gateway/stop":
+                json_response(self, stop_smart_gateway())
+                log_event("智能网关已停止", category="代理")
+            elif self.path == "/api/smart-gateway/settings":
+                json_response(self, update_smart_gateway_settings(payload))
             elif self.path == "/api/settings/network":
                 result = update_network_settings(payload)
                 state_label = "开启" if result.get("network", {}).get("allow_lan") else "关闭"
@@ -8921,6 +9891,46 @@ def shutdown() -> None:
     with SHUTDOWN_LOCK:
         SHUTTING_DOWN.set()
         SUBSCRIPTION_SCHEDULER_WAKE.set()
+        cancelled_refresh_history_ids: list[str] = []
+        with SUBSCRIPTION_REFRESH_TASK_LOCK:
+            cancelled_at = now_ts()
+            for task_id, cancel_event in SUBSCRIPTION_REFRESH_CANCEL_EVENTS.items():
+                cancel_event.set()
+                task = SUBSCRIPTION_REFRESH_TASKS.get(task_id)
+                if task is None or task.get("status") not in {"queued", "running", "cancelling"}:
+                    continue
+                subscription_ids = [str(item or "") for item in task.get("subscription_ids") or []]
+                cancelled_refresh_history_ids.extend(
+                    _cancel_pending_subscription_refresh_items(
+                        task_id,
+                        subscription_ids,
+                        include_active=True,
+                        error="程序退出，订阅刷新已取消",
+                    )
+                )
+                task.update(
+                    {
+                        "status": "cancelled",
+                        "completed": sum(1 for item in task.get("items") or [] if item is not None),
+                        "updated_at": cancelled_at,
+                        "finished_at": cancelled_at,
+                    }
+                )
+        _record_subscription_refresh_cancellations(
+            cancelled_refresh_history_ids,
+            "程序退出，订阅刷新已取消",
+        )
+        with SMART_GATEWAY_LOCK:
+            gateway = SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID)
+        if gateway is not None:
+            try:
+                gateway.stop()
+            except BaseException as error:
+                log_event(f"智能网关停止失败：{error}", level="warn", category="代理")
+            finally:
+                with SMART_GATEWAY_LOCK:
+                    if SMART_GATEWAY_TABLE.get(SMART_GATEWAY_ID) is gateway:
+                        SMART_GATEWAY_TABLE.pop(SMART_GATEWAY_ID, None)
         with SPEED_TEST_TASK_LOCK:
             for cancel_event in SPEED_TEST_CANCEL_EVENTS.values():
                 cancel_event.set()
@@ -9124,6 +10134,7 @@ def main(argv: list[str] | None = None) -> None:
     if not args.no_core_auto_install:
         start_core_auto_install()
     restore_enabled_bridges()
+    restore_enabled_smart_gateway()
     try:
         get_sync_engine().maybe_check_on_startup()
     except Exception as exc:

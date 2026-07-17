@@ -22,6 +22,9 @@ class SpeedAndSubscriptionFeatureTests(unittest.TestCase):
         with app.SPEED_TEST_TASK_LOCK:
             app.SPEED_TEST_TASKS.clear()
             app.SPEED_TEST_CANCEL_EVENTS.clear()
+        with app.SUBSCRIPTION_REFRESH_TASK_LOCK:
+            app.SUBSCRIPTION_REFRESH_TASKS.clear()
+            app.SUBSCRIPTION_REFRESH_CANCEL_EVENTS.clear()
 
     def tearDown(self) -> None:
         with app.SPEED_TEST_TASK_LOCK:
@@ -29,6 +32,11 @@ class SpeedAndSubscriptionFeatureTests(unittest.TestCase):
                 event.set()
             app.SPEED_TEST_TASKS.clear()
             app.SPEED_TEST_CANCEL_EVENTS.clear()
+        with app.SUBSCRIPTION_REFRESH_TASK_LOCK:
+            for event in app.SUBSCRIPTION_REFRESH_CANCEL_EVENTS.values():
+                event.set()
+            app.SUBSCRIPTION_REFRESH_TASKS.clear()
+            app.SUBSCRIPTION_REFRESH_CANCEL_EVENTS.clear()
         app.configure_work_root(self.old_work_root)
         app.RUNTIME_ROOT = self.old_runtime_root
         app.STATE_PATH = self.old_state_path
@@ -43,6 +51,20 @@ class SpeedAndSubscriptionFeatureTests(unittest.TestCase):
                 return task
             time.sleep(0.01)
         self.fail(f"task {task_id} did not reach {statuses}")
+
+    def wait_for_subscription_task(
+        self,
+        task_id: str,
+        statuses: set[str],
+        timeout: float = 2.0,
+    ) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            task = app.subscription_refresh_task_payload(task_id)
+            if task["status"] in statuses:
+                return task
+            time.sleep(0.01)
+        self.fail(f"subscription task {task_id} did not reach {statuses}")
 
     def save_nodes(self, count: int) -> list[str]:
         state = app.empty_state()
@@ -124,6 +146,7 @@ class SpeedAndSubscriptionFeatureTests(unittest.TestCase):
         self.assertEqual(saved["subscriptions"][0]["id"], subscription_id)
         self.assertEqual(saved["subscriptions"][0]["refresh_interval_minutes"], 30)
         self.assertEqual([node["name"] for node in saved["nodes"]], ["A"])
+        self.assertEqual(saved["subscriptions"][0]["refresh_history"][-1]["status"], "not_modified")
 
     def test_failed_refresh_preserves_nodes_and_applies_exponential_backoff(self) -> None:
         original = app.import_subscription(
@@ -142,6 +165,10 @@ class SpeedAndSubscriptionFeatureTests(unittest.TestCase):
         self.assertEqual(subscription["refresh_failures"], 2)
         self.assertGreaterEqual(subscription["next_refresh_at"] - subscription["last_attempt"], 10 * 60)
         self.assertEqual([node["name"] for node in saved["nodes"]], ["A"])
+        self.assertEqual(
+            [entry["status"] for entry in subscription["refresh_history"]],
+            ["failed", "failed"],
+        )
 
     def test_refresh_reports_changed_nodes_without_changing_subscription_id(self) -> None:
         original = app.import_subscription(
@@ -215,6 +242,187 @@ class SpeedAndSubscriptionFeatureTests(unittest.TestCase):
             node_ids = self.save_nodes(3)
             with self.assertRaisesRegex(ValueError, "最多测试 2 个节点"):
                 app.start_speed_test_task({"node_ids": node_ids})
+
+    def test_subscription_refresh_history_keeps_latest_entries(self) -> None:
+        imported = app.import_subscription(
+            {"name": "history", "url": "https://example.test/history", "raw": "vless://a@example.com:443#A"}
+        )
+        subscription_id = imported["subscription"]["id"]
+
+        for index in range(app.SUBSCRIPTION_REFRESH_HISTORY_LIMIT + 5):
+            app._append_subscription_refresh_history(
+                subscription_id,
+                status="updated",
+                duration_ms=index,
+                changes={"added": index},
+            )
+
+        history = app.load_state()["subscriptions"][0]["refresh_history"]
+        self.assertEqual(len(history), app.SUBSCRIPTION_REFRESH_HISTORY_LIMIT)
+        self.assertEqual(history[0]["duration_ms"], 5)
+        self.assertEqual(history[-1]["duration_ms"], app.SUBSCRIPTION_REFRESH_HISTORY_LIMIT + 4)
+
+    def test_batch_subscription_refresh_reports_each_result(self) -> None:
+        first = app.import_subscription(
+            {"name": "first", "url": "https://example.test/first", "raw": "vless://a@example.com:443#A"}
+        )
+        second = app.import_subscription(
+            {"name": "second", "url": "https://example.test/second", "raw": "vless://b@example.com:443#B"}
+        )
+        subscription_ids = [first["subscription"]["id"], second["subscription"]["id"]]
+
+        with mock.patch.object(
+            app,
+            "refresh_subscription",
+            side_effect=[
+                {"not_modified": True, "changes": {"added": 0, "removed": 0, "changed": 0}},
+                TimeoutError("offline"),
+            ],
+        ):
+            task = app.start_subscription_refresh_task({"subscription_ids": subscription_ids})
+            finished = self.wait_for_subscription_task(task["id"], {"completed"})
+
+        self.assertEqual(finished["completed"], 2)
+        self.assertEqual([item["status"] for item in finished["items"]], ["not_modified", "failed"])
+        self.assertIn("offline", finished["items"][1]["error"])
+
+    def test_batch_subscription_refresh_cancel_marks_remaining_items(self) -> None:
+        subscription_ids = []
+        for index in range(3):
+            imported = app.import_subscription(
+                {
+                    "name": f"sub-{index}",
+                    "url": f"https://example.test/{index}",
+                    "raw": f"vless://node-{index}@example.com:443#Node-{index}",
+                }
+            )
+            subscription_ids.append(imported["subscription"]["id"])
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_refresh(_subscription_id: str) -> dict:
+            entered.set()
+            release.wait(timeout=1)
+            return {"changes": {"added": 0, "removed": 0, "changed": 0}}
+
+        with mock.patch.object(app, "refresh_subscription", side_effect=fake_refresh):
+            task = app.start_subscription_refresh_task({"subscription_ids": subscription_ids})
+            self.assertTrue(entered.wait(timeout=1))
+            cancelling = app.cancel_subscription_refresh_task(task["id"])
+            self.assertEqual(cancelling["status"], "cancelling")
+            release.set()
+            finished = self.wait_for_subscription_task(task["id"], {"cancelled"})
+
+        self.assertEqual(finished["completed"], 3)
+        self.assertEqual(finished["items"][0]["status"], "updated")
+        self.assertEqual([item["status"] for item in finished["items"][1:]], ["cancelled", "cancelled"])
+        saved = {item["id"]: item for item in app.load_state()["subscriptions"]}
+        self.assertEqual(
+            [saved[subscription_id]["refresh_history"][-1]["status"] for subscription_id in subscription_ids[1:]],
+            ["cancelled", "cancelled"],
+        )
+
+    def test_batch_subscription_refresh_cancel_keeps_inflight_task_cancelled(self) -> None:
+        imported = app.import_subscription(
+            {
+                "name": "inflight",
+                "url": "https://example.test/inflight",
+                "raw": "vless://node@example.com:443#Inflight",
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_refresh(_subscription_id: str) -> dict:
+            entered.set()
+            release.wait(timeout=1)
+            return {"changes": {"added": 0, "removed": 0, "changed": 0}}
+
+        with mock.patch.object(app, "refresh_subscription", side_effect=fake_refresh):
+            task = app.start_subscription_refresh_task({"subscription_ids": [imported["subscription"]["id"]]})
+            self.assertTrue(entered.wait(timeout=1))
+            app.cancel_subscription_refresh_task(task["id"])
+            release.set()
+            finished = self.wait_for_subscription_task(task["id"], {"cancelled"})
+
+        self.assertEqual(finished["items"][0]["status"], "updated")
+        self.assertEqual(finished["completed"], 1)
+
+    def test_shutdown_marks_pending_subscription_refresh_history(self) -> None:
+        subscription_ids = []
+        for index in range(2):
+            imported = app.import_subscription(
+                {
+                    "name": f"shutdown-{index}",
+                    "url": f"https://example.test/shutdown-{index}",
+                    "raw": f"vless://node-{index}@example.com:443#Shutdown-{index}",
+                }
+            )
+            subscription_ids.append(imported["subscription"]["id"])
+        entered = threading.Event()
+        release = threading.Event()
+
+        def fake_refresh(_subscription_id: str) -> dict:
+            entered.set()
+            release.wait(timeout=1)
+            return {"changes": {"added": 0, "removed": 0, "changed": 0}}
+
+        old_process_table = dict(app.PROCESS_TABLE)
+        old_bridge_node_table = dict(app.BRIDGE_NODE_TABLE)
+        old_browser_table = {key: list(value) for key, value in app.BROWSER_TABLE.items()}
+        old_browser_process_table = dict(app.BROWSER_PROCESS_TABLE)
+        old_log_proxy_table = dict(app.LOG_PROXY_TABLE)
+        old_runtime_log_pump_table = dict(app.RUNTIME_LOG_PUMP_TABLE)
+        old_traffic_table = {key: dict(value) for key, value in app.TRAFFIC_TABLE.items()}
+        old_test_process_table = dict(app.TEST_PROCESS_TABLE)
+        app.PROCESS_TABLE.clear()
+        app.BRIDGE_NODE_TABLE.clear()
+        app.BROWSER_TABLE.clear()
+        app.BROWSER_PROCESS_TABLE.clear()
+        app.LOG_PROXY_TABLE.clear()
+        app.RUNTIME_LOG_PUMP_TABLE.clear()
+        app.TRAFFIC_TABLE.clear()
+        app.TEST_PROCESS_TABLE.clear()
+        with mock.patch.object(app, "refresh_subscription", side_effect=fake_refresh):
+            try:
+                task = app.start_subscription_refresh_task({"subscription_ids": subscription_ids})
+                self.assertTrue(entered.wait(timeout=1))
+                app.shutdown()
+                release.set()
+                deadline = time.monotonic() + 2
+                finished = None
+                while time.monotonic() < deadline:
+                    candidate = app.subscription_refresh_task_payload(task["id"])
+                    if candidate["status"] == "cancelled" and all(item is not None for item in candidate["items"]):
+                        finished = candidate
+                        break
+                    time.sleep(0.01)
+                self.assertIsNotNone(finished)
+                assert finished is not None
+            finally:
+                app.PROCESS_TABLE.clear()
+                app.PROCESS_TABLE.update(old_process_table)
+                app.BRIDGE_NODE_TABLE.clear()
+                app.BRIDGE_NODE_TABLE.update(old_bridge_node_table)
+                app.BROWSER_TABLE.clear()
+                app.BROWSER_TABLE.update(old_browser_table)
+                app.BROWSER_PROCESS_TABLE.clear()
+                app.BROWSER_PROCESS_TABLE.update(old_browser_process_table)
+                app.LOG_PROXY_TABLE.clear()
+                app.LOG_PROXY_TABLE.update(old_log_proxy_table)
+                app.RUNTIME_LOG_PUMP_TABLE.clear()
+                app.RUNTIME_LOG_PUMP_TABLE.update(old_runtime_log_pump_table)
+                app.TRAFFIC_TABLE.clear()
+                app.TRAFFIC_TABLE.update(old_traffic_table)
+                app.TEST_PROCESS_TABLE.clear()
+                app.TEST_PROCESS_TABLE.update(old_test_process_table)
+
+        self.assertEqual([item["status"] for item in finished["items"]], ["cancelled", "cancelled"])
+        saved = {item["id"]: item for item in app.load_state()["subscriptions"]}
+        self.assertEqual(
+            [saved[subscription_id]["refresh_history"][-1]["status"] for subscription_id in subscription_ids],
+            ["cancelled", "cancelled"],
+        )
 
 
 if __name__ == "__main__":
