@@ -38,12 +38,13 @@
 - Web 控制台与代理端口通过宿主机回环地址访问
 - 不安装或启用指纹浏览器；WebDAV 仅同步订阅 / 节点
 
-## Windows / Linux 文档入口
+## 文档入口
 
-完整安装与使用教程（双击 exe、托盘、无壳控制台、开机自启、systemd、排障）：
+安装、部署、排障与开发资料：
 
 - [Windows / Linux 安装与使用教程](docs/windows-linux-install.md)
 - [Docker 运行教程](docs/docker.md)
+- [开发文档：架构、API、测试与扩展](doc/development-guide.md)
 
 快速选择：
 
