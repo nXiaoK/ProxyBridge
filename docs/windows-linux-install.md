@@ -164,6 +164,12 @@ cd C:\path\to\ProxyBridge
 .\scripts\build_windows_exe.ps1
 ```
 
+如果 `python` 命中了 Microsoft Store 的 `WindowsApps\python.exe` 执行别名，请改用真实 Python 路径：
+
+```powershell
+.\scripts\build_windows_exe.ps1 -Python "C:\Users\<用户名>\AppData\Local\Programs\Python\Python312\python.exe"
+```
+
 成功后产物：
 
 ```text

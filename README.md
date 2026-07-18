@@ -306,6 +306,12 @@ python -m desktop.tray_host --port 18787
 .\scripts\build_windows_exe.ps1
 ```
 
+如果 `python` 被 Windows 的 Microsoft Store 执行别名拦截，可显式指定真实解释器路径：
+
+```powershell
+.\scripts\build_windows_exe.ps1 -Python "C:\Users\<用户名>\AppData\Local\Programs\Python\Python312\python.exe"
+```
+
 构建产物：
 
 ```text

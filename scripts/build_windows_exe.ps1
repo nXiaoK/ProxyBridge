@@ -7,38 +7,99 @@ $ErrorActionPreference = "Stop"
 $RootDir = Split-Path -Parent $PSScriptRoot
 Set-Location $RootDir
 
+function Test-PythonCommand {
+  param(
+    [string]$Executable,
+    [string[]]$Arguments = @()
+  )
+  try {
+    $probeArgs = @()
+    if ($Arguments) {
+      $probeArgs += $Arguments
+    }
+    $probeArgs += @(
+      "-c",
+      "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 10) else 1)"
+    )
+    & $Executable @probeArgs 2>$null | Out-Null
+    return ($LASTEXITCODE -eq 0)
+  } catch {
+    return $false
+  }
+}
+
+function New-PythonCommand {
+  param(
+    [string]$Executable,
+    [string[]]$Arguments = @()
+  )
+  $display = $Executable
+  if ($Arguments) {
+    $display = "$Executable $($Arguments -join ' ')"
+  }
+  [pscustomobject]@{
+    Executable = $Executable
+    Arguments = $Arguments
+    Display = $display
+  }
+}
+
 function Resolve-Python {
   param([string]$Preferred)
   if ($Preferred) {
-    if (-not (Test-Path $Preferred)) {
+    if (-not (Test-Path -LiteralPath $Preferred -PathType Leaf)) {
       throw "Python executable not found: $Preferred"
     }
-    return (Resolve-Path $Preferred).Path
+    $preferredPath = (Resolve-Path -LiteralPath $Preferred).Path
+    if (-not (Test-PythonCommand -Executable $preferredPath)) {
+      throw "Python executable is not usable or is older than Python 3.10: $preferredPath"
+    }
+    return New-PythonCommand -Executable $preferredPath
   }
+
   foreach ($name in @("python", "python3", "py")) {
-    $cmd = Get-Command $name -ErrorAction SilentlyContinue
-    if ($cmd) {
-      if ($name -eq "py") {
-        return "py -3"
+    $commands = @(Get-Command $name -All -CommandType Application -ErrorAction SilentlyContinue)
+    foreach ($cmd in $commands) {
+      $candidatePath = $cmd.Path
+      if (-not $candidatePath) {
+        $candidatePath = $cmd.Source
       }
-      return $cmd.Source
+      if (-not $candidatePath -or -not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+        continue
+      }
+      $candidatePath = (Resolve-Path -LiteralPath $candidatePath).Path
+      if ($name -ne "py" -and $candidatePath -match '(?i)[\\/]WindowsApps[\\/]') {
+        continue
+      }
+
+      $candidateArgs = @()
+      if ($name -eq "py") {
+        $candidateArgs = @("-3")
+      }
+      if (Test-PythonCommand -Executable $candidatePath -Arguments $candidateArgs) {
+        return New-PythonCommand -Executable $candidatePath -Arguments $candidateArgs
+      }
     }
   }
-  throw "Python 3 was not found in PATH. Install Python 3.10+ for Windows and retry."
+
+  throw "Python 3.10+ was not found in PATH. If WindowsApps\python.exe is an App Execution Alias, install Python or pass -Python C:\path\to\python.exe."
 }
 
-$pythonCmd = Resolve-Python -Preferred $Python
-Write-Host "Using Python: $pythonCmd"
+$pythonCommand = Resolve-Python -Preferred $Python
+Write-Host "Using Python: $($pythonCommand.Display)"
 
 function Invoke-Python {
-  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Args)
-  if ($pythonCmd -like "py *") {
-    & py -3 @Args
-  } else {
-    & $pythonCmd @Args
+  param([Parameter(ValueFromRemainingArguments = $true)][string[]]$CommandArgs)
+  $invokeArgs = @()
+  if ($pythonCommand.Arguments) {
+    $invokeArgs += $pythonCommand.Arguments
   }
+  if ($CommandArgs) {
+    $invokeArgs += $CommandArgs
+  }
+  & $pythonCommand.Executable @invokeArgs
   if ($LASTEXITCODE -ne 0) {
-    throw "Python command failed: $Args"
+    throw "Python command failed: $($CommandArgs -join ' ')"
   }
 }
 
