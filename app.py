@@ -575,6 +575,13 @@ def normalize_log_settings(value: Any) -> dict[str, int]:
     }
 
 
+def normalize_subscription_settings(value: Any) -> dict[str, bool]:
+    raw = value if isinstance(value, dict) else {}
+    return {
+        "allow_non_public_urls": raw.get("allow_non_public_urls") is True,
+    }
+
+
 def cache_log_settings(value: Any) -> dict[str, int]:
     normalized = normalize_log_settings(value)
     with LOG_ROTATION_LOCK:
@@ -1608,6 +1615,7 @@ def empty_state() -> dict[str, Any]:
         "settings": {
             "allow_lan": False,
             "lan_security": normalize_lan_security({}),
+            "subscriptions": normalize_subscription_settings({}),
             "speed_test": normalize_speed_test_settings({}),
             "logs": normalize_log_settings({}),
             "smart_gateway": normalize_smart_gateway_settings({}),
@@ -1643,6 +1651,9 @@ def _normalize_loaded_state(state: Any, *, reset_running: bool = False) -> dict[
     # 局域网共享是设备本地安全设置：只接受持久化的 JSON 布尔值，旧状态默认关闭。
     state["settings"]["allow_lan"] = state["settings"].get("allow_lan") is True
     state["settings"]["lan_security"] = normalize_lan_security(state["settings"].get("lan_security"))
+    state["settings"]["subscriptions"] = normalize_subscription_settings(
+        state["settings"].get("subscriptions")
+    )
     state["settings"]["speed_test"] = normalize_speed_test_settings(state["settings"].get("speed_test"))
     state["settings"]["logs"] = cache_log_settings(state["settings"].get("logs"))
     state["settings"]["smart_gateway"] = normalize_smart_gateway_settings(
@@ -3215,6 +3226,9 @@ def _status_payload() -> dict[str, Any]:
                 "settings": speed_test_settings_payload(state),
                 **speed_test_task_payload(),
             },
+            "subscription_settings": normalize_subscription_settings(
+                (state.get("settings") or {}).get("subscriptions")
+            ),
             "subscription_refresh": subscription_refresh_task_payload(),
             "logs": {
                 "settings": log_settings_payload(state),
@@ -4183,7 +4197,11 @@ def parse_pool_path(path: str) -> tuple[str | None, str | None, str | None]:
     return token, action, None
 
 
-def _public_subscription_addresses(url: str) -> tuple[urllib.parse.SplitResult, list[str]]:
+def _public_subscription_addresses(
+    url: str,
+    *,
+    allow_non_public: bool = False,
+) -> tuple[urllib.parse.SplitResult, list[str]]:
     try:
         parsed = urllib.parse.urlsplit(url)
         port = parsed.port
@@ -4206,8 +4224,13 @@ def _public_subscription_addresses(url: str) -> tuple[urllib.parse.SplitResult, 
             address = ipaddress.ip_address(value)
         except ValueError as exc:
             raise ValueError(f"订阅 URL 解析地址无效: {value}") from exc
-        if not address.is_global:
-            raise ValueError(f"订阅 URL 不允许访问非公网地址: {value}")
+        if address.is_unspecified or address.is_multicast:
+            raise ValueError(f"订阅 URL 解析到不可用地址: {value}")
+        if not allow_non_public and not address.is_global:
+            raise ValueError(
+                f"订阅 URL 不允许访问非公网地址: {value}；"
+                "如需访问 TUN fake-IP 或局域网地址，请在订阅页开启“允许非公网订阅地址”"
+            )
     return parsed, addresses
 
 
@@ -4321,6 +4344,7 @@ def fetch_subscription_response(
     *,
     etag: str = "",
     last_modified: str = "",
+    allow_non_public: bool = False,
 ) -> dict[str, Any]:
     current_url = url
     deadline = time.monotonic() + SUBSCRIPTION_FETCH_TIMEOUT
@@ -4332,7 +4356,10 @@ def fetch_subscription_response(
     for redirect_count in range(SUBSCRIPTION_REDIRECT_LIMIT + 1):
         if time.monotonic() >= deadline:
             raise TimeoutError("订阅下载超时")
-        parsed, addresses = _public_subscription_addresses(current_url)
+        parsed, addresses = _public_subscription_addresses(
+            current_url,
+            allow_non_public=allow_non_public,
+        )
         connection, response, deadline_timer = _open_subscription_response(
             parsed,
             addresses,
@@ -4688,7 +4715,15 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
     raw = str(payload.get("raw") or "").strip()
     fetch_metadata = payload.get("_fetch_metadata") if isinstance(payload.get("_fetch_metadata"), dict) else {}
     if url and not raw:
-        fetched = fetch_subscription_response(url)
+        with STATE_LOCK:
+            state = load_state()
+            subscription_settings = normalize_subscription_settings(
+                (state.get("settings") or {}).get("subscriptions")
+            )
+        fetched = fetch_subscription_response(
+            url,
+            allow_non_public=subscription_settings["allow_non_public_urls"],
+        )
         raw = str(fetched.get("text") or "")
         fetch_metadata = fetched
     if not raw:
@@ -4780,6 +4815,9 @@ def refresh_subscription(subscription_id: str) -> dict[str, Any]:
         with STATE_LOCK:
             state = load_state()
             subscription = next((dict(s) for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+            subscription_settings = normalize_subscription_settings(
+                (state.get("settings") or {}).get("subscriptions")
+            )
         if not subscription:
             raise ValueError("订阅不存在")
         url = str(subscription.get("url") or "")
@@ -4794,6 +4832,7 @@ def refresh_subscription(subscription_id: str) -> dict[str, Any]:
                 url,
                 etag=str(subscription.get("etag") or ""),
                 last_modified=str(subscription.get("last_modified") or ""),
+                allow_non_public=subscription_settings["allow_non_public_urls"],
             )
             if fetched.get("not_modified"):
                 with SHUTDOWN_LOCK:
@@ -5116,6 +5155,17 @@ def update_subscription_schedule(payload: dict[str, Any]) -> dict[str, Any]:
         result = dict(subscription)
     SUBSCRIPTION_SCHEDULER_WAKE.set()
     return result
+
+
+def update_subscription_settings(payload: dict[str, Any]) -> dict[str, bool]:
+    if not isinstance(payload.get("allow_non_public_urls"), bool):
+        raise ValueError("allow_non_public_urls 必须是布尔值")
+    settings = normalize_subscription_settings(payload)
+    with STATE_LOCK:
+        state = load_state()
+        state.setdefault("settings", {})["subscriptions"] = settings
+        save_state(state)
+    return settings
 
 
 def due_subscription_ids(current_time: int | None = None) -> list[str]:
@@ -9731,6 +9781,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, cancel_subscription_refresh_task(str(payload.get("id") or "")))
             elif self.path == "/api/subscriptions/schedule":
                 json_response(self, {"ok": True, "subscription": update_subscription_schedule(payload)})
+            elif self.path == "/api/settings/subscriptions":
+                settings = update_subscription_settings(payload)
+                state_label = "开启" if settings["allow_non_public_urls"] else "关闭"
+                log_event(f"非公网订阅地址访问已{state_label}", category="设置")
+                json_response(self, {"ok": True, "settings": settings})
             elif self.path == "/api/subscriptions/delete":
                 json_response(self, delete_subscription(str(payload.get("id") or "")))
                 log_event("删除订阅", category="订阅")

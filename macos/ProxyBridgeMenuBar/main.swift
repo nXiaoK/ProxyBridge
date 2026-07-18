@@ -469,7 +469,7 @@ struct GenericOK: Decodable {
     let ok: Bool?
 }
 
-final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
+final class ConsoleWindowController: NSWindowController, WKNavigationDelegate, WKUIDelegate {
     private let webView: WKWebView
     private let backendURL: URL
 
@@ -496,6 +496,7 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
         window.center()
         super.init(window: window)
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.autoresizingMask = [.width, .height]
         webView.frame = window.contentView?.bounds ?? .zero
         window.contentView = webView
@@ -528,6 +529,27 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
         webView.stopLoading()
         webView.load(URLRequest(url: URL(string: "about:blank")!))
         close()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "确认操作"
+        alert.informativeText = message
+        alert.addButton(withTitle: "确认")
+        alert.addButton(withTitle: "取消")
+        if let window {
+            alert.beginSheetModal(for: window) { response in
+                completionHandler(response == .alertFirstButtonReturn)
+            }
+        } else {
+            completionHandler(alert.runModal() == .alertFirstButtonReturn)
+        }
     }
 }
 

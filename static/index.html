@@ -193,10 +193,13 @@
                   <input name="url" type="url" autocomplete="off" placeholder="https://example.com/sub">
                 </label>
               </div>
-              <label class="raw-field">
-                <span>原始内容</span>
-                <textarea name="raw" rows="5" spellcheck="false" placeholder="vless://..."></textarea>
-              </label>
+              <details class="raw-import-details">
+                <summary>改用原始订阅内容</summary>
+                <label class="raw-field">
+                  <span>原始内容</span>
+                  <textarea name="raw" rows="4" spellcheck="false" placeholder="vless://..."></textarea>
+                </label>
+              </details>
               <div class="import-card-actions">
                 <button class="primary-button" type="submit">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M20 16.5A4.5 4.5 0 0 1 15.5 21h-7A4.5 4.5 0 0 1 4 16.5"/></svg>
@@ -204,6 +207,20 @@
                 </button>
               </div>
             </form>
+
+            <div class="subscription-security" role="group" aria-labelledby="subscriptionSecurityTitle">
+              <div class="subscription-security-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><path d="M12 3 5 6v5c0 4.8 2.8 8 7 10 4.2-2 7-5.2 7-10V6l-7-3z"/><path d="M9 12h6M12 9v6"/></svg>
+              </div>
+              <div class="settings-toggle-copy">
+                <strong id="subscriptionSecurityTitle">允许非公网订阅地址</strong>
+                <span id="subscriptionSecurityDescription">用于 TUN fake-IP（198.18.0.0/15）或局域网订阅。开启后仅添加可信 URL。</span>
+              </div>
+              <label class="settings-switch">
+                <input id="allowNonPublicSubscriptions" type="checkbox" aria-label="允许非公网订阅地址" aria-describedby="subscriptionSecurityDescription">
+                <span class="settings-switch-track" aria-hidden="true"></span>
+              </label>
+            </div>
 
             <div class="section-divider"><span>已导入</span></div>
             <div class="subscription-task" id="subscriptionRefreshTask" hidden></div>

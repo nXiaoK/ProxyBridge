@@ -396,6 +396,31 @@ class SecurityTests(unittest.TestCase):
                 elif path.startswith("/api/"):
                     self.assertIn("error", json.loads(response_body))
 
+    def test_subscription_settings_api_dispatches_boolean_payload(self):
+        body = json.dumps({"allow_non_public_urls": True}).encode("utf-8")
+        handler = make_handler(
+            "POST",
+            "/api/settings/subscriptions",
+            {
+                "Host": "127.0.0.1:8787",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+            body,
+        )
+        settings = {"allow_non_public_urls": True}
+
+        with (
+            mock.patch.object(app, "update_subscription_settings", return_value=settings) as update,
+            mock.patch.object(app, "log_event"),
+        ):
+            handler.do_POST()
+
+        status, _headers, response_body = response_parts(handler)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(response_body)["settings"], settings)
+        update.assert_called_once_with({"allow_non_public_urls": True})
+
     def test_runtime_config_endpoint_never_returns_proxy_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(app, "RUNTIME_ROOT", Path(temp_dir)):
             (Path(temp_dir) / "bridge-secret.json").write_text(

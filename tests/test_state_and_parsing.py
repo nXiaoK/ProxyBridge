@@ -247,6 +247,7 @@ class StateAndParsingTests(unittest.TestCase):
             ("http://[::1]/sub", "::1"),
             ("https://example.test/sub", "10.0.0.8"),
             ("https://example.test/sub", "169.254.169.254"),
+            ("https://example.test/sub", "198.18.36.12"),
         )
         for url, address in cases:
             with self.subTest(url=url, address=address), mock.patch.object(
@@ -256,6 +257,105 @@ class StateAndParsingTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "非公网地址"):
                     app._public_subscription_addresses(url)
+
+    def test_subscription_url_allows_non_public_address_when_explicitly_enabled(self):
+        with mock.patch.object(
+            app.socket,
+            "getaddrinfo",
+            return_value=[(app.socket.AF_INET, app.socket.SOCK_STREAM, 6, "", ("198.18.36.12", 443))],
+        ):
+            parsed, addresses = app._public_subscription_addresses(
+                "https://example.test/sub",
+                allow_non_public=True,
+            )
+
+        self.assertEqual(parsed.hostname, "example.test")
+        self.assertEqual(addresses, ["198.18.36.12"])
+
+    def test_subscription_settings_default_fail_closed_and_persist(self):
+        self.assertEqual(
+            app.empty_state()["settings"]["subscriptions"],
+            {"allow_non_public_urls": False},
+        )
+        normalized = app._normalize_loaded_state(
+            {"settings": {"subscriptions": {"allow_non_public_urls": "true"}}}
+        )
+        self.assertIs(normalized["settings"]["subscriptions"]["allow_non_public_urls"], False)
+
+        saved = app.update_subscription_settings({"allow_non_public_urls": True})
+
+        self.assertEqual(saved, {"allow_non_public_urls": True})
+        self.assertIs(
+            app.load_state()["settings"]["subscriptions"]["allow_non_public_urls"],
+            True,
+        )
+        with self.assertRaisesRegex(ValueError, "必须是布尔值"):
+            app.update_subscription_settings({"allow_non_public_urls": 1})
+
+    def test_url_import_uses_persisted_non_public_setting(self):
+        state = app.empty_state()
+        state["settings"]["subscriptions"]["allow_non_public_urls"] = True
+        app.save_state(state)
+        with mock.patch.object(
+            app,
+            "fetch_subscription_response",
+            return_value={
+                "text": "vless://node@example.com:443#Node",
+                "etag": "",
+                "last_modified": "",
+            },
+        ) as fetch:
+            result = app.import_subscription(
+                {"name": "TUN", "url": "https://subscription.example/sub"}
+            )
+
+        fetch.assert_called_once_with(
+            "https://subscription.example/sub",
+            allow_non_public=True,
+        )
+        self.assertEqual(result["subscription"]["node_count"], 1)
+
+    def test_fetch_subscription_applies_non_public_setting_to_redirects(self):
+        class RedirectResponse(io.BytesIO):
+            def __init__(self, status: int, location: str = "") -> None:
+                super().__init__(b"vless://node@example.com:443#Node")
+                self.status = status
+                self.headers = Message()
+                if location:
+                    self.headers["Location"] = location
+
+        responses = [
+            RedirectResponse(302, "https://redirect.test/sub"),
+            RedirectResponse(200),
+        ]
+        with (
+            mock.patch.object(
+                app,
+                "_public_subscription_addresses",
+                side_effect=[
+                    (urllib.parse.urlsplit("https://source.test/sub"), ["198.18.1.1"]),
+                    (urllib.parse.urlsplit("https://redirect.test/sub"), ["198.18.1.2"]),
+                ],
+            ) as resolver,
+            mock.patch.object(
+                app,
+                "_open_subscription_response",
+                side_effect=[
+                    (mock.Mock(), responses[0], mock.Mock()),
+                    (mock.Mock(), responses[1], mock.Mock()),
+                ],
+            ),
+        ):
+            result = app.fetch_subscription_response(
+                "https://source.test/sub",
+                allow_non_public=True,
+            )
+
+        self.assertIn("vless://", result["text"])
+        self.assertEqual(
+            [call.kwargs for call in resolver.call_args_list],
+            [{"allow_non_public": True}, {"allow_non_public": True}],
+        )
 
     def test_fetch_subscription_revalidates_redirect_target(self):
         class RedirectResponse(io.BytesIO):

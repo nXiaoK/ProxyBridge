@@ -711,17 +711,22 @@ select {
    Subscriptions view
    ============================================================ */
 .subscriptions-body {
-  max-width: 760px;
+  width: 100%;
+  max-width: 980px;
+  gap: 14px;
 }
 .import-card {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 16px;
+  padding: 18px;
   background: var(--bg-panel);
   border: 0.5px solid var(--border-subtle);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-panel);
+}
+.subscriptions-body .form-grid {
+  grid-template-columns: minmax(180px, 0.7fr) minmax(300px, 1.3fr);
 }
 .import-card-title {
   display: flex;
@@ -797,6 +802,56 @@ select {
   display: flex;
   justify-content: flex-end;
 }
+.raw-import-details {
+  border-top: 0.5px solid var(--separator);
+  padding-top: 10px;
+}
+.raw-import-details summary,
+.subscription-history summary {
+  width: fit-content;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 550;
+  user-select: none;
+}
+.raw-import-details[open] summary {
+  margin-bottom: 10px;
+}
+.raw-import-details textarea {
+  min-height: 92px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.subscription-security {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 0.5px solid color-mix(in oklab, var(--warning) 28%, var(--border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in oklab, var(--warning) 6%, var(--bg-panel));
+}
+.subscription-security-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  color: var(--warning);
+  background: color-mix(in oklab, var(--warning) 12%, transparent);
+  border-radius: var(--radius-sm);
+}
+.subscription-security-icon svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 
 .section-divider {
   display: flex;
@@ -819,7 +874,7 @@ select {
 .subscription-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 .subscription-empty {
   font-size: 12px;
@@ -830,48 +885,70 @@ select {
   border-radius: var(--radius-md);
 }
 .subscription-item {
-  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  padding: 16px 18px 14px;
   border-radius: var(--radius-md);
   background: var(--bg-panel);
   border: 0.5px solid var(--border-subtle);
   box-shadow: var(--shadow-panel);
-  display: flex;
-  align-items: center;
-  gap: 12px;
 }
 .subscription-head {
   display: flex;
-  align-items: center;
-  gap: 11px;
-  flex: 1 1 auto;
+  align-items: flex-start;
+  gap: 12px;
   min-width: 0;
 }
 .sub-avatar {
-  width: 32px; height: 32px;
+  width: 38px; height: 38px;
   border-radius: 8px;
   display: flex; align-items: center; justify-content: center;
   background: linear-gradient(135deg, #64d2ff, #0a84ff);
   color: #fff;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   flex-shrink: 0;
 }
-.subscription-head > div {
+.subscription-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.subscription-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   min-width: 0;
 }
 .subscription-name {
-  display: block;
-  font-size: 13px;
-  font-weight: 550;
+  min-width: 0;
+  font-size: 14px;
+  font-weight: 600;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .subscription-meta {
+  margin-top: 2px;
   font-size: 11px;
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
+}
+.subscription-url,
+.subscription-error {
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+}
+.subscription-url {
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+}
+.subscription-error {
+  color: var(--danger);
 }
 .sub-status {
   font-size: 10px;
@@ -880,21 +957,44 @@ select {
   background: color-mix(in oklab, var(--success) 16%, transparent);
   color: var(--success);
   font-weight: 550;
-  flex-shrink: 0;
+  flex: 0 0 auto;
+}
+.sub-status.is-error {
+  color: var(--danger);
+  background: color-mix(in oklab, var(--danger) 12%, transparent);
 }
 .item-actions {
   display: flex;
+  align-items: end;
+  justify-content: flex-end;
+  flex-wrap: wrap;
   gap: 6px;
-  flex-shrink: 0;
+  padding-top: 11px;
+  border-top: 0.5px solid var(--separator);
+}
+.item-actions .field-inline {
+  margin-right: auto;
+}
+.subscription-schedule {
+  width: 136px;
 }
 .subscription-history {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px 10px;
-  width: 100%;
-  margin: 4px 0 0 43px;
+  padding-top: 1px;
   color: var(--text-tertiary);
   font-size: 10px;
+}
+.subscription-history > div {
+  display: grid;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+}
+.subscription-history span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .history-failed { color: var(--danger); }
 .history-updated { color: var(--success); }
@@ -905,11 +1005,14 @@ select {
   gap: 10px;
   padding: 8px 10px;
   margin-bottom: 8px;
-  border: 0.5px solid var(--border-subtle);
+  border: 0;
   border-radius: var(--radius-md);
   color: var(--text-secondary);
   font-size: 11px;
-  background: var(--bg-panel);
+  background: var(--bg-elevated);
+}
+.subscription-task[hidden] {
+  display: none;
 }
 .subscription-task-head,
 .subscription-task-item {
@@ -923,16 +1026,17 @@ select {
 }
 .subscription-task-items {
   display: grid;
-  gap: 1px;
+  gap: 2px;
   max-height: 220px;
   overflow: auto;
-  border: 0.5px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--separator);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
 }
 .subscription-task-item {
   min-width: 0;
   padding: 6px 8px;
+  border-radius: var(--radius-sm);
   background: var(--bg-panel);
 }
 .subscription-task-item strong,
@@ -2363,22 +2467,29 @@ tbody .row-actions .row-button {
   .nav-count { display: none; }
   .sidebar-footer { flex-direction: column; }
   .view-toolbar { flex-wrap: wrap; }
+  .subscriptions-body .form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 520px) {
-  .subscription-item {
-    align-items: stretch;
-    flex-wrap: wrap;
-  }
-  .subscription-head,
+  .subscription-item { padding: 14px; }
   .item-actions {
+    align-items: stretch;
+  }
+  .item-actions .field-inline {
+    width: 100%;
+    margin-right: 0;
+  }
+  .subscription-schedule {
     width: 100%;
   }
-  .item-actions {
-    flex-wrap: wrap;
+  .subscription-security {
+    grid-template-columns: 30px minmax(0, 1fr);
+    align-items: start;
   }
-  .subscription-history {
-    margin-left: 0;
+  .subscription-security .settings-switch {
+    grid-column: 2;
   }
   .subscription-task-item {
     align-items: flex-start;

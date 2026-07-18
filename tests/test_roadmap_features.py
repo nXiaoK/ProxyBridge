@@ -123,6 +123,7 @@ class SpeedAndSubscriptionFeatureTests(unittest.TestCase):
         state = app.load_state()
         state["subscriptions"][0]["etag"] = '"etag-v1"'
         state["subscriptions"][0]["last_modified"] = "Wed, 01 Jan 2025 00:00:00 GMT"
+        state["settings"]["subscriptions"]["allow_non_public_urls"] = True
         app.save_state(state)
 
         with mock.patch.object(
@@ -141,6 +142,7 @@ class SpeedAndSubscriptionFeatureTests(unittest.TestCase):
             "https://example.test/sub",
             etag='"etag-v1"',
             last_modified="Wed, 01 Jan 2025 00:00:00 GMT",
+            allow_non_public=True,
         )
         self.assertTrue(result["not_modified"])
         self.assertEqual(saved["subscriptions"][0]["id"], subscription_id)

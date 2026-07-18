@@ -11,6 +11,7 @@ const appState = {
   bridges: [],
   tests: {},
   speedTest: { settings: null, tasks: [] },
+  subscriptionSettings: { allow_non_public_urls: false },
   subscriptionRefresh: { tasks: [] },
   smartGateway: null,
   requestLogs: [],
@@ -1260,7 +1261,11 @@ function renderActiveView({ force = false } = {}) {
     case "subscriptions":
       renderWhenChanged(
         "subscriptions",
-        { subscriptions: appState.subscriptions, refresh: appState.subscriptionRefresh },
+        {
+          subscriptions: appState.subscriptions,
+          settings: appState.subscriptionSettings,
+          refresh: appState.subscriptionRefresh,
+        },
         renderSubscriptions,
         force
       );
@@ -1359,6 +1364,7 @@ async function loadStatus({ forceFresh = false } = {}) {
       appState.bridges = status.bridges || [];
       appState.tests = status.tests || {};
       appState.speedTest = status.speed_test || { settings: null, tasks: [] };
+      appState.subscriptionSettings = status.subscription_settings || { allow_non_public_urls: false };
       appState.subscriptionRefresh = status.subscription_refresh || { tasks: [] };
       appState.smartGateway = status.smart_gateway || null;
       appState.logCenter = status.logs || appState.logCenter;
@@ -1471,6 +1477,10 @@ function renderSubscriptions() {
   const list = $("#subscriptionList");
   const count = $("#subsCount");
   if (count) count.textContent = `${appState.subscriptions.length} 个订阅`;
+  const allowNonPublic = $("#allowNonPublicSubscriptions");
+  if (allowNonPublic) {
+    allowNonPublic.checked = Boolean(appState.subscriptionSettings?.allow_non_public_urls);
+  }
   renderSubscriptionRefreshTask();
   if (!appState.subscriptions.length) {
     list.innerHTML = '<div class="subscription-empty">暂无订阅，粘贴订阅 URL 或原始链接后即可导入。</div>';
@@ -1482,11 +1492,15 @@ function renderSubscriptions() {
         <article class="subscription-item">
           <div class="subscription-head">
             <span class="sub-avatar">${escapeHtml(initials(item.name))}</span>
-            <div>
-              <strong class="subscription-name">${escapeHtml(item.name)}</strong>
-              <div class="subscription-meta">${item.node_count || 0} 个节点 · ${formatTime(item.last_update)}${item.last_error ? ` · 上次失败：${escapeHtml(item.last_error)}` : ""}</div>
+            <div class="subscription-copy">
+              <div class="subscription-title-row">
+                <strong class="subscription-name">${escapeHtml(item.name)}</strong>
+                <span class="sub-status ${item.last_error ? "is-error" : ""}">${item.last_error ? "需检查" : "正常"}</span>
+              </div>
+              <div class="subscription-meta">${item.node_count || 0} 个节点 · 更新于 ${formatTime(item.last_update)}</div>
+              ${item.url ? `<div class="subscription-url" title="${escapeHtml(item.url)}">${escapeHtml(item.url)}</div>` : '<div class="subscription-url">手动导入</div>'}
+              ${item.last_error ? `<div class="subscription-error" title="${escapeHtml(item.last_error)}">${escapeHtml(item.last_error)}</div>` : ""}
             </div>
-            <span class="sub-status">${item.last_error ? "需检查" : "已启用"}</span>
           </div>
           <div class="item-actions">
             <label class="field-inline">
@@ -1520,13 +1534,13 @@ function renderSubscriptionHistory(item) {
   const history = Array.isArray(item.refresh_history) ? item.refresh_history.slice(-3).reverse() : [];
   if (!history.length) return "";
   const labels = { updated: "已更新", not_modified: "无变化", failed: "失败", cancelled: "已取消" };
-  return `<div class="subscription-history">${history.map((entry) => {
+  return `<details class="subscription-history"><summary>最近刷新记录 · ${history.length}</summary><div>${history.map((entry) => {
     const changes = entry.changes || {};
     const detail = entry.status === "updated"
       ? `+${Number(changes.added || 0)} / -${Number(changes.removed || 0)} / ~${Number(changes.changed || 0)}`
       : entry.error ? escapeHtml(entry.error) : `${Number(entry.duration_ms || 0)} ms`;
     return `<span class="history-${escapeHtml(entry.status)}">${escapeHtml(labels[entry.status] || entry.status)} · ${formatTime(entry.at)} · ${detail}</span>`;
-  }).join("")}</div>`;
+  }).join("")}</div></details>`;
 }
 
 function activeSubscriptionRefreshTask() {
@@ -2879,12 +2893,33 @@ async function handleImport(event) {
       raw: formData.get("raw"),
     });
     form.reset();
+    form.querySelector(".raw-import-details")?.removeAttribute("open");
     await loadStatus({ forceFresh: true });
     showToast(`导入 ${result.subscription.node_count} 个节点`);
   } catch (error) {
     showToast(error.message, "error");
   } finally {
     submit.disabled = false;
+  }
+}
+
+async function saveSubscriptionSettings(control) {
+  const previous = Boolean(appState.subscriptionSettings?.allow_non_public_urls);
+  control.disabled = true;
+  try {
+    const result = await api("/api/settings/subscriptions", {
+      allow_non_public_urls: Boolean(control.checked),
+    });
+    appState.subscriptionSettings = result.settings || {
+      allow_non_public_urls: Boolean(control.checked),
+    };
+    renderActiveView({ force: true });
+    showToast(control.checked ? "已允许非公网订阅地址" : "已恢复仅允许公网订阅地址");
+  } catch (error) {
+    control.checked = previous;
+    showToast(error.message, "error");
+  } finally {
+    control.disabled = false;
   }
 }
 
@@ -3010,6 +3045,10 @@ function bindEvents() {
     }
   });
   document.addEventListener("change", async (event) => {
+    if (event.target.matches("#allowNonPublicSubscriptions")) {
+      await saveSubscriptionSettings(event.target);
+      return;
+    }
     const coreControl = event.target.closest("[data-core-select], [data-core-fallback]");
     if (coreControl) {
       const nodeId = coreControl.dataset.coreSelect || coreControl.dataset.coreFallback;

@@ -239,6 +239,9 @@ work/
   "settings": {
     "allow_lan": false,
     "lan_security": {},
+    "subscriptions": {
+      "allow_non_public_urls": false
+    },
     "speed_test": {},
     "logs": {}
   }
@@ -332,7 +335,7 @@ Bridge 是一个节点到本地代理端口的运行记录，通常包含：
 `refresh_subscription()` 的关键流程：
 
 1. 在 `SUBSCRIPTION_LOCK` 下确认目标订阅。
-2. 校验 URL、DNS 解析和重定向安全，阻止访问本机、私网和非预期协议。
+2. 校验 URL、DNS 解析和重定向安全；默认阻止本机与私网地址，用户显式开启 `allow_non_public_urls` 后才允许 TUN fake-IP 或可信局域网地址。
 3. 携带 `If-None-Match` / `If-Modified-Since`。
 4. `304 Not Modified` 时只更新时间，不重建节点。
 5. 下载响应受大小、超时和重定向次数限制。
@@ -690,7 +693,7 @@ http://127.0.0.1:8787/#token=...
 | Bridge | `/api/bridges/start`、`stop`、`stop-all` |
 | 测速 | `/api/nodes/test`、`/api/nodes/test-batch/start`、`cancel` |
 | 核心偏好 | `/api/nodes/core` |
-| 设置 | `/api/settings/speed-test`、`logs`、`network` |
+| 设置 | `/api/settings/subscriptions`、`speed-test`、`logs`、`network` |
 | 诊断 | `/api/diagnostics/run` |
 | 浏览器 | `/api/browser/launch`、`stop`、`update`、`download-kernel` |
 | 日志 | `/api/logs/clear`、`/api/system/logs/clear` |
@@ -1102,6 +1105,7 @@ ss -ltnp | grep 21080
 检查：
 
 - URL 是否被 SSRF 校验拒绝。
+- macOS TUN 是否把域名映射到 `198.18.0.0/15`；仅在 URL 可信时开启订阅页的“允许非公网订阅地址”。
 - 响应是否超过 8 MiB。
 - YAML 是否需要 PyYAML。
 - 是否返回零节点而触发 fail-closed。
