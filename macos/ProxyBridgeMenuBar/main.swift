@@ -469,12 +469,15 @@ struct GenericOK: Decodable {
     let ok: Bool?
 }
 
-final class ConsoleWindowController: NSWindowController, WKNavigationDelegate, WKUIDelegate {
+final class ConsoleWindowController: NSWindowController, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
     private let webView: WKWebView
     private let backendURL: URL
+    private let onWindowPresenceChanged: (Bool) -> Void
+    private(set) var hasOpenWindow = false
 
-    init(backendURL: URL) {
+    init(backendURL: URL, onWindowPresenceChanged: @escaping (Bool) -> Void) {
         self.backendURL = backendURL
+        self.onWindowPresenceChanged = onWindowPresenceChanged
         let configuration = WKWebViewConfiguration()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         // Tag the WebView so the web UI can detect the native shell and hide
@@ -495,6 +498,8 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate, W
         window.minSize = NSSize(width: 1040, height: 640)
         window.center()
         super.init(window: window)
+        window.delegate = self
+        window.isReleasedWhenClosed = false
         webView.navigationDelegate = self
         webView.uiDelegate = self
         webView.autoresizingMask = [.width, .height]
@@ -507,7 +512,11 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate, W
     }
 
     func showAndReloadIfNeeded() {
+        reportWindowPresence(true)
         showWindow(nil)
+        if window?.isMiniaturized == true {
+            window?.deminiaturize(nil)
+        }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if webView.url == nil {
@@ -515,6 +524,15 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate, W
         } else {
             webView.reload()
         }
+    }
+
+    func restoreAndFocus() {
+        guard hasOpenWindow else { return }
+        if window?.isMiniaturized == true {
+            window?.deminiaturize(nil)
+        }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func reload() {
@@ -529,6 +547,18 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate, W
         webView.stopLoading()
         webView.load(URLRequest(url: URL(string: "about:blank")!))
         close()
+        reportWindowPresence(false)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        // 最小化不会触发此回调，因此窗口仍存在时 Dock 图标会继续保留。
+        reportWindowPresence(false)
+    }
+
+    private func reportWindowPresence(_ isOpen: Bool) {
+        guard hasOpenWindow != isOpen else { return }
+        hasOpenWindow = isOpen
+        onWindowPresenceChanged(isOpen)
     }
 
     func webView(
@@ -619,6 +649,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.refreshNow()
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard backendIsReady, consoleWindowController?.hasOpenWindow == true else { return false }
+        consoleWindowController?.restoreAndFocus()
+        return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     // 安装标准主菜单。菜单栏 App(.accessory)默认没有主菜单,导致控制台窗口里
@@ -742,7 +782,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         if consoleWindowController == nil, let api {
-            consoleWindowController = ConsoleWindowController(backendURL: api.consoleURL)
+            consoleWindowController = ConsoleWindowController(
+                backendURL: api.consoleURL,
+                onWindowPresenceChanged: { [weak self] isOpen in
+                    self?.consoleWindowPresenceChanged(isOpen)
+                }
+            )
         }
         consoleWindowController?.showAndReloadIfNeeded()
     }
@@ -750,6 +795,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func invalidateConsole() {
         consoleWindowController?.invalidateAndClose()
         consoleWindowController = nil
+    }
+
+    private func consoleWindowPresenceChanged(_ isOpen: Bool) {
+        guard !terminationRequested() else { return }
+        if isOpen {
+            reconcileActivationPolicy()
+            return
+        }
+        // 等 AppKit 完成窗口关闭通知后再隐藏 Dock；执行时读取最新窗口状态，
+        // 避免快速关闭并重新打开时被上一轮关闭回调切回 accessory。
+        DispatchQueue.main.async { [weak self] in
+            self?.reconcileActivationPolicy()
+        }
+    }
+
+    private func reconcileActivationPolicy() {
+        guard !terminationRequested() else { return }
+        // Info.plist 保持 LSUIElement=true，让无窗口时维持纯菜单栏形态；
+        // 控制台窗口存在期间临时切到 regular，使应用图标出现在 Dock。
+        let visible = consoleWindowController?.hasOpenWindow == true
+        let activationPolicy: NSApplication.ActivationPolicy = visible ? .regular : .accessory
+        guard NSApp.activationPolicy() != activationPolicy else { return }
+        if !NSApp.setActivationPolicy(activationPolicy) {
+            NSLog("ProxyBridge: 无法切换应用激活策略以更新 Dock 图标")
+        }
     }
 
     private func resourceBridgeScript() -> URL? {
