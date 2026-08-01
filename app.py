@@ -3770,6 +3770,22 @@ def mark_sync_local_change() -> None:
         pass
 
 
+def maybe_auto_upload_browser_instances(instance_ids: list[str]) -> None:
+    """Queue stopped browser Profiles for WebDAV without blocking lifecycle APIs."""
+    unique_ids = [instance_id for instance_id in dict.fromkeys(instance_ids) if instance_id]
+    if not unique_ids:
+        return
+    try:
+        engine = get_sync_engine()
+    except Exception:
+        return
+    for instance_id in unique_ids:
+        try:
+            engine.maybe_auto_upload_instance(instance_id)
+        except Exception:
+            pass
+
+
 def pool_tokens_equal(provided: str, expected: str) -> bool:
     if not provided or not expected:
         return False
@@ -6435,12 +6451,7 @@ def _stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
             killed = stop_browser_processes_for_node(node_id, state)
         save_state(state)
     # v1.1: optional auto-upload after browser stop.
-    for iid in stopped_instance_ids:
-        if iid:
-            try:
-                get_sync_engine().maybe_auto_upload_instance(iid)
-            except Exception:
-                pass
+    maybe_auto_upload_browser_instances(stopped_instance_ids)
     return {
         "ok": True,
         "node_id": node_id,
@@ -8983,12 +8994,27 @@ def _stop_bridge(bridge_id: str) -> dict[str, Any]:
             if bridge.get("id") == bridge_id:
                 bridge_node_id = str(bridge.get("node_id") or "")
                 break
+        browser_instance_ids = [
+            str(instance.get("id") or "")
+            for instance in state.get("browser_instances", [])
+            if str(instance.get("node_id") or "") == bridge_node_id
+            and instance.get("id")
+            and (
+                instance.get("status") in ACTIVE_BROWSER_STATUSES
+                or instance.get("pid")
+                or browser_process_is_active(str(instance.get("id") or ""))
+            )
+        ]
 
     killed_browsers = (
         stop_browser_processes_for_node(bridge_node_id)
         if bridge_node_id and browser_feature_enabled()
         else 0
     )
+    # stop_browser_processes_for_node() has persisted the stopped state. Queue the
+    # same WebDAV upload used by the dedicated browser-stop path before a later
+    # records-modal pull can replace local state with an older remote snapshot.
+    maybe_auto_upload_browser_instances(browser_instance_ids)
     traffic = stop_process(bridge_id, pop_traffic=False)
     persisted_traffic = persist_stopped_bridges({bridge_id: traffic}, disable=True)
     release_persisted_bridge_traffic(persisted_traffic)
@@ -9015,6 +9041,16 @@ def _stop_all_bridges() -> dict[str, Any]:
             for instance in state.get("browser_instances", [])
             if str(instance.get("node_id") or "")
         }
+        browser_instance_ids = [
+            str(instance.get("id") or "")
+            for instance in state.get("browser_instances", [])
+            if instance.get("id")
+            and (
+                instance.get("status") in ACTIVE_BROWSER_STATUSES
+                or instance.get("pid")
+                or browser_process_is_active(str(instance.get("id") or ""))
+            )
+        ]
         gateway_enabled = normalize_smart_gateway_settings(
             (state.get("settings") or {}).get("smart_gateway")
         )["enabled"]
@@ -9029,6 +9065,7 @@ def _stop_all_bridges() -> dict[str, Any]:
         if browser_feature_enabled()
         else 0
     )
+    maybe_auto_upload_browser_instances(browser_instance_ids)
     with PROCESS_LOCK:
         bridge_ids = active_bridge_ids | set(PROCESS_TABLE) | set(LOG_PROXY_TABLE)
     with TRAFFIC_LOCK:
@@ -9339,11 +9376,7 @@ def sync_browser_instance_status(state: dict[str, Any]) -> bool:
             newly_stopped.append(instance_id)
     if newly_stopped:
         # Defer upload outside STATE_LOCK: status_payload holds locks; schedule after return.
-        for iid in newly_stopped:
-            try:
-                get_sync_engine().maybe_auto_upload_instance(iid)
-            except Exception:
-                pass
+        maybe_auto_upload_browser_instances(newly_stopped)
     return changed
 
 
@@ -9895,8 +9928,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, result)
             elif self.path == "/api/sync/pull":
                 force = truthy(payload.get("force"))
-                result = get_sync_engine().pull(force=force)
-                log_event(result.get("settings", {}).get("last_status") or "同步下载完成", category="同步")
+                preserve_local_changes = truthy(payload.get("preserve_local_changes"))
+                result = get_sync_engine().pull(
+                    force=force,
+                    preserve_local_changes=preserve_local_changes,
+                )
+                log_event(
+                    result.get("status")
+                    or result.get("settings", {}).get("last_status")
+                    or "同步下载完成",
+                    category="同步",
+                )
                 json_response(self, result)
             elif self.path == "/api/sync/check":
                 json_response(self, get_sync_engine().check_remote())

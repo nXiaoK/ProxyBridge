@@ -190,6 +190,47 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertEqual(state["browser_instances"][0]["status"], "stopped")
         self.assertTrue((self.profiles / "nodehash" / "inst1" / "Default" / "Cookies").exists())
 
+    def test_convenience_pull_preserves_unuploaded_local_browser_record(self):
+        self.engine.push()
+        local_record = {
+            "id": "local-new-browser",
+            "node_id": "n1",
+            "name": "浏览器 2",
+            "status": "stopped",
+            "legacy": False,
+        }
+        with self.lock:
+            state = self._load()
+            state["browser_instances"].append(dict(local_record))
+            self._save(state)
+        self.engine.mark_local_change()
+
+        result = self.engine.pull(preserve_local_changes=True)
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "local_changes_pending")
+        saved_ids = {item["id"] for item in self._load()["browser_instances"]}
+        self.assertEqual(saved_ids, {"inst1", "local-new-browser"})
+
+        manual = self.engine.pull()
+        self.assertTrue(manual["ok"])
+        self.assertNotIn(
+            "local-new-browser",
+            {item["id"] for item in self._load()["browser_instances"]},
+        )
+
+        with self.lock:
+            state = self._load()
+            state["browser_instances"].append(dict(local_record))
+            self._save(state)
+        self.engine.mark_local_change()
+        forced = self.engine.pull(force=True, preserve_local_changes=True)
+        self.assertTrue(forced["ok"])
+        self.assertNotIn(
+            "local-new-browser",
+            {item["id"] for item in self._load()["browser_instances"]},
+        )
+
     def test_push_rejects_disabled_sync_without_touching_remote(self):
         state = self._load()
         state["settings"]["webdav"]["enabled"] = False

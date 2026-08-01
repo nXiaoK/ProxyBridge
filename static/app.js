@@ -2532,10 +2532,14 @@ async function openBrowserRecordsWithSync(nodeId, trigger = null) {
   if (sync.enabled && sync.url) {
     try {
       showToast("正在从远端同步浏览器数据…");
-      const result = await withSyncOperation(() => api("/api/sync/pull", {}));
+      const result = await withSyncOperation(() =>
+        api("/api/sync/pull", { preserve_local_changes: true })
+      );
       if (result.settings) appState.sync = result.settings;
       await loadStatus({ forceFresh: true });
-      if (result.skipped && result.reason === "already_latest") {
+      if (result.skipped && result.reason === "local_changes_pending") {
+        showToast("检测到本地未上传变更，已保留本地记录；请等待自动上传，或先上传到远端");
+      } else if (result.skipped && result.reason === "already_latest") {
         showToast("已是最新");
       } else if (result.ok === false) {
         showToast((result.errors || []).join("; ") || "同步有错误，显示本地记录", "error");

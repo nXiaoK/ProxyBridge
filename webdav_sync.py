@@ -1708,7 +1708,12 @@ class SyncEngine:
         }
 
     @_serialized_sync_operation
-    def pull(self, *, force: bool = False) -> dict[str, Any]:
+    def pull(
+        self,
+        *,
+        force: bool = False,
+        preserve_local_changes: bool = False,
+    ) -> dict[str, Any]:
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
@@ -1716,6 +1721,35 @@ class SyncEngine:
             local_last_change = cfg.get("last_local_change_at")
             local_device = cfg.get("device_id")
             local_state_fingerprint = self._local_state_fingerprint(state)
+
+        # The browser-record modal performs a convenience pull before opening. Never
+        # let that implicit pull erase a newly-created local record while its async
+        # stop upload is still queued/failed/disabled. Explicit sync-page pulls keep
+        # the existing remote-authoritative behavior (preserve_local_changes=False),
+        # and force=True always remains an intentional override.
+        if (
+            preserve_local_changes
+            and not force
+            and local_last_change
+            and not str(cfg.get("last_applied_state_sha256") or "")
+        ):
+            status = "检测到本地未上传变更，已跳过浏览器记录自动拉取"
+            self.log(status, level="warn", category="同步")
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "local_changes_pending",
+                "status": status,
+                "downloaded_profiles": [],
+                "skipped_running": [],
+                "skipped_unchanged": [],
+                "purged_local_profiles": [],
+                "errors": [],
+                "conflict_warning": "",
+                "manifest": None,
+                "applied": {"subscriptions": 0, "nodes": 0, "browser_instances": 0},
+                "settings": self.public_settings(cfg),
+            }
 
         client = self.client_factory(cfg)
         urls = self._remote_urls(client, cfg)
