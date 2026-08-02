@@ -2191,6 +2191,8 @@ tbody .row-actions .row-button {
   padding: 14px 16px;
   border-bottom: 0.5px solid var(--separator);
 }
+.modal-head > div { min-width: 0; }
+.modal-head > .icon-button { flex-shrink: 0; }
 .modal-head h2 {
   font-size: 15px;
   font-weight: 650;
@@ -2445,6 +2447,111 @@ tbody .row-actions .row-button {
   font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.core-upload-modal {
+  width: min(560px, 100%);
+  max-height: min(720px, calc(100dvh - 48px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: var(--radius-lg);
+  background: var(--bg-content);
+  border: 0.5px solid var(--border-subtle);
+  box-shadow: var(--shadow-modal);
+}
+.core-upload-form {
+  min-height: 0;
+  padding: 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.core-upload-description {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.core-upload-platform {
+  position: relative;
+  min-height: 38px;
+  padding: 9px 11px 9px 30px;
+  border: 0.5px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.core-upload-platform::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  top: 14px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.core-upload-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.core-upload-field > span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 550;
+}
+.core-upload-field select,
+.core-upload-field input[type="text"] {
+  width: 100%;
+}
+.core-upload-field input[type="file"] {
+  width: 100%;
+  padding: 7px 9px;
+  border: 0.5px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 11px;
+  box-shadow: var(--shadow-inset);
+}
+.core-upload-field input[type="file"]::file-selector-button {
+  margin-right: 9px;
+  padding: 4px 9px;
+  border: 0.5px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.core-upload-field small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.45;
+}
+.core-upload-error {
+  padding: 9px 11px;
+  border: 0.5px solid color-mix(in oklab, var(--danger) 35%, var(--border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in oklab, var(--danger) 9%, var(--bg-panel));
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.core-upload-error[hidden] { display: none; }
+.core-upload-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 2px;
 }
 
 .remote-browser-launch-modal {
@@ -2721,6 +2828,20 @@ tbody .row-actions .row-button {
   }
   .remote-browser-launch-modal {
     max-height: calc(100dvh - 24px);
+  }
+  .core-upload-modal {
+    max-height: calc(100dvh - 24px);
+  }
+  .core-upload-form {
+    padding: 14px;
+  }
+  .core-upload-actions {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+  .core-upload-actions > button {
+    justify-content: center;
+    width: 100%;
   }
   .remote-browser-launch-form {
     padding: 14px;

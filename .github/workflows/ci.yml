@@ -45,10 +45,10 @@ jobs:
         with:
           node-version: "22"
       - name: Check JavaScript syntax
-        # 三个可独立加载的前端辅助模块与主脚本都必须通过 Node 语法检查。
-        run: node --check static/auth.js && node --check static/diagnostics.js && node --check static/browser-ui.js && node --check static/app.js
+        # 四个可独立加载的前端辅助模块（含大文件内核上传）与主脚本都必须通过 Node 语法检查。
+        run: node --check static/auth.js && node --check static/diagnostics.js && node --check static/browser-ui.js && node --check static/core-upload.js && node --check static/app.js
       - name: Test frontend modules
-        # 通配符覆盖认证、诊断和远程浏览器凭据交互测试；新增同前缀测试会自动进入 CI。
+        # 通配符覆盖认证、诊断、远程浏览器凭据和内核上传测试；新增同前缀测试会自动进入 CI。
         run: node --test tests/test_frontend_*.js
       - name: Check shell syntax
         run: bash -n scripts/*.sh

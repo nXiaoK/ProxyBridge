@@ -386,7 +386,9 @@ Bridge 是一个节点到本地代理端口的运行记录，通常包含：
 3. 工作目录自动安装位置。
 4. App 内置资源或系统可执行路径。
 
-核心缺失时，普通模式可通过后台线程从 GitHub Releases 下载并事务性安装。替换失败必须保留上一份可执行文件。
+核心缺失时，普通模式可通过后台线程从 GitHub Releases 下载并事务性安装。控制台也可调用 `POST /api/cores/upload` 本地导入官方包：请求正文是 `application/octet-stream` 原始文件，后端验证官方文件名中的 OS/架构标记，以 1 MiB 分块写入工作目录的 `0700` 私有暂存目录，并在安装前核对长度、可选 SHA-256 和可执行文件的 `version` 输出。单文件上限 2 GiB，解压后上限 4 GiB、成员上限 100,000；替换失败必须保留上一份可执行文件。
+
+上传和在线下载复用 `_install_core_from_archive()`、`_install_fingerprint_package()`、安全解压及原子替换逻辑。上传代理核心前必须没有使用目标核心的活动 Bridge；上传指纹内核前必须没有活动浏览器实例。Docker 远程模式只接受 Linux x86_64 指纹包，并在替换前要求与 `chrome` 同目录存在可执行 `chrome-wrapper`。
 
 ### 9.2 启动顺序
 
@@ -726,6 +728,7 @@ http://127.0.0.1:8787/#token=...
 | Bridge | `/api/bridges/start`、`stop`、`stop-all` |
 | 测速 | `/api/nodes/test`、`/api/nodes/test-batch/start`、`cancel` |
 | 核心偏好 | `/api/nodes/core` |
+| 内核安装 | `/api/cores/upload`（`application/octet-stream`，不是 JSON） |
 | 设置 | `/api/settings/subscriptions`、`speed-test`、`logs`、`network` |
 | 诊断 | `/api/diagnostics/run` |
 | 浏览器 | `/api/browser/launch`、`stop`、`update`、`download-kernel` |
@@ -750,7 +753,7 @@ http://127.0.0.1:8787/#token=...
 1. 业务逻辑先写成可直接测试的函数，不把全部逻辑塞进 `AppHandler`。
 2. 在 `do_GET()` 或 `do_POST()` 中添加明确路由。
 3. 管理接口复用 `require_api_authentication()`。
-4. 输入体受 JSON 大小限制，字段必须显式校验类型和范围。
+4. 普通输入体受 JSON 大小限制，字段必须显式校验类型和范围。大文件上传必须使用独立固定路由、原始二进制流、准确 `Content-Length`、分块落盘和单独大小限制，不能 Base64/JSON 化。
 5. 成功响应使用 `json_response()`，下载使用 `download_response()`。
 6. 错误走 `error_response()`，但敏感信息必须在进入错误通道前脱敏。
 7. 长操作不要持有 `STATE_LOCK`。
@@ -764,6 +767,7 @@ http://127.0.0.1:8787/#token=...
 - `app.js`：全局状态、数据加载、渲染、事件、API 业务流。
 - `auth.js`：管理令牌会话。
 - `diagnostics.js`：纯函数化的 WebRTC 诊断，可在 Node 中测试。
+- `core-upload.js`：内核文件、SHA-256 与请求头校验，使用原始 `File` 正文上传并验证响应实例令牌。
 - `styles.css`：主题、布局、组件、移动端断点和 focus 样式。
 
 ### 18.2 视图
@@ -812,7 +816,7 @@ diagnostics
 - 响应实例 token 校验。
 - HTTP 非成功状态和 `payload.error`。
 
-新增前端请求必须使用 `api()`，除日志文件下载等确实需要原始响应的路径。
+新增前端请求必须使用 `api()`，除日志文件下载和内核原始文件上传等确实需要原始响应/正文的路径。此类例外仍必须复用 `auth.js` 的请求 token 与响应实例 token 校验；内核上传封装在 `core-upload.js`，不能绕过认证直接调用 `fetch()`。
 
 ### 18.5 状态轮询和渲染
 
@@ -993,6 +997,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 node --check static/auth.js
 node --check static/diagnostics.js
 node --check static/browser-ui.js
+node --check static/core-upload.js
 node --check static/app.js
 node --test tests/test_frontend_*.js
 
@@ -1028,9 +1033,11 @@ xcrun swiftc -parse macos/ProxyBridgeMenuBar/main.swift
 | `test_log_center.py` | 分页、导出、CSV 安全、轮转和磁盘配额 |
 | `test_roadmap_features.py` | 订阅 304/退避/diff、批量测速限流/取消 |
 | `test_core_selection_and_fallback.py` | 核心偏好、兼容性和失败回退 |
+| `test_core_upload.py` | 流式上传、请求头/SHA 校验、平台包选择、安全解压和原子内核替换 |
 | `test_frontend_auth.js` | fragment token 和会话认证 |
 | `test_frontend_diagnostics.js` | ICE 解析、WebRTC 风险分类和失败结果 |
 | `test_frontend_browser_ui.js` | 远程浏览器凭据保留/清除、复制回退、URL 与 CSS 选择器安全 |
+| `test_frontend_core_upload.js` | 文件格式、上传请求头/正文、SHA 与响应实例令牌校验 |
 
 ### 21.3 测试策略
 

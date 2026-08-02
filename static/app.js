@@ -50,13 +50,16 @@ const appState = {
 
 const managementAuth = window.ProxyBridgeAuth;
 const browserUi = window.ProxyBridgeBrowserUi;
+const coreUploadClient = window.ProxyBridgeCoreUpload;
 let managementToken = managementAuth.loadManagementToken(window);
 
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
+let lastCoreUploadTrigger = null;
 let lastBrowserRecordTrigger = null;
 let lastRemoteBrowserLaunchTrigger = null;
 let lastCoreLogTriggerKey = null;
+let lastCoreUploadTriggerKey = null;
 let lastBrowserRecordTriggerKey = null;
 let lastRemoteBrowserLaunchTriggerKey = null;
 let lastRemoteBrowserLaunchTriggerAction = null;
@@ -66,6 +69,7 @@ let pendingModalFocusKey = null;
 let coreLogRequestGeneration = 0;
 let coreLogAbortController = null;
 let kernelDownloadPromise = null;
+let coreUploadPromise = null;
 let statusRequestPromise = null;
 let statusAbortController = null;
 let statusPollTimer = null;
@@ -1456,7 +1460,8 @@ function render() {
     {
       cores: appState.cores,
       fingerprint: appState.fingerprint_chromium,
-      busy: Boolean(kernelDownloadPromise),
+      downloadBusy: Boolean(kernelDownloadPromise),
+      uploadBusy: Boolean(coreUploadPromise),
       browserEnabled: browserEnabled(),
     },
     renderCores
@@ -1503,18 +1508,21 @@ function renderCores() {
   const singBox = appState.cores["sing-box"];
   const xray = appState.cores.xray;
   const fpKernel = appState.fingerprint_chromium;
-  const kernelBusyClass = kernelDownloadPromise ? " is-busy" : "";
-  const kernelBusyAttributes = kernelDownloadPromise ? ' disabled aria-busy="true"' : "";
+  const installBusy = Boolean(kernelDownloadPromise || coreUploadPromise);
+  const kernelBusyClass = installBusy ? " is-busy" : "";
+  const kernelBusyAttributes = installBusy ? ' disabled aria-busy="true"' : "";
+  const uploadBusyLabel = coreUploadPromise ? "正在导入" : "本地导入";
   // 指纹内核状态:已安装显示 ready,缺失显示可点击的「下载指纹内核」按钮。
   const fpPill = !browserEnabled()
     ? ""
     : fpKernel
-      ? `<button class="pill core-pill ok${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}"${kernelBusyAttributes}>指纹内核 ready</button>`
-      : `<button class="pill core-pill warn${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium"${kernelBusyAttributes}>下载指纹内核</button>`;
+      ? `<button class="pill core-pill ok${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}"${kernelBusyAttributes}><span>指纹内核 ready</span></button>`
+      : `<button class="pill core-pill warn${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium"${kernelBusyAttributes}><span>下载指纹内核</span></button>`;
   coreStrip.innerHTML = `
-    <button class="pill core-pill ${singBox ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="sing-box" aria-label="查看 sing-box 运行日志" title="查看 sing-box 运行日志">sing-box ${singBox ? "ready" : "missing"}</button>
-    <button class="pill core-pill ${xray ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="xray" aria-label="查看 xray 运行日志" title="查看 xray 运行日志">xray ${xray ? "ready" : "missing"}</button>
+    <button class="pill core-pill ${singBox ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="sing-box" aria-label="查看 sing-box 运行日志" title="查看 sing-box 运行日志"><span>sing-box ${singBox ? "ready" : "missing"}</span></button>
+    <button class="pill core-pill ${xray ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="xray" aria-label="查看 xray 运行日志" title="查看 xray 运行日志"><span>xray ${xray ? "ready" : "missing"}</span></button>
     ${fpPill}
+    <button class="pill core-pill${coreUploadPromise ? " is-busy" : ""}" type="button" data-action="show-core-upload" aria-label="从本地文件导入代理或指纹内核" title="上传官方 Release 安装包，绕过 GitHub 在线下载"${installBusy ? ' disabled aria-busy="true"' : ""}><span>${uploadBusyLabel}</span></button>
   `;
 }
 
@@ -2329,6 +2337,7 @@ function closeModal(modal) {
   modal.hidden = true;
   if (
     $("#coreLogModal").hidden
+    && $("#coreUploadModal").hidden
     && $("#browserRecordModal").hidden
     && $("#remoteBrowserLaunchModal").hidden
   ) {
@@ -2361,6 +2370,162 @@ function closeCoreLogModal() {
   }
   lastCoreLogTrigger = null;
   lastCoreLogTriggerKey = null;
+}
+
+function showCoreUploadError(message = "") {
+  const element = $("#coreUploadError");
+  element.textContent = message;
+  element.hidden = !message;
+}
+
+function coreUploadAccept(kind) {
+  if (kind === "sing-box") return ".tar.gz,.tgz,.zip";
+  if (kind === "xray") return ".zip";
+  return ".zip,.tar.gz,.tgz,.tar.xz,.tar,.dmg";
+}
+
+function coreUploadExample(kind) {
+  const os = appState.platform?.os || "linux";
+  const hostArch = appState.platform?.arch || "x86_64";
+  const arch = kind === "fingerprint-chromium" && remoteBrowserEnabled() ? "x86_64" : hostArch;
+  if (kind === "sing-box") {
+    const osName = os === "darwin" ? "darwin" : os === "windows" ? "windows" : "linux";
+    const archName = arch === "arm64" ? "arm64" : "amd64";
+    const suffix = os === "windows" ? ".zip" : ".tar.gz";
+    return `例如 sing-box-版本-${osName}-${archName}${suffix}`;
+  }
+  if (kind === "xray") {
+    const osName = os === "darwin" ? "macos" : os === "windows" ? "windows" : "linux";
+    const archName = arch === "arm64" ? "arm64-v8a" : "64";
+    return `例如 Xray-${osName}-${archName}.zip`;
+  }
+  const platformName = remoteBrowserEnabled()
+    ? "linux"
+    : appState.platform?.fingerprint_platform || os;
+  const archName = arch === "arm64" ? "arm64" : "x64";
+  return `例如 fingerprint-chromium_${platformName}_${archName}.zip（以实际上游文件名为准）`;
+}
+
+function updateCoreUploadControls({ clearFile = false } = {}) {
+  const kindSelect = $("#coreUploadKind");
+  const fingerprintOption = kindSelect.querySelector('option[value="fingerprint-chromium"]');
+  fingerprintOption.disabled = !browserEnabled();
+  if (fingerprintOption.disabled && kindSelect.value === "fingerprint-chromium") {
+    kindSelect.value = "sing-box";
+  }
+  const kind = kindSelect.value;
+  const fileInput = $("#coreUploadFile");
+  fileInput.accept = coreUploadAccept(kind);
+  if (clearFile) fileInput.value = "";
+  $("#coreUploadPlatformHint").textContent = coreUploadClient.platformHint(
+    kind,
+    appState.platform || {},
+    remoteBrowserEnabled(),
+  );
+  const idleHint = kind === "fingerprint-chromium"
+    ? "替换前请停止所有浏览器实例。"
+    : `替换前请停止正在使用 ${kind} 的本地代理。`;
+  $("#coreUploadFileHint").textContent = `${coreUploadExample(kind)}。${idleHint}`;
+  $("#coreUploadMeta").textContent = "原始文件流式上传 · 单文件最大 2 GiB · 解压后最大 4 GiB";
+}
+
+function setCoreUploadBusy(busy) {
+  const modal = $("#coreUploadModal");
+  modal.querySelectorAll("button, input, select").forEach((control) => {
+    control.disabled = busy;
+  });
+  const submit = $("#coreUploadSubmit");
+  submit.classList.toggle("is-busy", busy);
+  submit.setAttribute("aria-busy", busy ? "true" : "false");
+  submit.querySelector("span").textContent = busy ? "正在上传并安装…" : "上传并安装";
+  if (busy) {
+    const file = $("#coreUploadFile").files?.[0];
+    $("#coreUploadMeta").textContent = file
+      ? `正在处理 ${file.name} · ${formatBytes(file.size)}`
+      : "正在上传并安装";
+  } else {
+    updateCoreUploadControls();
+  }
+}
+
+function showCoreUploadModal(trigger = null) {
+  if (!coreUploadClient) throw new Error("本地导入模块未加载，请刷新页面后重试");
+  const modal = $("#coreUploadModal");
+  $("#coreUploadForm").reset();
+  showCoreUploadError();
+  updateCoreUploadControls();
+  setCoreUploadBusy(false);
+  lastCoreUploadTrigger = trigger;
+  lastCoreUploadTriggerKey = trigger ? actionLockKey(trigger) : null;
+  openModal(modal);
+  window.requestAnimationFrame(() => {
+    if (!modal.hidden) $("#coreUploadKind")?.focus();
+  });
+}
+
+function closeCoreUploadModal({ force = false } = {}) {
+  if (coreUploadPromise && !force) return false;
+  const modal = $("#coreUploadModal");
+  if (!modal || modal.hidden) return false;
+  closeModal(modal);
+  $("#coreUploadForm").reset();
+  showCoreUploadError();
+  const trigger = lastCoreUploadTrigger?.isConnected
+    ? lastCoreUploadTrigger
+    : findActionTrigger(lastCoreUploadTriggerKey, "show-core-upload");
+  trigger?.focus();
+  lastCoreUploadTrigger = null;
+  lastCoreUploadTriggerKey = null;
+  return true;
+}
+
+async function handleCoreUploadSubmit(event) {
+  event.preventDefault();
+  if (coreUploadPromise) return;
+  const kind = $("#coreUploadKind").value;
+  const file = $("#coreUploadFile").files?.[0];
+  const sha256 = $("#coreUploadSha256").value;
+  showCoreUploadError();
+
+  const upload = coreUploadClient.uploadKernel({
+    fetchImpl: window.fetch.bind(window),
+    auth: managementAuth,
+    browser: window,
+    token: managementToken,
+    kind,
+    file,
+    sha256,
+  });
+  coreUploadPromise = upload;
+  setCoreUploadBusy(true);
+  renderCores();
+
+  let result = null;
+  let statusWarning = "";
+  try {
+    result = await upload;
+    try {
+      await loadStatus({ forceFresh: true });
+    } catch (error) {
+      statusWarning = `，但状态刷新失败：${error.message}`;
+    }
+  } catch (error) {
+    if (error?.code === "AUTH_INVALID") managementToken = "";
+    const message = `本地导入失败：${error.message}`;
+    showCoreUploadError(message);
+    showToast(message, "error");
+  } finally {
+    coreUploadPromise = null;
+    setCoreUploadBusy(false);
+    renderCores();
+  }
+
+  if (!result) return;
+  closeCoreUploadModal();
+  const digest = String(result.sha256 || "");
+  const digestLabel = digest ? ` · SHA-256 ${digest.slice(0, 12)}…` : "";
+  const successMessage = `${kind} 本地导入完成${digestLabel}${statusWarning}`;
+  showToast(result.arch_warning || successMessage, result.arch_warning || statusWarning ? "error" : "ok");
 }
 
 function renderCoreLogPayload(payload) {
@@ -3162,6 +3327,8 @@ function actionLockKey(button) {
 function actionUsesSpinner(action) {
   return ![
     "close-core-log",
+    "show-core-upload",
+    "close-core-upload",
     "close-browser-records",
     "close-remote-browser-launch",
     "generate-remote-browser-password",
@@ -3238,6 +3405,8 @@ async function handleAction(event) {
       openRemoteBrowserInstance(button.dataset.instance);
     } else if (action === "download-kernel") {
       await downloadKernel();
+    } else if (action === "show-core-upload") {
+      showCoreUploadModal(button);
     } else if (action === "copy") {
       await copyText(button.dataset.text);
     } else if (action === "rotate-pool-token") {
@@ -3339,6 +3508,8 @@ async function handleAction(event) {
       await showCoreLog(button.dataset.core);
     } else if (action === "close-core-log") {
       closeCoreLogModal();
+    } else if (action === "close-core-upload") {
+      closeCoreUploadModal();
     } else if (action === "close-browser-records") {
       closeBrowserRecordModal();
     } else if (action === "close-remote-browser-launch") {
@@ -3416,11 +3587,13 @@ function trapModalFocus(event) {
   if (event.key !== "Tab") return false;
   const modal = !$("#remoteBrowserLaunchModal").hidden
     ? $("#remoteBrowserLaunchModal")
-    : !$("#browserRecordModal").hidden
-      ? $("#browserRecordModal")
-      : !$("#coreLogModal").hidden
-        ? $("#coreLogModal")
-        : null;
+    : !$("#coreUploadModal").hidden
+      ? $("#coreUploadModal")
+      : !$("#browserRecordModal").hidden
+        ? $("#browserRecordModal")
+        : !$("#coreLogModal").hidden
+          ? $("#coreLogModal")
+          : null;
   if (!modal) return false;
   const dialog = modal.querySelector('[role="dialog"]');
   const focusable = [...dialog.querySelectorAll(
@@ -3469,6 +3642,11 @@ function bindEvents() {
     item.addEventListener("click", () => setActiveView(item.dataset.view));
   });
   $("#importForm").addEventListener("submit", handleImport);
+  $("#coreUploadForm")?.addEventListener("submit", handleCoreUploadSubmit);
+  $("#coreUploadKind")?.addEventListener("change", () => {
+    showCoreUploadError();
+    updateCoreUploadControls({ clearFile: true });
+  });
   $("#remoteBrowserLaunchForm")?.addEventListener("submit", handleRemoteBrowserLaunchSubmit);
   const networkForm = $("#networkSettingsForm");
   if (networkForm) {
@@ -3732,6 +3910,11 @@ function bindEvents() {
       closeCoreLogModal();
     }
   });
+  $("#coreUploadModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeCoreUploadModal();
+    }
+  });
   $("#browserRecordModal").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) {
       closeBrowserRecordModal();
@@ -3746,6 +3929,8 @@ function bindEvents() {
     if (trapModalFocus(event)) return;
     if (event.key === "Escape" && !$("#remoteBrowserLaunchModal").hidden) {
       closeRemoteBrowserLaunchModal();
+    } else if (event.key === "Escape" && !$("#coreUploadModal").hidden) {
+      closeCoreUploadModal();
     } else if (event.key === "Escape" && !$("#coreLogModal").hidden) {
       closeCoreLogModal();
     } else if (event.key === "Escape" && !$("#browserRecordModal").hidden) {

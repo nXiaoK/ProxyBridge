@@ -208,6 +208,20 @@ SMART_GATEWAY_MAX_CLIENTS = 128
 DOWNLOAD_RETRY_COUNT = 3
 DOWNLOAD_RETRY_BACKOFF = 0.25
 DOWNLOAD_RESPONSE_LIMIT = 2 * 1024 * 1024 * 1024
+# 本地内核上传与在线下载共用 2 GiB 上限；上传必须提供准确 Content-Length，
+# 并以 1 MiB 分块写入工作目录（Docker 中为 /data）下的私有暂存目录，避免把大文件读入内存。
+CORE_UPLOAD_LIMIT = DOWNLOAD_RESPONSE_LIMIT
+CORE_UPLOAD_CHUNK_SIZE = 1024 * 1024
+# 每个上传分块最多等待 120 秒；只允许一个上传并行，避免多个 2 GiB 暂存文件耗尽数据卷。
+CORE_UPLOAD_IO_TIMEOUT = 120.0
+CORE_UPLOAD_KINDS = frozenset({"sing-box", "xray", "fingerprint-chromium"})
+CORE_UPLOAD_PATH = "/api/cores/upload"
+CORE_UPLOAD_KIND_HEADER = "X-ProxyBridge-Upload-Kind"
+CORE_UPLOAD_NAME_HEADER = "X-ProxyBridge-Upload-Name"
+CORE_UPLOAD_SHA256_HEADER = "X-ProxyBridge-Upload-Sha256"
+# 压缩包解压后的总文件大小和成员数也必须有界，防止压缩炸弹耗尽数据卷。
+ARCHIVE_EXTRACTED_SIZE_LIMIT = 4 * 1024 * 1024 * 1024
+ARCHIVE_MEMBER_LIMIT = 100_000
 GITHUB_JSON_RESPONSE_LIMIT = 8 * 1024 * 1024
 POOL_TOKEN_MIN_LEN = 16
 POOL_TOKEN_MAX_LEN = 128
@@ -246,6 +260,7 @@ SHUTDOWN_SIGNAL_CLAIM_LOCK = threading.Lock()
 PATH_CACHE_LOCK = threading.RLock()
 LAN_ADDRESS_CACHE_LOCK = threading.RLock()
 CORE_INSTALL_LOCK = threading.RLock()
+CORE_UPLOAD_LOCK = threading.Lock()
 BRIDGE_START_LOCK = threading.RLock()
 BROWSER_LAUNCH_LOCK = threading.RLock()
 REMOTE_BROWSER_LIFECYCLE_CONDITION = threading.Condition(threading.RLock())
@@ -425,6 +440,22 @@ class Node:
 
 
 class CoreStartError(RuntimeError):
+    pass
+
+
+class CoreUploadTooLarge(ValueError):
+    pass
+
+
+class CoreUploadUnsupportedMediaType(ValueError):
+    pass
+
+
+class CoreUploadLengthRequired(ValueError):
+    pass
+
+
+class CoreUploadBusy(RuntimeError):
     pass
 
 
@@ -2815,7 +2846,14 @@ def _download_asset(
 def _safe_extract_zip(archive_path: Path, dest: Path) -> None:
     root = dest.resolve()
     with zipfile.ZipFile(archive_path) as archive:
-        for member in archive.infolist():
+        members = archive.infolist()
+        if len(members) > ARCHIVE_MEMBER_LIMIT:
+            raise RuntimeError("压缩包文件数量过多")
+        extracted_size = 0
+        for member in members:
+            extracted_size += max(0, int(member.file_size))
+            if extracted_size > ARCHIVE_EXTRACTED_SIZE_LIMIT:
+                raise RuntimeError("压缩包解压后体积超过限制")
             target = (dest / member.filename).resolve()
             if target != root and root not in target.parents:
                 raise RuntimeError("压缩包包含非法路径")
@@ -2823,7 +2861,7 @@ def _safe_extract_zip(archive_path: Path, dest: Path) -> None:
         # zipfile 不会可靠恢复 Unix 可执行位；Linux 指纹内核的 chrome 与
         # chrome-wrapper 必须保持可执行，否则下载成功后 worker 仍无法启动。
         executable_names = {"chrome", "chromium", "chrome-wrapper"}
-        for member in archive.infolist():
+        for member in members:
             if member.is_dir():
                 continue
             target = (dest / member.filename).resolve()
@@ -2837,9 +2875,17 @@ def _safe_extract_zip(archive_path: Path, dest: Path) -> None:
 def _safe_extract_tar(archive_path: Path, dest: Path) -> None:
     root = dest.resolve()
     with tarfile.open(archive_path) as archive:
-        for member in archive.getmembers():
+        members = archive.getmembers()
+        if len(members) > ARCHIVE_MEMBER_LIMIT:
+            raise RuntimeError("压缩包文件数量过多")
+        extracted_size = 0
+        for member in members:
             if not (member.isfile() or member.isdir()):
                 raise RuntimeError("压缩包包含非法类型")
+            if member.isfile():
+                extracted_size += max(0, int(member.size))
+                if extracted_size > ARCHIVE_EXTRACTED_SIZE_LIMIT:
+                    raise RuntimeError("压缩包解压后体积超过限制")
             target = (dest / member.name).resolve()
             if target != root and root not in target.parents:
                 raise RuntimeError("压缩包包含非法路径")
@@ -2848,12 +2894,15 @@ def _safe_extract_tar(archive_path: Path, dest: Path) -> None:
 
 def _extract_archive(archive_path: Path, dest: Path) -> None:
     name = archive_path.name.lower()
-    if name.endswith(".zip"):
-        _safe_extract_zip(archive_path, dest)
-    elif name.endswith((".tar.gz", ".tgz", ".tar.xz", ".tar")):
-        _safe_extract_tar(archive_path, dest)
-    else:
-        raise RuntimeError(f"不支持的核心压缩包格式:{archive_path.name}")
+    try:
+        if name.endswith(".zip"):
+            _safe_extract_zip(archive_path, dest)
+        elif name.endswith((".tar.gz", ".tgz", ".tar.xz", ".tar")):
+            _safe_extract_tar(archive_path, dest)
+        else:
+            raise RuntimeError(f"不支持的核心压缩包格式:{archive_path.name}")
+    except (zipfile.BadZipFile, tarfile.TarError, EOFError) as error:
+        raise RuntimeError("压缩包损坏，或文件内容与扩展名不匹配") from error
 
 
 def _find_extracted_file(root: Path, names: set[str]) -> Path | None:
@@ -2976,22 +3025,43 @@ def _xray_wrapper_data() -> bytes:
     ).encode("utf-8")
 
 
-def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
+def _validate_uploaded_core_binary(core: str, binary: Path) -> str:
+    """执行上传包中的 version 子命令，拒绝错误平台或伪装成核心的文件。"""
+    if os.name != "nt":
+        binary.chmod(stat.S_IMODE(binary.stat().st_mode) | 0o755)
+    try:
+        version = _core_version_line(str(binary), core)
+    except (OSError, subprocess.SubprocessError) as error:
+        raise RuntimeError(f"上传的 {core} 无法在当前系统运行，请检查 OS 与 CPU 架构") from error
+    marker = "sing-box" if core == "sing-box" else "xray"
+    if marker not in version.casefold():
+        raise RuntimeError(f"上传包中的可执行文件不是有效的 {core}")
+    return version
+
+
+def _install_core_from_archive(
+    core: str,
+    archive_path: Path,
+    source_name: str,
+    tag: str,
+    *,
+    validate_binary: bool = False,
+) -> str:
+    if core not in {"sing-box", "xray"}:
+        raise ValueError("核心只能是 sing-box 或 xray")
     ensure_dirs()
     with tempfile.TemporaryDirectory(prefix=f"proxybridge-{core}-", dir=str(proxy_core_root())) as temp_dir:
-        temp_root = Path(temp_dir)
-        archive_path = temp_root / _safe_asset_name(asset)
-        extract_root = temp_root / "extract"
+        extract_root = Path(temp_dir) / "extract"
         extract_root.mkdir()
-        _download_asset(asset, archive_path)
         _extract_archive(archive_path, extract_root)
         if core == "sing-box":
             binary = _find_extracted_file(extract_root, set(_core_binary_candidates("sing-box")))
             if not binary:
                 raise RuntimeError("sing-box 压缩包中未找到 sing-box 可执行文件")
+            validated_version = _validate_uploaded_core_binary(core, binary) if validate_binary else ""
             target = proxy_core_bin_dir() / ("sing-box.exe" if os.name == "nt" else "sing-box")
             version_path = proxy_core_root() / "sing-box.version"
-            version_data = f"{tag}\n{_asset_name(asset)}\n".encode("utf-8")
+            version_data = f"{tag or validated_version}\n{source_name}\n".encode("utf-8")
             _install_files_atomically(
                 [(binary, target, 0o755)],
                 [(version_path, version_data, 0o600)],
@@ -3004,10 +3074,11 @@ def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
         )
         if not binary:
             raise RuntimeError("Xray 压缩包中未找到 xray 可执行文件")
+        validated_version = _validate_uploaded_core_binary(core, binary) if validate_binary else ""
+        version_path = proxy_core_root() / "xray.version"
+        version_data = f"{tag or validated_version}\n{source_name}\n".encode("utf-8")
         if os.name == "nt":
             target = proxy_core_bin_dir() / "xray.exe"
-            version_path = proxy_core_root() / "xray.version"
-            version_data = f"{tag}\n{_asset_name(asset)}\n".encode("utf-8")
             _install_files_atomically(
                 [(binary, target, 0o755)],
                 [(version_path, version_data, 0o600)],
@@ -3016,8 +3087,6 @@ def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
 
         core_target = proxy_core_bin_dir() / "xray-core"
         wrapper_target = proxy_core_bin_dir() / "xray"
-        version_path = proxy_core_root() / "xray.version"
-        version_data = f"{tag}\n{_asset_name(asset)}\n".encode("utf-8")
         _install_files_atomically(
             [(binary, core_target, 0o755)],
             [
@@ -3026,6 +3095,14 @@ def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
             ],
         )
         return str(wrapper_target)
+
+
+def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
+    ensure_dirs()
+    with tempfile.TemporaryDirectory(prefix=f"proxybridge-{core}-", dir=str(proxy_core_root())) as temp_dir:
+        archive_path = Path(temp_dir) / _safe_asset_name(asset)
+        _download_asset(asset, archive_path)
+        return _install_core_from_archive(core, archive_path, _asset_name(asset), tag)
 
 
 def ensure_core_installed(core: str) -> str:
@@ -7507,7 +7584,12 @@ def _install_from_dmg(dmg_path: Path, dest_root: Path) -> Path:
     return target_app
 
 
-def _install_fingerprint_from_archive(archive_path: Path, dest_root: Path) -> Path:
+def _install_fingerprint_from_archive(
+    archive_path: Path,
+    dest_root: Path,
+    *,
+    require_wrapper: bool = False,
+) -> Path:
     extract_root = dest_root / "_extract"
     if extract_root.exists():
         shutil.rmtree(extract_root, ignore_errors=True)
@@ -7518,6 +7600,10 @@ def _install_fingerprint_from_archive(archive_path: Path, dest_root: Path) -> Pa
         if not resolved:
             raise RuntimeError("压缩包中未找到 Chromium/chrome 可执行文件")
         resolved_path = Path(resolved)
+        if require_wrapper:
+            wrapper = resolved_path.parent / "chrome-wrapper"
+            if not wrapper.is_file() or (os.name != "nt" and not os.access(wrapper, os.X_OK)):
+                raise RuntimeError("远程浏览器指纹内核包缺少可执行的 chrome-wrapper")
         # Prefer keeping a Chromium.app bundle layout when present.
         app_root = next((parent for parent in resolved_path.parents if parent.name.endswith(".app")), None)
         if app_root is not None:
@@ -7542,6 +7628,54 @@ def _install_fingerprint_from_archive(archive_path: Path, dest_root: Path) -> Pa
         return target_dir / resolved_path.name
     finally:
         shutil.rmtree(extract_root, ignore_errors=True)
+
+
+def _install_fingerprint_package(
+    package_path: Path,
+    source_name: str,
+    version: str,
+) -> dict[str, Any]:
+    host_os = host_os_token()
+    host_arch = host_arch_token()
+    fingerprint_arch = "x86_64" if remote_browser_feature_enabled() else host_arch
+    dest_root = fingerprint_chromium_root()
+    dest_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lowered = source_name.lower()
+    if lowered.endswith(".dmg"):
+        target = _install_from_dmg(package_path, dest_root)
+    else:
+        target = _install_fingerprint_from_archive(
+            package_path,
+            dest_root,
+            require_wrapper=remote_browser_feature_enabled(),
+        )
+
+    # 安装后校验 macOS 二进制架构；Docker 远程包在安装前已按文件名严格限定 x86_64，
+    # arm64 主服务不应尝试直接执行给 amd64 worker 使用的内核。
+    binary_arch = _verify_macos_binary_arch(target) if host_os == "darwin" else None
+    arch_warning = ""
+    if binary_arch and binary_arch != host_arch:
+        if host_arch == "x86_64" and binary_arch == "arm64":
+            arch_warning = "警告:导入的是 arm64 内核,但本机是 Intel(x86_64),无法运行。"
+        elif host_arch == "arm64" and binary_arch == "x86_64":
+            arch_warning = "提示:导入的是 x86_64 内核,将通过 Rosetta 在 Apple Silicon 上运行。"
+
+    invalidate_fingerprint_chromium_cache()
+    resolved = fingerprint_chromium_path(force_refresh=True)
+    if not resolved:
+        raise RuntimeError("指纹内核安装后未找到可执行文件")
+    return {
+        "ok": True,
+        "already_installed": False,
+        "path": resolved,
+        "version": version,
+        "host_os": host_os,
+        "host_arch": host_arch,
+        "fingerprint_arch": fingerprint_arch,
+        "binary_arch": binary_arch,
+        "arch_warning": arch_warning,
+        "asset": source_name,
+    }
 
 
 def download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
@@ -7589,38 +7723,279 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(f"下载指纹内核失败:{error}") from error
 
     try:
-        lowered = asset["name"].lower()
-        if lowered.endswith(".dmg"):
-            target = _install_from_dmg(package_path, dest_root)
-        else:
-            target = _install_fingerprint_from_archive(package_path, dest_root)
+        return _install_fingerprint_package(
+            package_path,
+            str(asset["name"]),
+            str(asset.get("tag") or ""),
+        )
     finally:
         package_path.unlink(missing_ok=True)
 
-    # 安装后校验二进制架构:若与主机不一致,给出明确提示(arm64 内核在 Intel Mac 无法运行;
-    # 反之 Apple Silicon 可通过 Rosetta 兼容 x86_64,但仍提醒用户以免困惑)。
-    binary_arch = _verify_macos_binary_arch(target) if host_os == "darwin" else None
-    arch_warning = ""
-    if binary_arch and binary_arch != host_arch:
-        if host_arch == "x86_64" and binary_arch == "arm64":
-            arch_warning = "警告:下载到的是 arm64 内核,但本机是 Intel(x86_64),无法运行。"
-        elif host_arch == "arm64" and binary_arch == "x86_64":
-            arch_warning = "提示:下载到的是 x86_64 内核,将通过 Rosetta 在 Apple Silicon 上运行。"
 
-    invalidate_fingerprint_chromium_cache()
-    resolved = fingerprint_chromium_path(force_refresh=True)
-    return {
-        "ok": True,
-        "already_installed": False,
-        "path": resolved or str(target),
-        "version": asset.get("tag"),
-        "host_os": host_os,
-        "host_arch": host_arch,
-        "fingerprint_arch": fingerprint_arch,
-        "binary_arch": binary_arch,
-        "arch_warning": arch_warning,
-        "asset": asset["name"],
+def _safe_uploaded_filename(encoded_name: Any) -> str:
+    raw = str(encoded_name or "")
+    if not raw or len(raw) > 720 or any(ord(char) < 32 or ord(char) == 127 for char in raw):
+        raise ValueError("上传文件名无效")
+    try:
+        name = urllib.parse.unquote(raw, encoding="utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise ValueError("上传文件名编码无效") from error
+    if (
+        not name
+        or len(name) > 180
+        or name in {".", ".."}
+        or Path(name).name != name
+        or "/" in name
+        or "\\" in name
+        or any(ord(char) < 32 or ord(char) == 127 for char in name)
+    ):
+        raise ValueError("上传文件名无效")
+    return name
+
+
+def _validate_uploaded_package_name(kind: str, filename: str) -> None:
+    if kind not in CORE_UPLOAD_KINDS:
+        raise ValueError("上传目标只能是 sing-box、xray 或 fingerprint-chromium")
+    host_os = host_os_token()
+    host_arch = host_arch_token()
+    fake_asset = {
+        "name": filename,
+        "browser_download_url": "https://upload.invalid/package",
     }
+    if kind == "sing-box":
+        release = {"assets": [fake_asset]}
+        if _pick_sing_box_asset(release, host_arch, host_os) is None:
+            raise ValueError(
+                f"请选择保留官方文件名、适配 {host_os}/{host_arch} 的 sing-box .tar.gz/.tgz/.zip 包"
+            )
+        return
+    if kind == "xray":
+        release = {"assets": [fake_asset]}
+        if _pick_xray_asset(release, host_arch, host_os) is None:
+            raise ValueError(
+                f"请选择保留官方文件名、适配 {host_os}/{host_arch} 的 Xray .zip 包"
+            )
+        return
+
+    if filename.lower().endswith(".7z"):
+        raise ValueError("当前不支持直接导入 .7z，请下载 fingerprint-chromium 的 zip/tar/dmg 包")
+    fingerprint_arch = "x86_64" if remote_browser_feature_enabled() else host_arch
+    releases = [{"tag_name": "upload", "assets": [fake_asset]}]
+    if _pick_fingerprint_asset(
+        releases,
+        host_os=host_os,
+        host_arch=fingerprint_arch,
+        strict_arch=remote_browser_feature_enabled(),
+    ) is None:
+        raise ValueError(
+            "请选择保留官方文件名、适配 "
+            f"{host_os}/{fingerprint_arch} 的 fingerprint-chromium 安装包"
+        )
+
+
+def _assert_kernel_upload_target_idle(kind: str) -> None:
+    with STATE_LOCK:
+        state = load_state()
+        matching_bridge_ids = {
+            str(item.get("id") or "")
+            for item in state.get("bridges", [])
+            if isinstance(item, dict)
+            and str(item.get("core") or "") == kind
+            and item.get("id")
+        }
+        active_bridges = {
+            str(item.get("id") or "")
+            for item in state.get("bridges", [])
+            if isinstance(item, dict)
+            and item.get("status") in ACTIVE_BRIDGE_STATUSES
+            and str(item.get("core") or "") == kind
+            and item.get("id")
+        }
+        active_browsers = {
+            str(item.get("id") or "")
+            for item in state.get("browser_instances", [])
+            if isinstance(item, dict) and item.get("status") in ACTIVE_BROWSER_STATUSES
+        }
+
+    with PROCESS_LOCK:
+        if kind in {"sing-box", "xray"}:
+            active_bridges.update(
+                bridge_id
+                for bridge_id in matching_bridge_ids
+                if (process := PROCESS_TABLE.get(bridge_id)) is not None and process.poll() is None
+            )
+            active_tests = [
+                test_id
+                for test_id, process in TEST_PROCESS_TABLE.items()
+                if process.poll() is None
+            ]
+            if active_bridges:
+                raise RuntimeError(f"请先停止正在使用 {kind} 的本地代理，再替换核心")
+            if active_tests:
+                raise RuntimeError("请等待所有节点测速结束，再替换代理核心")
+            return
+        active_browsers.update(
+            instance_id
+            for instance_id, process in BROWSER_PROCESS_TABLE.items()
+            if process.poll() is None
+        )
+        active_browsers.update(
+            str(node_id)
+            for node_id, processes in BROWSER_TABLE.items()
+            if any(process.poll() is None for process in processes)
+        )
+    if remote_browser_feature_enabled():
+        sessions, broker_error = remote_browser_sessions(force=True)
+        if sessions is None:
+            raise RuntimeError(
+                "无法确认远程浏览器 Worker 是否已停止，请先恢复 Browser Broker："
+                f"{broker_error or '状态不可用'}"
+            )
+        active_browsers.update(
+            instance_id
+            for instance_id, session in sessions.items()
+            if session.get("status") in REMOTE_BROWSER_LIVE_SESSION_STATUSES
+        )
+    if active_browsers:
+        raise RuntimeError("请先停止所有浏览器实例，再替换 fingerprint-chromium")
+
+
+def install_uploaded_kernel(
+    kind: str,
+    package_path: Path,
+    filename: str,
+    *,
+    size: int,
+    sha256: str,
+) -> dict[str, Any]:
+    _validate_uploaded_package_name(kind, filename)
+    if kind in {"sing-box", "xray"}:
+        # 与 start_bridge() 使用相同的锁顺序，上传安装期间禁止新 Bridge 抢占旧核心。
+        with BRIDGE_START_LOCK:
+            with CORE_INSTALL_LOCK:
+                _assert_kernel_upload_target_idle(kind)
+                installed = _install_core_from_archive(
+                    kind,
+                    package_path,
+                    filename,
+                    "",
+                    validate_binary=True,
+                )
+                version = _core_version_line(installed, kind)
+        return {
+            "ok": True,
+            "kind": kind,
+            "filename": filename,
+            "size": size,
+            "sha256": sha256,
+            "path": installed,
+            "version": version,
+        }
+
+    require_browser_feature()
+    # 阻止上传校验后又启动新实例；锁顺序与浏览器启动路径保持一致。
+    with BROWSER_LAUNCH_LOCK:
+        with FINGERPRINT_INSTALL_LOCK:
+            _assert_kernel_upload_target_idle(kind)
+            result = _install_fingerprint_package(package_path, filename, "本地上传")
+    return {
+        **result,
+        "kind": kind,
+        "filename": filename,
+        "size": size,
+        "sha256": sha256,
+    }
+
+
+def _single_upload_header(headers: Any, name: str, *, required: bool = True) -> str:
+    values = headers.get_all(name, [])
+    if len(values) > 1:
+        raise ValueError(f"{name} 不能重复")
+    if not values:
+        if required:
+            raise ValueError(f"缺少 {name}")
+        return ""
+    value = str(values[0])
+    if not value or any(char in value for char in "\r\n\0"):
+        raise ValueError(f"{name} 无效")
+    return value
+
+
+def _parse_core_upload_headers(headers: Any) -> tuple[str, str, int, str]:
+    transfer_encoding = _single_upload_header(headers, "Transfer-Encoding", required=False)
+    if transfer_encoding:
+        raise ValueError("内核上传不支持 Transfer-Encoding")
+
+    content_encoding = _single_upload_header(headers, "Content-Encoding", required=False)
+    if content_encoding and content_encoding.strip().lower() != "identity":
+        raise CoreUploadUnsupportedMediaType("内核上传不支持压缩的 HTTP 请求正文")
+
+    content_type = _single_upload_header(headers, "Content-Type")
+    if content_type.strip().lower() != "application/octet-stream":
+        raise CoreUploadUnsupportedMediaType("内核上传仅支持 application/octet-stream")
+
+    length_values = headers.get_all("Content-Length", [])
+    if not length_values:
+        raise CoreUploadLengthRequired("内核上传必须提供 Content-Length")
+    if len(length_values) != 1:
+        raise ValueError("Content-Length 不能重复")
+    raw_length = str(length_values[0])
+    if re.fullmatch(r"[0-9]+", raw_length) is None:
+        raise ValueError("Content-Length 无效")
+    length = int(raw_length)
+    if length < 1:
+        raise ValueError("不能上传空文件")
+    if length > CORE_UPLOAD_LIMIT:
+        raise CoreUploadTooLarge(f"上传文件不能超过 {CORE_UPLOAD_LIMIT // (1024 ** 3)} GiB")
+
+    kind = _single_upload_header(headers, CORE_UPLOAD_KIND_HEADER).strip().lower()
+    if kind not in CORE_UPLOAD_KINDS:
+        raise ValueError("上传目标只能是 sing-box、xray 或 fingerprint-chromium")
+    filename = _safe_uploaded_filename(_single_upload_header(headers, CORE_UPLOAD_NAME_HEADER))
+
+    expected_sha256 = _single_upload_header(
+        headers,
+        CORE_UPLOAD_SHA256_HEADER,
+        required=False,
+    ).strip().lower()
+    if expected_sha256 and re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise ValueError("SHA-256 必须是 64 位十六进制字符串")
+    return kind, filename, length, expected_sha256
+
+
+def _uploaded_package_suffix(filename: str) -> str:
+    lowered = filename.lower()
+    for suffix in (".tar.gz", ".tar.xz", ".tgz", ".zip", ".tar", ".dmg"):
+        if lowered.endswith(suffix):
+            return suffix
+    return Path(filename).suffix[:20]
+
+
+def _stream_core_upload(
+    source: Any,
+    destination: Any,
+    length: int,
+    expected_sha256: str = "",
+) -> str:
+    remaining = length
+    digest = hashlib.sha256()
+    while remaining:
+        try:
+            chunk = source.read(min(CORE_UPLOAD_CHUNK_SIZE, remaining))
+        except TimeoutError as error:
+            raise RuntimeError("上传读取超时，请检查网络后重试") from error
+        if not chunk:
+            raise ValueError("上传数据不完整，请重新选择文件后重试")
+        if len(chunk) > remaining:
+            raise ValueError("上传数据长度与 Content-Length 不一致")
+        destination.write(chunk)
+        digest.update(chunk)
+        remaining -= len(chunk)
+    actual_sha256 = digest.hexdigest()
+    if expected_sha256 and not hmac.compare_digest(actual_sha256, expected_sha256):
+        raise ValueError("SHA-256 校验失败，文件可能不完整或选择了错误的校验值")
+    return actual_sha256
+
 
 def runtime_log_backup_path(path: Path, index: int) -> Path:
     return path.with_name(f"{path.name}.{index}")
@@ -9633,17 +10008,20 @@ def test_node(
                         os.fchmod(log_file.fileno(), 0o600)
                     except OSError:
                         pass
-                process = subprocess.Popen(
-                    command,
-                    cwd=str(APP_ROOT),
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    **_popen_kwargs(),
-                )
+                # 与本地核心上传共用安装锁：上传事务完成前不启动测速进程；一旦
+                # 进程登记完成，上传侧会检测 TEST_PROCESS_TABLE 并要求等待测速结束。
+                with CORE_INSTALL_LOCK:
+                    process = subprocess.Popen(
+                        command,
+                        cwd=str(APP_ROOT),
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        **_popen_kwargs(),
+                    )
+                    with PROCESS_LOCK:
+                        TEST_PROCESS_TABLE[test_id] = process
             finally:
                 log_file.close()
-            with PROCESS_LOCK:
-                TEST_PROCESS_TABLE[test_id] = process
             break
 
     try:
@@ -10580,6 +10958,78 @@ class AppHandler(BaseHTTPRequestHandler):
         data = self.rfile.read(length)
         return json.loads(data.decode("utf-8"))
 
+    def handle_core_upload(self) -> None:
+        kind, filename, length, expected_sha256 = _parse_core_upload_headers(self.headers)
+        _validate_uploaded_package_name(kind, filename)
+        if kind == "fingerprint-chromium":
+            require_browser_feature()
+        # 大文件写盘前先给出可恢复的运行状态错误；安装锁内还会再次检查，防止上传期间启动实例。
+        _assert_kernel_upload_target_idle(kind)
+        if not CORE_UPLOAD_LOCK.acquire(blocking=False):
+            raise CoreUploadBusy("已有内核文件正在上传或安装，请等待完成后重试")
+        connection = getattr(self, "connection", None)
+        previous_timeout: float | None = None
+        timeout_changed = False
+        try:
+            if connection is not None:
+                try:
+                    previous_timeout = connection.gettimeout()
+                    connection.settimeout(CORE_UPLOAD_IO_TIMEOUT)
+                    timeout_changed = True
+                except OSError:
+                    pass
+            ensure_dirs()
+            with tempfile.TemporaryDirectory(prefix="proxybridge-upload-", dir=str(RUNTIME_ROOT)) as temp_dir:
+                temp_root = Path(temp_dir)
+                try:
+                    temp_root.chmod(0o700)
+                except OSError:
+                    pass
+                descriptor, staged_name = tempfile.mkstemp(
+                    prefix="package-",
+                    suffix=_uploaded_package_suffix(filename),
+                    dir=temp_dir,
+                )
+                staged_path = Path(staged_name)
+                try:
+                    try:
+                        os.fchmod(descriptor, 0o600)
+                    except (AttributeError, OSError):
+                        pass
+                    with os.fdopen(descriptor, "wb") as destination:
+                        descriptor = -1
+                        actual_sha256 = _stream_core_upload(
+                            self.rfile,
+                            destination,
+                            length,
+                            expected_sha256,
+                        )
+                        destination.flush()
+                        os.fsync(destination.fileno())
+                    result = install_uploaded_kernel(
+                        kind,
+                        staged_path,
+                        filename,
+                        size=length,
+                        sha256=actual_sha256,
+                    )
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+        finally:
+            if timeout_changed:
+                try:
+                    connection.settimeout(previous_timeout)
+                except OSError:
+                    pass
+            CORE_UPLOAD_LOCK.release()
+
+        log_event(
+            f"本地导入 {kind} 完成：{filename} · SHA-256 {actual_sha256[:12]}…",
+            category="核心",
+        )
+        json_response(self, result)
+
     def handle_pool_request(self, parsed: urllib.parse.SplitResult, *, head_only: bool = False) -> None:
         host = self.headers.get("Host") or ""
         if not _is_loopback_host(host):
@@ -10808,6 +11258,21 @@ class AppHandler(BaseHTTPRequestHandler):
             self._send_request_error(403, "不可信请求来源")
             return
         if not self.require_api_authentication():
+            return
+        parsed_path = urllib.parse.urlsplit(self.path).path
+        if parsed_path == CORE_UPLOAD_PATH:
+            try:
+                self.handle_core_upload()
+            except CoreUploadTooLarge as exc:
+                error_response(self, exc, 413)
+            except CoreUploadUnsupportedMediaType as exc:
+                error_response(self, exc, 415)
+            except CoreUploadLengthRequired as exc:
+                error_response(self, exc, 411)
+            except CoreUploadBusy as exc:
+                error_response(self, exc, 409)
+            except Exception as exc:
+                error_response(self, exc, 400)
             return
         if self.headers.get_content_type() != "application/json":
             self._send_request_error(415, "仅支持 application/json")

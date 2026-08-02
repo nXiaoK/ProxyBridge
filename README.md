@@ -11,6 +11,7 @@
 - HTTP 代理模式支持普通 HTTP 请求和 HTTPS CONNECT,兼容不支持 SOCKS5 的软件。
 - 节点可选择 `sing-box` 或 `xray`；双核心兼容节点可记忆偏好，并在首选核心启动失败时按设置尝试备用核心。
 - 菜单栏 App 默认不内置 `sing-box` / `xray`，首次运行时会自动下载到用户数据目录;也可构建时选择内置核心。
+- GitHub 下载缓慢或不可用时，可在别的电脑下载官方 Release，通过控制台「本地导入」上传并安装 `sing-box`、`xray` 或 fingerprint-chromium。
 - 桌面/普通无壳模式可启动本机**独立指纹浏览器**；默认 Docker Compose 则为每条浏览器记录动态创建一个可通过 HTTPS 链接访问的隔离 worker，同样使用独立指纹、独立 Profile 和对应节点代理。
 - 测速结果显示年龄与过期状态，支持延迟/成功率排序、探测目标轮换，以及 3–5 路有界并发的可取消批量测速。
 - 订阅可配置周期自动刷新；请求使用 `ETag` / `Last-Modified`，失败时保留旧节点并指数退避，成功后报告节点增删改 diff。
@@ -32,7 +33,7 @@
 ### 无壳跨平台 Web 控制台
 - Python 3.10+
 - macOS / Linux / Windows
-- 首次运行需要能访问 GitHub，用于自动下载 `sing-box` / `xray`
+- 首次运行需要能访问 GitHub 自动下载 `sing-box` / `xray`，或提前在其他电脑下载官方包后通过控制台本地导入
 - 指纹浏览器一键下载依赖上游是否发布对应平台包；也可手动设置 `PROXY_BRIDGE_FP_CHROMIUM`
 
 ### Docker
@@ -126,7 +127,28 @@ outputs/ProxyBridgeMenuBar.app
 - 时区(`--timezone`)与语言(`--lang` / `--accept-lang`)按节点地区自动匹配,使浏览器时区/语言与代理出口地区一致,降低不一致被风控识别的概率。
 - 使用代理时强制 `--webrtc-ip-handling-policy=disable_non_proxied_udp`，阻止非代理 UDP 候选。
 
-指纹内核约 150–250MB,可点击控制台顶部的 `下载指纹内核` 一键安装(按本机架构从 GitHub Releases 下载并去除 Gatekeeper 隔离属性),或手动下载后用环境变量 `PROXY_BRIDGE_FP_CHROMIUM` 指向 Chromium 可执行文件。由于该内核并非每个版本都发布 macOS 包,如自动下载未命中可稍后重试或手动放置。
+指纹内核约 150–250MB,可点击控制台侧边栏底部的 `下载指纹内核` 一键安装(按本机架构从 GitHub Releases 下载并去除 Gatekeeper 隔离属性)，也可点击旁边的 `本地导入` 上传完整发布包，或手动下载后用环境变量 `PROXY_BRIDGE_FP_CHROMIUM` 指向 Chromium 可执行文件。由于该内核并非每个版本都发布 macOS 包,如自动下载未命中可稍后重试或使用本地导入。
+
+## 本地导入代理与指纹内核
+
+当 NAS、服务器或当前电脑访问 GitHub Releases 很慢时，可先在网络正常的电脑上下载官方文件，再打开 ProxyBridge 控制台侧边栏底部的「本地导入」：
+
+1. 选择 `sing-box`、`Xray` 或 `fingerprint-chromium`。
+2. 选择未经改名的官方 Release 文件；页面会显示当前目标 OS/架构和支持格式。
+3. 可选填写官方提供的 64 位 SHA-256；留空时服务端仍会计算实际 SHA-256 并在成功结果中返回。
+4. 停止正在使用目标代理核心的本地代理；替换指纹内核前需停止所有浏览器实例，然后上传并安装。
+
+常见 Linux amd64 文件名示例：
+
+| 目标 | 文件示例 | 支持格式 |
+|---|---|---|
+| sing-box | `sing-box-1.13.15-linux-amd64-glibc.tar.gz` | `.tar.gz`、`.tgz`、`.zip` |
+| Xray | `Xray-linux-64.zip` | `.zip` |
+| fingerprint-chromium | `fingerprint-chromium_linux_x64.zip`（以实际上游文件名为准） | `.zip`、`.tar.gz`、`.tgz`、`.tar.xz`、`.tar`；macOS 另支持 `.dmg` |
+
+必须保留官方文件名，因为后端会用其中的系统与 CPU 架构标记拒绝错误平台包。Docker 远程浏览器固定使用 Linux x86_64 指纹包，上传的必须是包含可执行 `chrome-wrapper` 及相邻资源的完整目录包，不能只上传单个 `chrome`，也不支持 `.7z`。单个上传文件最大 2 GiB，解压后总大小最大 4 GiB；文件按 1 MiB 分块写入私有暂存目录，不会整体读入服务端内存。
+
+本地导入只验证文件结构、平台、可执行性及可选校验值，不能证明发布来源。只应从 sing-box、Xray 和 fingerprint-chromium 的可信官方 Release 获取文件。
 
 如果 App 是从本项目的 `outputs/` 目录启动，首次运行会尝试迁移旧 Web 版的 `work/state.json`。
 
@@ -188,7 +210,7 @@ Proxy Bridge console: http://127.0.0.1:8787/#token=...
 说明：
 
 - 无壳模式与菜单栏 App 共用同一套 `app.py` 后端与 `static/` 前端。
-- 代理核心会按当前操作系统/架构从 GitHub Releases 自动选择 Linux / Windows / macOS 包。
+- 代理核心会按当前操作系统/架构从 GitHub Releases 自动选择 Linux / Windows / macOS 包；下载受阻时可通过控制台「本地导入」安装同一官方包。
 - 指纹浏览器若上游未提供当前平台安装包，可手动下载后通过 `PROXY_BRIDGE_FP_CHROMIUM` 指向可执行文件。
 - 管理控制台默认仅本机访问；局域网共享开关只影响本地代理端口，不会把控制台暴露到局域网。
 - 除 Docker 健康检查使用的 `HEAD /api/status` 外，管理 API 都需要当前后端实例令牌；直接打开不含 `#token=...` 的裸地址无法执行管理操作。
@@ -225,14 +247,14 @@ Compose 默认：
 - 使用 `proxybridge-data` 命名卷持久化 `/data`。远程浏览器通过 Docker Engine API 1.45+ 的 `volume-subpath` 只挂载对应 Profile 与指纹内核，因此此模式不支持把 `/data` 改为宿主机 bind mount。
 - Web 控制台默认仅发布到宿主机 `127.0.0.1:8787`；可通过 `.env` 中的 `PROXY_BRIDGE_CONSOLE_HOST=<宿主机局域网 IPv4>` 精确开放给局域网。
 - 代理端口范围发布为 `127.0.0.1:21080-21179`，容器内自动分配也限制在相同范围。
-- 首次启动自动下载 Linux 版 `sing-box` / `xray` 到数据卷。
+- 首次启动自动下载 Linux 版 `sing-box` / `xray` 到数据卷；下载受阻时可从控制台上传官方包替代。
 - 每个浏览器 worker 从 `23000-23099` 动态占用一个自签名 HTTPS 端口；默认只绑定 `127.0.0.1`。
 - worker 的 `/config` 使用随容器删除的匿名运行卷，只有 `/config/browser-profile` 指向持久化 Profile；Selkies 的 TLS、认证和其他运行文件不会进入 WebDAV Profile。
 - 每个 worker 只能免认证连接分配给自己的节点代理端口；主服务按 Broker 返回的精确 worker IP 与代理端口配对校验，不信任整个 worker 子网。
 - 浏览器功能启用时，WebDAV 可同步已停止的 Docker 浏览器 Profile；禁用 Broker 后才退回「仅订阅 / 节点」。
 - Broker 启动时会回收上次异常退出遗留的 worker；Compose 为主服务和 Broker 都保留 3 分钟停止宽限期，以完成 worker 回收与 Profile 落盘。
 
-首次使用时，先在控制台点击「下载指纹内核」，等待 Linux 内核保存到 `/data/fingerprint-chromium/`。然后在节点行点击「浏览器」：弹窗默认用户名为 `proxybridge`，并在本地生成可复制、可修改的随机强密码；提交后会创建独立 worker，并自动打开返回的远程链接。运行中的「浏览器记录」可再次「远程打开」或「停止」。密码不会写入状态文件或状态 API；停止后重新启动需使用新密码。
+首次使用时，先在控制台点击「下载指纹内核」，或通过「本地导入」上传 Linux x86_64 完整发布包，等待内核保存到 `/data/fingerprint-chromium/`。然后在节点行点击「浏览器」：弹窗默认用户名为 `proxybridge`，并在本地生成可复制、可修改的随机强密码；提交后会创建独立 worker，并自动打开返回的远程链接。运行中的「浏览器记录」可再次「远程打开」或「停止」。密码不会写入状态文件或状态 API；停止后重新启动需使用新密码。
 
 若要让同一可信局域网或 VPN 中的其他电脑直接打开控制台和浏览器链接，在仓库根目录创建 `.env`，三项均填写 Docker 宿主机的同一个私有 IPv4：
 
@@ -501,6 +523,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 node --check static/auth.js
 node --check static/diagnostics.js
 node --check static/browser-ui.js
+node --check static/core-upload.js
 node --check static/app.js
 node --test tests/test_frontend_*.js
 bash -n scripts/*.sh

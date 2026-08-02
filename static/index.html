@@ -724,6 +724,50 @@
       </section>
     </div>
 
+    <!-- ============ 本地导入代理 / 指纹内核弹窗 ============ -->
+    <div class="modal-backdrop" id="coreUploadModal" hidden>
+      <section class="core-upload-modal" role="dialog" aria-modal="true" aria-labelledby="coreUploadTitle" aria-describedby="coreUploadDescription" tabindex="-1">
+        <header class="modal-head">
+          <div>
+            <h2 id="coreUploadTitle">本地导入内核</h2>
+            <p id="coreUploadMeta" class="modal-subtitle"></p>
+          </div>
+          <button class="icon-button" type="button" data-action="close-core-upload" aria-label="关闭本地导入窗口" title="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </header>
+        <form class="core-upload-form" id="coreUploadForm">
+          <p class="core-upload-description" id="coreUploadDescription">
+            可在网络条件较好的电脑下载官方 Release，再从这里上传并安装。上传文件会执行可执行性校验并原子替换现有内核；请只使用可信官方来源。
+          </p>
+          <div class="core-upload-platform" id="coreUploadPlatformHint" role="status"></div>
+          <label class="core-upload-field">
+            <span>导入目标</span>
+            <select id="coreUploadKind" name="kind" required>
+              <option value="sing-box">sing-box</option>
+              <option value="xray">Xray</option>
+              <option value="fingerprint-chromium">fingerprint-chromium 指纹内核</option>
+            </select>
+          </label>
+          <label class="core-upload-field">
+            <span>官方安装包</span>
+            <input id="coreUploadFile" name="package" type="file" accept=".tar.gz,.tgz,.zip" aria-describedby="coreUploadFileHint" required>
+            <small id="coreUploadFileHint">必须保留 GitHub Release 中的官方文件名，后端会据此核验系统与 CPU 架构。</small>
+          </label>
+          <label class="core-upload-field">
+            <span>SHA-256（可选）</span>
+            <input id="coreUploadSha256" name="sha256" type="text" inputmode="text" autocomplete="off" spellcheck="false" minlength="64" maxlength="64" pattern="[A-Fa-f0-9]{64}" placeholder="64 位十六进制校验值" aria-describedby="coreUploadSha256Hint">
+            <small id="coreUploadSha256Hint">填写官方发布的校验值后，服务端会在安装前核对完整文件；留空时仍会计算并返回实际 SHA-256。</small>
+          </label>
+          <div class="core-upload-error" id="coreUploadError" role="alert" hidden></div>
+          <footer class="core-upload-actions">
+            <button class="row-button" type="button" data-action="close-core-upload"><span>取消</span></button>
+            <button class="primary-button" id="coreUploadSubmit" type="submit"><span>上传并安装</span></button>
+          </footer>
+        </form>
+      </section>
+    </div>
+
     <!-- ============ Docker 远程浏览器启动弹窗 ============ -->
     <div class="modal-backdrop" id="remoteBrowserLaunchModal" hidden>
       <section class="remote-browser-launch-modal" role="dialog" aria-modal="true" aria-labelledby="remoteBrowserLaunchTitle" aria-describedby="remoteBrowserLaunchDescription" tabindex="-1">
@@ -841,6 +885,7 @@
     <script src="/static/auth.js"></script>
     <script src="/static/diagnostics.js"></script>
     <script src="/static/browser-ui.js"></script>
+    <script src="/static/core-upload.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

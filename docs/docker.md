@@ -175,6 +175,14 @@ worker 网络也属于强制部署契约：必须是 `internal=true`、作用域
 
 默认启动后会从 GitHub Releases 自动下载当前 Linux 架构对应的 `sing-box` 和 `xray`，并保存到 `/data/proxy-cores/`。因此首次启动需要容器能访问 GitHub。
 
+如果 fnOS、NAS 或服务器访问 GitHub 很慢，不需要进入容器或直接修改命名卷。可在另一台电脑下载官方 Release 文件，使用最新启动日志中的完整认证 URL 打开控制台，点击侧边栏底部「本地导入」上传：
+
+- Linux amd64 sing-box：例如 `sing-box-1.13.15-linux-amd64-glibc.tar.gz`。
+- Linux amd64 Xray：例如 `Xray-linux-64.zip`。
+- 远程浏览器指纹内核：例如 `fingerprint-chromium_linux_x64.zip`，具体名称以上游实际 Release 为准。
+
+文件名不能修改，后端会按官方文件名校验 Linux 与 CPU 架构。可填写官方 SHA-256，服务端会在安装前核对；留空时也会返回实际 SHA-256。代理核心替换前需停止所有正在使用该核心的本地代理，指纹内核替换前需停止所有浏览器 worker。上传上限为 2 GiB，解压后上限为 4 GiB，只应上传可信官方来源文件。
+
 若要禁止自动下载，在 Compose 服务中增加：
 
 ```yaml
@@ -194,7 +202,7 @@ environment:
 远程浏览器首次使用还需要单独安装 fingerprint-chromium：
 
 1. 使用最新启动日志中的完整认证 URL 打开控制台。
-2. 点击控制台的「下载指纹内核」，等待约 150–250 MB 的 Linux 包下载并安装完成。
+2. 点击控制台的「下载指纹内核」，或点击「本地导入」上传已下载的 Linux x86_64 完整包，等待约 150–250 MB 的文件安装完成。
 3. 内核会保存到 `proxybridge-data` 卷的 `/data/fingerprint-chromium/`；不要只把一个可执行文件放到卷外，Broker 必须通过命名卷 `volume-subpath` 把包含 `chrome-wrapper` 及相邻资源的完整目录只读挂载给 worker。
 4. 第一次启动浏览器时，Broker 还会拉取 `lscr.io/linuxserver/chromium:latest`，所需时间取决于镜像缓存和网络速度。
 
@@ -310,11 +318,11 @@ docker port proxybridge
 
 ### 首次启动后核心仍显示 missing
 
-查看日志中的 GitHub 下载错误，确认容器 DNS、HTTPS 出站和系统时间正常。核心下载成功后会持久化在数据卷中。
+查看日志中的 GitHub 下载错误，确认容器 DNS、HTTPS 出站和系统时间正常。若 GitHub 在当前网络不可用，在其他电脑下载保留官方文件名的 Linux/当前架构发布包，通过控制台「本地导入」安装；成功后同样会持久化在数据卷中。
 
 ### 点击浏览器提示未找到 Linux 指纹内核
 
-先在控制台点击「下载指纹内核」，并确认 `/data/fingerprint-chromium/` 位于 `proxybridge-data` 卷内。Broker 需要完整的 Linux 发行目录和可执行 `chrome-wrapper`，只设置指向卷外文件的路径无法挂载给 worker。
+先在控制台点击「下载指纹内核」，或本地导入 Linux x86_64 完整发布包，并确认 `/data/fingerprint-chromium/` 位于 `proxybridge-data` 卷内。Broker 需要完整的 Linux 发行目录和可执行 `chrome-wrapper`，上传单个 `chrome`、`.7z` 或只设置指向卷外文件的路径都无法供 worker 使用。
 
 ### 远程浏览器链接打不开
 

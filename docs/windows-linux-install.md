@@ -44,7 +44,7 @@ ProxyBridge 在 Windows / Linux 上提供两种形态：
 #### 前提
 
 - Windows 10/11 x64（常见）
-- 能访问 GitHub（首次自动下载 `sing-box` / `xray`）
+- 能访问 GitHub 自动下载 `sing-box` / `xray`，或可在别的电脑下载官方包后从控制台本地导入
 - 不强制预装 Python
 
 #### 步骤
@@ -225,10 +225,10 @@ A: 确认托盘还在，然后用托盘菜单的 **打开控制台** 重新进�
 A: 默认单实例。先退出旧托盘，或（源码模式）加 `--allow-multiple`。
 
 **Q: 首次很慢？**  
-A: 正在下载 `sing-box` / `xray`。需能访问 GitHub。
+A: 通常是在从 GitHub 下载 `sing-box` / `xray`。如果当前网络几乎无法完成下载，可在别的电脑取得保留官方文件名的 Windows x64 Release 包（如 `sing-box-版本-windows-amd64.zip`、`Xray-windows-64.zip`），再点击控制台侧边栏底部「本地导入」上传；替换前先停止使用对应核心的本地代理。
 
 **Q: 指纹浏览器下载失败？**  
-A: 上游不一定每次都发 Windows 包。可手动下载后设置：
+A: 上游不一定每次都发 Windows 包。若已有匹配 Windows/x86_64 的完整 `.zip` 发布包，可用控制台「本地导入」安装；也可手动下载后设置：
 
 ```powershell
 $env:PROXY_BRIDGE_FP_CHROMIUM="C:\path\to\chrome.exe"
@@ -255,7 +255,7 @@ A:
 
 - 图形桌面会话（`DISPLAY` 或 `WAYLAND_DISPLAY`）
 - Python 3.10+
-- 能访问 GitHub
+- 能访问 GitHub 自动下载核心，或可从控制台本地导入预先下载的官方包
 
 #### Debian / Ubuntu 依赖示例
 
