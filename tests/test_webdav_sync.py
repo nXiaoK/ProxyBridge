@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -681,6 +682,33 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         client, manifest = self._remote_manifest()
         remote_state = json.loads(self.store.files[self._remote_state_url(client, manifest)].decode("utf-8"))
         self.assertNotIn("local-node", {item["id"] for item in remote_state["nodes"]})
+
+    def test_remote_worker_compat_layout_syncs_only_chromium_profile(self):
+        root = self.profiles / "nodehash" / "inst1"
+        chromium_profile = root / "chromium-profile"
+        chromium_profile.mkdir()
+        (root / "Default").replace(chromium_profile / "Default")
+        (root / "GPUCache").replace(chromium_profile / "GPUCache")
+        (root / "selkies-tls.key").write_text("must-not-sync", encoding="utf-8")
+        with self.lock:
+            state = self._load()
+            state["browser_instances"][0]["profile_layout"] = "remote-worker-v1"
+            self._save(state)
+
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        archive = self.store.files[self._remote_profile_url(client, manifest, "inst1")]
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as package:
+            names = set(package.getnames())
+        self.assertIn("Default/Cookies", names)
+        self.assertNotIn("selkies-tls.key", names)
+        self.assertFalse(any(name.startswith("chromium-profile/") for name in names))
+
+        shutil.rmtree(chromium_profile)
+        result = self.engine.pull(force=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual((chromium_profile / "Default" / "Cookies").read_bytes(), b"cookie-data")
+        self.assertEqual((root / "selkies-tls.key").read_text(encoding="utf-8"), "must-not-sync")
 
     def test_subscription_only_push_rejects_tampered_remote_state(self):
         self.engine.push()

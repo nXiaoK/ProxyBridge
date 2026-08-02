@@ -1,7 +1,8 @@
 const appState = {
   cores: {},
-  features: { browser: true, browser_profile_sync: true, docker: false },
+  features: { browser: true, browser_profile_sync: true, remote_browser: false, docker: false },
   runtime: { mode: "headless", docker: false },
+  remoteBrowser: { configured: false, available: false, active_sessions: 0, error: "" },
   platform: null,
   fingerprint_chromium: null,
   active_browsers: [],
@@ -48,13 +49,19 @@ const appState = {
 };
 
 const managementAuth = window.ProxyBridgeAuth;
+const browserUi = window.ProxyBridgeBrowserUi;
 let managementToken = managementAuth.loadManagementToken(window);
 
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
 let lastBrowserRecordTrigger = null;
+let lastRemoteBrowserLaunchTrigger = null;
 let lastCoreLogTriggerKey = null;
 let lastBrowserRecordTriggerKey = null;
+let lastRemoteBrowserLaunchTriggerKey = null;
+let lastRemoteBrowserLaunchTriggerAction = null;
+let pendingRemoteBrowserLaunch = null;
+let remoteBrowserLaunchPromise = null;
 let pendingModalFocusKey = null;
 let coreLogRequestGeneration = 0;
 let coreLogAbortController = null;
@@ -80,6 +87,10 @@ const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "settin
 
 function browserEnabled() {
   return appState.features?.browser !== false;
+}
+
+function remoteBrowserEnabled() {
+  return appState.features?.remote_browser === true;
 }
 
 function dockerRuntime() {
@@ -1177,8 +1188,16 @@ function nodeById(nodeId) {
   return appState.nodes.find((node) => node.id === nodeId);
 }
 
+function browserInstanceById(instanceId) {
+  return (appState.browser_instances || []).find((instance) => instance.id === instanceId) || null;
+}
+
+function safeRemoteBrowserUrl(value) {
+  return browserUi.safeRemoteBrowserUrl(value, URL);
+}
+
 function browserInstancesForNode(nodeId) {
-  const rank = { running: 0, starting: 1, stopped: 2, failed: 3 };
+  const rank = { running: 0, starting: 1, stopping: 2, stopped: 3, failed: 4 };
   return (appState.browser_instances || [])
     .filter((instance) => instance.node_id === nodeId)
     .slice()
@@ -1191,13 +1210,14 @@ function browserInstancesForNode(nodeId) {
 }
 
 function runningBrowserInstancesForNode(nodeId) {
-  return browserInstancesForNode(nodeId).filter((instance) => ["running", "starting"].includes(instance.status));
+  return browserInstancesForNode(nodeId).filter((instance) => ["running", "starting", "stopping"].includes(instance.status));
 }
 
 function browserStatusLabel(status) {
   const labels = {
     running: "运行中",
     starting: "启动中",
+    stopping: "停止中",
     stopped: "已停止",
     failed: "失败",
   };
@@ -1246,6 +1266,8 @@ function renderActiveView({ force = false } = {}) {
           tests: appState.tests,
           speedTest: appState.speedTest,
           browserEnabled: browserEnabled(),
+          remoteBrowserEnabled: remoteBrowserEnabled(),
+          remoteBrowser: appState.remoteBrowser,
           activeBrowsers: appState.active_browsers,
           browserInstances: appState.browser_instances,
           filters: appState.filters,
@@ -1352,8 +1374,19 @@ async function loadStatus({ forceFresh = false } = {}) {
   const request = (async () => {
     try {
       const status = await api("/api/status", null, { signal: controller.signal });
-      appState.features = status.features || { browser: true, browser_profile_sync: true, docker: false };
+      appState.features = status.features || {
+        browser: true,
+        browser_profile_sync: true,
+        remote_browser: false,
+        docker: false,
+      };
       appState.runtime = status.runtime || { mode: status.platform?.shell_mode || "headless", docker: false };
+      appState.remoteBrowser = status.remote_browser || {
+        configured: false,
+        available: false,
+        active_sessions: 0,
+        error: "",
+      };
       appState.platform = status.platform || null;
       appState.cores = status.cores || {};
       appState.fingerprint_chromium = status.fingerprint_chromium || null;
@@ -1432,6 +1465,18 @@ function render() {
   if (brandSubtitle) {
     brandSubtitle.textContent = dockerRuntime() ? "Docker 控制台 · 订阅节点" : "订阅节点 · 本地代理";
   }
+  const remoteLaunchModal = $("#remoteBrowserLaunchModal");
+  const remoteLaunchHasCredentials = !$("#remoteBrowserLaunchSuccess").hidden;
+  if (
+    !remoteBrowserEnabled()
+    && !remoteLaunchModal.hidden
+    && !remoteBrowserLaunchPromise
+    && !remoteLaunchHasCredentials
+  ) {
+    closeRemoteBrowserLaunchModal({ force: true });
+  } else if (remoteBrowserEnabled() && !remoteLaunchModal.hidden) {
+    renderRemoteBrowserBrokerStatus();
+  }
   if (!browserEnabled() && !$("#browserRecordModal").hidden) {
     closeBrowserRecordModal();
   }
@@ -1443,7 +1488,7 @@ function render() {
     if (typingLabel) {
       const node = nodeById(appState.browserRecordNodeId);
       const instances = browserInstancesForNode(appState.browserRecordNodeId);
-      const runningCount = instances.filter((i) => ["running", "starting"].includes(i.status)).length;
+      const runningCount = instances.filter((i) => ["running", "starting", "stopping"].includes(i.status)).length;
       $("#browserRecordTitle").textContent = `${node?.name || "节点"} 浏览器记录`;
       $("#browserRecordMeta").textContent = `${instances.length} 个记录 · ${runningCount} 个运行中`;
     } else {
@@ -1837,13 +1882,20 @@ function renderNodeRow(node) {
         </label>
       </div>`
     : `<span class="tag core-tag" title="当前节点仅兼容此核心">${escapeHtml(coreOptions[0])}</span>`;
+  const browserActionLabel = remoteBrowserEnabled() ? "远程浏览器" : "浏览器";
+  const browserActionTitle = remoteBrowserEnabled()
+    ? "新开远程浏览器：独立 Docker Worker + 独立 Profile + 绑定该节点代理"
+    : "新开不同指纹浏览器：独立 Profile + 绑定该节点代理";
+  const browserStopTitle = remoteBrowserEnabled()
+    ? "停止该节点的远程浏览器 Worker，保留本地代理"
+    : "结束该节点的指纹浏览器进程，保留本地代理";
   const browserActions = browserEnabled()
     ? `
-          <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开不同指纹浏览器 ${escapeHtml(node.name)}" title="新开不同指纹浏览器：独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
+          <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开${escapeHtml(browserActionLabel)} ${escapeHtml(node.name)}" title="${escapeHtml(browserActionTitle)}">${icon("browser")}<span>${escapeHtml(browserActionLabel)}</span></button>
           <button class="row-button" data-action="browser-records" data-node="${escapeHtml(node.id)}" aria-label="查看 ${escapeHtml(node.name)} 的浏览器记录" title="浏览器记录">${icon("list")}<span>${escapeHtml(recordLabel)}</span></button>
           ${
             browserActive
-              ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
+              ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="${escapeHtml(browserStopTitle)}">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
               : ""
           }
         `
@@ -2275,7 +2327,11 @@ function openModal(modal) {
 
 function closeModal(modal) {
   modal.hidden = true;
-  if ($("#coreLogModal").hidden && $("#browserRecordModal").hidden) {
+  if (
+    $("#coreLogModal").hidden
+    && $("#browserRecordModal").hidden
+    && $("#remoteBrowserLaunchModal").hidden
+  ) {
     const shell = $(".app-shell");
     if (shell) {
       shell.inert = false;
@@ -2284,9 +2340,11 @@ function closeModal(modal) {
   }
 }
 
-function findActionTrigger(key) {
+function findActionTrigger(key, action = "") {
   if (!key) return null;
-  return [...document.querySelectorAll("button[data-action]")].find((button) => actionLockKey(button) === key) || null;
+  return [...document.querySelectorAll("button[data-action]")].find((button) => (
+    actionLockKey(button) === key && (!action || button.dataset.action === action)
+  )) || null;
 }
 
 function closeCoreLogModal() {
@@ -2384,6 +2442,258 @@ function closeBrowserRecordModal() {
   lastBrowserRecordTriggerKey = null;
 }
 
+function renderRemoteBrowserBrokerStatus() {
+  const element = $("#remoteBrowserBrokerStatus");
+  if (!element) return;
+  const broker = appState.remoteBrowser || {};
+  const available = broker.configured === true && broker.available === true;
+  element.classList.toggle("is-ready", available);
+  element.classList.toggle("is-error", !available);
+  if (available) {
+    const count = Number(broker.active_sessions || 0);
+    element.textContent = `浏览器 Broker 已连接 · ${count} 个 Worker 运行中`;
+    element.setAttribute("role", "status");
+    return;
+  }
+  const message = String(broker.error || "浏览器 Broker 尚未就绪，请检查 Docker 服务状态").trim();
+  element.textContent = `浏览器 Broker 不可用：${message}`;
+  element.setAttribute("role", "alert");
+}
+
+function showRemoteBrowserLaunchError(message = "") {
+  const element = $("#remoteBrowserLaunchError");
+  if (!element) return;
+  const text = String(message || "").trim();
+  element.textContent = text;
+  element.hidden = !text;
+}
+
+function generateRemoteBrowserPassword() {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const cryptoApi = window.crypto;
+  if (!cryptoApi?.getRandomValues) return "";
+  const bytes = new Uint8Array(20);
+  cryptoApi.getRandomValues(bytes);
+  return Array.from(bytes, (value) => alphabet[value & 63]).join("");
+}
+
+function fillGeneratedRemoteBrowserPassword({ announce = false } = {}) {
+  const password = generateRemoteBrowserPassword();
+  if (!password) {
+    showRemoteBrowserLaunchError("当前浏览器无法安全生成随机密码，请手动填写强密码");
+    return false;
+  }
+  $("#remoteBrowserPassword").value = password;
+  $("#remoteBrowserPasswordConfirm").value = password;
+  showRemoteBrowserLaunchError();
+  if (announce) showToast("已生成新的远程浏览器密码");
+  return true;
+}
+
+async function copyRemoteBrowserPassword() {
+  const password = String($("#remoteBrowserPassword")?.value || "");
+  if (!password) throw new Error("当前没有可复制的远程浏览器密码");
+  if (!await browserUi.copyText(password, window)) {
+    throw new Error("当前环境无法复制密码，请手动保存");
+  }
+  showToast("已复制远程浏览器密码");
+}
+
+function remoteBrowserSuccessFields() {
+  return {
+    remoteUrl: $("#remoteBrowserSuccessUrl"),
+    username: $("#remoteBrowserSuccessUsername"),
+    password: $("#remoteBrowserSuccessPassword"),
+  };
+}
+
+function remoteBrowserCredentialView() {
+  return {
+    setup: $("#remoteBrowserLaunchSetup"),
+    success: $("#remoteBrowserLaunchSuccess"),
+    dialog: $("#remoteBrowserLaunchModal")?.querySelector('[role="dialog"]'),
+  };
+}
+
+function launchedRemoteBrowserCredentials() {
+  const credentials = browserUi.credentialFields(remoteBrowserSuccessFields());
+  credentials.remoteUrl = safeRemoteBrowserUrl(credentials.remoteUrl);
+  if (!credentials.remoteUrl || !credentials.username || !credentials.password) {
+    throw new Error("当前页面中的远程浏览器凭据已被清除");
+  }
+  return credentials;
+}
+
+function resetRemoteBrowserLaunchContent() {
+  browserUi.clearCredentialFields(remoteBrowserSuccessFields());
+  $("#remoteBrowserUsername").value = "";
+  $("#remoteBrowserPassword").value = "";
+  $("#remoteBrowserPasswordConfirm").value = "";
+  $("#remoteBrowserLaunchTitle").textContent = "启动远程浏览器";
+  $("#remoteBrowserLaunchMeta").textContent = "";
+  browserUi.setCredentialView(remoteBrowserCredentialView(), false);
+}
+
+function showRemoteBrowserLaunchSuccess(result, credentials) {
+  const remoteUrl = safeRemoteBrowserUrl(result?.remote_url);
+  if (!remoteUrl) throw new Error("浏览器 Worker 未返回有效的远程访问地址");
+  browserUi.setCredentialFields(remoteBrowserSuccessFields(), {
+    remoteUrl,
+    username: credentials.username,
+    password: credentials.password,
+  });
+  // 成功态只保留一份凭据，避免隐藏的设置表单继续持有密码副本。
+  $("#remoteBrowserUsername").value = "";
+  $("#remoteBrowserPassword").value = "";
+  $("#remoteBrowserPasswordConfirm").value = "";
+  browserUi.setCredentialView(remoteBrowserCredentialView(), true);
+  $("#remoteBrowserLaunchTitle").textContent = `${result.browser_name || "远程浏览器"} 已启动`;
+  $("#remoteBrowserLaunchMeta").textContent = `${credentials.username} · ${remoteUrl}`;
+}
+
+async function copyLaunchedRemoteBrowserPassword() {
+  const credentials = launchedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(credentials.password, window)) {
+    throw new Error("当前环境无法复制密码，请手动保存");
+  }
+  showToast("已复制远程浏览器密码");
+}
+
+async function copyLaunchedRemoteBrowserUrl() {
+  const credentials = launchedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(credentials.remoteUrl, window)) {
+    throw new Error("当前环境无法复制远程链接，请手动选择链接");
+  }
+  showToast("已复制远程浏览器链接");
+}
+
+async function copyLaunchedRemoteBrowserCredentials() {
+  const credentials = launchedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(browserUi.formatCredentials(credentials), window)) {
+    throw new Error("当前环境无法复制完整凭据，请分别手动保存");
+  }
+  showToast("已复制远程浏览器完整凭据");
+}
+
+function openLaunchedRemoteBrowser() {
+  const credentials = launchedRemoteBrowserCredentials();
+  openRemoteBrowserUrl(credentials.remoteUrl);
+  showToast("正在打开远程浏览器");
+}
+
+function finishRemoteBrowserLaunch() {
+  if (closeRemoteBrowserLaunchModal()) {
+    showToast("远程浏览器凭据已从当前页面清除");
+  }
+}
+
+function setRemoteBrowserLaunchBusy(busy) {
+  const modal = $("#remoteBrowserLaunchModal");
+  const submit = $("#remoteBrowserLaunchSubmit");
+  if (submit) {
+    submit.disabled = busy;
+    submit.classList.toggle("is-busy", busy);
+    submit.setAttribute("aria-busy", busy ? "true" : "false");
+  }
+  modal?.querySelectorAll([
+    '[data-action="close-remote-browser-launch"]',
+    '[data-action="generate-remote-browser-password"]',
+    '[data-action="copy-remote-browser-password"]',
+    '[data-action="copy-launched-remote-browser-password"]',
+    '[data-action="copy-launched-remote-browser-url"]',
+    '[data-action="copy-launched-remote-browser-credentials"]',
+    '[data-action="open-launched-remote-browser"]',
+    '[data-action="finish-remote-browser-launch"]',
+  ].join(",")).forEach((button) => {
+    button.disabled = busy;
+  });
+  ["#remoteBrowserUsername", "#remoteBrowserPassword", "#remoteBrowserPasswordConfirm"].forEach((selector) => {
+    const input = $(selector);
+    if (input) input.disabled = busy;
+  });
+}
+
+function showRemoteBrowserLaunchModal(nodeId, instanceId = "", trigger = null) {
+  if (!remoteBrowserEnabled()) throw new Error("当前运行模式不提供远程浏览器功能");
+  const node = nodeById(nodeId);
+  if (!nodeId || !node) throw new Error("找不到远程浏览器对应的节点");
+  const instance = instanceId ? browserInstanceById(instanceId) : null;
+  if (instanceId && !instance) throw new Error("找不到浏览器记录");
+
+  resetRemoteBrowserLaunchContent();
+  pendingRemoteBrowserLaunch = { nodeId, instanceId };
+  lastRemoteBrowserLaunchTrigger = trigger;
+  lastRemoteBrowserLaunchTriggerKey = trigger ? actionLockKey(trigger) : null;
+  lastRemoteBrowserLaunchTriggerAction = trigger?.dataset?.action || null;
+  $("#remoteBrowserLaunchTitle").textContent = instance
+    ? `启动 ${instance.name || "远程浏览器"}`
+    : "启动远程浏览器";
+  $("#remoteBrowserLaunchMeta").textContent = `${node.name || nodeId} · ${instance ? "复用独立 Profile" : "新建独立 Worker 与 Profile"}`;
+  $("#remoteBrowserUsername").value = String(instance?.remote_username || "proxybridge");
+  $("#remoteBrowserPassword").value = "";
+  $("#remoteBrowserPasswordConfirm").value = "";
+  showRemoteBrowserLaunchError();
+  fillGeneratedRemoteBrowserPassword();
+  renderRemoteBrowserBrokerStatus();
+  setRemoteBrowserLaunchBusy(false);
+
+  const recordsModal = $("#browserRecordModal");
+  const modal = $("#remoteBrowserLaunchModal");
+  modal.dataset.returnToBrowserRecords = recordsModal.hidden ? "false" : "true";
+  if (!recordsModal.hidden) {
+    recordsModal.inert = true;
+    recordsModal.setAttribute("aria-hidden", "true");
+  }
+  openModal(modal);
+  window.requestAnimationFrame(() => {
+    if (!modal.hidden) $("#remoteBrowserUsername")?.focus();
+  });
+}
+
+function closeRemoteBrowserLaunchModal({ force = false } = {}) {
+  if (remoteBrowserLaunchPromise && !force) return false;
+  const modal = $("#remoteBrowserLaunchModal");
+  if (!modal || modal.hidden) return false;
+  closeModal(modal);
+  if (modal.dataset.returnToBrowserRecords === "true") {
+    const recordsModal = $("#browserRecordModal");
+    recordsModal.inert = false;
+    recordsModal.removeAttribute("aria-hidden");
+  }
+  delete modal.dataset.returnToBrowserRecords;
+  pendingRemoteBrowserLaunch = null;
+  showRemoteBrowserLaunchError();
+  resetRemoteBrowserLaunchContent();
+
+  const trigger = lastRemoteBrowserLaunchTrigger?.isConnected
+    ? lastRemoteBrowserLaunchTrigger
+    : findActionTrigger(lastRemoteBrowserLaunchTriggerKey, lastRemoteBrowserLaunchTriggerAction);
+  trigger?.focus();
+  lastRemoteBrowserLaunchTrigger = null;
+  lastRemoteBrowserLaunchTriggerKey = null;
+  lastRemoteBrowserLaunchTriggerAction = null;
+  return true;
+}
+
+function openRemoteBrowserUrl(value) {
+  const remoteUrl = safeRemoteBrowserUrl(value);
+  if (!remoteUrl) throw new Error("远程浏览器访问地址无效，请刷新状态后重试");
+  const link = document.createElement("a");
+  link.href = remoteUrl;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function openRemoteBrowserInstance(instanceId) {
+  const instance = browserInstanceById(instanceId);
+  if (!instance) throw new Error("找不到远程浏览器记录");
+  openRemoteBrowserUrl(instance.remote_url);
+  showToast(`正在打开 ${instance.name || "远程浏览器"}`);
+}
+
 function compactPath(value) {
   const parts = String(value || "").split("/").filter(Boolean);
   return parts.length > 3 ? `.../${parts.slice(-3).join("/")}` : value || "-";
@@ -2392,12 +2702,19 @@ function compactPath(value) {
 function renderBrowserRecords(nodeId) {
   const node = nodeById(nodeId);
   const instances = browserInstancesForNode(nodeId);
-  const runningCount = instances.filter((instance) => ["running", "starting"].includes(instance.status)).length;
+  const runningCount = instances.filter((instance) => ["running", "starting", "stopping"].includes(instance.status)).length;
   $("#browserRecordTitle").textContent = `${node?.name || "节点"} 浏览器记录`;
   $("#browserRecordMeta").textContent = `${instances.length} 个记录 · ${runningCount} 个运行中`;
   const body = $("#browserRecordBody");
+  const brokerError = remoteBrowserEnabled() && appState.remoteBrowser?.available !== true;
+  const brokerAlert = brokerError
+    ? `<div class="browser-record-broker-alert" role="alert">
+        <strong>浏览器 Broker 不可用</strong>
+        <span>${escapeHtml(appState.remoteBrowser?.error || "请检查 Docker Broker 与 Worker 服务状态后重试")}</span>
+      </div>`
+    : "";
   if (!instances.length) {
-    body.innerHTML = `
+    body.innerHTML = `${brokerAlert}
       <div class="core-log-empty">
         <strong>暂无浏览器记录</strong>
         <span>${escapeHtml(node?.name || nodeId || "-")}</span>
@@ -2424,9 +2741,15 @@ function renderBrowserRecords(nodeId) {
     selEnd = active.selectionEnd;
   }
 
-  body.innerHTML = instances
+  body.innerHTML = brokerAlert + instances
     .map((instance) => {
-      const running = ["running", "starting"].includes(instance.status);
+      const running = ["running", "starting", "stopping"].includes(instance.status);
+      const remoteWorker = instance.remote_worker === true || remoteBrowserEnabled();
+      const remoteUrl = safeRemoteBrowserUrl(instance.remote_url);
+      const remoteUrlDisplay = String(instance.remote_url || "").trim() || "-";
+      const workerId = String(instance.remote_container_id || "").slice(0, 12);
+      const workerStatus = browserStatusLabel(instance.status);
+      const instanceError = String(instance.error || "").trim();
       const profilePath = instance.profile_path || "";
       const action = running ? "stop-browser-instance" : "launch-browser-instance";
       const actionLabel = running ? "停止" : "启动";
@@ -2443,7 +2766,7 @@ function renderBrowserRecords(nodeId) {
           <header>
             <div>
               <strong>${escapeHtml(instance.name || "浏览器")}</strong>
-              <span>${instance.legacy ? "默认浏览器" : "独立指纹"} · ${escapeHtml(formatTime(instance.created_at))}</span>
+              <span>${remoteWorker ? "远程 Worker" : instance.legacy ? "默认浏览器" : "独立指纹"} · ${escapeHtml(formatTime(instance.created_at))}</span>
               ${pillLabel ? `<span class="browser-record-label-pill" title="${escapeHtml(pillLabel)}">${escapeHtml(pillLabel)}</span>` : ""}
             </div>
             <span class="status ${escapeHtml(instance.status || "stopped")}">${escapeHtml(browserStatusLabel(instance.status))}</span>
@@ -2452,8 +2775,16 @@ function renderBrowserRecords(nodeId) {
             <span>指纹</span><code>${escapeHtml(instance.fingerprint_seed || "-")}</code>
             <span>Profile</span><code title="${escapeHtml(profilePath)}">${escapeHtml(compactPath(profilePath))}</code>
             <span>上次启动</span><code>${escapeHtml(formatTime(instance.last_started_at))}</code>
-            <span>PID</span><code>${escapeHtml(instance.pid || "-")}</code>
+            ${remoteWorker
+              ? `<span>Worker 状态</span><code>${escapeHtml(workerStatus)}${workerId ? ` · ${escapeHtml(workerId)}` : ""}</code>
+                 <span>远程端口</span><code>${escapeHtml(instance.remote_host_port || "-")}</code>
+                 <span>远程地址</span><code title="${escapeHtml(remoteUrlDisplay)}">${escapeHtml(remoteUrlDisplay)}</code>
+                 <span>访问用户</span><code>${escapeHtml(instance.remote_username || "-")}</code>`
+              : `<span>PID</span><code>${escapeHtml(instance.pid || "-")}</code>`}
           </div>
+          ${instanceError
+            ? `<div class="browser-record-error" role="alert"><strong>${remoteWorker ? "Worker 错误" : "启动错误"}</strong><span>${escapeHtml(instanceError)}</span></div>`
+            : ""}
           <div class="browser-record-label-row">
             <label>
               <span>标签</span>
@@ -2475,6 +2806,14 @@ function renderBrowserRecords(nodeId) {
             ><span>保存标签</span></button>
           </div>
           <div class="browser-record-actions">
+            ${remoteUrl
+              ? `<button class="row-button" type="button" data-action="copy" data-text="${escapeHtml(remoteUrl)}" aria-label="复制 ${escapeHtml(instance.name || "浏览器")} 的远程链接">
+                  ${icon("copy")}<span>复制链接</span>
+                </button>
+                <button class="row-button primary-row" type="button" data-action="open-remote-browser" data-instance="${escapeHtml(instance.id)}" aria-label="远程打开 ${escapeHtml(instance.name || "浏览器")}">
+                  ${icon("link")}<span>远程打开</span>
+                </button>`
+              : ""}
             <button class="row-button ${running ? "danger" : ""}" type="button" data-action="${action}" data-node="${escapeHtml(nodeId)}" data-instance="${escapeHtml(instance.id)}" aria-label="${actionLabel} ${escapeHtml(instance.name || "浏览器")}">
               ${icon(actionIcon)}<span>${actionLabel}</span>
             </button>
@@ -2485,7 +2824,9 @@ function renderBrowserRecords(nodeId) {
     .join("");
 
   if (activeId) {
-    const input = body.querySelector(`.browser-label-input[data-instance="${activeId}"]`);
+    const input = body.querySelector(
+      `.browser-label-input[data-instance="${browserUi.cssEscape(activeId, window.CSS)}"]`
+    );
     if (input) {
       input.focus();
       try {
@@ -2502,7 +2843,9 @@ function renderBrowserRecords(nodeId) {
 async function saveBrowserLabel(instanceId) {
   if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   if (!instanceId) return;
-  const input = document.querySelector(`.browser-label-input[data-instance="${instanceId}"]`);
+  const input = document.querySelector(
+    `.browser-label-input[data-instance="${browserUi.cssEscape(instanceId, window.CSS)}"]`
+  );
   const label = String(input?.value || "").trim();
   await api("/api/browser/update", { instance_id: instanceId, label });
   await loadStatus({ forceFresh: true });
@@ -2566,14 +2909,10 @@ async function copyText(text) {
   } catch {}
 
   if (!copied) {
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error();
-      await navigator.clipboard.writeText(text);
-      copied = true;
-    } catch {
-      throw new Error("当前环境无法复制到剪贴板");
-    }
+    copied = await browserUi.copyText(text, window);
   }
+
+  if (!copied) throw new Error("当前环境无法复制到剪贴板");
 
   showToast(`已复制 ${text}`);
 }
@@ -2617,13 +2956,131 @@ async function saveNodeCoreSettings(nodeId) {
   }
 }
 
-async function launchBrowser(nodeId, instanceId = "") {
+async function requestBrowserLaunch(nodeId, instanceId = "", credentials = null) {
   if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   const payload = instanceId ? { node_id: nodeId, instance_id: instanceId } : { node_id: nodeId };
-  const result = await api("/api/browser/launch", payload);
+  if (credentials) {
+    payload.username = credentials.username;
+    payload.password = credentials.password;
+  }
+  return api("/api/browser/launch", payload);
+}
+
+async function launchBrowser(nodeId, instanceId = "", trigger = null) {
+  if (remoteBrowserEnabled()) {
+    showRemoteBrowserLaunchModal(nodeId, instanceId, trigger);
+    return null;
+  }
+  const result = await requestBrowserLaunch(nodeId, instanceId);
   await loadStatus({ forceFresh: true });
   showToast(`已启动${result.browser_name ? ` ${result.browser_name}` : "指纹浏览器"}：${result.proxy}`);
   return result;
+}
+
+function openRemoteBrowserLoadingWindow() {
+  const remoteWindow = window.open("about:blank", "_blank");
+  if (!remoteWindow) return null;
+  try {
+    remoteWindow.opener = null;
+    remoteWindow.document.documentElement.lang = "zh-CN";
+    remoteWindow.document.title = "正在启动远程浏览器";
+    remoteWindow.document.body.style.cssText = "margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f7;color:#3a3a3c;font:14px -apple-system,BlinkMacSystemFont,sans-serif";
+    remoteWindow.document.body.textContent = "正在创建远程浏览器 Worker，请稍候…";
+  } catch (_) {
+    // about:blank 通常同源；若浏览器限制写入，仍可在启动成功后导航。
+  }
+  return remoteWindow;
+}
+
+async function handleRemoteBrowserLaunchSubmit(event) {
+  event.preventDefault();
+  if (remoteBrowserLaunchPromise || !pendingRemoteBrowserLaunch) return;
+
+  const username = String($("#remoteBrowserUsername").value || "").trim();
+  const password = String($("#remoteBrowserPassword").value || "");
+  const passwordConfirm = String($("#remoteBrowserPasswordConfirm").value || "");
+  const passwordLength = Array.from(password).length;
+  if (!/^[A-Za-z0-9._-]{1,32}$/.test(username)) {
+    showRemoteBrowserLaunchError("用户名必须为 1–32 位字母、数字、点、下划线或短横线");
+    $("#remoteBrowserUsername").focus();
+    return;
+  }
+  if (passwordLength < 10 || passwordLength > 128 || /[\x00-\x1f\x7f]/.test(password)) {
+    showRemoteBrowserLaunchError("密码必须为 10–128 个字符，且不能包含控制字符");
+    $("#remoteBrowserPassword").focus();
+    return;
+  }
+  if (password !== passwordConfirm) {
+    showRemoteBrowserLaunchError("两次输入的密码不一致");
+    $("#remoteBrowserPasswordConfirm").focus();
+    return;
+  }
+  if (appState.remoteBrowser?.available !== true) {
+    const brokerMessage = appState.remoteBrowser?.error || "浏览器 Broker 尚未就绪，请检查 Docker 服务状态";
+    showRemoteBrowserLaunchError(`无法启动远程浏览器：${brokerMessage}`);
+    showToast(`浏览器 Broker 不可用：${brokerMessage}`, "error");
+    return;
+  }
+
+  const pending = { ...pendingRemoteBrowserLaunch };
+  const remoteWindow = openRemoteBrowserLoadingWindow();
+  showRemoteBrowserLaunchError();
+  setRemoteBrowserLaunchBusy(true);
+  let result = null;
+  let openedAutomatically = false;
+  remoteBrowserLaunchPromise = requestBrowserLaunch(
+    pending.nodeId,
+    pending.instanceId,
+    { username, password }
+  );
+  try {
+    result = await remoteBrowserLaunchPromise;
+    const remoteUrl = safeRemoteBrowserUrl(result.remote_url);
+    if (!remoteUrl) throw new Error("浏览器 Worker 未返回有效的远程访问地址");
+    showRemoteBrowserLaunchSuccess(result, { username, password });
+    pendingRemoteBrowserLaunch = null;
+    if (remoteWindow && !remoteWindow.closed) {
+      try {
+        remoteWindow.location.replace(remoteUrl);
+        openedAutomatically = true;
+      } catch (_) {
+        // Worker 已成功启动；保留凭据成功页，让用户通过真实点击重新打开。
+        try { remoteWindow.close(); } catch (_) {}
+      }
+    }
+    try {
+      await loadStatus({ forceFresh: true });
+    } catch (statusError) {
+      showToast(`远程浏览器已启动，但状态刷新失败：${statusError.message}`, "error");
+    }
+  } catch (error) {
+    result = null;
+    try { remoteWindow?.close(); } catch (_) {}
+    try {
+      await loadStatus({ forceFresh: true });
+    } catch (_) {
+      // 启动接口错误本身更具体，保留为主要提示。
+    }
+    const message = `远程浏览器启动失败：${error.message}`;
+    showRemoteBrowserLaunchError(message);
+    showToast(message, "error");
+  } finally {
+    remoteBrowserLaunchPromise = null;
+    setRemoteBrowserLaunchBusy(false);
+  }
+
+  if (result) {
+    const browserName = result.browser_name || "远程浏览器";
+    const popupHint = openedAutomatically
+      ? "已在新标签页打开；凭据会保留到你明确完成"
+      : "请保存凭据并点击“打开远程浏览器”";
+    showToast(`${browserName} 已启动，${popupHint}`);
+    window.requestAnimationFrame(() => {
+      if (!$("#remoteBrowserLaunchSuccess").hidden) {
+        $("#remoteBrowserSuccessOpen")?.focus();
+      }
+    });
+  }
 }
 
 // 停止某节点的指纹浏览器进程,保留其本地代理。
@@ -2632,7 +3089,7 @@ async function stopBrowser(nodeId, instanceId = "") {
   const payload = instanceId ? { instance_id: instanceId } : { node_id: nodeId };
   const result = await api("/api/browser/stop", payload);
   await loadStatus({ forceFresh: true });
-  showToast("已停止浏览器，SOCKS5 端口保持运行");
+  showToast(remoteBrowserEnabled() ? "已停止远程浏览器 Worker，代理端口保持运行" : "已停止浏览器，SOCKS5 端口保持运行");
   return result;
 }
 
@@ -2685,6 +3142,7 @@ function actionLockKey(button) {
     case "launch-browser-instance":
     case "stop-browser-instance":
     case "save-browser-label":
+    case "open-remote-browser":
       return `browser-instance:${button.dataset.instance || ""}`;
     case "test":
       return `node-test:${button.dataset.node || ""}`;
@@ -2705,6 +3163,15 @@ function actionUsesSpinner(action) {
   return ![
     "close-core-log",
     "close-browser-records",
+    "close-remote-browser-launch",
+    "generate-remote-browser-password",
+    "copy-remote-browser-password",
+    "copy-launched-remote-browser-password",
+    "copy-launched-remote-browser-url",
+    "copy-launched-remote-browser-credentials",
+    "open-launched-remote-browser",
+    "finish-remote-browser-launch",
+    "open-remote-browser",
     "copy",
     "browser-records",
     "toggle-node-group",
@@ -2756,9 +3223,9 @@ async function handleAction(event) {
     } else if (action === "test") {
       await testNode(button.dataset.node);
     } else if (action === "launch-browser") {
-      await launchBrowser(button.dataset.node);
+      await launchBrowser(button.dataset.node, "", button);
     } else if (action === "launch-browser-instance") {
-      await launchBrowser(button.dataset.node, button.dataset.instance);
+      await launchBrowser(button.dataset.node, button.dataset.instance, button);
     } else if (action === "stop-browser") {
       await stopBrowser(button.dataset.node);
     } else if (action === "stop-browser-instance") {
@@ -2767,6 +3234,8 @@ async function handleAction(event) {
       await openBrowserRecordsWithSync(button.dataset.node, button);
     } else if (action === "save-browser-label") {
       await saveBrowserLabel(button.dataset.instance);
+    } else if (action === "open-remote-browser") {
+      openRemoteBrowserInstance(button.dataset.instance);
     } else if (action === "download-kernel") {
       await downloadKernel();
     } else if (action === "copy") {
@@ -2872,6 +3341,22 @@ async function handleAction(event) {
       closeCoreLogModal();
     } else if (action === "close-browser-records") {
       closeBrowserRecordModal();
+    } else if (action === "close-remote-browser-launch") {
+      closeRemoteBrowserLaunchModal();
+    } else if (action === "generate-remote-browser-password") {
+      fillGeneratedRemoteBrowserPassword({ announce: true });
+    } else if (action === "copy-remote-browser-password") {
+      await copyRemoteBrowserPassword();
+    } else if (action === "copy-launched-remote-browser-password") {
+      await copyLaunchedRemoteBrowserPassword();
+    } else if (action === "copy-launched-remote-browser-url") {
+      await copyLaunchedRemoteBrowserUrl();
+    } else if (action === "copy-launched-remote-browser-credentials") {
+      await copyLaunchedRemoteBrowserCredentials();
+    } else if (action === "open-launched-remote-browser") {
+      openLaunchedRemoteBrowser();
+    } else if (action === "finish-remote-browser-launch") {
+      finishRemoteBrowserLaunch();
     }
   } catch (error) {
     showToast(error.message, "error");
@@ -2929,11 +3414,13 @@ async function saveSubscriptionSettings(control) {
 
 function trapModalFocus(event) {
   if (event.key !== "Tab") return false;
-  const modal = !$("#browserRecordModal").hidden
-    ? $("#browserRecordModal")
-    : !$("#coreLogModal").hidden
-      ? $("#coreLogModal")
-      : null;
+  const modal = !$("#remoteBrowserLaunchModal").hidden
+    ? $("#remoteBrowserLaunchModal")
+    : !$("#browserRecordModal").hidden
+      ? $("#browserRecordModal")
+      : !$("#coreLogModal").hidden
+        ? $("#coreLogModal")
+        : null;
   if (!modal) return false;
   const dialog = modal.querySelector('[role="dialog"]');
   const focusable = [...dialog.querySelectorAll(
@@ -2982,6 +3469,7 @@ function bindEvents() {
     item.addEventListener("click", () => setActiveView(item.dataset.view));
   });
   $("#importForm").addEventListener("submit", handleImport);
+  $("#remoteBrowserLaunchForm")?.addEventListener("submit", handleRemoteBrowserLaunchSubmit);
   const networkForm = $("#networkSettingsForm");
   if (networkForm) {
     networkForm.addEventListener("input", markNetworkFormDirty);
@@ -3249,9 +3737,16 @@ function bindEvents() {
       closeBrowserRecordModal();
     }
   });
+  $("#remoteBrowserLaunchModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeRemoteBrowserLaunchModal();
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (trapModalFocus(event)) return;
-    if (event.key === "Escape" && !$("#coreLogModal").hidden) {
+    if (event.key === "Escape" && !$("#remoteBrowserLaunchModal").hidden) {
+      closeRemoteBrowserLaunchModal();
+    } else if (event.key === "Escape" && !$("#coreLogModal").hidden) {
       closeCoreLogModal();
     } else if (event.key === "Escape" && !$("#browserRecordModal").hidden) {
       closeBrowserRecordModal();

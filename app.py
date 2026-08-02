@@ -23,6 +23,7 @@ import shutil
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import tarfile
@@ -39,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import webdav_sync
+from remote_browser import RemoteBrowserBrokerClient, RemoteBrowserError
 
 
 def _detect_app_root() -> Path:
@@ -55,6 +57,17 @@ if VENDOR_ROOT.is_dir() and str(VENDOR_ROOT) not in sys.path:
     sys.path.insert(0, str(VENDOR_ROOT))
 STATIC_ROOT = APP_ROOT / "static"
 SYNC_ENGINE: webdav_sync.SyncEngine | None = None
+REMOTE_BROWSER_CLIENT: RemoteBrowserBrokerClient | None = None
+REMOTE_BROWSER_CLIENT_KEY: tuple[str, str] | None = None
+REMOTE_BROWSER_LOCK = threading.RLock()
+REMOTE_BROWSER_SESSION_CONDITION = threading.Condition(REMOTE_BROWSER_LOCK)
+REMOTE_BROWSER_SESSION_CACHE: dict[str, Any] = {
+    "checked_at": 0.0,
+    "sessions": None,
+    "error": "",
+    "epoch": 0,
+    "fetching": False,
+}
 
 
 def host_os_token() -> str:
@@ -115,6 +128,9 @@ LAN_PROXY_LISTEN_HOST = "0.0.0.0"
 PRIVATE_IPV4_NETWORKS = tuple(
     ipaddress.IPv4Network(value) for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 )
+REMOTE_BROWSER_PUBLIC_IPV4_NETWORKS = PRIVATE_IPV4_NETWORKS + (
+    ipaddress.IPv4Network("100.64.0.0/10"),
+)
 REQUEST_LOG_LIMIT = 500
 SYSTEM_LOG_LIMIT = 1000
 HTTP_PROXY_HEADER_LIMIT = 65536
@@ -130,8 +146,14 @@ BACKEND_INSTANCE_HEADER = "X-ProxyBridge-Instance"
 BACKEND_INSTANCE_TOKEN_MAX_LENGTH = 128
 BACKEND_INSTANCE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~-]+")
 GENERATED_BACKEND_INSTANCE_TOKEN = secrets.token_urlsafe(32)
+REMOTE_BROWSER_PASSWORD_MIN_LENGTH = 10
+REMOTE_BROWSER_PASSWORD_MAX_LENGTH = 128
+REMOTE_BROWSER_USERNAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,32}")
+REMOTE_BROWSER_SESSION_CACHE_TTL = 2.0
+REMOTE_BROWSER_SESSIONS_UNSET = object()
+REMOTE_BROWSER_LIVE_SESSION_STATUSES = {"running", "starting", "failed"}
 ACTIVE_BRIDGE_STATUSES = {"running", "starting"}
-ACTIVE_BROWSER_STATUSES = {"running", "starting"}
+ACTIVE_BROWSER_STATUSES = {"running", "starting", "stopping"}
 CORE_LOG_VISIBLE_STATUSES = ACTIVE_BRIDGE_STATUSES | {"failed"}
 CORE_LOG_TAIL_LIMIT = 12000
 CORE_LOG_ENTRY_LIMIT = 30
@@ -217,6 +239,8 @@ PROCESS_LOCK = threading.RLock()
 TRAFFIC_LOCK = threading.RLock()
 REQUEST_LOG_PENDING_LOCK = threading.RLock()
 SHUTTING_DOWN = threading.Event()
+SHUTDOWN_COMPLETE = threading.Event()
+SHUTDOWN_RUN_LOCK = threading.Lock()
 SHUTDOWN_SIGNAL_CLAIMED = threading.Event()
 SHUTDOWN_SIGNAL_CLAIM_LOCK = threading.Lock()
 PATH_CACHE_LOCK = threading.RLock()
@@ -224,6 +248,11 @@ LAN_ADDRESS_CACHE_LOCK = threading.RLock()
 CORE_INSTALL_LOCK = threading.RLock()
 BRIDGE_START_LOCK = threading.RLock()
 BROWSER_LAUNCH_LOCK = threading.RLock()
+REMOTE_BROWSER_LIFECYCLE_CONDITION = threading.Condition(threading.RLock())
+REMOTE_BROWSER_GENERATIONS: dict[str, int] = {}
+REMOTE_BROWSER_PENDING_STARTS: dict[str, int] = {}
+REMOTE_BROWSER_PENDING_START_TOKENS: dict[str, str] = {}
+REMOTE_BROWSER_OPERATIONS: set[tuple[str, int, str]] = set()
 FINGERPRINT_INSTALL_LOCK = threading.RLock()
 SHUTDOWN_LOCK = threading.RLock()
 SUBSCRIPTION_LOCK = threading.RLock()
@@ -465,16 +494,285 @@ def docker_mode() -> bool:
     return truthy(os.environ.get("PROXY_BRIDGE_DOCKER"))
 
 
-def browser_feature_enabled() -> bool:
-    """Browser automation is intentionally excluded from Docker deployments."""
-    if docker_mode():
+def remote_browser_feature_enabled() -> bool:
+    """Return whether Docker remote-browser workers are configured.
+
+    配置说明：PROXY_BRIDGE_BROWSER_BROKER_URL 只允许指向 Compose 内部网络的
+    Broker；PROXY_BRIDGE_BROWSER_BROKER_TOKEN_FILE 是共享只读凭证文件，不能映射到
+    Web 控制台或公开目录（未设置时使用容器内固定路径）。Broker URL 缺失时 Docker
+    会保持旧版“禁用浏览器”的安全行为。
+    """
+    if not docker_mode() or truthy(os.environ.get("PROXY_BRIDGE_DISABLE_BROWSER")):
         return False
+    return bool(str(os.environ.get("PROXY_BRIDGE_BROWSER_BROKER_URL") or "").strip())
+
+
+def browser_feature_enabled() -> bool:
+    """Return whether local or Docker-worker browser sessions are available."""
+    if docker_mode():
+        return remote_browser_feature_enabled()
     return not truthy(os.environ.get("PROXY_BRIDGE_DISABLE_BROWSER"))
 
 
 def require_browser_feature() -> None:
     if not browser_feature_enabled():
         raise RuntimeError("当前运行模式不提供浏览器功能")
+
+
+def remote_browser_broker_client() -> RemoteBrowserBrokerClient:
+    global REMOTE_BROWSER_CLIENT, REMOTE_BROWSER_CLIENT_KEY
+    if not remote_browser_feature_enabled():
+        raise RuntimeError("Docker 远程浏览器功能未配置")
+    url = str(os.environ.get("PROXY_BRIDGE_BROWSER_BROKER_URL") or "").strip()
+    token_path = str(
+        os.environ.get("PROXY_BRIDGE_BROWSER_BROKER_TOKEN_FILE")
+        or "/run/proxybridge-browser/token"
+    ).strip()
+    key = (url, token_path)
+    with REMOTE_BROWSER_LOCK:
+        if REMOTE_BROWSER_CLIENT is None or REMOTE_BROWSER_CLIENT_KEY != key:
+            REMOTE_BROWSER_CLIENT = RemoteBrowserBrokerClient(url, Path(token_path))
+            REMOTE_BROWSER_CLIENT_KEY = key
+        return REMOTE_BROWSER_CLIENT
+
+
+def invalidate_remote_browser_session_cache() -> None:
+    with REMOTE_BROWSER_SESSION_CONDITION:
+        REMOTE_BROWSER_SESSION_CACHE.update(
+            {
+                "checked_at": 0.0,
+                "sessions": None,
+                "error": "",
+                "epoch": safe_int(REMOTE_BROWSER_SESSION_CACHE.get("epoch"), 0) + 1,
+            }
+        )
+        REMOTE_BROWSER_SESSION_CONDITION.notify_all()
+
+
+def begin_remote_browser_start(instance_id: str) -> tuple[int, str]:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        generation = REMOTE_BROWSER_GENERATIONS.get(instance_id, 0) + 1
+        operation_id = secrets.token_hex(16)
+        REMOTE_BROWSER_GENERATIONS[instance_id] = generation
+        REMOTE_BROWSER_PENDING_STARTS[instance_id] = generation
+        REMOTE_BROWSER_PENDING_START_TOKENS[instance_id] = operation_id
+        return generation, operation_id
+
+
+def remote_browser_pending_start_tokens(
+    instance_ids: list[str] | set[str] | None = None,
+) -> dict[str, str]:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        selected = (
+            set(str(item or "") for item in instance_ids)
+            if instance_ids is not None
+            else set(REMOTE_BROWSER_PENDING_START_TOKENS)
+        )
+        return {
+            instance_id: token
+            for instance_id, token in REMOTE_BROWSER_PENDING_START_TOKENS.items()
+            if instance_id in selected and token
+        }
+
+
+def invalidate_remote_browser_generations(instance_ids: list[str] | set[str]) -> dict[str, int]:
+    generations: dict[str, int] = {}
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        for instance_id in dict.fromkeys(str(item or "") for item in instance_ids):
+            if not instance_id:
+                continue
+            generation = REMOTE_BROWSER_GENERATIONS.get(instance_id, 0) + 1
+            REMOTE_BROWSER_GENERATIONS[instance_id] = generation
+            generations[instance_id] = generation
+        REMOTE_BROWSER_LIFECYCLE_CONDITION.notify_all()
+    return generations
+
+
+def remote_browser_generation_current(instance_id: str, generation: int) -> bool:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        return REMOTE_BROWSER_GENERATIONS.get(instance_id, 0) == generation
+
+
+def remote_browser_start_pending(instance_id: str) -> bool:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        generation = REMOTE_BROWSER_GENERATIONS.get(instance_id, 0)
+        return REMOTE_BROWSER_PENDING_STARTS.get(instance_id) == generation
+
+
+def finish_remote_browser_start(instance_id: str, generation: int) -> None:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        if REMOTE_BROWSER_PENDING_STARTS.get(instance_id) == generation:
+            REMOTE_BROWSER_PENDING_STARTS.pop(instance_id, None)
+            REMOTE_BROWSER_PENDING_START_TOKENS.pop(instance_id, None)
+        REMOTE_BROWSER_LIFECYCLE_CONDITION.notify_all()
+
+
+def prune_remote_browser_lifecycle(instance_id: str) -> None:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        active_operation = any(item[0] == instance_id for item in REMOTE_BROWSER_OPERATIONS)
+        if instance_id not in REMOTE_BROWSER_PENDING_STARTS and not active_operation:
+            REMOTE_BROWSER_GENERATIONS.pop(instance_id, None)
+            REMOTE_BROWSER_PENDING_START_TOKENS.pop(instance_id, None)
+
+
+def register_remote_browser_operation(instance_id: str, generation: int, operation: str) -> bool:
+    token = (instance_id, generation, operation)
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        if SHUTTING_DOWN.is_set() or REMOTE_BROWSER_GENERATIONS.get(instance_id, 0) != generation:
+            return False
+        REMOTE_BROWSER_OPERATIONS.add(token)
+        return True
+
+
+def finish_remote_browser_operation(instance_id: str, generation: int, operation: str) -> None:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        REMOTE_BROWSER_OPERATIONS.discard((instance_id, generation, operation))
+        REMOTE_BROWSER_LIFECYCLE_CONDITION.notify_all()
+
+
+def invalidate_all_remote_browser_operations() -> set[str]:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        instance_ids = (
+            set(REMOTE_BROWSER_PENDING_STARTS)
+            | {item[0] for item in REMOTE_BROWSER_OPERATIONS}
+        )
+        for instance_id in instance_ids:
+            REMOTE_BROWSER_GENERATIONS[instance_id] = (
+                REMOTE_BROWSER_GENERATIONS.get(instance_id, 0) + 1
+            )
+        REMOTE_BROWSER_LIFECYCLE_CONDITION.notify_all()
+        return instance_ids
+
+
+def wait_remote_browser_operations(timeout: float) -> bool:
+    deadline = time.monotonic() + max(0.0, timeout)
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        while REMOTE_BROWSER_OPERATIONS:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            REMOTE_BROWSER_LIFECYCLE_CONDITION.wait(timeout=remaining)
+        return True
+
+
+def remote_browser_sessions(
+    *,
+    force: bool = False,
+    timeout: float | None = None,
+) -> tuple[dict[str, dict[str, Any]] | None, str]:
+    """Return (sessions_by_instance, error). None means the broker is unreachable."""
+    if not remote_browser_feature_enabled():
+        return {}, ""
+    wait_deadline = (
+        time.monotonic() + max(1.0, float(timeout)) + 0.5
+        if timeout is not None
+        else None
+    )
+    force_refresh = force
+    while True:
+        current = time.monotonic()
+        if wait_deadline is not None and current >= wait_deadline:
+            return None, "等待浏览器 Broker 会话快照超时"
+        with REMOTE_BROWSER_SESSION_CONDITION:
+            cached_at = float(REMOTE_BROWSER_SESSION_CACHE.get("checked_at") or 0.0)
+            cached_sessions = REMOTE_BROWSER_SESSION_CACHE.get("sessions")
+            cached_error = str(REMOTE_BROWSER_SESSION_CACHE.get("error") or "")
+            if (
+                not force_refresh
+                and cached_at > 0.0
+                and current - cached_at < REMOTE_BROWSER_SESSION_CACHE_TTL
+            ):
+                return cached_sessions, cached_error
+            if REMOTE_BROWSER_SESSION_CACHE.get("fetching") is True:
+                wait_timeout = 30.5
+                if wait_deadline is not None:
+                    wait_timeout = wait_deadline - current
+                    if wait_timeout <= 0:
+                        return None, "等待浏览器 Broker 会话快照超时"
+                REMOTE_BROWSER_SESSION_CONDITION.wait(timeout=wait_timeout)
+                force_refresh = False
+                continue
+            fetch_epoch = safe_int(REMOTE_BROWSER_SESSION_CACHE.get("epoch"), 0)
+            REMOTE_BROWSER_SESSION_CACHE["fetching"] = True
+
+        try:
+            request_timeout = timeout
+            if wait_deadline is not None:
+                request_timeout = max(1.0, wait_deadline - time.monotonic())
+            broker_client = remote_browser_broker_client()
+            broker_sessions = (
+                broker_client.sessions()
+                if request_timeout is None
+                else broker_client.sessions(timeout=request_timeout)
+            )
+            sessions = {
+                str(item.get("instance_id") or ""): dict(item)
+                for item in broker_sessions
+                if item.get("instance_id")
+            }
+            error = ""
+        except (RemoteBrowserError, RuntimeError, ValueError) as exc:
+            sessions = None
+            error = str(exc)
+        except BaseException:
+            with REMOTE_BROWSER_SESSION_CONDITION:
+                REMOTE_BROWSER_SESSION_CACHE["fetching"] = False
+                REMOTE_BROWSER_SESSION_CONDITION.notify_all()
+            raise
+
+        with REMOTE_BROWSER_SESSION_CONDITION:
+            REMOTE_BROWSER_SESSION_CACHE["fetching"] = False
+            if safe_int(REMOTE_BROWSER_SESSION_CACHE.get("epoch"), 0) == fetch_epoch:
+                REMOTE_BROWSER_SESSION_CACHE.update(
+                    {"checked_at": time.monotonic(), "sessions": sessions, "error": error}
+                )
+                REMOTE_BROWSER_SESSION_CONDITION.notify_all()
+                return sessions, error
+            # A start/stop invalidated this request while it was in flight. Do not let
+            # that stale snapshot repopulate the cache; fetch the new lifecycle epoch.
+            REMOTE_BROWSER_SESSION_CONDITION.notify_all()
+            force_refresh = False
+
+
+def remote_browser_broker_status() -> dict[str, Any]:
+    if not remote_browser_feature_enabled():
+        return {"configured": False, "available": False}
+    try:
+        status = remote_browser_broker_client().status()
+        return {"configured": True, "available": True, **status}
+    except (RemoteBrowserError, RuntimeError, ValueError) as exc:
+        return {"configured": True, "available": False, "error": str(exc)}
+
+
+def normalize_remote_browser_url(value: Any) -> str:
+    """只接受 Broker 可生成的私有 HTTPS worker 链接。"""
+    try:
+        parsed = urllib.parse.urlsplit(str(value or "").strip())
+        port = parsed.port
+        address = ipaddress.IPv4Address(str(parsed.hostname or ""))
+    except (ValueError, ipaddress.AddressValueError):
+        return ""
+    if (
+        parsed.scheme != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or port is None
+        or not 1024 <= port <= 65535
+        or not (
+            address.is_loopback
+            or any(address in network for network in REMOTE_BROWSER_PUBLIC_IPV4_NETWORKS)
+        )
+    ):
+        return ""
+    return f"https://{address}:{port}/"
+
+
+def normalize_remote_browser_container_id(value: Any) -> str:
+    container_id = str(value or "").strip().lower()
+    return container_id if re.fullmatch(r"[a-f0-9]{12,64}", container_id) else ""
 
 
 def runtime_mode() -> str:
@@ -998,6 +1296,7 @@ def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[
     while instance_id in existing_ids:
         instance_id = new_browser_instance_id(node_id)
     profile_path = browser_instance_profile_path(node_id, instance_id)
+    remote_worker = remote_browser_feature_enabled()
     return {
         "id": instance_id,
         "node_id": node_id,
@@ -1014,6 +1313,14 @@ def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[
         "proxy": "",
         "launch_count": 0,
         "legacy": False,
+        "remote_worker": remote_worker,
+        "remote_url": "",
+        "remote_container_id": "",
+        "remote_host_port": None,
+        "remote_username": "",
+        # Chromium Profile 在桌面进程与 Docker worker 间保持同一布局；Selkies
+        # TLS/认证运行文件由 worker 匿名卷承载，不写入这个同步目录。
+        "profile_layout": "native-v1",
     }
 
 
@@ -1055,6 +1362,25 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
         status = str(record.get("status") or "stopped")
         if status not in ACTIVE_BROWSER_STATUSES | {"stopped", "failed"}:
             status = "stopped"
+        remote_worker = record.get("remote_worker") is True
+        remote_url = (
+            normalize_remote_browser_url(record.get("remote_url"))
+            if remote_worker and status in ACTIVE_BROWSER_STATUSES
+            else ""
+        )
+        remote_host_port = safe_int(record.get("remote_host_port"), 0)
+        if (
+            not remote_worker
+            or status not in ACTIVE_BROWSER_STATUSES
+            or not 1024 <= remote_host_port <= 65535
+        ):
+            remote_host_port = 0
+        remote_username = str(record.get("remote_username") or "")
+        if REMOTE_BROWSER_USERNAME_PATTERN.fullmatch(remote_username) is None:
+            remote_username = ""
+        profile_layout = str(record.get("profile_layout") or "native-v1")
+        if profile_layout not in {"native-v1", "remote-worker-v1"}:
+            profile_layout = "native-v1"
         # Prefer explicit label; accept legacy "tag" key if present.
         label = normalize_browser_label(record.get("label") if "label" in record else record.get("tag"))
         record.update(
@@ -1077,6 +1403,16 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
                 "proxy": str(record.get("proxy") or ""),
                 "launch_count": safe_int(record.get("launch_count"), 0),
                 "legacy": legacy,
+                "remote_worker": remote_worker,
+                "remote_url": remote_url,
+                "remote_container_id": (
+                    normalize_remote_browser_container_id(record.get("remote_container_id"))
+                    if remote_worker and status in ACTIVE_BROWSER_STATUSES
+                    else ""
+                ),
+                "remote_host_port": remote_host_port or None,
+                "remote_username": remote_username,
+                "profile_layout": profile_layout,
             }
         )
         record.pop("tag", None)
@@ -2484,6 +2820,18 @@ def _safe_extract_zip(archive_path: Path, dest: Path) -> None:
             if target != root and root not in target.parents:
                 raise RuntimeError("压缩包包含非法路径")
         archive.extractall(dest)
+        # zipfile 不会可靠恢复 Unix 可执行位；Linux 指纹内核的 chrome 与
+        # chrome-wrapper 必须保持可执行，否则下载成功后 worker 仍无法启动。
+        executable_names = {"chrome", "chromium", "chrome-wrapper"}
+        for member in archive.infolist():
+            if member.is_dir():
+                continue
+            target = (dest / member.filename).resolve()
+            archived_mode = (member.external_attr >> 16) & 0o777
+            if archived_mode:
+                target.chmod(archived_mode)
+            if target.name in executable_names and os.name != "nt" and not os.access(target, os.X_OK):
+                target.chmod(stat.S_IMODE(target.stat().st_mode) | 0o755)
 
 
 def _safe_extract_tar(archive_path: Path, dest: Path) -> None:
@@ -2502,7 +2850,7 @@ def _extract_archive(archive_path: Path, dest: Path) -> None:
     name = archive_path.name.lower()
     if name.endswith(".zip"):
         _safe_extract_zip(archive_path, dest)
-    elif name.endswith((".tar.gz", ".tgz", ".tar")):
+    elif name.endswith((".tar.gz", ".tgz", ".tar.xz", ".tar")):
         _safe_extract_tar(archive_path, dest)
     else:
         raise RuntimeError(f"不支持的核心压缩包格式:{archive_path.name}")
@@ -2926,6 +3274,32 @@ def proxy_client_allowed(value: Any, allowed_cidrs: Any = None) -> bool:
     return any(address in ipaddress.IPv4Network(network) for network in networks)
 
 
+def remote_browser_worker_client(value: Any, proxy_port: Any = None) -> bool:
+    """只允许 Broker 报告的 worker IP 使用分配给它的节点代理端口。"""
+    if not remote_browser_feature_enabled():
+        return False
+    try:
+        address = ipaddress.IPv4Address(str(value or "").strip())
+    except ipaddress.AddressValueError:
+        return False
+    expected_port = safe_int(proxy_port, 0)
+    if expected_port <= 0:
+        return False
+    sessions, _error = remote_browser_sessions()
+    if not isinstance(sessions, dict):
+        return False
+    for session in sessions.values():
+        if session.get("status") not in REMOTE_BROWSER_LIVE_SESSION_STATUSES:
+            continue
+        try:
+            worker_ip = ipaddress.IPv4Address(str(session.get("worker_ip") or ""))
+        except ipaddress.AddressValueError:
+            continue
+        if worker_ip == address and safe_int(session.get("proxy_port"), 0) == expected_port:
+            return True
+    return False
+
+
 def register_active_proxy_client(
     *,
     proxy: "Socks5LogProxy",
@@ -3163,20 +3537,55 @@ def network_settings_payload(
 
 
 def status_payload() -> dict[str, Any]:
+    remote_enabled = remote_browser_feature_enabled()
+    remote_sessions, remote_error = (
+        remote_browser_sessions() if remote_enabled else ({}, "")
+    )
     with SHUTDOWN_LOCK:
-        return _status_payload()
+        return _status_payload(
+            remote_sessions_snapshot=remote_sessions,
+            remote_error_snapshot=remote_error,
+        )
 
 
-def _status_payload() -> dict[str, Any]:
+def _status_payload(
+    *,
+    remote_sessions_snapshot: Any = REMOTE_BROWSER_SESSIONS_UNSET,
+    remote_error_snapshot: str = "",
+) -> dict[str, Any]:
     synchronize_process_state()
     browser_enabled = browser_feature_enabled()
     docker_enabled = docker_mode()
+    remote_browser_enabled = remote_browser_feature_enabled()
+    if remote_browser_enabled and remote_sessions_snapshot is REMOTE_BROWSER_SESSIONS_UNSET:
+        remote_sessions, remote_error = remote_browser_sessions()
+    elif remote_browser_enabled:
+        remote_sessions = remote_sessions_snapshot
+        remote_error = str(remote_error_snapshot or "")
+    else:
+        remote_sessions, remote_error = {}, ""
+    remote_runtime = {
+        "configured": remote_browser_enabled,
+        "available": remote_sessions is not None if remote_browser_enabled else False,
+        "active_sessions": (
+            sum(
+                item.get("status") in REMOTE_BROWSER_LIVE_SESSION_STATUSES
+                for item in remote_sessions.values()
+            )
+            if isinstance(remote_sessions, dict)
+            else 0
+        ),
+        "error": remote_error,
+    }
     lan_addresses = [] if docker_enabled else lan_ipv4_addresses()
     with STATE_LOCK:
         state = load_state()
         changed = sync_process_status(state)
         if browser_enabled:
-            changed |= sync_browser_instance_status(state)
+            changed |= sync_browser_instance_status(
+                state,
+                remote_sessions_snapshot=remote_sessions,
+            )
         token, token_changed = ensure_pool_token(state)
         members = pool_members(state, ready_only=False)
         if changed or token_changed:
@@ -3206,11 +3615,14 @@ def _status_payload() -> dict[str, Any]:
             "features": {
                 "browser": browser_enabled,
                 "browser_profile_sync": browser_enabled,
+                "remote_browser": remote_browser_enabled,
+                "browser_kernel_download": browser_enabled,
                 "docker": docker_enabled,
             },
             "cores": core_paths(),
-            "chrome": chrome_path() if browser_enabled else None,
+            "chrome": chrome_path() if browser_enabled and not remote_browser_enabled else None,
             "fingerprint_chromium": fingerprint_chromium_path() if browser_enabled else None,
+            "remote_browser": remote_runtime,
             "active_browsers": active_browser_node_ids_from_state(state) if browser_enabled else [],
             "browser_instances": state.get("browser_instances", []) if browser_enabled else [],
             "subscriptions": state["subscriptions"],
@@ -3727,6 +4139,15 @@ def ensure_pool_token(state: dict[str, Any]) -> tuple[str, bool]:
 
 
 def browser_process_is_active(instance_id: str) -> bool:
+    if remote_browser_feature_enabled():
+        sessions, _error = remote_browser_sessions()
+        if sessions is None:
+            # Fail closed for WebDAV: never archive a Profile while worker status is unknown.
+            return True
+        return bool(
+            sessions.get(instance_id, {}).get("status")
+            in REMOTE_BROWSER_LIVE_SESSION_STATUSES
+        )
     with PROCESS_LOCK:
         process = BROWSER_PROCESS_TABLE.get(instance_id)
     return bool(process and process.poll() is None)
@@ -4797,11 +5218,15 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
                     node_dicts=node_dicts,
                 )
                 runtime_snapshot = _runtime_snapshot_for_nodes(state, remove_ids)
-            runtime_cleanup = _stop_runtime_for_nodes(runtime_snapshot) if remove_ids else {
-                "killed_browsers": 0,
-                "traffic_by_bridge": {},
-                "browser_instances": [],
-            }
+        # 停止远程 worker 可能需要等待 Broker；不能占用关机屏障，否则 SIGTERM
+        # 无法及时开始兜底回收。提交订阅变更前会重新检查关机状态。
+        runtime_cleanup = _stop_runtime_for_nodes(runtime_snapshot) if remove_ids else {
+            "killed_browsers": 0,
+            "traffic_by_bridge": {},
+            "browser_instances": [],
+        }
+        with SHUTDOWN_LOCK:
+            _ensure_subscription_refresh_allowed()
             with STATE_LOCK:
                 state = load_state()
                 _apply_subscription_replacement(
@@ -5269,6 +5694,7 @@ def _purge_browser_resources_for_nodes(state: dict[str, Any], node_ids: set[str]
 def delete_subscription(subscription_id: str) -> dict[str, Any]:
     with SUBSCRIPTION_LOCK:
         with SHUTDOWN_LOCK:
+            _ensure_subscription_refresh_allowed()
             with STATE_LOCK:
                 state = load_state()
                 subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
@@ -5281,11 +5707,14 @@ def delete_subscription(subscription_id: str) -> dict[str, Any]:
                     if node_id
                 }
                 runtime_snapshot = _runtime_snapshot_for_nodes(state, remove_ids)
-            runtime_cleanup = _stop_runtime_for_nodes(runtime_snapshot) if remove_ids else {
-                "killed_browsers": 0,
-                "traffic_by_bridge": {},
-                "browser_instances": [],
-            }
+        # 与订阅替换相同，Broker 网络调用必须位于 SHUTDOWN_LOCK 之外。
+        runtime_cleanup = _stop_runtime_for_nodes(runtime_snapshot) if remove_ids else {
+            "killed_browsers": 0,
+            "traffic_by_bridge": {},
+            "browser_instances": [],
+        }
+        with SHUTDOWN_LOCK:
+            _ensure_subscription_refresh_allowed()
             with STATE_LOCK:
                 state = load_state()
                 state["subscriptions"] = [s for s in state["subscriptions"] if s.get("id") != subscription_id]
@@ -6096,9 +6525,289 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("没有可用的核心启动方案")
 
 
+def validate_remote_browser_login(payload: dict[str, Any]) -> tuple[str, str]:
+    username = str(payload.get("username") or "proxybridge").strip()
+    if REMOTE_BROWSER_USERNAME_PATTERN.fullmatch(username) is None:
+        raise ValueError("远程浏览器用户名必须为 1–32 位字母、数字、点、下划线或短横线")
+    password = str(payload.get("password") or "")
+    if not REMOTE_BROWSER_PASSWORD_MIN_LENGTH <= len(password) <= REMOTE_BROWSER_PASSWORD_MAX_LENGTH:
+        raise ValueError(
+            f"远程浏览器密码必须为 {REMOTE_BROWSER_PASSWORD_MIN_LENGTH}–{REMOTE_BROWSER_PASSWORD_MAX_LENGTH} 个字符"
+        )
+    if any(ord(char) < 32 or ord(char) == 127 for char in password):
+        raise ValueError("远程浏览器密码不能包含控制字符")
+    return username, password
+
+
+def remote_browser_profile_relative(profile_path: Path) -> str:
+    try:
+        relative = profile_path.resolve().relative_to(WORK_ROOT.resolve())
+    except ValueError as exc:
+        raise RuntimeError("远程浏览器 Profile 不在工作目录内") from exc
+    parts = relative.parts
+    if len(parts) not in {2, 3, 4} or parts[0] != "browser_profiles":
+        raise RuntimeError("远程浏览器 Profile 路径结构无效")
+    if len(parts) == 4 and parts[-1] != "chromium-profile":
+        raise RuntimeError("远程浏览器 Profile 兼容布局无效")
+    return relative.as_posix()
+
+
+def remote_browser_fingerprint_relative() -> str:
+    executable = fingerprint_chromium_path(force_refresh=True)
+    if not executable:
+        raise RuntimeError(
+            "未找到 Linux 指纹内核。请先点击「下载指纹内核」，再启动远程浏览器。"
+        )
+    root = Path(executable).resolve().parent
+    wrapper = root / "chrome-wrapper"
+    if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
+        candidates = [path for path in fingerprint_chromium_root().glob("**/chrome-wrapper") if path.is_file()]
+        wrapper = next((path for path in candidates if os.access(path, os.X_OK)), wrapper)
+        root = wrapper.parent
+    if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
+        raise RuntimeError("指纹内核缺少可执行的 chrome-wrapper，请重新下载内核")
+    try:
+        relative = root.resolve().relative_to(WORK_ROOT.resolve())
+    except ValueError as exc:
+        raise RuntimeError("指纹内核不在 Docker 数据目录内，无法挂载到 worker") from exc
+    if not relative.parts or relative.parts[0] != "fingerprint-chromium":
+        raise RuntimeError("指纹内核目录结构无效")
+    return relative.as_posix()
+
+
+def launch_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    username, password = validate_remote_browser_login(payload)
+    with SHUTDOWN_LOCK:
+        if SHUTTING_DOWN.is_set():
+            raise RuntimeError("程序正在退出，不能启动新的浏览器")
+        synchronize_process_state()
+    remote_sessions_snapshot, _remote_error = remote_browser_sessions()
+    node_id = str(payload.get("node_id") or "")
+    requested_instance_id = str(payload.get("instance_id") or "")
+    with STATE_LOCK:
+        state = load_state()
+        instance: dict[str, Any] | None = None
+        if requested_instance_id:
+            instance = find_browser_instance(state, requested_instance_id)
+            if not node_id:
+                node_id = str(instance.get("node_id") or "")
+        if not node_id:
+            raise ValueError("缺少节点 ID")
+        node = dict(find_node(state, node_id))
+        sync_browser_instance_status(
+            state,
+            remote_sessions_snapshot=remote_sessions_snapshot,
+        )
+        created = False
+        if instance is None:
+            instance = create_browser_instance_record(state, node_id)
+            state["browser_instances"].append(instance)
+            created = True
+        elif str(instance.get("node_id") or "") != node_id:
+            raise ValueError("浏览器记录与节点不匹配")
+        elif instance.get("status") in ACTIVE_BROWSER_STATUSES:
+            raise ValueError("浏览器实例已在运行")
+        instance.update(
+            {
+                "status": "starting",
+                "pid": None,
+                "remote_worker": True,
+                "remote_url": "",
+                "remote_container_id": "",
+                "remote_host_port": None,
+                "remote_username": username,
+            }
+        )
+        instance.pop("error", None)
+        instance_id = str(instance["id"])
+        generation, operation_id = begin_remote_browser_start(instance_id)
+        # 不信任状态文件中的绝对路径；始终由经过校验的节点/实例 ID 重建 Profile 路径。
+        profile_root = browser_instance_profile_path(
+            node_id,
+            instance_id,
+            legacy=bool(instance.get("legacy")),
+        )
+        chromium_profile = (
+            profile_root / "chromium-profile"
+            if instance.get("profile_layout") == "remote-worker-v1"
+            else profile_root
+        )
+        profile_rel = remote_browser_profile_relative(chromium_profile)
+        instance["profile_path"] = str(profile_root)
+        instance_snapshot = dict(instance)
+        save_state(state)
+        bridge = active_bridge_for_node(state, node_id)
+    if created:
+        mark_sync_local_change()
+
+    broker_start_attempted = False
+    operation_registered = False
+    try:
+        if not bridge:
+            bridge = start_bridge({"node_id": node_id, "core": "auto"})
+        local_port = safe_int(bridge.get("port"), 0)
+        if local_port <= 0:
+            raise RuntimeError("当前节点没有可用的本地代理端口")
+        chromium_profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            chromium_profile.chmod(0o700)
+        except OSError:
+            pass
+        configure_browser_profile_defaults(chromium_profile)
+        fingerprint_rel = remote_browser_fingerprint_relative()
+        seed = safe_int(instance.get("fingerprint_seed"), browser_instance_seed(node_id, instance_id))
+        region = node.get("region") or node_region(node.get("name") or "", node.get("server") or "")
+        timezone, language, accept_language = region_locale(region)
+        broker_client = remote_browser_broker_client()
+        # 镜像下载可能耗时数分钟，但不会创建容器；先在生命周期操作之外完成，
+        # 避免关机为等待一个无副作用的拉取而留下竞态。
+        broker_client.prepare()
+        if not register_remote_browser_operation(instance_id, generation, "start"):
+            raise RuntimeError("远程浏览器启动已被停止或关机操作取消")
+        operation_registered = True
+        broker_start_attempted = True
+        # worker 启动后会立即连接节点代理。先清掉会话缓存，避免刚创建的精确
+        # worker IP 因命中旧快照而在最初几秒被代理认证误拒绝。
+        invalidate_remote_browser_session_cache()
+        broker_result = broker_client.start(
+            {
+                "instance_id": instance_id,
+                "operation_id": operation_id,
+                "profile_rel": profile_rel,
+                "fingerprint_rel": fingerprint_rel,
+                "username": username,
+                "password": password,
+                "proxy_port": local_port,
+                "fingerprint_seed": seed,
+                "timezone": timezone,
+                "language": language,
+                "accept_language": accept_language,
+            }
+        )
+        invalidate_remote_browser_session_cache()
+        remote_url = normalize_remote_browser_url(broker_result.get("url"))
+        if not remote_url:
+            raise RuntimeError("浏览器 worker 未返回有效的私有 HTTPS 访问地址")
+        remote_container_id = normalize_remote_browser_container_id(
+            broker_result.get("container_id")
+        )
+        remote_host_port = safe_int(broker_result.get("host_port"), 0)
+        remote_url_port = urllib.parse.urlsplit(remote_url).port
+        try:
+            worker_ip = ipaddress.IPv4Address(str(broker_result.get("worker_ip") or ""))
+        except ipaddress.AddressValueError:
+            worker_ip = None
+        if (
+            not remote_container_id
+            or not 1024 <= remote_host_port <= 65535
+            or remote_host_port != remote_url_port
+            or broker_result.get("status") != "running"
+            or broker_result.get("health") != "healthy"
+            or safe_int(broker_result.get("proxy_port"), 0) != local_port
+            or worker_ip is None
+            or not any(worker_ip in network for network in PRIVATE_IPV4_NETWORKS)
+        ):
+            raise RuntimeError("浏览器 worker 返回的容器状态无效")
+        with STATE_LOCK:
+            state = load_state()
+            saved_instance = find_browser_instance(state, instance_id)
+            if (
+                SHUTTING_DOWN.is_set()
+                or not remote_browser_generation_current(instance_id, generation)
+                or saved_instance.get("status") != "starting"
+            ):
+                raise RuntimeError("远程浏览器启动结果已失效，正在回收 worker")
+            saved_instance.update(
+                {
+                    "status": "running",
+                    "pid": None,
+                    "bridge_id": bridge.get("id"),
+                    "proxy": (
+                        "socks5://"
+                        f"{os.environ.get('PROXY_BRIDGE_BROWSER_PROXY_HOST', 'proxybridge')}:{local_port}"
+                    ),
+                    "remote_worker": True,
+                    "remote_url": remote_url,
+                    "remote_container_id": remote_container_id,
+                    "remote_host_port": remote_host_port,
+                    "remote_username": username,
+                    "last_started_at": now_ts(),
+                    "last_stopped_at": None,
+                    "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
+                }
+            )
+            saved_instance.pop("error", None)
+            save_state(state)
+            saved_instance_snapshot = dict(saved_instance)
+        mark_sync_local_change()
+    except BaseException as exc:
+        if broker_start_attempted:
+            try:
+                remote_browser_broker_client().stop(instance_id, operation_id)
+            except BaseException as cleanup_error:
+                log_event(
+                    f"回收启动失败的远程浏览器 {instance_id} 失败：{cleanup_error}",
+                    level="warn",
+                    category="浏览器",
+                )
+            finally:
+                invalidate_remote_browser_session_cache()
+        with STATE_LOCK:
+            state = load_state()
+            try:
+                failed_instance = find_browser_instance(state, instance_id)
+            except ValueError:
+                failed_instance = None
+            if (
+                failed_instance is not None
+                and remote_browser_generation_current(instance_id, generation)
+                and failed_instance.get("status") == "starting"
+            ):
+                failed_instance.update(
+                    {
+                        "status": "failed",
+                        "pid": None,
+                        "remote_url": "",
+                        "remote_container_id": "",
+                        "remote_host_port": None,
+                        "error": str(exc)[:1000],
+                    }
+                )
+                save_state(state)
+        raise
+    finally:
+        if operation_registered:
+            finish_remote_browser_operation(instance_id, generation, "start")
+        finish_remote_browser_start(instance_id, generation)
+        prune_remote_browser_lifecycle(instance_id)
+    return {
+        "ok": True,
+        "pid": None,
+        "node_id": node_id,
+        "node_name": node.get("name") or node_id,
+        "instance_id": instance_id,
+        "browser_name": instance_snapshot.get("name") or "浏览器",
+        "proxy": saved_instance_snapshot["proxy"],
+        "bridge_id": bridge.get("id"),
+        "profile_path": str(profile_root),
+        "fingerprint_seed": seed,
+        "region": region,
+        "timezone": timezone,
+        "language": language,
+        "remote": True,
+        "remote_url": remote_url,
+        "remote_username": username,
+        "worker_image": remote_browser_broker_status().get("worker_image"),
+        "isolation": "独立 Docker worker + 独立 Profile + 节点代理",
+        "fingerprint_note": "已向 worker 传入固定指纹种子；底层指纹能力取决于所配置 worker 镜像中的 Chromium 构建。",
+    }
+
+
 def launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     require_browser_feature()
     with BROWSER_LAUNCH_LOCK:
+        if remote_browser_feature_enabled():
+            return launch_remote_browser(payload)
         return _launch_browser(payload)
 
 
@@ -6193,7 +6902,12 @@ def _run_browser_launch(
 
     instance_id = str(instance["id"])
     legacy = bool(instance.get("legacy"))
-    profile_path = Path(str(instance.get("profile_path") or browser_instance_profile_path(node_id, instance_id, legacy)))
+    profile_root = Path(str(instance.get("profile_path") or browser_instance_profile_path(node_id, instance_id, legacy)))
+    profile_path = (
+        profile_root / "chromium-profile"
+        if instance.get("profile_layout") == "remote-worker-v1"
+        else profile_root
+    )
     first_profile_launch = not profile_path.exists()
     profile_path.mkdir(parents=True, exist_ok=True)
     configure_browser_profile_defaults(profile_path)
@@ -6249,11 +6963,16 @@ def _run_browser_launch(
             saved_instance.update(
                 {
                     "status": "running",
-                    "profile_path": str(profile_path),
+                    "profile_path": str(profile_root),
                     "fingerprint_seed": seed,
                     "pid": process.pid,
                     "bridge_id": bridge.get("id"),
                     "proxy": proxy,
+                    "remote_worker": False,
+                    "remote_url": "",
+                    "remote_container_id": "",
+                    "remote_host_port": None,
+                    "remote_username": "",
                     "last_started_at": now_ts(),
                     "last_stopped_at": None,
                     "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
@@ -6286,7 +7005,7 @@ def _run_browser_launch(
         "browser_name": instance.get("name") or "浏览器",
         "proxy": proxy,
         "bridge_id": bridge.get("id"),
-        "profile_path": str(profile_path),
+        "profile_path": str(profile_root),
         "chromium_path": fp_chromium,
         "fingerprint_seed": seed,
         "region": region,
@@ -6312,14 +7031,25 @@ def prune_browser_processes(node_id: str) -> list[subprocess.Popen]:
 
 
 def active_browser_node_ids() -> list[str]:
+    remote_sessions_snapshot: Any = REMOTE_BROWSER_SESSIONS_UNSET
+    if remote_browser_feature_enabled():
+        remote_sessions_snapshot, _remote_error = remote_browser_sessions()
     with SHUTDOWN_LOCK:
-        return _active_browser_node_ids()
+        return _active_browser_node_ids(
+            remote_sessions_snapshot=remote_sessions_snapshot,
+        )
 
 
-def _active_browser_node_ids() -> list[str]:
+def _active_browser_node_ids(
+    *,
+    remote_sessions_snapshot: Any = REMOTE_BROWSER_SESSIONS_UNSET,
+) -> list[str]:
     with STATE_LOCK:
         state = load_state()
-        if sync_browser_instance_status(state):
+        if sync_browser_instance_status(
+            state,
+            remote_sessions_snapshot=remote_sessions_snapshot,
+        ):
             save_state(state)
     return active_browser_node_ids_from_state(state)
 
@@ -6358,6 +7088,13 @@ def remove_registered_browser_process(
 
 
 def stop_browser_instance_process(instance_id: str) -> int:
+    if remote_browser_feature_enabled():
+        operation_id = remote_browser_pending_start_tokens([instance_id]).get(instance_id, "")
+        generation = invalidate_remote_browser_generations([instance_id]).get(instance_id, 0)
+        try:
+            return stop_remote_browser_worker(instance_id, generation, operation_id)
+        finally:
+            prune_remote_browser_lifecycle(instance_id)
     with PROCESS_LOCK:
         process = BROWSER_PROCESS_TABLE.get(instance_id)
     if process is None:
@@ -6369,6 +7106,116 @@ def stop_browser_instance_process(instance_id: str) -> int:
         killed = 1
     remove_registered_browser_process(process, instance_id)
     return killed
+
+
+def stop_remote_browser_worker(
+    instance_id: str,
+    generation: int,
+    cancelled_operation_id: str = "",
+) -> int:
+    if not register_remote_browser_operation(instance_id, generation, "stop"):
+        raise RuntimeError("远程浏览器停止操作已被新的操作或关机取消")
+    try:
+        result = remote_browser_broker_client().stop(instance_id, cancelled_operation_id)
+        return safe_int(result.get("stopped"), 0)
+    finally:
+        invalidate_remote_browser_session_cache()
+        finish_remote_browser_operation(instance_id, generation, "stop")
+
+
+def _stop_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
+    node_id = str(payload.get("node_id") or "")
+    instance_id = str(payload.get("instance_id") or "")
+    all_instances = payload.get("all_instances") is True
+    with STATE_LOCK:
+        state = load_state()
+        if all_instances:
+            target_ids = [
+                str(item.get("id") or "")
+                for item in state.get("browser_instances", [])
+                if isinstance(item, dict) and item.get("id")
+            ]
+        elif instance_id:
+            instance = find_browser_instance(state, instance_id)
+            node_id = str(instance.get("node_id") or "")
+            target_ids = [instance_id]
+        else:
+            if not node_id:
+                raise ValueError("缺少节点 ID")
+            target_ids = [
+                str(item.get("id") or "")
+                for item in browser_instances_for_node(state, node_id)
+                if item.get("id")
+            ]
+        cancelled_operations = remote_browser_pending_start_tokens(target_ids)
+        generations = invalidate_remote_browser_generations(target_ids)
+        for target_id in target_ids:
+            try:
+                target = find_browser_instance(state, target_id)
+            except ValueError:
+                continue
+            target["status"] = "stopping"
+            target["pid"] = None
+            target.pop("error", None)
+        save_state(state)
+
+    stopped: list[str] = []
+    killed = 0
+    failures: list[tuple[str, BaseException]] = []
+    for target_id in target_ids:
+        try:
+            killed += stop_remote_browser_worker(
+                target_id,
+                generations[target_id],
+                cancelled_operations.get(target_id, ""),
+            )
+            stopped.append(target_id)
+        except BaseException as error:
+            failures.append((target_id, error))
+
+    with STATE_LOCK:
+        state = load_state()
+        stopped_at = now_ts()
+        for target_id in target_ids:
+            generation = generations[target_id]
+            if not remote_browser_generation_current(target_id, generation):
+                continue
+            try:
+                target = find_browser_instance(state, target_id)
+            except ValueError:
+                continue
+            failure = next((error for failed_id, error in failures if failed_id == target_id), None)
+            if failure is not None:
+                target["status"] = "stopping"
+                target["error"] = f"停止远程浏览器失败：{failure}"[:1000]
+                continue
+            target.update(
+                {
+                    "status": "stopped",
+                    "pid": None,
+                    "remote_url": "",
+                    "remote_container_id": "",
+                    "remote_host_port": None,
+                    "last_stopped_at": stopped_at,
+                }
+            )
+            target.pop("error", None)
+        save_state(state)
+
+    for target_id in target_ids:
+        prune_remote_browser_lifecycle(target_id)
+
+    maybe_auto_upload_browser_instances(stopped)
+    if failures:
+        details = "; ".join(f"{target_id}: {error}" for target_id, error in failures)
+        raise RuntimeError(f"停止部分远程浏览器失败（{len(failures)} 项）：{details}") from failures[0][1]
+    return {
+        "ok": True,
+        "node_id": node_id,
+        "instance_id": instance_id or None,
+        "killed_browsers": killed,
+        "stopped_bridges": [],
+    }
 
 
 def stop_untracked_browser_processes_for_node(node_id: str) -> int:
@@ -6392,6 +7239,8 @@ def stop_untracked_browser_processes_for_node(node_id: str) -> int:
 
 
 def stop_browser_instances(state: dict[str, Any], instance_ids: list[str]) -> int:
+    if remote_browser_feature_enabled():
+        raise RuntimeError("远程浏览器必须使用锁外两阶段停止流程")
     killed = 0
     stopped_at = now_ts()
     for instance_id in dict.fromkeys(instance_ids):
@@ -6400,12 +7249,25 @@ def stop_browser_instances(state: dict[str, Any], instance_ids: list[str]) -> in
         except ValueError:
             continue
         killed += stop_browser_instance_process(instance_id)
-        if instance.get("status") != "stopped" or instance.get("pid"):
-            instance.update({"status": "stopped", "pid": None, "last_stopped_at": stopped_at})
+        if instance.get("status") != "stopped" or instance.get("pid") or instance.get("remote_url"):
+            instance.update(
+                {
+                    "status": "stopped",
+                    "pid": None,
+                    "remote_url": "",
+                    "remote_container_id": "",
+                    "remote_host_port": None,
+                    "last_stopped_at": stopped_at,
+                }
+            )
     return killed
 
 
 def stop_browser_processes_for_node(node_id: str, state: dict[str, Any] | None = None) -> int:
+    if remote_browser_feature_enabled():
+        if state is not None:
+            raise RuntimeError("远程浏览器不能在 STATE_LOCK 内停止")
+        return safe_int(_stop_remote_browser({"node_id": node_id}).get("killed_browsers"), 0)
     if state is None:
         with STATE_LOCK:
             state = load_state()
@@ -6424,6 +7286,11 @@ def stop_browser_processes_for_node(node_id: str, state: dict[str, Any] | None =
 
 def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
     require_browser_feature()
+    if remote_browser_feature_enabled():
+        with SHUTDOWN_LOCK:
+            if SHUTTING_DOWN.is_set():
+                raise RuntimeError("程序正在退出，不能停止浏览器")
+        return _stop_remote_browser(payload)
     with SHUTDOWN_LOCK:
         return _stop_browser(payload)
 
@@ -6469,7 +7336,22 @@ def _macos_arch_token() -> str:
     return host_arch_token()
 
 
-def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None = None) -> dict[str, Any] | None:
+def _fingerprint_asset_arch(name: str) -> str | None:
+    lowered = name.lower()
+    if any(term in lowered for term in ("arm64", "aarch64")):
+        return "arm64"
+    if any(term in lowered for term in ("amd64", "x86_64", "x86-64", "x64")):
+        return "x86_64"
+    return None
+
+
+def _pick_fingerprint_asset(
+    releases: list[dict[str, Any]],
+    host_os: str | None = None,
+    host_arch: str | None = None,
+    *,
+    strict_arch: bool = False,
+) -> dict[str, Any] | None:
     """Pick the newest fingerprint-chromium package for the current OS.
 
     macOS packages are typically `*_macos.dmg` and often omit arch tokens.
@@ -6477,8 +7359,7 @@ def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None 
     `windows`/`linux` and arch markers in the file name.
     """
     os_token = host_os or host_os_token()
-    host_arch = host_arch_token()
-    arch_terms = ("arm64", "aarch64") if host_arch == "arm64" else ("amd64", "x86_64", "x64", "64")
+    desired_arch = host_arch or host_arch_token()
 
     def asset_score(name: str) -> int:
         lowered = name.lower()
@@ -6500,8 +7381,11 @@ def _pick_fingerprint_asset(releases: list[dict[str, Any]], host_os: str | None 
             return -1
         if any(skip in lowered for skip in _foreign_os_skip_terms(os_token)):
             return -1
+        asset_arch = _fingerprint_asset_arch(lowered)
+        if strict_arch and asset_arch != desired_arch:
+            return -1
         value = 10
-        if any(term in lowered for term in arch_terms):
+        if asset_arch == desired_arch:
             value += 20
         if lowered.endswith(".zip"):
             value += 5
@@ -6674,15 +7558,23 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
 
     host_os = host_os_token()
     host_arch = host_arch_token()
+    # Docker worker 与其 Linux 指纹内核必须使用同一架构。当前 worker 固定
+    # linux/amd64，因此 arm64 主服务容器也必须选择 x86_64 指纹包。
+    fingerprint_arch = "x86_64" if remote_browser_feature_enabled() else host_arch
     try:
         releases = _github_json(f"{FP_CHROMIUM_RELEASES_API}?per_page=20")
     except Exception as error:
         raise RuntimeError(f"获取指纹内核版本列表失败:{error}") from error
 
-    asset = _pick_fingerprint_asset(releases if isinstance(releases, list) else [], host_os=host_os)
+    asset = _pick_fingerprint_asset(
+        releases if isinstance(releases, list) else [],
+        host_os=host_os,
+        host_arch=fingerprint_arch,
+        strict_arch=remote_browser_feature_enabled(),
+    )
     if not asset:
         raise RuntimeError(
-            f"未找到适配 {host_os}/{host_arch} 的指纹内核包。"
+            f"未找到适配 {host_os}/{fingerprint_arch} 的指纹内核包。"
             "该项目并非每个版本都为全部平台发布安装包;可稍后重试,"
             "或手动下载后设置 PROXY_BRIDGE_FP_CHROMIUM 指向 Chromium 可执行文件。"
         )
@@ -6724,6 +7616,7 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
         "version": asset.get("tag"),
         "host_os": host_os,
         "host_arch": host_arch,
+        "fingerprint_arch": fingerprint_arch,
         "binary_arch": binary_arch,
         "arch_warning": arch_warning,
         "asset": asset["name"],
@@ -7276,6 +8169,8 @@ class Socks5LogProxy:
             return True
 
     def _client_requires_auth(self, address: tuple[str, int]) -> bool:
+        if remote_browser_worker_client(address[0], self.listen_port):
+            return False
         return self._client_is_lan(address) and self.security_snapshot()["auth_mode"] != "none"
 
     def _credentials_match(self, username: str, password: str) -> bool:
@@ -7454,8 +8349,10 @@ class Socks5LogProxy:
                 break
             security = self.security_snapshot()
             is_lan = self._client_is_lan(address)
-            if self.listen_host == LAN_PROXY_LISTEN_HOST and not proxy_client_allowed(
-                address[0], security["allowed_cidrs"]
+            if (
+                self.listen_host == LAN_PROXY_LISTEN_HOST
+                and not remote_browser_worker_client(address[0], self.listen_port)
+                and not proxy_client_allowed(address[0], security["allowed_cidrs"])
             ):
                 client.close()
                 continue
@@ -8982,11 +9879,42 @@ def cancel_speed_test_task(task_id: str) -> dict[str, Any]:
 
 
 def stop_bridge(bridge_id: str) -> dict[str, Any]:
+    if remote_browser_feature_enabled():
+        # Share the launch barrier across the browser snapshot and bridge stop so a
+        # worker cannot be created between those two phases and lose its proxy.
+        with BROWSER_LAUNCH_LOCK:
+            with SHUTDOWN_LOCK:
+                if SHUTTING_DOWN.is_set():
+                    raise RuntimeError("程序正在退出，不能停止本地代理")
+            with STATE_LOCK:
+                state = load_state()
+                bridge_node_id = next(
+                    (
+                        str(bridge.get("node_id") or "")
+                        for bridge in state.get("bridges", [])
+                        if bridge.get("id") == bridge_id
+                    ),
+                    "",
+                )
+            killed = (
+                safe_int(_stop_remote_browser({"node_id": bridge_node_id}).get("killed_browsers"), 0)
+                if bridge_node_id
+                else 0
+            )
+            with SHUTDOWN_LOCK:
+                if SHUTTING_DOWN.is_set():
+                    raise RuntimeError("程序正在退出，本地代理将由关机流程停止")
+                return _stop_bridge(bridge_id, browsers_already_stopped=True, killed_browsers=killed)
     with SHUTDOWN_LOCK:
         return _stop_bridge(bridge_id)
 
 
-def _stop_bridge(bridge_id: str) -> dict[str, Any]:
+def _stop_bridge(
+    bridge_id: str,
+    *,
+    browsers_already_stopped: bool = False,
+    killed_browsers: int = 0,
+) -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         bridge_node_id = ""
@@ -9002,15 +9930,19 @@ def _stop_bridge(bridge_id: str) -> dict[str, Any]:
             and (
                 instance.get("status") in ACTIVE_BROWSER_STATUSES
                 or instance.get("pid")
-                or browser_process_is_active(str(instance.get("id") or ""))
+                or (
+                    not remote_browser_feature_enabled()
+                    and browser_process_is_active(str(instance.get("id") or ""))
+                )
             )
         ]
 
-    killed_browsers = (
-        stop_browser_processes_for_node(bridge_node_id)
-        if bridge_node_id and browser_feature_enabled()
-        else 0
-    )
+    if not browsers_already_stopped:
+        killed_browsers = (
+            stop_browser_processes_for_node(bridge_node_id)
+            if bridge_node_id and browser_feature_enabled()
+            else 0
+        )
     # stop_browser_processes_for_node() has persisted the stopped state. Queue the
     # same WebDAV upload used by the dedicated browser-stop path before a later
     # records-modal pull can replace local state with an older remote snapshot.
@@ -9022,12 +9954,35 @@ def _stop_bridge(bridge_id: str) -> dict[str, Any]:
 
 
 def stop_all_bridges() -> dict[str, Any]:
+    if remote_browser_feature_enabled():
+        # Keep remote browser discovery/stop and bridge shutdown in one launch barrier;
+        # otherwise a new worker can appear after the all-instances snapshot.
+        with BROWSER_LAUNCH_LOCK:
+            with SHUTDOWN_LOCK:
+                if SHUTTING_DOWN.is_set():
+                    raise RuntimeError("程序正在退出，不能停止全部代理")
+            killed = safe_int(
+                _stop_remote_browser({"all_instances": True}).get("killed_browsers"),
+                0,
+            )
+            with BRIDGE_START_LOCK:
+                with SHUTDOWN_LOCK:
+                    if SHUTTING_DOWN.is_set():
+                        raise RuntimeError("程序正在退出，代理将由关机流程停止")
+                    return _stop_all_bridges(
+                        browsers_already_stopped=True,
+                        killed_browsers=killed,
+                    )
     with BRIDGE_START_LOCK:
         with SHUTDOWN_LOCK:
             return _stop_all_bridges()
 
 
-def _stop_all_bridges() -> dict[str, Any]:
+def _stop_all_bridges(
+    *,
+    browsers_already_stopped: bool = False,
+    killed_browsers: int = 0,
+) -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         active_bridge_ids = {
@@ -9048,7 +10003,10 @@ def _stop_all_bridges() -> dict[str, Any]:
             and (
                 instance.get("status") in ACTIVE_BROWSER_STATUSES
                 or instance.get("pid")
-                or browser_process_is_active(str(instance.get("id") or ""))
+                or (
+                    not remote_browser_feature_enabled()
+                    and browser_process_is_active(str(instance.get("id") or ""))
+                )
             )
         ]
         gateway_enabled = normalize_smart_gateway_settings(
@@ -9060,11 +10018,12 @@ def _stop_all_bridges() -> dict[str, Any]:
 
     with PROCESS_LOCK:
         browser_node_ids.update(BROWSER_TABLE.keys())
-    killed_browsers = (
-        sum(stop_browser_processes_for_node(node_id) for node_id in browser_node_ids)
-        if browser_feature_enabled()
-        else 0
-    )
+    if not browsers_already_stopped:
+        killed_browsers = (
+            sum(stop_browser_processes_for_node(node_id) for node_id in browser_node_ids)
+            if browser_feature_enabled()
+            else 0
+        )
     maybe_auto_upload_browser_instances(browser_instance_ids)
     with PROCESS_LOCK:
         bridge_ids = active_bridge_ids | set(PROCESS_TABLE) | set(LOG_PROXY_TABLE)
@@ -9346,7 +10305,11 @@ def sync_process_status(state: dict[str, Any]) -> bool:
     return changed
 
 
-def sync_browser_instance_status(state: dict[str, Any]) -> bool:
+def sync_browser_instance_status(
+    state: dict[str, Any],
+    *,
+    remote_sessions_snapshot: Any = REMOTE_BROWSER_SESSIONS_UNSET,
+) -> bool:
     """Reconcile browser instance status with live processes.
 
     Returns True if any state field changed. Instances that transition from
@@ -9356,9 +10319,68 @@ def sync_browser_instance_status(state: dict[str, Any]) -> bool:
     changed = False
     newly_stopped: list[str] = []
     stopped_at = now_ts()
+    remote_sessions: dict[str, dict[str, Any]] | None = {}
+    if remote_browser_feature_enabled():
+        if remote_sessions_snapshot is REMOTE_BROWSER_SESSIONS_UNSET:
+            remote_sessions, _remote_error = remote_browser_sessions()
+        else:
+            remote_sessions = remote_sessions_snapshot
     for instance in state.get("browser_instances", []):
         instance_id = str(instance.get("id") or "")
         if not instance_id:
+            continue
+        if remote_browser_feature_enabled() and (instance.get("remote_worker") is True or docker_mode()):
+            # A broker outage is not evidence that a running worker stopped. Keep the
+            # last known state until the broker is reachable again.
+            if remote_sessions is None:
+                continue
+            session = remote_sessions.get(instance_id)
+            if (
+                instance.get("status") == "starting"
+                and remote_browser_start_pending(instance_id)
+            ):
+                # Broker may already expose a container before launch_remote_browser()
+                # validates health and commits the result. Keep the app-side transaction
+                # in starting until that owner finishes or a stop invalidates it.
+                continue
+            if session and session.get("status") in REMOTE_BROWSER_LIVE_SESSION_STATUSES:
+                current_status = str(instance.get("status") or "stopped")
+                updates = {
+                    "status": (
+                        current_status
+                        if current_status in {"running", "starting", "stopping"}
+                        else "starting"
+                    ),
+                    "pid": None,
+                    "remote_worker": True,
+                    "remote_url": normalize_remote_browser_url(
+                        session.get("url") or instance.get("remote_url") or ""
+                    ),
+                    "remote_container_id": normalize_remote_browser_container_id(
+                        session.get("container_id") or instance.get("remote_container_id") or ""
+                    ),
+                    "remote_host_port": safe_int(
+                        session.get("host_port"), safe_int(instance.get("remote_host_port"), 0)
+                    )
+                    or None,
+                }
+                changed |= apply_updates(instance, updates)
+                if "error" in instance:
+                    instance.pop("error", None)
+                    changed = True
+            elif instance.get("status") in ACTIVE_BROWSER_STATUSES:
+                changed |= apply_updates(
+                    instance,
+                    {
+                        "status": "stopped",
+                        "pid": None,
+                        "remote_url": "",
+                        "remote_container_id": "",
+                        "remote_host_port": None,
+                        "last_stopped_at": stopped_at,
+                    },
+                )
+                newly_stopped.append(instance_id)
             continue
         with PROCESS_LOCK:
             process = BROWSER_PROCESS_TABLE.get(instance_id)
@@ -9984,10 +11006,88 @@ class ProxyBridgeHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
 
-def shutdown() -> None:
+def _shutdown_remote_browser_workers() -> tuple[
+    set[str],
+    list[str],
+    list[tuple[str, BaseException]],
+]:
+    """Cancel and stop remote workers without holding ``SHUTDOWN_LOCK``."""
+    pending_tokens = remote_browser_pending_start_tokens()
+    pending_instance_ids = invalidate_all_remote_browser_operations()
+    remote_instance_ids = set(pending_instance_ids)
+    stopped_remote_ids: list[str] = []
+    failures: list[tuple[str, BaseException]] = []
+    if not remote_browser_feature_enabled():
+        wait_remote_browser_operations(5.0)
+        return remote_instance_ids, stopped_remote_ids, failures
+
+    with STATE_LOCK:
+        shutdown_state = load_state()
+        remote_instance_ids.update(
+            str(item.get("id") or "")
+            for item in shutdown_state.get("browser_instances", [])
+            if item.get("status") in ACTIVE_BROWSER_STATUSES and item.get("id")
+        )
+    broker_sessions, _broker_error = remote_browser_sessions(force=True, timeout=10.0)
+    if isinstance(broker_sessions, dict):
+        remote_instance_ids.update(
+            instance_id
+            for instance_id, session in broker_sessions.items()
+            if session.get("status") in REMOTE_BROWSER_LIVE_SESSION_STATUSES
+        )
+
+    instance_ids = sorted(instance_id for instance_id in remote_instance_ids if instance_id)
+    if instance_ids:
+        try:
+            broker_client = remote_browser_broker_client()
+        except BaseException as error:
+            failures.append(("远程浏览器 Broker", error))
+        else:
+            def stop_worker(instance_id: str) -> None:
+                broker_client.stop(
+                    instance_id,
+                    pending_tokens.get(instance_id, ""),
+                    timeout=45.0,
+                )
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(instance_ids), 10)
+            ) as executor:
+                future_ids = {
+                    executor.submit(stop_worker, instance_id): instance_id
+                    for instance_id in instance_ids
+                }
+                for future in concurrent.futures.as_completed(future_ids):
+                    instance_id = future_ids[future]
+                    try:
+                        future.result()
+                    except BaseException as error:
+                        failures.append((f"远程浏览器 {instance_id}", error))
+                    else:
+                        stopped_remote_ids.append(instance_id)
+    if stopped_remote_ids:
+        invalidate_remote_browser_session_cache()
+    # stop 会先在 Broker 写入本次 start 的取消 tombstone，再等待容器生命周期锁；
+    # 因此先发 stop 比被动等待 readiness 更快。响应结束后只需短暂等待应用侧
+    # start/stop 线程完成 finally 登记清理。
+    if not wait_remote_browser_operations(10.0):
+        failures.append(
+            ("远程浏览器生命周期", RuntimeError("等待正在进行的远程浏览器操作超时"))
+        )
+    return remote_instance_ids, stopped_remote_ids, failures
+
+
+def _shutdown_once() -> None:
+    SHUTTING_DOWN.set()
+    SUBSCRIPTION_SCHEDULER_WAKE.set()
+    with SPEED_TEST_TASK_LOCK:
+        for cancel_event in SPEED_TEST_CANCEL_EVENTS.values():
+            cancel_event.set()
+    remote_instance_ids, stopped_remote_ids, remote_shutdown_failures = (
+        _shutdown_remote_browser_workers()
+    )
+
     with SHUTDOWN_LOCK:
-        SHUTTING_DOWN.set()
-        SUBSCRIPTION_SCHEDULER_WAKE.set()
         cancelled_refresh_history_ids: list[str] = []
         with SUBSCRIPTION_REFRESH_TASK_LOCK:
             cancelled_at = now_ts()
@@ -10031,6 +11131,29 @@ def shutdown() -> None:
         with SPEED_TEST_TASK_LOCK:
             for cancel_event in SPEED_TEST_CANCEL_EVENTS.values():
                 cancel_event.set()
+        if remote_browser_feature_enabled():
+            if stopped_remote_ids:
+                with STATE_LOCK:
+                    shutdown_state = load_state()
+                    stopped_at = now_ts()
+                    for instance_id in stopped_remote_ids:
+                        try:
+                            instance = find_browser_instance(shutdown_state, instance_id)
+                        except ValueError:
+                            continue
+                        instance.update(
+                            {
+                                "status": "stopped",
+                                "pid": None,
+                                "remote_url": "",
+                                "remote_container_id": "",
+                                "remote_host_port": None,
+                                "last_stopped_at": stopped_at,
+                            }
+                        )
+                    save_state(shutdown_state)
+            for instance_id in remote_instance_ids:
+                prune_remote_browser_lifecycle(instance_id)
         # 只在进程表锁内快照句柄;外部进程的退出等待交给独立工作线程。
         with PROCESS_LOCK:
             browser_procs = list(BROWSER_PROCESS_TABLE.values())
@@ -10051,7 +11174,7 @@ def shutdown() -> None:
             unique_browser_procs.append((identity, process))
 
         traffic_by_bridge: dict[str, dict[str, int]] = {}
-        failures: list[tuple[str, BaseException]] = []
+        failures: list[tuple[str, BaseException]] = list(remote_shutdown_failures)
         worker_count = len(unique_browser_procs) + len(bridge_ids) + len(test_processes)
         if worker_count:
             with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -10138,6 +11261,20 @@ def shutdown() -> None:
         if failures:
             details = "; ".join(f"{label}: {error}" for label, error in failures)
             raise RuntimeError(f"关闭部分进程失败（{len(failures)} 项）: {details}") from failures[0][1]
+
+
+def shutdown() -> None:
+    # signal、main.finally 与 atexit 可能依次触发；成功完成后不重复访问 Broker
+    # 或再次保存状态。若某项清理失败则保留重试能力，兼容显式二次清理。
+    if SHUTDOWN_COMPLETE.is_set() and SHUTTING_DOWN.is_set():
+        return
+    with SHUTDOWN_RUN_LOCK:
+        if SHUTDOWN_COMPLETE.is_set() and SHUTTING_DOWN.is_set():
+            return
+        if not SHUTTING_DOWN.is_set():
+            SHUTDOWN_COMPLETE.clear()
+        _shutdown_once()
+        SHUTDOWN_COMPLETE.set()
 
 
 def handle_shutdown_signal(signum: int, _frame: Any) -> None:

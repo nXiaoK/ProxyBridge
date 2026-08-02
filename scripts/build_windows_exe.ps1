@@ -139,6 +139,8 @@ Write-Host "Building ProxyBridge.exe (onefile, windowed)..."
 $addData = @(
   "app.py;.",
   "webdav_sync.py;.",
+  # 主模块会导入远程浏览器 Broker 客户端；Windows 包需收集该同级模块。
+  "remote_browser.py;.",
   "static;static",
   "desktop;desktop"
 )
@@ -162,6 +164,8 @@ foreach ($item in $addData) {
 $pyiArgs += @(
   "--hidden-import", "app",
   "--hidden-import", "webdav_sync",
+  # 明确声明隐藏导入，避免动态加载 app 时遗漏 Broker 客户端模块。
+  "--hidden-import", "remote_browser",
   "--hidden-import", "desktop",
   "--hidden-import", "desktop.tray_host",
   "--hidden-import", "desktop.autostart",

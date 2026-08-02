@@ -44,7 +44,12 @@ flowchart TD
     CoreManager --> OuterProxy["Socks5LogProxy\n用户端口 SOCKS5 + HTTP"]
     OuterProxy --> Core
     OuterProxy --> Clients["本机或允许的 LAN 客户端"]
-    Backend --> Browser["指纹 Chromium 子进程\n独立 Profile"]
+    Backend --> Browser["本机指纹 Chromium 子进程\n独立 Profile"]
+    Backend --> BrokerClient["Docker Broker 客户端\nBearer token"]
+    BrokerClient --> Broker["Browser Broker\n内部控制网络"]
+    Broker --> DockerEngine["Docker Engine API 1.45+\nUnix Socket"]
+    DockerEngine --> Worker["Selkies Chromium worker\n独立 Profile / HTTPS / Basic Auth"]
+    Worker --> OuterProxy
     Backend --> WebDAV["WebDAVClient / SyncEngine"]
 ```
 
@@ -56,6 +61,7 @@ flowchart TD
 4. **前端层**：`static/` 直接由后端提供，使用管理令牌调用 API。
 5. **同步层**：`webdav_sync.py` 独立处理同步设置、快照、Profile 归档、加密和远端原子发布。
 6. **桌面壳层**：`desktop/` 和 `macos/` 负责进程托管、菜单栏/托盘、自动打开控制台和开机自启，不重复实现后端业务。
+7. **Docker 浏览器层**：`remote_browser.py` 只负责调用内部 Broker；`browser_broker.py` 独占 Docker Socket，为每个实例创建/销毁隔离 worker，不把 Docker Engine 权限交给主 Web 服务。
 
 ### 2.2 请求链路
 
@@ -91,6 +97,8 @@ Web 前端
 | 路径 | 作用 |
 |---|---|
 | `app.py` | 主后端、协议解析、HTTP API、核心与代理生命周期、浏览器、日志、诊断 |
+| `remote_browser.py` | 主服务到内部 Browser Broker 的带 Bearer token 客户端 |
+| `browser_broker.py` | Docker Engine 客户端、远程浏览器 worker 创建/查询/销毁与端口分配 |
 | `webdav_sync.py` | WebDAV 客户端、同步引擎、Profile 打包、校验、加密和 LWW 应用 |
 | `static/index.html` | Web 控制台页面结构与所有视图 |
 | `static/app.js` | 前端状态、API 调用、渲染、事件和业务交互 |
@@ -102,6 +110,7 @@ Web 前端
 | `macos/ProxyBridgeMenuBar/` | 原生 macOS 菜单栏 App、Info.plist 和图标 |
 | `scripts/` | 启动脚本、平台构建、图标生成和 macOS 原子替换工具 |
 | `Dockerfile` / `compose.yaml` | 容器镜像和默认部署拓扑 |
+| `docker/Dockerfile.broker` | 最小 Browser Broker 镜像 |
 | `docker/requirements.txt` | Docker Python 依赖 |
 | `tests/` | Python 与 Node 回归测试 |
 | `docs/` | 安装、部署和历史设计文档 |
@@ -116,7 +125,8 @@ Web 前端
 | 无壳 Web | `python3 app.py` | 仓库 `work/` | 开启 | 最适合开发和后端调试 |
 | Windows/Linux 托盘 | `python3 -m desktop.tray_host` | 平台用户数据目录 | 开启 | 托盘托管同一 `app.py` 后端 |
 | macOS 菜单栏 | 构建后的 `.app` | `~/Library/Application Support/ProxyBridge` | 开启 | Swift 壳负责运行时下载和内嵌 WebView/菜单 |
-| Docker | `docker compose up` | `/data` | 关闭 | 仅订阅/节点 WebDAV 同步，端口范围固定发布 |
+| Docker Compose | `docker compose up` | `/data` | 远程 worker | 每实例独立 HTTPS worker；已停止 Profile 可同步 |
+| 单容器 Docker | `docker run` | `/data` | 关闭 | 未配置 Broker 时保持旧版安全行为，只同步订阅/节点 |
 
 ### 4.1 功能开关
 
@@ -125,7 +135,7 @@ Web 前端
 - `PROXY_BRIDGE_DOCKER=1`：进入 Docker 模式。
 - `PROXY_BRIDGE_DISABLE_BROWSER=1`：关闭浏览器与 Profile 同步能力。
 - `PROXY_BRIDGE_SHELL_MODE`：标识 `headless`、`tray` 等外壳模式。
-- Docker 模式会强制使用容器端口范围，并关闭浏览器相关入口。
+- Docker 模式会强制使用容器代理端口范围；只有同时配置内部 `PROXY_BRIDGE_BROWSER_BROKER_URL` 且未显式禁用浏览器时，才启用远程浏览器及 Profile 同步。
 
 ## 5. 后端启动与关闭
 
@@ -576,8 +586,9 @@ Bridge 是一个节点到本地代理端口的运行记录，通常包含：
 
 ### 15.2 同步范围
 
-- 桌面/普通无壳模式：订阅、节点、浏览器记录和已停止 Profile。
-- Docker/禁浏览器模式：只同步订阅与节点，保留远端和本地浏览器数据。
+- 桌面/普通无壳模式，以及已配置 Browser Broker 的 Docker Compose：订阅、节点、浏览器记录和已停止 Profile。
+- 未配置 Broker 或显式禁用浏览器的模式：只同步订阅与节点，保留远端和本地浏览器数据。
+- Docker Broker 不可达时不能据此判断 worker 已停止；对相关 Profile 必须 fail-closed，拒绝归档可能仍在运行的目录。
 
 ### 15.3 发布协议
 
@@ -626,20 +637,23 @@ pull 先验证 schema、对象大小和哈希，再应用远端 LWW 状态。校
 - App 内置资源。
 - 普通 Chrome 路径用于兼容场景。
 
+Docker 远程模式只接受 `proxybridge-data` 命名卷中 `/data/fingerprint-chromium/` 下的 Linux 内核完整目录，并要求存在可执行的 `chrome-wrapper`。Broker 要求 Docker Engine API 1.45+，使用 `VolumeOptions.Subpath` 将该命名卷子目录只读挂载到 worker 的 `/opt/fingerprint-chromium`，再通过容器初始化脚本安装 `/usr/bin/chromium` 启动器；启动器直接执行真实 wrapper 路径，避免符号链接改变其相邻资源定位。远程模式不接受 `/data` 的宿主机 bind mount。当前 Linux 指纹包为 x86_64，镜像拉取、检查和 worker 创建均固定 `platform=linux/amd64`；arm64 宿主机依赖 Docker 仿真，性能与 GPU 能力不作为原生支持保证。
+
 ### 16.2 实例模型
 
 每个浏览器实例关联：
 
 - `id`、`node_id`、名称和标签。
 - 独立 Profile 目录。
-- `running` / `starting` / `stopped` 状态。
+- `running` / `starting` / `stopping` / `stopped` / `failed` 状态。
 - 可恢复的启动次数和更新时间。
+- Docker 记录还包含 `remote_worker`、`remote_url`、worker 容器 ID、宿主端口和用户名；新记录继续使用与桌面浏览器一致的 `native-v1` Profile 布局，旧版嵌套 Profile 目录只作为兼容布局读取。密码绝不能写入记录或状态 API。
 
 同一节点可存在多个历史记录，但运行时表必须阻止同一实例重复启动。
 
 ### 16.3 启动与停止
 
-启动浏览器时：
+本机浏览器启动时：
 
 1. 确保关联 Bridge 已运行。
 2. 确保指纹内核存在。
@@ -647,7 +661,26 @@ pull 先验证 schema、对象大小和哈希，再应用远端 LWW 状态。校
 4. 创建独立 Profile 并登记进程句柄。
 5. 状态保存失败时尝试终止；终止失败则保留句柄。
 
-停止浏览器时，只有进程确认退出后才能从实例表和节点表删除句柄。运行中的 Profile 不允许参与 WebDAV 上传。
+Docker 远程浏览器启动时：
+
+1. 前端凭据弹窗默认用户名 `proxybridge`，并用 Web Crypto 生成可复制、可修改的随机强密码；密码仅随本次启动请求发送。
+2. 后端确保关联 Bridge 已运行，创建独立 Profile，并派生该实例固定的指纹种子、语言和时区。
+3. Broker 校验 Profile/内核相对路径和 `/data` 命名卷来源，选择 `23000-23099` 中的空闲端口，为密码创建临时只读 secret，并创建一个非特权 `linux/amd64` worker。
+4. worker 的 `/config` 是随容器删除的匿名卷；只有当前 Profile 通过命名卷 `volume-subpath` 读写挂到 `/config/browser-profile`，指纹内核子目录只读挂到 `/opt/fingerprint-chromium`。Selkies TLS、认证与 nginx 运行文件不会进入 Profile 或 WebDAV 快照。
+5. worker 使用该节点的内部 SOCKS5 端口；主服务查询 Broker 会话，只对“精确 worker IP + 分配给该实例的代理端口”组合免除代理二次认证，不按整个 worker CIDR 放行。
+6. LinuxServer Selkies 在匿名 `/config` 中动态生成自签名 HTTPS，并通过 `CUSTOM_USER` / `FILE__PASSWORD` 开启 Basic Auth。Broker 等到容器运行、`3001` 端口可连接且 Docker health 为 `healthy` 后才返回。
+7. Broker 返回 `remote_url` 后，前端打开链接；运行记录提供再次打开与停止入口，并显示用户名、URL、端口和 worker 状态。
+
+停止本机浏览器时，只有进程确认退出后才能从实例表和节点表删除句柄。停止远程实例采用 generation 失效与两阶段提交：先在锁内标记 `stopping`，再在锁外请求 Broker 停止，防止并发启动结果把实例恢复为 `running`。Broker 停止并删除 worker、匿名 `/config` 运行卷和临时 secret，但保留 Profile 与稳定指纹种子；下次启动必须设置新密码。任何运行中的 Profile 都不允许参与 WebDAV 上传。Broker 启动时会回收上次异常退出遗留的带所有权标签 worker，Compose 为主服务和 Broker 都配置 3 分钟 `stop_grace_period`，用于完成并行回收与 Profile 落盘。
+
+### 16.4 Docker 远程访问安全边界
+
+- Broker token 只通过私有命名卷在主服务与 Broker 间共享；Broker HTTP 端口只存在于 `browser-control` internal 网络。
+- Profile 和指纹内核只能来自 `/data` 对应的 Docker 命名卷，通过 Engine API 1.45+ 的 `volume-subpath` 挂载；远程模式拒绝宿主机 bind mount，避免主服务数据目录中的符号链接扩大为任意宿主路径挂载。
+- worker 网络仅提供隔离与寻址，不是认证边界。代理免认证每次都以 Broker 当前返回的 worker RFC1918 IP 和该实例代理端口精确匹配；inspect/sessions 失败时 fail-closed。
+- Browser worker 的自签名 HTTPS 加 Basic Auth 只适合可信 LAN/VPN。公网入口必须使用受信任证书的 TLS 反向代理，并叠加 SSO/MFA 或等效强认证；不得直接发布动态 worker 端口。
+- `PROXY_BRIDGE_BROWSER_HOST` 与 `PROXY_BRIDGE_BROWSER_PUBLIC_HOST` 只接受回环、RFC1918 或 Tailscale `100.64.0.0/10` IPv4，拒绝 `0.0.0.0`、主机名和公网地址。
+- Docker Socket 的 `:ro` 不限制 Docker API 的写操作。持有该 Socket 的 Broker 仍能创建/删除容器和挂载宿主机路径，应视为宿主机级高权限组件，不能部署到不可信多租户 daemon。
 
 ## 17. HTTP API
 
@@ -863,8 +896,29 @@ diagnostics
 | `PROXY_BRIDGE_FP_CHROMIUM` | 指纹 Chromium 路径 |
 | `PROXY_BRIDGE_PROXY_PORT_START` | 用户代理端口起点 |
 | `PROXY_BRIDGE_PROXY_PORT_END` | 用户代理端口终点 |
+| `PROXY_BRIDGE_BROWSER_BROKER_URL` | 仅供 Docker 主服务访问的内部 Broker HTTP 地址；缺失时关闭远程浏览器 |
+| `PROXY_BRIDGE_BROWSER_BROKER_TOKEN_FILE` | Broker 随机 Bearer token 的只读文件；不得放到公开目录 |
+| `PROXY_BRIDGE_BROWSER_PROXY_HOST` | worker 连接 ProxyBridge 节点代理时使用的内部服务名，Compose 默认 `proxybridge` |
 
-### 19.3 构建环境变量
+### 19.3 Browser Broker 与 Compose 部署环境变量
+
+| 环境变量 | 作用与注意事项 |
+|---|---|
+| `PROXY_BRIDGE_BROWSER_HOST` | worker HTTPS 端口实际绑定的宿主机 IPv4；只允许回环、RFC1918 或 Tailscale `100.64.0.0/10` 地址，不能填 `0.0.0.0` |
+| `PROXY_BRIDGE_BROWSER_PUBLIC_HOST` | 生成给用户的远程链接所用 IPv4；通常与上一项相同，地址范围限制相同 |
+| `PROXY_BRIDGE_BROWSER_PORT_START` / `PROXY_BRIDGE_BROWSER_PORT_END` | 每实例一个端口的动态范围，默认 `23000-23099`；修改时同步调整防火墙 |
+| `PROXY_BRIDGE_BROWSER_MAX_SESSIONS` | worker 并发上限，默认 10；用于限制 CPU 与内存消耗 |
+| `PROXY_BRIDGE_BROWSER_MEMORY_BYTES` | 单 worker 内存上限（字节），默认 2 GiB，范围 512 MiB–16 GiB |
+| `PROXY_BRIDGE_BROWSER_NANO_CPUS` | 单 worker CPU 上限（Docker NanoCPUs），10 亿表示 1 核，默认 2 核 |
+| `PROXY_BRIDGE_BROWSER_PIDS_LIMIT` | 单 worker 进程数上限，默认 512；过低会破坏 Chromium 多进程运行 |
+| `PROXY_BRIDGE_BROWSER_SHM_BYTES` | 单 worker `/dev/shm` 大小（字节），默认 1 GiB；过低可能导致标签崩溃 |
+| `PROXY_BRIDGE_BROWSER_WORKER_IMAGE` | Selkies worker 镜像，默认 `lscr.io/linuxserver/chromium:latest`；覆盖时必须兼容现有启动和认证变量 |
+| `PROXY_BRIDGE_BROWSER_NETWORK` | worker 加入的隔离 Docker 网络名；必须与 Compose 创建的网络一致 |
+| `PROXY_BRIDGE_BROWSER_NETWORK_SUBNET` | 仅供 Compose IPAM 插值的 RFC1918 IPv4 子网，默认 `172.31.254.0/24`；应避免地址冲突，但不作为代理认证白名单，主服务只信任精确 worker IP 与实例代理端口组合 |
+
+Broker 启动前还会校验该网络必须是 `internal=true`、作用域为 `local` 的 Docker `bridge`，具有明确的 RFC1918 IPv4 IPAM，并且 ProxyBridge owner 容器以配置的名称或别名加入该网络。任一条件不满足时都会拒绝创建 worker。
+
+### 19.4 构建环境变量
 
 | 环境变量 | 作用 |
 |---|---|
@@ -938,8 +992,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
 node --check static/auth.js
 node --check static/diagnostics.js
+node --check static/browser-ui.js
 node --check static/app.js
-node --test tests/test_frontend_auth.js tests/test_frontend_diagnostics.js
+node --test tests/test_frontend_*.js
 
 bash -n scripts/*.sh
 docker compose config --quiet
@@ -964,7 +1019,8 @@ xcrun swiftc -parse macos/ProxyBridgeMenuBar/main.swift
 | `test_proxy_regressions.py` | 半关闭、容量、超时和代理 I/O 回归 |
 | `test_security.py` | 管理 token、Host/Origin、归档安全、请求体限制、敏感信息脱敏 |
 | `test_diagnostics.py` | 本地/联网诊断、失败隔离和敏感信息保护 |
-| `test_docker_mode.py` | Docker feature、端口和订阅-only 同步 |
+| `test_docker_mode.py` | Docker feature、Broker 启用条件、端口和同步范围 |
+| `test_remote_browser.py` | Broker/worker 生命周期、Docker Engine 契约、并发竞态、网络与凭据安全 |
 | `test_lan_settings.py` | LAN 重绑、回滚、ACL、控制台隔离 |
 | `test_lan_security_and_smart_pool.py` | SOCKS/HTTP 认证、客户端踢出、熔断恢复 |
 | `test_webdav_sync.py` | 归档、hash、原子发布、LWW、加密、并发和凭据脱敏 |
@@ -974,6 +1030,7 @@ xcrun swiftc -parse macos/ProxyBridgeMenuBar/main.swift
 | `test_core_selection_and_fallback.py` | 核心偏好、兼容性和失败回退 |
 | `test_frontend_auth.js` | fragment token 和会话认证 |
 | `test_frontend_diagnostics.js` | ICE 解析、WebRTC 风险分类和失败结果 |
+| `test_frontend_browser_ui.js` | 远程浏览器凭据保留/清除、复制回退、URL 与 CSS 选择器安全 |
 
 ### 21.3 测试策略
 
@@ -1002,7 +1059,7 @@ scripts/build_menubar_app.sh --bundle-cores
 流程包括：
 
 - 编译 Swift 菜单栏程序、图标和原子替换工具。
-- 复制 `app.py`、`webdav_sync.py` 和 `static/`。
+- 复制 `app.py`、`webdav_sync.py`、`remote_browser.py` 和 `static/`；桌面模式只打包 Broker 客户端，不启用 Docker worker。
 - 安装锁定的 PyYAML vendored 依赖。
 - 可选复制核心。
 - 输出 `outputs/ProxyBridgeMenuBar.app`。
@@ -1046,6 +1103,12 @@ docker compose logs --tail=100 proxybridge
 - drop all capabilities 和 `no-new-privileges`。
 - `/data` 持久化。
 - 健康检查调用 `HEAD /api/status`。
+- 默认 Compose 另建只读根文件系统的 Broker 服务；Broker 独占 Docker Socket、控制卷和 internal 控制网络，要求 Docker Engine API 1.45+。
+- `/data` 必须使用命名卷；Broker 通过 `volume-subpath` 挂载当前实例 Profile 和指纹内核，不支持宿主机 bind mount。
+- 每个浏览器记录动态创建独立 `linux/amd64` worker，Profile 持久化到 `/data/browser_profiles/`；`/config` 使用匿名运行卷，worker 停止后容器、匿名卷与密码 secret 被删除。
+- worker 只在精确 IP 与实例代理端口配对成功时免除代理二次认证；整个 worker 子网不享有此权限。
+- worker HTTPS 端口默认绑定 `127.0.0.1:23000-23099`；LAN 部署必须显式配置私有 IPv4 并收紧防火墙。
+- Broker 启动时清理异常退出遗留 worker；主服务和 Broker 的停止宽限期均为 3 分钟。
 
 ### 22.5 发布前清单
 

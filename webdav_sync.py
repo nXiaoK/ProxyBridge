@@ -654,6 +654,13 @@ def sanitize_browser_instance_for_sync(instance: dict[str, Any]) -> dict[str, An
     record["pid"] = None
     record["bridge_id"] = None
     record["proxy"] = ""
+    # 远程 worker 的地址、容器和用户名都是本机运行时信息；跨设备只同步 Profile
+    # 布局与固定指纹，不传播可能失效或由远端状态注入的访问链接。
+    record["remote_worker"] = False
+    record["remote_url"] = ""
+    record["remote_container_id"] = ""
+    record["remote_host_port"] = None
+    record["remote_username"] = ""
     # Keep free-text label/tag for cross-machine notes (e.g. 访问 xx 的浏览器).
     label = str(record.get("label") or record.get("tag") or "").strip()
     if len(label) > 120:
@@ -1385,7 +1392,12 @@ class SyncEngine:
         node_id = str(instance.get("node_id") or "")
         instance_id = str(instance.get("id") or "")
         legacy = bool(instance.get("legacy"))
-        return self._safe_profile_path(node_id, instance_id, legacy)
+        root = self._safe_profile_path(node_id, instance_id, legacy)
+        # 早期远程 worker 记录把真正的 Chromium Profile 放在兼容子目录。
+        # 只同步该子目录，避免把旧 Selkies TLS/认证运行文件打包或恢复。
+        if str(instance.get("profile_layout") or "native-v1") == "remote-worker-v1":
+            return root / "chromium-profile"
+        return root
 
     def _collect_pushable_profiles(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -1395,7 +1407,7 @@ class SyncEngine:
             instance_id = str(instance.get("id") or "")
             if not instance_id:
                 continue
-            if instance.get("status") in {"running", "starting"} or self.browser_runtime_is_active(instance_id):
+            if instance.get("status") in {"running", "starting", "stopping"} or self.browser_runtime_is_active(instance_id):
                 continue
             path = self._profile_path_for(instance)
             if path.exists() and path.is_dir():
@@ -1446,7 +1458,7 @@ class SyncEngine:
                     for item in state.get("browser_instances", [])
                     if isinstance(item, dict)
                     and (
-                        item.get("status") in {"running", "starting"}
+                        item.get("status") in {"running", "starting", "stopping"}
                         or self.browser_runtime_is_active(str(item.get("id") or ""))
                     )
                 ]
@@ -1854,7 +1866,7 @@ class SyncEngine:
                 if isinstance(item, dict)
             }
             for instance_id, local in local_instances.items():
-                if local.get("status") in {"running", "starting"} or self.browser_runtime_is_active(instance_id):
+                if local.get("status") in {"running", "starting", "stopping"} or self.browser_runtime_is_active(instance_id):
                     skipped_running.append(instance_id)
 
             for instance_id, expected_hash in profile_hashes.items():
@@ -1862,7 +1874,7 @@ class SyncEngine:
                 expected_hash = _validate_sha256(expected_hash, f"Profile {instance_id} SHA-256")
                 local = local_instances.get(instance_id)
                 if local and (
-                    local.get("status") in {"running", "starting"}
+                    local.get("status") in {"running", "starting", "stopping"}
                     or self.browser_runtime_is_active(instance_id)
                 ):
                     if instance_id not in skipped_running:
@@ -1870,11 +1882,7 @@ class SyncEngine:
                     continue
                 try:
                     meta = remote_instances[instance_id]
-                    dest = self._safe_profile_path(
-                        str(meta.get("node_id") or ""),
-                        instance_id,
-                        bool(meta.get("legacy")),
-                    )
+                    dest = self._profile_path_for(meta)
                     if dest.exists():
                         try:
                             # Cheap skip: if a marker hash file matches.
@@ -1951,7 +1959,7 @@ class SyncEngine:
                     if isinstance(item, dict)
                     and item.get("id")
                     and (
-                        item.get("status") in {"running", "starting"}
+                        item.get("status") in {"running", "starting", "stopping"}
                         or self.browser_runtime_is_active(str(item.get("id") or ""))
                     )
                 ]
@@ -1978,7 +1986,8 @@ class SyncEngine:
                     continue
                 iid = str(record.get("id") or "")
                 if iid and (
-                    record.get("status") in {"running", "starting"} or self.browser_runtime_is_active(iid)
+                    record.get("status") in {"running", "starting", "stopping"}
+                    or self.browser_runtime_is_active(iid)
                 ):
                     skipped_running.append(iid)
                     continue

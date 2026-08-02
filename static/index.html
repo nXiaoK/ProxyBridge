@@ -724,6 +724,87 @@
       </section>
     </div>
 
+    <!-- ============ Docker 远程浏览器启动弹窗 ============ -->
+    <div class="modal-backdrop" id="remoteBrowserLaunchModal" hidden>
+      <section class="remote-browser-launch-modal" role="dialog" aria-modal="true" aria-labelledby="remoteBrowserLaunchTitle" aria-describedby="remoteBrowserLaunchDescription" tabindex="-1">
+        <header class="modal-head">
+          <div>
+            <h2 id="remoteBrowserLaunchTitle">启动远程浏览器</h2>
+            <p id="remoteBrowserLaunchMeta" class="modal-subtitle"></p>
+          </div>
+          <button class="icon-button" type="button" data-action="close-remote-browser-launch" aria-label="关闭远程浏览器启动窗口" title="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </header>
+        <form class="remote-browser-launch-form" id="remoteBrowserLaunchForm">
+          <div class="remote-browser-launch-setup" id="remoteBrowserLaunchSetup">
+            <p class="remote-browser-launch-description" id="remoteBrowserLaunchDescription">
+              将创建独立 Docker Worker，并通过加密链接共享同一个浏览器窗口。下面的凭据仅用于本次远程浏览器登录，控制台不会保存密码。
+            </p>
+            <div class="remote-browser-broker-status" id="remoteBrowserBrokerStatus" role="status"></div>
+            <div class="remote-browser-login-grid">
+              <label>
+                <span>访问用户名</span>
+                <input id="remoteBrowserUsername" name="username" type="text" value="proxybridge" minlength="1" maxlength="32" pattern="[A-Za-z0-9._-]{1,32}" autocomplete="username" spellcheck="false" required aria-describedby="remoteBrowserUsernameHint">
+                <small id="remoteBrowserUsernameHint">1–32 位字母、数字、点、下划线或短横线</small>
+              </label>
+              <div class="remote-browser-login-field">
+                <label for="remoteBrowserPassword">访问密码</label>
+                <div class="remote-browser-password-row">
+                  <input id="remoteBrowserPassword" name="password" type="password" minlength="10" maxlength="128" autocomplete="new-password" required aria-describedby="remoteBrowserPasswordHint">
+                  <button class="row-button" type="button" data-action="generate-remote-browser-password"><span>重新生成</span></button>
+                  <button class="row-button" type="button" data-action="copy-remote-browser-password"><span>复制密码</span></button>
+                </div>
+                <small id="remoteBrowserPasswordHint">已在本机随机生成；启动成功后仍可在本窗口复制，完成时会立即清除</small>
+              </div>
+              <label>
+                <span>确认密码</span>
+                <input id="remoteBrowserPasswordConfirm" name="password_confirm" type="password" minlength="10" maxlength="128" autocomplete="new-password" required>
+              </label>
+            </div>
+            <div class="remote-browser-launch-error" id="remoteBrowserLaunchError" role="alert" hidden></div>
+            <footer class="remote-browser-launch-actions">
+              <button class="row-button" type="button" data-action="close-remote-browser-launch"><span>取消</span></button>
+              <button class="primary-button" id="remoteBrowserLaunchSubmit" type="submit"><span>启动并打开</span></button>
+            </footer>
+          </div>
+
+          <section class="remote-browser-launch-success" id="remoteBrowserLaunchSuccess" aria-labelledby="remoteBrowserLaunchSuccessTitle" aria-describedby="remoteBrowserLaunchSuccessDescription" hidden>
+            <div class="remote-browser-launch-success-head">
+              <span class="remote-browser-launch-success-mark" aria-hidden="true"></span>
+              <div>
+                <h3 id="remoteBrowserLaunchSuccessTitle">远程浏览器已就绪</h3>
+                <p id="remoteBrowserLaunchSuccessDescription">密码只保留在当前页面中。请复制并妥善保存；点击“完成并清除”或关闭窗口后无法找回。</p>
+              </div>
+            </div>
+            <div class="remote-browser-success-fields">
+              <label>
+                <span>远程链接</span>
+                <input id="remoteBrowserSuccessUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false" readonly>
+              </label>
+              <label>
+                <span>访问用户名</span>
+                <input id="remoteBrowserSuccessUsername" type="text" autocomplete="off" spellcheck="false" readonly>
+              </label>
+              <label>
+                <span>访问密码</span>
+                <input id="remoteBrowserSuccessPassword" type="text" autocomplete="off" spellcheck="false" readonly>
+              </label>
+            </div>
+            <div class="remote-browser-success-copy-actions" aria-label="复制远程浏览器凭据">
+              <button class="row-button" type="button" data-action="copy-launched-remote-browser-password"><span>复制密码</span></button>
+              <button class="row-button" type="button" data-action="copy-launched-remote-browser-url"><span>复制链接</span></button>
+              <button class="row-button" type="button" data-action="copy-launched-remote-browser-credentials"><span>复制完整凭据</span></button>
+            </div>
+            <footer class="remote-browser-launch-actions remote-browser-success-actions">
+              <button class="row-button" type="button" data-action="finish-remote-browser-launch"><span>完成并清除</span></button>
+              <button class="primary-button" id="remoteBrowserSuccessOpen" type="button" data-action="open-launched-remote-browser"><span>打开远程浏览器</span></button>
+            </footer>
+          </section>
+        </form>
+      </section>
+    </div>
+
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
     <script>
@@ -759,6 +840,7 @@
     </script>
     <script src="/static/auth.js"></script>
     <script src="/static/diagnostics.js"></script>
+    <script src="/static/browser-ui.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

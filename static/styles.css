@@ -1985,7 +1985,7 @@ tbody .row-actions .row-button {
   flex-shrink: 0;
 }
 .status.running { background: color-mix(in oklab, var(--success) 18%, transparent); color: var(--success); }
-.status.starting { background: color-mix(in oklab, var(--warning) 18%, transparent); color: var(--warning); }
+.status.starting, .status.stopping { background: color-mix(in oklab, var(--warning) 18%, transparent); color: var(--warning); }
 .status.failed, .status.stopped { background: color-mix(in oklab, var(--danger) 15%, transparent); color: var(--danger); }
 
 .traffic-strip {
@@ -2401,8 +2401,251 @@ tbody .row-actions .row-button {
 }
 .browser-record-actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   justify-content: flex-end;
   padding: 9px 12px;
+}
+.browser-record-error {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin: 0 12px 10px;
+  padding: 9px 10px;
+  border: 0.5px solid color-mix(in oklab, var(--danger) 35%, var(--border-subtle));
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklab, var(--danger) 9%, var(--bg-elevated));
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+.browser-record-error strong {
+  font-size: 11px;
+  font-weight: 650;
+}
+.browser-record-error span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.browser-record-broker-alert {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 0.5px solid color-mix(in oklab, var(--danger) 35%, var(--border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in oklab, var(--danger) 9%, var(--bg-panel));
+}
+.browser-record-broker-alert strong {
+  color: var(--danger);
+  font-size: 12px;
+}
+.browser-record-broker-alert span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.remote-browser-launch-modal {
+  width: min(540px, 100%);
+  max-height: min(720px, calc(100dvh - 48px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: var(--radius-lg);
+  background: var(--bg-content);
+  border: 0.5px solid var(--border-subtle);
+  box-shadow: var(--shadow-modal);
+}
+.remote-browser-launch-form {
+  min-height: 0;
+  padding: 16px;
+  overflow-y: auto;
+}
+.remote-browser-launch-setup,
+.remote-browser-launch-success {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.remote-browser-launch-setup[hidden],
+.remote-browser-launch-success[hidden] { display: none; }
+.remote-browser-launch-description {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+.remote-browser-broker-status {
+  position: relative;
+  min-height: 38px;
+  padding: 9px 11px 9px 30px;
+  border: 0.5px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.remote-browser-broker-status::before {
+  content: "";
+  position: absolute;
+  left: 12px;
+  top: 14px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--text-tertiary) 14%, transparent);
+}
+.remote-browser-broker-status.is-ready::before {
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--success) 14%, transparent);
+}
+.remote-browser-broker-status.is-error {
+  border-color: color-mix(in oklab, var(--danger) 35%, var(--border-subtle));
+  background: color-mix(in oklab, var(--danger) 9%, var(--bg-panel));
+  color: var(--danger);
+}
+.remote-browser-broker-status.is-error::before {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--danger) 14%, transparent);
+}
+.remote-browser-login-grid {
+  display: grid;
+  gap: 12px;
+}
+.remote-browser-login-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.remote-browser-login-grid label > span,
+.remote-browser-login-field > label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 550;
+}
+.remote-browser-login-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.remote-browser-password-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 6px;
+}
+.remote-browser-password-row .row-button {
+  justify-content: center;
+  white-space: nowrap;
+}
+.remote-browser-login-grid small {
+  color: var(--text-tertiary);
+  font-size: 10px;
+  line-height: 1.4;
+}
+.remote-browser-login-grid input {
+  width: 100%;
+  padding: 8px 10px;
+  background: var(--bg-input);
+  border: 0.5px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-inset);
+  outline: none;
+  transition: var(--transition);
+}
+.remote-browser-login-grid input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.remote-browser-launch-error {
+  padding: 9px 11px;
+  border: 0.5px solid color-mix(in oklab, var(--danger) 35%, var(--border-subtle));
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklab, var(--danger) 9%, var(--bg-panel));
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.remote-browser-launch-error[hidden] { display: none; }
+.remote-browser-launch-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 2px;
+}
+.remote-browser-launch-success-head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 0.5px solid color-mix(in oklab, var(--success) 35%, var(--border-subtle));
+  border-radius: var(--radius-md);
+  background: color-mix(in oklab, var(--success) 9%, var(--bg-panel));
+}
+.remote-browser-launch-success-mark {
+  width: 9px;
+  height: 9px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--success) 14%, transparent);
+}
+.remote-browser-launch-success-head h3 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 650;
+}
+.remote-browser-launch-success-head p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.remote-browser-success-fields {
+  display: grid;
+  gap: 10px;
+}
+.remote-browser-success-fields label {
+  display: grid;
+  gap: 5px;
+}
+.remote-browser-success-fields label > span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 550;
+}
+.remote-browser-success-fields input {
+  width: 100%;
+  padding: 8px 10px;
+  border: 0.5px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-inset);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.remote-browser-success-fields input:focus {
+  border-color: var(--accent);
+  outline: 2px solid var(--accent-soft);
+  outline-offset: 0;
+}
+.remote-browser-success-copy-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.remote-browser-success-actions {
+  padding-top: 6px;
+  border-top: 0.5px solid var(--separator);
 }
 
 /* ============================================================
@@ -2473,6 +2716,37 @@ tbody .row-actions .row-button {
 }
 
 @media (max-width: 520px) {
+  .modal-backdrop {
+    padding: 12px;
+  }
+  .remote-browser-launch-modal {
+    max-height: calc(100dvh - 24px);
+  }
+  .remote-browser-launch-form {
+    padding: 14px;
+  }
+  .remote-browser-launch-actions {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+  .remote-browser-launch-actions > button {
+    justify-content: center;
+    width: 100%;
+  }
+  .remote-browser-password-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .remote-browser-password-row input {
+    grid-column: 1 / -1;
+  }
+  .remote-browser-success-copy-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .remote-browser-success-copy-actions > button {
+    justify-content: center;
+    width: 100%;
+  }
   .subscription-item { padding: 14px; }
   .item-actions {
     align-items: stretch;

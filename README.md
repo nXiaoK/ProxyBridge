@@ -11,7 +11,7 @@
 - HTTP 代理模式支持普通 HTTP 请求和 HTTPS CONNECT,兼容不支持 SOCKS5 的软件。
 - 节点可选择 `sing-box` 或 `xray`；双核心兼容节点可记忆偏好，并在首选核心启动失败时按设置尝试备用核心。
 - 菜单栏 App 默认不内置 `sing-box` / `xray`，首次运行时会自动下载到用户数据目录;也可构建时选择内置核心。
-- 桌面/普通无壳模式下，节点操作列可启动**独立指纹浏览器**(每节点独立指纹 + 独立 Profile),并自动绑定该节点的本地代理；Docker 模式会完整关闭该能力。
+- 桌面/普通无壳模式可启动本机**独立指纹浏览器**；默认 Docker Compose 则为每条浏览器记录动态创建一个可通过 HTTPS 链接访问的隔离 worker，同样使用独立指纹、独立 Profile 和对应节点代理。
 - 测速结果显示年龄与过期状态，支持延迟/成功率排序、探测目标轮换，以及 3–5 路有界并发的可取消批量测速。
 - 订阅可配置周期自动刷新；请求使用 `ETag` / `Last-Modified`，失败时保留旧节点并指数退避，成功后报告节点增删改 diff。
 - 订阅页支持一次刷新全部 URL 订阅，任务可取消并显示逐项结果；每个订阅保留最近 20 次成功、304、失败或取消历史。取消会停止调度后续订阅，已经发出的当前请求会完成并保留真实结果。
@@ -36,10 +36,11 @@
 - 指纹浏览器一键下载依赖上游是否发布对应平台包；也可手动设置 `PROXY_BRIDGE_FP_CHROMIUM`
 
 ### Docker
-- Docker Engine 24+ / Docker Compose v2（推荐）
-- 当前支持 `linux/amd64` 与 `linux/arm64`
-- Web 控制台与代理端口通过宿主机回环地址访问
-- 不安装或启用指纹浏览器；WebDAV 仅同步订阅 / 节点
+- Docker Engine API 1.45+（通常为 Docker Engine 26+）/ Docker Compose v2；远程浏览器依赖命名卷 `volume-subpath`
+- 主服务支持 `linux/amd64` 与 `linux/arm64`；远程浏览器 worker 当前固定为 `linux/amd64`
+- `arm64` 宿主机运行远程浏览器需要 Docker 的 amd64 仿真，性能较低，且不保证 GPU 加速可用
+- Web 控制台、代理端口和远程浏览器端口默认仅通过宿主机回环地址访问
+- 首次使用远程浏览器需从控制台下载 Linux 指纹内核；已停止的 Docker 浏览器 Profile 可参与 WebDAV 同步
 
 ## 文档入口
 
@@ -206,7 +207,7 @@ curl --retry 10 --retry-connrefused \
 
 ## Docker 运行
 
-Docker 模式直接提供 Web 控制台和本地代理，不包含托盘、系统浏览器调用或指纹浏览器功能。
+默认 Compose 同时提供 Web 控制台、本地代理和远程指纹浏览器。浏览器不在主容器内运行：内部 Browser Broker 会为每条运行记录创建一个 `lscr.io/linuxserver/chromium` worker，并把该记录的固定指纹、独立 Profile 和节点 SOCKS5 代理交给它。未配置 Broker 的单容器 `docker run` 仍保持禁用浏览器的安全行为。
 
 ```bash
 docker compose up -d --build
@@ -221,11 +222,32 @@ Proxy Bridge console: http://127.0.0.1:8787/#token=...
 
 Compose 默认：
 
-- 使用 `proxybridge-data` 命名卷持久化 `/data`。
+- 使用 `proxybridge-data` 命名卷持久化 `/data`。远程浏览器通过 Docker Engine API 1.45+ 的 `volume-subpath` 只挂载对应 Profile 与指纹内核，因此此模式不支持把 `/data` 改为宿主机 bind mount。
 - Web 控制台默认仅发布到宿主机 `127.0.0.1:8787`；可通过 `.env` 中的 `PROXY_BRIDGE_CONSOLE_HOST=<宿主机局域网 IPv4>` 精确开放给局域网。
 - 代理端口范围发布为 `127.0.0.1:21080-21179`，容器内自动分配也限制在相同范围。
 - 首次启动自动下载 Linux 版 `sing-box` / `xray` 到数据卷。
-- WebDAV 页面显示「仅订阅 / 节点」；上传不会删除远端已有浏览器 Profile，拉取也不会处理本地 Profile。
+- 每个浏览器 worker 从 `23000-23099` 动态占用一个自签名 HTTPS 端口；默认只绑定 `127.0.0.1`。
+- worker 的 `/config` 使用随容器删除的匿名运行卷，只有 `/config/browser-profile` 指向持久化 Profile；Selkies 的 TLS、认证和其他运行文件不会进入 WebDAV Profile。
+- 每个 worker 只能免认证连接分配给自己的节点代理端口；主服务按 Broker 返回的精确 worker IP 与代理端口配对校验，不信任整个 worker 子网。
+- 浏览器功能启用时，WebDAV 可同步已停止的 Docker 浏览器 Profile；禁用 Broker 后才退回「仅订阅 / 节点」。
+- Broker 启动时会回收上次异常退出遗留的 worker；Compose 为主服务和 Broker 都保留 3 分钟停止宽限期，以完成 worker 回收与 Profile 落盘。
+
+首次使用时，先在控制台点击「下载指纹内核」，等待 Linux 内核保存到 `/data/fingerprint-chromium/`。然后在节点行点击「浏览器」：弹窗默认用户名为 `proxybridge`，并在本地生成可复制、可修改的随机强密码；提交后会创建独立 worker，并自动打开返回的远程链接。运行中的「浏览器记录」可再次「远程打开」或「停止」。密码不会写入状态文件或状态 API；停止后重新启动需使用新密码。
+
+若要让同一可信局域网或 VPN 中的其他电脑直接打开控制台和浏览器链接，在仓库根目录创建 `.env`，三项均填写 Docker 宿主机的同一个私有 IPv4：
+
+```dotenv
+# Web 控制台发布地址；只填宿主机明确的私有 IPv4，不能填 0.0.0.0。
+PROXY_BRIDGE_CONSOLE_HOST=192.168.1.20
+# 浏览器 worker 实际绑定地址；只允许回环或宿主机明确的私有 IPv4。
+PROXY_BRIDGE_BROWSER_HOST=192.168.1.20
+# 控制台生成浏览器链接时使用的地址；通常必须与上一项相同。
+PROXY_BRIDGE_BROWSER_PUBLIC_HOST=192.168.1.20
+```
+
+重新创建服务后，只在宿主机防火墙中向可信网段开放 TCP `8787` 和 `23000-23099`。每个 worker 会在本次容器的匿名 `/config` 运行卷中动态生成自签名证书，浏览器首次访问会显示证书警告；内置 Basic Auth 只适合作为可信 LAN/VPN 内的便利防护。**不得把这些端口直接发布到公网**；公网访问必须在前面部署使用受信任证书的 TLS 反向代理，并增加 SSO 或等效的强认证。
+
+> Browser Broker 挂载了 `/var/run/docker.sock`。即使 Compose 标记为 `:ro`，Docker API 仍可创建/删除容器及挂载宿主机路径，权限事实上接近宿主机 root。不要在不可信或多租户 Docker 主机上部署，也不要把 Broker 控制网络或凭证卷暴露给其他容器。
 
 完整的 `docker run`、端口扩容、数据卷、离线核心、SSH 隧道和排障步骤见 [`docs/docker.md`](docs/docker.md)。
 
@@ -379,7 +401,7 @@ Windows 额外可用快捷方式脚本（桌面 + 开机启动）：
 
 桌面/普通无壳模式支持同步**订阅 / 节点**与**指纹浏览器 Profile**（Cookie、LocalStorage 等），用于换机接力。
 
-Docker / 禁用浏览器模式会自动切换为**仅订阅 / 节点同步**：不会打包、下载或删除 Profile；如果相同远端目录中已有桌面版浏览器数据，Docker 上传会验证并保留它们。
+默认 Docker Compose 的远程浏览器也支持同步**订阅 / 节点**与**已停止的浏览器 Profile**。只有未配置 Broker 或显式禁用浏览器的 Docker/其他模式才会切换为**仅订阅 / 节点同步**：不会打包、下载或删除 Profile；如果相同远端目录中已有浏览器数据，上传会验证并保留它们。
 
 控制台侧边栏 **「WebDAV 同步」**：
 
@@ -396,9 +418,9 @@ Docker / 禁用浏览器模式会自动切换为**仅订阅 / 节点同步**：�
 - **删除订阅**会停止并删除关联节点的指纹浏览器记录与本地 Profile；WebDAV 已启用时会**自动全量上传**，远端 `state` 与多余 `profiles/*.tar.gz` 一并清理。
 - 打开节点 **浏览器记录** 时（WebDAV 已启用）会先**自动拉取**一次远端；若检测到本地未上传变更，会保留本地记录并提示先上传，避免旧远端快照覆盖新记录。
 - 浏览器记录支持 **标签**（如「访问 xx 的浏览器」）；保存标签会标记本地变更并尝试同步。
-- 关闭浏览器窗口、点浏览器「停止」，或在「本地代理」停止关联节点（且开启「关闭后自动上传」）会**自动上传**该 Profile（含标签）。
+- 本机浏览器窗口退出、在控制台点浏览器「停止」，或在「本地代理」停止关联节点（且开启「关闭后自动上传」）会**自动上传**该 Profile（含标签）；远程 worker 关闭网页标签不等于停止实例，需在「浏览器记录」中点击「停止」。
 - 拉取时以远端为权威：本机多出来的订阅/节点/浏览器记录会被移除，对应本地 Profile 目录也会清理。
-- Docker / 禁用浏览器模式下，上述覆盖与清理只适用于订阅和节点，本地浏览器记录/Profile 保持不变。
+- 未配置 Broker 或显式禁用浏览器时，上述覆盖与清理只适用于订阅和节点，本地浏览器记录/Profile 保持不变。
 - 可选：关闭浏览器后自动上传、启动时检查远端更新、**忽略 SSL 证书**（过期/自签）。
 - 可选：PBENC2 端到端加密（PBKDF2 + OpenSSL AES-256-CBC + HMAC 完整性校验）；本机需有 `openssl`。仍可读取旧 PBENC1 数据，新上传统一使用 PBENC2。
 - 冲突策略为远端后写覆盖（LWW），并记录设备 ID。
@@ -478,8 +500,9 @@ Web 控制台模式：
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 node --check static/auth.js
 node --check static/diagnostics.js
+node --check static/browser-ui.js
 node --check static/app.js
-node --test tests/test_frontend_auth.js tests/test_frontend_diagnostics.js
+node --test tests/test_frontend_*.js
 bash -n scripts/*.sh
 git diff --check
 ```
