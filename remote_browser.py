@@ -10,6 +10,7 @@ from typing import Any
 
 
 BROKER_RESPONSE_LIMIT = 2 * 1024 * 1024
+BROKER_IMAGE_PREPARE_TIMEOUT = 930.0
 BROKER_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~-]{32,256}")
 BROKER_INSTANCE_ID_PATTERN = re.compile(r"[a-f0-9]{16}")
 
@@ -80,6 +81,7 @@ class RemoteBrowserBrokerClient:
         payload: dict[str, Any] | None = None,
         *,
         timeout: float | None = None,
+        timeout_error: str = "",
     ) -> dict[str, Any]:
         if not path.startswith("/") or "?" in path or "#" in path:
             raise ValueError("Broker 请求路径无效")
@@ -109,6 +111,12 @@ class RemoteBrowserBrokerClient:
                 message = ""
             raise RemoteBrowserError(message or f"浏览器 Broker 请求失败（HTTP {exc.code}）") from exc
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            reason_text = str(reason).casefold()
+            if isinstance(reason, TimeoutError) or "timed out" in reason_text or "超时" in reason_text:
+                raise RemoteBrowserError(
+                    timeout_error or "等待浏览器 Broker 响应超时，请检查 Broker 日志"
+                ) from exc
             raise RemoteBrowserError("无法连接浏览器 Broker，请检查 Docker 服务状态") from exc
         result = self._decode_response(body)
         if result.get("ok") is not True:
@@ -136,10 +144,27 @@ class RemoteBrowserBrokerClient:
 
     def prepare(self) -> dict[str, Any]:
         """拉取并校验固定平台镜像，但不创建容器或处理用户密码。"""
-        return self._request("POST", "/v1/image/prepare", {}, timeout=max(self.timeout, 900.0))
+        # Broker 内部 Docker pull 最多等待 900 秒；客户端额外保留 30 秒，确保
+        # 服务端能先返回“镜像拉取超时”的真实原因，而不是被误报为 Broker 断连。
+        return self._request(
+            "POST",
+            "/v1/image/prepare",
+            {},
+            timeout=max(self.timeout, BROKER_IMAGE_PREPARE_TIMEOUT),
+            timeout_error=(
+                "准备远程浏览器 Worker 镜像超时；Broker 可能仍在拉取 "
+                "Worker 镜像，请检查 browser-broker 日志，或在宿主机预先 docker pull/load"
+            ),
+        )
 
     def start(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/v1/sessions/start", payload, timeout=max(self.timeout, 600.0))
+        return self._request(
+            "POST",
+            "/v1/sessions/start",
+            payload,
+            timeout=max(self.timeout, 600.0),
+            timeout_error="创建远程浏览器 Worker 超时，请检查 browser-broker 与 Worker 容器日志",
+        )
 
     def stop(
         self,

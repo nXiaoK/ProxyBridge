@@ -324,6 +324,39 @@ docker port proxybridge
 
 先在控制台点击「下载指纹内核」，或本地导入 Linux x86_64 完整发布包，并确认 `/data/fingerprint-chromium/` 位于 `proxybridge-data` 卷内。Broker 需要完整的 Linux 发行目录和可执行 `chrome-wrapper`，上传单个 `chrome`、`.7z` 或只设置指向卷外文件的路径都无法供 worker 使用。
 
+### 一直显示“正在创建远程浏览器 Worker”，随后提示无法连接 Broker
+
+Broker 可以正常显示“已连接”但首次启动仍可能耗时很久，因为 `lscr.io/linuxserver/chromium:latest` 不会在构建 ProxyBridge 时下载，而是在第一次创建 Worker 前按 `linux/amd64` 拉取。先检查 Broker 日志和本地镜像：
+
+```bash
+docker compose ps
+docker compose logs --tail=200 browser-broker
+docker image inspect lscr.io/linuxserver/chromium:latest --format '{{.Os}}/{{.Architecture}}'
+```
+
+若镜像不存在，可在 fnOS Docker 宿主机上直接拉取并观察实际进度；拉取完成后无需重建 ProxyBridge，回到控制台重新启动该浏览器记录即可：
+
+```bash
+docker pull --platform linux/amd64 lscr.io/linuxserver/chromium:latest
+docker image inspect lscr.io/linuxserver/chromium:latest --format '{{.Os}}/{{.Architecture}}'
+```
+
+如果 fnOS 无法稳定访问 `lscr.io`，可在网络正常且支持 Docker 的电脑预先拉取并导出：
+
+```bash
+docker pull --platform linux/amd64 lscr.io/linuxserver/chromium:latest
+docker save -o proxybridge-chromium-amd64.tar lscr.io/linuxserver/chromium:latest
+```
+
+将 `proxybridge-chromium-amd64.tar` 复制到 fnOS 后导入：
+
+```bash
+docker load -i proxybridge-chromium-amd64.tar
+docker image inspect lscr.io/linuxserver/chromium:latest --format '{{.Os}}/{{.Architecture}}'
+```
+
+最后一条必须输出 `linux/amd64`。本地导入 `sing-box`、`Xray` 或 fingerprint-chromium 不能替代这个 Worker Docker 镜像；两者是不同的运行层。
+
 ### 远程浏览器链接打不开
 
 确认 `.env` 的 `PROXY_BRIDGE_BROWSER_HOST` 与 `PROXY_BRIDGE_BROWSER_PUBLIC_HOST` 都是宿主机实际私有 IPv4，重新创建过 Compose 服务，并检查 worker 是否占用了 `23000-23099` 内的端口：

@@ -254,7 +254,7 @@ Compose 默认：
 - 浏览器功能启用时，WebDAV 可同步已停止的 Docker 浏览器 Profile；禁用 Broker 后才退回「仅订阅 / 节点」。
 - Broker 启动时会回收上次异常退出遗留的 worker；Compose 为主服务和 Broker 都保留 3 分钟停止宽限期，以完成 worker 回收与 Profile 落盘。
 
-首次使用时，先在控制台点击「下载指纹内核」，或通过「本地导入」上传 Linux x86_64 完整发布包，等待内核保存到 `/data/fingerprint-chromium/`。然后在节点行点击「浏览器」：弹窗默认用户名为 `proxybridge`，并在本地生成可复制、可修改的随机强密码；提交后会创建独立 worker，并自动打开返回的远程链接。运行中的「浏览器记录」可再次「远程打开」或「停止」。密码不会写入状态文件或状态 API；停止后重新启动需使用新密码。
+首次使用时，先在控制台点击「下载指纹内核」，或通过「本地导入」上传 Linux x86_64 完整发布包，等待内核保存到 `/data/fingerprint-chromium/`。然后在节点行点击「浏览器」：弹窗默认用户名为 `proxybridge`，并在本地生成可复制、可修改的随机强密码；提交后会创建独立 worker，并自动打开返回的远程链接。第一次创建前还需拉取较大的 `lscr.io/linuxserver/chromium:latest` Worker 镜像；控制台会提示镜像是否已经缓存，网络受阻时可按 Docker 文档使用 `docker pull` 或在其他电脑 `docker save` 后到服务器 `docker load`。运行中的「浏览器记录」可再次「远程打开」或「停止」。密码不会写入状态文件或状态 API；停止后重新启动需使用新密码。
 
 若要让同一可信局域网或 VPN 中的其他电脑直接打开控制台和浏览器链接，在仓库根目录创建 `.env`，三项均填写 Docker 宿主机的同一个私有 IPv4：
 

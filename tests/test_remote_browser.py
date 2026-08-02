@@ -125,6 +125,18 @@ class RemoteBrowserBrokerClientTests(unittest.TestCase):
             with self.assertRaisesRegex(remote_browser.RemoteBrowserError, "无法连接浏览器 Broker"):
                 self.client().sessions()
 
+        with mock.patch.object(
+            remote_browser.RemoteBrowserBrokerClient,
+            "_open",
+            side_effect=TimeoutError("timed out"),
+        ) as opener:
+            with self.assertRaisesRegex(remote_browser.RemoteBrowserError, "准备远程浏览器 Worker 镜像超时"):
+                self.client().prepare()
+        self.assertGreaterEqual(
+            opener.call_args.kwargs["timeout"],
+            remote_browser.BROKER_IMAGE_PREPARE_TIMEOUT,
+        )
+
         error = urllib.error.HTTPError(
             "http://browser-broker:8765/v1/sessions/start",
             503,
@@ -654,6 +666,26 @@ class BrowserBrokerTests(unittest.TestCase):
         self.assertEqual(query["fromImage"], ["lscr.io/linuxserver/chromium"])
         self.assertEqual(query["tag"], ["latest"])
 
+    def test_image_pull_timeout_reports_registry_context_and_status_exposes_cache_state(self) -> None:
+        self.engine.json_request.side_effect = browser_broker.EngineError(404, "not found")
+        self.engine.request.side_effect = browser_broker.EngineTimeoutError("Docker Engine 请求超时")
+
+        with self.assertRaisesRegex(browser_broker.BrokerError, "超过 15 分钟.*pull/load"):
+            self.broker._ensure_image()
+
+        self.engine.json_request.side_effect = [
+            browser_broker.EngineError(404, "not found"),
+        ]
+        with (
+            mock.patch.object(self.broker, "_require_volume_subpath_api"),
+            mock.patch.object(self.broker, "_validated_worker_network"),
+            mock.patch.object(self.broker, "_data_volume", return_value="proxybridge-data"),
+            mock.patch.object(self.broker, "_control_volume_source", return_value="/control"),
+            mock.patch.object(self.broker, "sessions", return_value=[]),
+        ):
+            status = self.broker.status()
+        self.assertFalse(status["worker_image_ready"])
+
     def test_port_exhaustion_removes_session_password_file(self) -> None:
         occupied = [
             {"instance_id": "aaaaaaaaaaaaaaaa", "status": "running", "host_port": 23000},
@@ -905,6 +937,15 @@ class BrowserBrokerTests(unittest.TestCase):
         self.assertEqual(raw_request.call_args_list[0].args[:2], ("GET", "/version"))
         self.assertEqual(raw_request.call_args_list[1].args[:2], ("POST", "/v1.45/containers/create"))
         self.assertEqual(raw_request.call_args_list[2].args[:2], ("GET", "/v1.45/containers/bad/json"))
+
+    def test_docker_engine_socket_timeout_is_not_reported_as_disconnect(self) -> None:
+        connection = mock.Mock()
+        connection.request.side_effect = TimeoutError("timed out")
+        with mock.patch.object(browser_broker, "UnixHTTPConnection", return_value=connection):
+            client = browser_broker.DockerEngineClient("/var/run/docker.sock")
+            with self.assertRaisesRegex(browser_broker.EngineTimeoutError, "请求超时"):
+                client._raw_request("POST", "/images/create", timeout=1.0)
+        connection.close.assert_called_once_with()
 
 
 class AppRemoteBrowserTests(unittest.TestCase):

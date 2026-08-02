@@ -2616,7 +2616,11 @@ function renderRemoteBrowserBrokerStatus() {
   element.classList.toggle("is-error", !available);
   if (available) {
     const count = Number(broker.active_sessions || 0);
-    element.textContent = `浏览器 Broker 已连接 · ${count} 个 Worker 运行中`;
+    const imagePending = broker.worker_image_ready === false;
+    const image = String(broker.worker_image || "lscr.io/linuxserver/chromium:latest");
+    element.textContent = imagePending
+      ? `浏览器 Broker 已连接 · Worker 镜像尚未缓存，首次启动需拉取 ${image}`
+      : `浏览器 Broker 已连接 · ${count} 个 Worker 运行中`;
     element.setAttribute("role", "status");
     return;
   }
@@ -2759,6 +2763,14 @@ function setRemoteBrowserLaunchBusy(busy) {
     submit.disabled = busy;
     submit.classList.toggle("is-busy", busy);
     submit.setAttribute("aria-busy", busy ? "true" : "false");
+    const label = submit.querySelector("span");
+    if (label) {
+      label.textContent = busy
+        ? appState.remoteBrowser?.worker_image_ready === false
+          ? "正在准备 Worker 镜像…"
+          : "正在创建 Worker…"
+        : "启动并打开";
+    }
   }
   modal?.querySelectorAll([
     '[data-action="close-remote-browser-launch"]',
@@ -3150,7 +3162,9 @@ function openRemoteBrowserLoadingWindow() {
     remoteWindow.document.documentElement.lang = "zh-CN";
     remoteWindow.document.title = "正在启动远程浏览器";
     remoteWindow.document.body.style.cssText = "margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f7;color:#3a3a3c;font:14px -apple-system,BlinkMacSystemFont,sans-serif";
-    remoteWindow.document.body.textContent = "正在创建远程浏览器 Worker，请稍候…";
+    remoteWindow.document.body.textContent = appState.remoteBrowser?.worker_image_ready === false
+      ? "首次启动正在拉取远程浏览器 Worker 镜像；镜像较大，请稍候…"
+      : "正在创建远程浏览器 Worker，请稍候…";
   } catch (_) {
     // about:blank 通常同源；若浏览器限制写入，仍可在启动成功后导航。
   }

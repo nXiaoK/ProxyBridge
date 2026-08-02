@@ -25,6 +25,7 @@ REQUEST_BODY_LIMIT = 128 * 1024
 ENGINE_RESPONSE_LIMIT = 16 * 1024 * 1024
 MIN_VOLUME_SUBPATH_API = (1, 45)
 WORKER_PLATFORM = "linux/amd64"
+WORKER_IMAGE_PULL_TIMEOUT = 900.0
 INSTANCE_ID_PATTERN = re.compile(r"[a-f0-9]{16}")
 OPERATION_ID_PATTERN = re.compile(r"[a-f0-9]{32}")
 USERNAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,32}")
@@ -54,6 +55,10 @@ chmod 0755 /usr/bin/chromium
 
 
 class BrokerError(RuntimeError):
+    pass
+
+
+class EngineTimeoutError(BrokerError):
     pass
 
 
@@ -110,6 +115,8 @@ class DockerEngineClient:
             connection.request(method, path, body=body, headers=headers)
             response = connection.getresponse()
             data = response.read(ENGINE_RESPONSE_LIMIT + 1)
+        except TimeoutError as exc:
+            raise EngineTimeoutError("Docker Engine 请求超时") from exc
         except (OSError, http.client.HTTPException) as exc:
             raise BrokerError("无法连接 Docker Engine") from exc
         finally:
@@ -690,20 +697,25 @@ class BrowserWorkerBroker:
                     result.append(session)
         return result
 
-    def _ensure_image(self) -> None:
+    def _worker_image_ready(self) -> bool:
         encoded = urllib.parse.quote(self.config.worker_image, safe="")
         try:
             current = self.engine.json_request("GET", f"/images/{encoded}/json")
-            if (
-                str(current.get("Os") or "").lower() == "linux"
-                and str(current.get("Architecture") or "").lower() == "amd64"
-            ):
-                return
         except EngineError as exc:
-            if exc.status != 404:
-                raise
+            if exc.status == 404:
+                return False
+            raise
+        return (
+            str(current.get("Os") or "").lower() == "linux"
+            and str(current.get("Architecture") or "").lower() == "amd64"
+        )
+
+    def _ensure_image(self) -> None:
+        if self._worker_image_ready():
+            return
 
         image = self.config.worker_image
+        encoded = urllib.parse.quote(image, safe="")
         query_values = {"platform": WORKER_PLATFORM}
         if "@" in image:
             query_values["fromImage"] = image
@@ -717,20 +729,50 @@ class BrowserWorkerBroker:
                 query_values["fromImage"] = image
                 query_values["tag"] = "latest"
         query = urllib.parse.urlencode(query_values)
-        data = self.engine.request("POST", f"/images/create?{query}", expected=(200,), timeout=900.0)
-        for line in data.splitlines():
+        started = time.monotonic()
+        print(
+            "ProxyBridge browser broker pulling worker image "
+            f"{image} ({WORKER_PLATFORM}), timeout={int(WORKER_IMAGE_PULL_TIMEOUT)}s",
+            flush=True,
+        )
+        try:
             try:
-                event = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if isinstance(event, dict) and event.get("error"):
-                raise BrokerError(f"拉取远程浏览器镜像失败：{str(event['error'])[:500]}")
-        pulled = self.engine.json_request("GET", f"/images/{encoded}/json")
-        if not (
-            str(pulled.get("Os") or "").lower() == "linux"
-            and str(pulled.get("Architecture") or "").lower() == "amd64"
-        ):
-            raise BrokerError("远程浏览器镜像不是 linux/amd64，请检查 Docker 平台模拟配置")
+                data = self.engine.request(
+                    "POST",
+                    f"/images/create?{query}",
+                    expected=(200,),
+                    timeout=WORKER_IMAGE_PULL_TIMEOUT,
+                )
+            except EngineTimeoutError as exc:
+                raise BrokerError(
+                    "拉取远程浏览器 Worker 镜像超过 15 分钟；请检查镜像仓库网络，"
+                    "或在 Docker 宿主机预先 pull/load linux/amd64 镜像后重试"
+                ) from exc
+            for line in data.splitlines():
+                try:
+                    event = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(event, dict) and event.get("error"):
+                    raise BrokerError(f"拉取远程浏览器镜像失败：{str(event['error'])[:500]}")
+            pulled = self.engine.json_request("GET", f"/images/{encoded}/json")
+            if not (
+                str(pulled.get("Os") or "").lower() == "linux"
+                and str(pulled.get("Architecture") or "").lower() == "amd64"
+            ):
+                raise BrokerError("远程浏览器镜像不是 linux/amd64，请检查 Docker 平台模拟配置")
+        except BaseException as exc:
+            elapsed = max(0.0, time.monotonic() - started)
+            print(
+                f"ProxyBridge browser broker worker image pull failed after {elapsed:.1f}s: {exc}",
+                flush=True,
+            )
+            raise
+        elapsed = max(0.0, time.monotonic() - started)
+        print(
+            f"ProxyBridge browser broker worker image ready after {elapsed:.1f}s: {image}",
+            flush=True,
+        )
 
     def _existing_session(
         self,
@@ -1143,6 +1185,7 @@ class BrowserWorkerBroker:
             "ok": True,
             "docker_api_version": version,
             "worker_image": self.config.worker_image,
+            "worker_image_ready": self._worker_image_ready(),
             "bind_host": self.config.bind_host,
             "public_host": self.config.public_host,
             "port_range": [self.config.port_start, self.config.port_end],
