@@ -900,7 +900,9 @@ class BrowserWorkerBroker:
                 "NanoCpus": self.config.nano_cpus,
                 "PidsLimit": self.config.pids_limit,
                 "ShmSize": self.config.shm_bytes,
-                "Init": True,
+                # LinuxServer Chromium 自带 s6-overlay，必须让镜像的 /init 保持
+                # PID 1。Docker Init 会在外层插入 tini，使 s6-overlay-suexec
+                # 以 "can only run as pid 1" 和退出码 100 终止。
             },
         }
 

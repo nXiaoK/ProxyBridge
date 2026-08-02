@@ -364,6 +364,16 @@ docker image inspect lscr.io/linuxserver/chromium:latest --format '{{.Os}}/{{.Ar
 
 最后一条必须输出 `linux/amd64`。本地导入 `sing-box`、`Xray` 或 fingerprint-chromium 不能替代这个 Worker Docker 镜像；两者是不同的运行层。
 
+### 点击浏览器提示 Worker 退出码 100
+
+LinuxServer Chromium 使用自带的 s6-overlay 作为容器 PID 1，不能再给 worker 启用 Docker Init。旧版 ProxyBridge 曾错误地在 worker 外层插入 `tini`，容器会输出 `s6-overlay-suexec: fatal: can only run as pid 1` 并以 100 退出。更新代码后必须重新构建 Broker；只重启旧容器不会应用修复：
+
+```bash
+docker compose up -d --build --force-recreate browser-broker proxybridge
+```
+
+更新后仍出现退出码 100 时，先检查是否实际运行了新构建的 `proxybridge-browser-broker:local`，以及是否在自定义 Compose 覆盖中再次给动态 worker 添加了 Init 包装。
+
 ### 远程浏览器链接打不开
 
 确认 `.env` 的 `PROXY_BRIDGE_BROWSER_HOST` 与 `PROXY_BRIDGE_BROWSER_PUBLIC_HOST` 都是宿主机实际私有 IPv4，重新创建过 Compose 服务，并检查 worker 是否占用了 `23000-23099` 内的端口：

@@ -524,6 +524,7 @@ class BrowserBrokerTests(unittest.TestCase):
         self.assertNotIn(f"PASSWORD={secret}", payload["Env"])
         self.assertEqual(payload["HostConfig"]["NetworkMode"], "proxybridge-browser-workers")
         self.assertFalse(payload["HostConfig"]["Privileged"])
+        self.assertNotIn("Init", payload["HostConfig"])
         self.assertEqual(payload["HostConfig"]["SecurityOpt"], ["no-new-privileges:true"])
         self.assertEqual(payload["Volumes"], {"/config": {}})
         mounts = payload["HostConfig"]["Mounts"]
