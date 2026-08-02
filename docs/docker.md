@@ -345,8 +345,15 @@ docker image inspect lscr.io/linuxserver/chromium:latest --format '{{.Os}}/{{.Ar
 
 ```bash
 docker pull --platform linux/amd64 lscr.io/linuxserver/chromium:latest
-docker save -o proxybridge-chromium-amd64.tar lscr.io/linuxserver/chromium:latest
+docker image inspect --platform linux/amd64 \
+  lscr.io/linuxserver/chromium:latest \
+  --format '{{.Os}}/{{.Architecture}}'
+docker image save --platform linux/amd64 \
+  -o proxybridge-chromium-amd64.tar \
+  lscr.io/linuxserver/chromium:latest
 ```
+
+OrbStack、启用 containerd image store 的 Docker Desktop 等环境中，镜像标签可能指向多平台 manifest index，普通 `docker image inspect` 因而只显示 `/`，普通 `docker save` 也可能尝试导出未缓存的平台并报 `content digest ... not found`。这不代表 amd64 镜像拉取失败；上面的 `inspect --platform` 与 `save --platform` 会明确选择已经缓存的 `linux/amd64` 子镜像。
 
 将 `proxybridge-chromium-amd64.tar` 复制到 fnOS 后导入：
 
