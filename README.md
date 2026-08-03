@@ -248,7 +248,7 @@ Compose 默认：
 - Web 控制台默认仅发布到宿主机 `127.0.0.1:8787`；可通过 `.env` 中的 `PROXY_BRIDGE_CONSOLE_HOST=<宿主机局域网 IPv4>` 精确开放给局域网。
 - 代理端口范围发布为 `127.0.0.1:21080-21179`，容器内自动分配也限制在相同范围。
 - 首次启动自动下载 Linux 版 `sing-box` / `xray` 到数据卷；下载受阻时可从控制台上传官方包替代。
-- 每个浏览器 worker 从 `23000-23099` 动态占用一个自签名 HTTPS 端口；默认只绑定 `127.0.0.1`。
+- 每个浏览器实例从 `23000-23099` 动态占用一个 Broker TLS TCP 中继端口；默认只绑定宿主机 `127.0.0.1`。worker 仍只加入 internal 网络，不直接发布 HostPort，也不能借入口网络绕过节点代理出网。
 - worker 的 `/config` 使用随容器删除的匿名运行卷，只有 `/config/browser-profile` 指向持久化 Profile；Selkies 的 TLS、认证和其他运行文件不会进入 WebDAV Profile。
 - 每个 worker 只能免认证连接分配给自己的节点代理端口；主服务按 Broker 返回的精确 worker IP 与代理端口配对校验，不信任整个 worker 子网。
 - 浏览器功能启用时，WebDAV 可同步已停止的 Docker 浏览器 Profile；禁用 Broker 后才退回「仅订阅 / 节点」。
@@ -261,7 +261,7 @@ Compose 默认：
 ```dotenv
 # Web 控制台发布地址；只填宿主机明确的私有 IPv4，不能填 0.0.0.0。
 PROXY_BRIDGE_CONSOLE_HOST=192.168.1.20
-# 浏览器 worker 实际绑定地址；只允许回环或宿主机明确的私有 IPv4。
+# Browser Broker HTTPS 中继的宿主机绑定地址；只允许回环或宿主机明确的私有 IPv4。
 PROXY_BRIDGE_BROWSER_HOST=192.168.1.20
 # 控制台生成浏览器链接时使用的地址；通常必须与上一项相同。
 PROXY_BRIDGE_BROWSER_PUBLIC_HOST=192.168.1.20

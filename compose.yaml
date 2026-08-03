@@ -84,8 +84,13 @@ services:
       # Broker 独占 Docker Socket；主 Web 服务不直接获得宿主机级 Docker 权限。
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - proxybridge-browser-control:/control
+    ports:
+      # worker 保持在 internal 网络；此映射只把 Broker 的 TLS TCP 中继发布到指定宿主机私有地址。端口起止值必须与上方 Broker 环境变量一致。
+      - "${PROXY_BRIDGE_BROWSER_HOST:-127.0.0.1}:${PROXY_BRIDGE_BROWSER_PORT_START:-23000}-${PROXY_BRIDGE_BROWSER_PORT_END:-23099}:${PROXY_BRIDGE_BROWSER_PORT_START:-23000}-${PROXY_BRIDGE_BROWSER_PORT_END:-23099}"
     networks:
       - browser-control
+      - browser-workers
+      - browser-ingress
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
@@ -113,3 +118,8 @@ networks:
       config:
         # worker 子网可通过 .env 修改；必须是无地址冲突的 RFC1918 IPv4 子网。代理免认证按精确 worker IP 与实例端口匹配，不使用整个子网白名单。
         - subnet: "${PROXY_BRIDGE_BROWSER_NETWORK_SUBNET:-172.31.254.0/24}"
+  browser-ingress:
+    name: proxybridge-browser-ingress
+    driver: bridge
+    # 只有 Broker 加入此非 internal 网络，Docker 才能建立宿主机端口映射；worker 禁止加入，避免绕过节点代理直接出网。
+    internal: false

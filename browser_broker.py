@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import errno
 import hmac
 import http.client
 import ipaddress
@@ -18,7 +19,7 @@ import urllib.parse
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 REQUEST_BODY_LIMIT = 128 * 1024
@@ -26,6 +27,7 @@ ENGINE_RESPONSE_LIMIT = 16 * 1024 * 1024
 MIN_VOLUME_SUBPATH_API = (1, 45)
 WORKER_PLATFORM = "linux/amd64"
 WORKER_IMAGE_PULL_TIMEOUT = 900.0
+BROKER_CONTROL_PORT = 8765
 INSTANCE_ID_PATTERN = re.compile(r"[a-f0-9]{16}")
 OPERATION_ID_PATTERN = re.compile(r"[a-f0-9]{32}")
 USERNAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,32}")
@@ -40,7 +42,12 @@ LABEL_WORKER = "com.proxybridge.browser-worker"
 LABEL_INSTANCE = "com.proxybridge.browser-instance"
 LABEL_OWNER = "com.proxybridge.owner"
 LABEL_PROXY_PORT = "com.proxybridge.browser-proxy-port"
+LABEL_PUBLIC_PORT = "com.proxybridge.browser-public-port"
 LIVE_WORKER_STATUSES = frozenset({"running", "starting", "failed"})
+RELAY_ACTIVE_STATUSES = frozenset({"running", "starting"})
+WORKER_HTTPS_PORT = 3001
+RELAY_BUFFER_SIZE = 64 * 1024
+RELAY_MAX_CONNECTIONS = 16
 WORKER_INIT_SCRIPT = """#!/usr/bin/with-contenv bash
 set -euo pipefail
 test -x /opt/fingerprint-chromium/chrome-wrapper
@@ -66,6 +73,169 @@ class EngineError(RuntimeError):
     def __init__(self, status: int, message: str) -> None:
         super().__init__(message)
         self.status = status
+
+
+class RelayPortInUseError(BrokerError):
+    pass
+
+
+class WorkerTCPRelay:
+    """把 Broker 发布端口上的 TLS 字节流转发到 internal worker。"""
+
+    def __init__(self, listen_port: int, target_host: str, target_port: int = WORKER_HTTPS_PORT) -> None:
+        self.listen_port = listen_port
+        self.target_host = target_host
+        self.target_port = target_port
+        self.stopping = threading.Event()
+        self._connection_lock = threading.Lock()
+        self._connections: set[socket.socket] = set()
+        self._connection_slots = threading.BoundedSemaphore(RELAY_MAX_CONNECTIONS)
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            # Broker 容器内监听全部接口；真正允许的宿主机地址由 Compose 的
+            # PROXY_BRIDGE_BROWSER_HOST 端口映射限制，不能在这里绑定宿主机 IP。
+            self._listener.bind(("0.0.0.0", listen_port))
+            self._listener.listen(128)
+            self._listener.settimeout(0.5)
+        except OSError as exc:
+            self._listener.close()
+            if exc.errno == errno.EADDRINUSE:
+                raise RelayPortInUseError(f"远程浏览器发布端口已被占用（{listen_port}）") from exc
+            raise BrokerError(f"无法监听远程浏览器发布端口 {listen_port}") from exc
+        self._thread = threading.Thread(
+            target=self._serve,
+            name=f"browser-relay-{listen_port}",
+            daemon=True,
+        )
+
+    @staticmethod
+    def _close_socket(connection: socket.socket) -> None:
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _pump(source: socket.socket, destination: socket.socket, finished: threading.Event) -> None:
+        try:
+            while True:
+                data = source.recv(RELAY_BUFFER_SIZE)
+                if not data:
+                    return
+                destination.sendall(data)
+        except OSError:
+            return
+        finally:
+            finished.set()
+
+    def _track(self, *connections: socket.socket) -> None:
+        with self._connection_lock:
+            self._connections.update(connections)
+
+    def _untrack(self, *connections: socket.socket) -> None:
+        with self._connection_lock:
+            for connection in connections:
+                self._connections.discard(connection)
+
+    def _handle_client(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
+        try:
+            if self.stopping.is_set():
+                return
+            upstream = socket.create_connection(
+                (self.target_host, self.target_port),
+                timeout=5.0,
+            )
+            upstream.settimeout(None)
+            client.settimeout(None)
+            if self.stopping.is_set():
+                return
+            self._track(client, upstream)
+            finished = threading.Event()
+            forward = threading.Thread(
+                target=self._pump,
+                args=(client, upstream, finished),
+                name=f"browser-relay-{self.listen_port}-up",
+                daemon=True,
+            )
+            reverse = threading.Thread(
+                target=self._pump,
+                args=(upstream, client, finished),
+                name=f"browser-relay-{self.listen_port}-down",
+                daemon=True,
+            )
+            forward.start()
+            reverse.start()
+            while not self.stopping.is_set() and not finished.wait(0.5):
+                pass
+            self._close_socket(client)
+            self._close_socket(upstream)
+            forward.join(timeout=2.0)
+            reverse.join(timeout=2.0)
+        except OSError:
+            pass
+        finally:
+            self._close_socket(client)
+            if upstream is not None:
+                self._close_socket(upstream)
+                self._untrack(client, upstream)
+            self._connection_slots.release()
+
+    def _serve(self) -> None:
+        while not self.stopping.is_set():
+            try:
+                client, _address = self._listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not self._connection_slots.acquire(blocking=False):
+                self._close_socket(client)
+                continue
+            handler = threading.Thread(
+                target=self._handle_client,
+                args=(client,),
+                name=f"browser-relay-{self.listen_port}-connection",
+                daemon=True,
+            )
+            try:
+                handler.start()
+            except RuntimeError:
+                self._close_socket(client)
+                self._connection_slots.release()
+
+    def start(self) -> None:
+        try:
+            # 在返回公开链接前确认 Broker 确实已加入 worker internal 网络；
+            # 只依赖 Docker 元数据会让错误的 Compose 覆盖延迟到用户打开链接才暴露。
+            upstream_probe = socket.create_connection(
+                (self.target_host, self.target_port),
+                timeout=5.0,
+            )
+        except OSError as exc:
+            raise BrokerError("Browser Broker 无法连接 internal worker HTTPS 服务") from exc
+        self._close_socket(upstream_probe)
+        self._thread.start()
+        print(
+            "ProxyBridge browser relay listening on "
+            f"0.0.0.0:{self.listen_port} -> {self.target_host}:{self.target_port}",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        self.stopping.set()
+        self._close_socket(self._listener)
+        with self._connection_lock:
+            connections = list(self._connections)
+        for connection in connections:
+            self._close_socket(connection)
+        if self._thread.ident is not None:
+            self._thread.join(timeout=3.0)
 
 
 class UnixHTTPConnection(http.client.HTTPConnection):
@@ -238,7 +408,9 @@ class BrokerConfig:
         )
         start = _safe_positive_int(os.environ.get("PROXY_BRIDGE_BROWSER_PORT_START"), 23000, 1024, 65535)
         end = _safe_positive_int(os.environ.get("PROXY_BRIDGE_BROWSER_PORT_END"), 23099, 1024, 65535)
-        if end < start or end - start > 999:
+        # 端口范围会由 Compose 整段发布到 Broker 容器；不得包含内部控制端口
+        # 8765，否则会把 Bearer 控制 API 一并映射到宿主机。
+        if end < start or end - start > 999 or start <= BROKER_CONTROL_PORT <= end:
             raise BrokerError("远程浏览器端口范围无效")
         owner = str(os.environ.get("PROXY_BRIDGE_OWNER_CONTAINER") or "proxybridge").strip()
         broker = str(os.environ.get("HOSTNAME") or "proxybridge-browser-broker").strip()
@@ -362,9 +534,16 @@ def _validate_start_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 class BrowserWorkerBroker:
-    def __init__(self, config: BrokerConfig, engine: DockerEngineClient) -> None:
+    def __init__(
+        self,
+        config: BrokerConfig,
+        engine: DockerEngineClient,
+        *,
+        relay_factory: Callable[[int, str], WorkerTCPRelay] = WorkerTCPRelay,
+    ) -> None:
         self.config = config
         self.engine = engine
+        self.relay_factory = relay_factory
         self.lock = threading.RLock()
         # 镜像拉取最长可达 15 分钟，但它不会创建公开 worker。与容器生命周期锁
         # 分离后，SIGTERM 可以立即进入 worker 回收，不必等待无副作用的 pull。
@@ -374,6 +553,49 @@ class BrowserWorkerBroker:
         self._broker_inspect: dict[str, Any] | None = None
         self._cancelled_operation_lock = threading.Lock()
         self._cancelled_operations: dict[tuple[str, str], float] = {}
+        self._relay_lock = threading.RLock()
+        self._relays: dict[str, WorkerTCPRelay] = {}
+
+    def _start_relay(self, instance_id: str, port: int, worker_ip: str) -> None:
+        try:
+            target = ipaddress.IPv4Address(worker_ip)
+        except ipaddress.AddressValueError as exc:
+            raise BrokerError("远程浏览器 worker 缺少有效的中继目标地址") from exc
+        if not any(target in network for network in PRIVATE_WORKER_NETWORKS):
+            raise BrokerError("远程浏览器中继目标必须是 RFC1918 worker 地址")
+        if not self.config.port_start <= port <= self.config.port_end:
+            raise BrokerError("远程浏览器中继端口超出已配置范围")
+        self._stop_relay(instance_id)
+        relay = self.relay_factory(port, str(target))
+        try:
+            relay.start()
+        except BaseException:
+            relay.stop()
+            raise
+        with self._relay_lock:
+            self._relays[instance_id] = relay
+
+    def _stop_relay(self, instance_id: str) -> None:
+        with self._relay_lock:
+            relay = self._relays.pop(instance_id, None)
+        if relay is None:
+            return
+        try:
+            relay.stop()
+        except Exception as exc:
+            raise BrokerError("无法停止远程浏览器端口中继") from exc
+
+    def _stop_all_relays(self) -> list[Exception]:
+        with self._relay_lock:
+            relays = list(self._relays.values())
+            self._relays.clear()
+        failures: list[Exception] = []
+        for relay in relays:
+            try:
+                relay.stop()
+            except Exception as exc:
+                failures.append(exc)
+        return failures
 
     def _cancel_operation(self, instance_id: str, operation_id: str) -> None:
         if not operation_id:
@@ -453,7 +675,7 @@ class BrowserWorkerBroker:
         return _mount_source(broker, str(self.config.control_dir))
 
     def _validated_worker_network(self) -> dict[str, Any]:
-        """校验 worker 网络是仅连接当前 owner 的本地私有隔离网络。"""
+        """校验 worker 隔离网络以及 Broker 的中继网络与宿主端口。"""
         network = self.engine.json_request(
             "GET",
             f"/networks/{urllib.parse.quote(self.config.worker_network, safe='')}",
@@ -540,6 +762,54 @@ class BrowserWorkerBroker:
                     resolvable_names.add(normalized)
         if self.config.proxy_host.casefold() not in resolvable_names:
             raise BrokerError("远程浏览器代理主机名不是 ProxyBridge owner 的网络名称或别名")
+
+        broker = self._broker()
+        broker_network_settings = (
+            broker.get("NetworkSettings")
+            if isinstance(broker.get("NetworkSettings"), dict)
+            else {}
+        )
+        broker_networks = (
+            broker_network_settings.get("Networks")
+            if isinstance(broker_network_settings.get("Networks"), dict)
+            else {}
+        )
+        broker_attachment = (
+            broker_networks.get(self.config.worker_network)
+            if isinstance(broker_networks.get(self.config.worker_network), dict)
+            else {}
+        )
+        if (
+            not broker_attachment
+            or str(broker_attachment.get("NetworkID") or "") != network_id
+        ):
+            raise BrokerError("Browser Broker 容器未加入远程浏览器 worker 网络")
+        try:
+            broker_ip = ipaddress.IPv4Address(str(broker_attachment.get("IPAddress") or ""))
+        except ValueError:
+            raise BrokerError("Browser Broker 缺少有效的 worker 网络 IPv4 地址") from None
+        if not any(broker_ip in subnet for subnet in private_subnets):
+            raise BrokerError("Browser Broker 的 worker 网络地址不属于私有 IPAM")
+
+        # 只检查 HostConfig 会误把 internal 网络中未实际生效的 PortBindings 当作
+        # 可访问入口；NetworkSettings.Ports 才反映 Docker 真正建立的宿主机映射。
+        published_ports = (
+            broker_network_settings.get("Ports")
+            if isinstance(broker_network_settings.get("Ports"), dict)
+            else {}
+        )
+        for port in range(self.config.port_start, self.config.port_end + 1):
+            bindings = published_ports.get(f"{port}/tcp")
+            if not isinstance(bindings, list) or not any(
+                isinstance(binding, dict)
+                and str(binding.get("HostIp") or "") == self.config.bind_host
+                and _safe_positive_int(binding.get("HostPort"), 0, 0, 65535) == port
+                for binding in bindings
+            ):
+                raise BrokerError(
+                    f"Browser Broker 未实际发布 {self.config.bind_host}:{port}；"
+                    "请使用最新 compose.yaml 重新创建服务"
+                )
         return network
 
     def _require_volume_subpath_api(self) -> None:
@@ -624,11 +894,9 @@ class BrowserWorkerBroker:
         labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
         state = inspect.get("State") if isinstance(inspect.get("State"), dict) else {}
         network = inspect.get("NetworkSettings") if isinstance(inspect.get("NetworkSettings"), dict) else {}
-        ports = network.get("Ports") if isinstance(network.get("Ports"), dict) else {}
-        bindings = ports.get("3001/tcp") if isinstance(ports, dict) else None
-        host_port = 0
-        if isinstance(bindings, list) and bindings and isinstance(bindings[0], dict):
-            host_port = _safe_positive_int(bindings[0].get("HostPort"), 0, 0, 65535)
+        # internal worker 网络不会真正发布 Docker HostPort。公开端口由 Broker
+        # TCP 中继监听，因此以创建时写入且随容器不可变的标签为准。
+        host_port = _safe_positive_int(labels.get(LABEL_PUBLIC_PORT), 0, 0, 65535)
         running = bool(state.get("Running"))
         health = state.get("Health") if isinstance(state.get("Health"), dict) else {}
         health_status = str(health.get("Status") or "")
@@ -684,17 +952,29 @@ class BrowserWorkerBroker:
                 return session
             return None
 
-        if not summaries:
-            return []
         result: list[dict[str, Any]] = []
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(len(summaries), self.config.max_sessions, 100)
-        ) as executor:
-            futures = [executor.submit(inspect_summary, summary) for summary in summaries]
-            for future in concurrent.futures.as_completed(futures):
-                session = future.result()
-                if session is not None:
-                    result.append(session)
+        if summaries:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(summaries), self.config.max_sessions, 100)
+            ) as executor:
+                futures = [executor.submit(inspect_summary, summary) for summary in summaries]
+                for future in concurrent.futures.as_completed(futures):
+                    session = future.result()
+                    if session is not None:
+                        result.append(session)
+        relay_instances = {
+            str(session.get("instance_id") or "")
+            for session in result
+            if session.get("status") in RELAY_ACTIVE_STATUSES
+        }
+        with self._relay_lock:
+            stale_relays = [
+                instance_id
+                for instance_id in self._relays
+                if instance_id not in relay_instances
+            ]
+        for instance_id in stale_relays:
+            self._stop_relay(instance_id)
         return result
 
     def _worker_image_ready(self) -> bool:
@@ -847,6 +1127,7 @@ class BrowserWorkerBroker:
                 LABEL_INSTANCE: values["instance_id"],
                 LABEL_OWNER: self.config.owner_container,
                 LABEL_PROXY_PORT: str(values["proxy_port"]),
+                LABEL_PUBLIC_PORT: str(port),
             },
             # /config 使用随容器删除的匿名卷，避免把 Selkies TLS/认证运行文件混入
             # ProxyBridge Profile 与 WebDAV；只有 Chromium 用户数据挂入命名卷子路径。
@@ -891,9 +1172,9 @@ class BrowserWorkerBroker:
                         "VolumeOptions": {"NoCopy": True, "Subpath": values["fingerprint_rel"]},
                     },
                 ],
-                "PortBindings": {
-                    "3001/tcp": [{"HostIp": self.config.bind_host, "HostPort": str(port)}]
-                },
+                # worker 只加入 internal 网络，Docker 会忽略或拒绝其 HostPort。
+                # 宿主机端口由 Broker 容器的固定映射和进程内 TCP 中继提供；这里
+                # 不得再增加 PortBindings，否则会产生“配置存在但端口未监听”的假象。
                 "NetworkMode": self.config.worker_network,
                 "RestartPolicy": {"Name": "no", "MaximumRetryCount": 0},
                 "AutoRemove": False,
@@ -1048,6 +1329,7 @@ class BrowserWorkerBroker:
             existing = self._existing_session(values["instance_id"], timeout=5.0)
             if existing:
                 # 每次启动都重建 worker，确保本次提交的新用户名/密码真正生效。
+                self._stop_relay(values["instance_id"])
                 existing_inspect = self._inspect_container(
                     str(existing.get("container_id") or ""),
                     timeout=5.0,
@@ -1123,6 +1405,11 @@ class BrowserWorkerBroker:
                             instance_id=values["instance_id"],
                             operation_id=values["operation_id"],
                         )
+                        self._start_relay(
+                            values["instance_id"],
+                            int(session["host_port"]),
+                            str(session["worker_ip"]),
+                        )
                         self._raise_if_operation_cancelled(
                             values["instance_id"],
                             values["operation_id"],
@@ -1131,6 +1418,7 @@ class BrowserWorkerBroker:
                         return {"ok": True, **session}
                     except (BrokerError, EngineError) as exc:
                         last_error = exc
+                        self._stop_relay(values["instance_id"])
                         if container_id:
                             try:
                                 failed_inspect = self._inspect_container(
@@ -1165,8 +1453,11 @@ class BrowserWorkerBroker:
         with self.lock:
             existing = self._existing_session(instance_id, timeout=5.0)
             if not existing:
+                self._stop_relay(instance_id)
                 self._remove_secret(instance_id)
                 return {"ok": True, "stopped": 0, "instance_id": instance_id}
+            # 先关闭公开入口，再优雅停止 worker，避免清理 Profile 时仍有新连接进入。
+            self._stop_relay(instance_id)
             inspect = self._inspect_container(
                 str(existing.get("container_id") or ""),
                 timeout=5.0,
@@ -1206,7 +1497,8 @@ class BrowserWorkerBroker:
             self.stopping.set()
         with self.lock:
             removed = 0
-            failures: list[Exception] = []
+            # 关闭外部入口不依赖 Docker Engine，应始终先执行。
+            failures: list[Exception] = self._stop_all_relays()
             summaries = self._list_raw(timeout=10.0)
 
             def cleanup(summary: dict[str, Any]) -> bool:
@@ -1378,7 +1670,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--port",
         type=int,
-        default=8765,
+        default=BROKER_CONTROL_PORT,
         help="Broker 内部监听端口（默认 8765；禁止发布到宿主机或公网）",
     )
     return parser.parse_args(argv)

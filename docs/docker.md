@@ -103,13 +103,13 @@ docker logs --tail=50 proxybridge
 
 ## 3. 端口说明
 
-默认发布两类端口：
+默认发布三类端口：
 
 | 端口 | 用途 |
 |---|---|
 | `127.0.0.1:8787` | Web 控制台、管理 API、代理池 URL |
 | `127.0.0.1:21080-21179` | 节点启动后生成的本地 SOCKS5 + HTTP 代理端口 |
-| `127.0.0.1:23000-23099` | Browser Broker 动态分配的远程浏览器 HTTPS 端口，每个运行实例占一个 |
+| `127.0.0.1:23000-23099` | Browser Broker 的 HTTPS TCP 中继端口，每个运行实例动态占一个 |
 
 同一个代理端口同时支持：
 
@@ -137,7 +137,7 @@ ports:
 
 不要只改环境变量而不改端口映射，否则控制台可能显示已启动，但宿主机无法连接超出映射范围的端口。
 
-`23000-23099` 不由 Compose 的固定 `ports` 列表发布，而是在 Broker 创建 worker 时直接绑定到 `PROXY_BRIDGE_BROWSER_HOST`。Broker 从小到大选择空闲端口；默认并发上限为 10。扩大浏览器范围时应同时调整 `PROXY_BRIDGE_BROWSER_PORT_START`、`PROXY_BRIDGE_BROWSER_PORT_END` 和宿主机防火墙规则，并确保范围不与其他服务冲突。
+`23000-23099` 由 Compose 映射到 Browser Broker 容器的同名端口。Broker 从小到大选择空闲端口，等待 internal worker 健康后才启动对应的 TLS 原样 TCP 中继；默认并发上限为 10。扩大浏览器范围时必须同时修改 Broker 的 `PROXY_BRIDGE_BROWSER_PORT_START`、`PROXY_BRIDGE_BROWSER_PORT_END`、Compose `ports` 映射和宿主机防火墙规则，并确保范围不与其他服务冲突，也不得包含 Broker 内部控制端口 `8765`。仓库默认 Compose 已让环境变量与映射范围共用同一组值，不要在覆盖文件中只改其中一处。
 
 ## 4. 数据持久化
 
@@ -169,7 +169,9 @@ docker volume inspect proxybridge-browser-control
 
 远程浏览器模式**不支持**把 `/data` 改成 `./docker-data:/data` 一类宿主机 bind mount。Broker 会校验主服务的 `/data` 来源并拒绝宿主目录：命名卷子路径既是 worker 隔离挂载的部署契约，也用于避免数据目录中的符号链接被解释成任意宿主机路径。需要宿主机直接管理文件时，请通过命名卷备份/恢复，而不是替换此挂载；只有明确关闭 Browser Broker 的单容器模式可自行承担 bind mount 的权限与路径安全风险。
 
-worker 网络也属于强制部署契约：必须是 `internal=true`、作用域为 `local` 的 Docker `bridge`，配置无冲突的 RFC1918 IPv4 IPAM，并让 ProxyBridge owner 容器以配置的名称或网络别名加入。Broker 会在拉取/创建 worker 前逐项校验；这既阻止 worker 绕过节点代理直接出网，也确保代理免认证仅能按 Broker 返回的精确 worker IP 与实例端口授权。
+worker 网络也属于强制部署契约：必须是 `internal=true`、作用域为 `local` 的 Docker `bridge`，配置无冲突的 RFC1918 IPv4 IPAM，并让 ProxyBridge owner 与 Browser Broker 加入。Broker 会在拉取/创建 worker 前逐项校验；这既阻止 worker 绕过节点代理直接出网，也确保代理免认证仅能按 Broker 返回的精确 worker IP 与实例端口授权。
+
+`browser-ingress` 是仅供 Broker 使用的普通 bridge 网络：Docker 需要至少一个非 internal 网络才能建立宿主机端口映射。worker **不得**加入该网络。外部 TLS 流量先到 Broker 的 `23000-23099` 中继，再原样转发至 internal worker 的 `3001`；Broker 不解密 TLS，也不会绕过 worker 自己的 Basic Auth。这样可以同时保留宿主机可访问入口和 worker 无直接外网出口两项约束。
 
 ## 5. 代理核心与 Linux 指纹内核下载
 
@@ -234,7 +236,7 @@ ssh -L 8787:127.0.0.1:8787 user@server
 ```dotenv
 # Web 控制台发布地址；只填宿主机明确的私有 IPv4，不能填 0.0.0.0。
 PROXY_BRIDGE_CONSOLE_HOST=192.168.1.20
-# 浏览器 worker 实际绑定地址；只允许回环或宿主机明确的私有 IPv4。
+# Browser Broker HTTPS 中继的宿主机绑定地址；只允许回环或宿主机明确的私有 IPv4。
 PROXY_BRIDGE_BROWSER_HOST=192.168.1.20
 # 控制台生成远程浏览器链接时使用的地址；通常必须与上一项相同。
 PROXY_BRIDGE_BROWSER_PUBLIC_HOST=192.168.1.20
@@ -264,13 +266,13 @@ PROXY_BRIDGE_PROXY_HOST=192.168.1.20
 
 1. 首次使用先按第 5 节下载 Linux 指纹内核。
 2. 在节点操作列点击「浏览器」。凭据弹窗默认用户名为 `proxybridge`，前端会生成一条可复制、可修改的随机强密码；每个实例应使用不同密码。
-3. 提交后，ProxyBridge 会先确保节点代理已运行，再创建独立 worker。Broker 等待 worker 的 `3001` 端口和 HTTPS 健康检查都就绪后，控制台才会自动打开 `https://<PROXY_BRIDGE_BROWSER_PUBLIC_HOST>:<动态端口>/`。
+3. 提交后，ProxyBridge 会先确保节点代理已运行，再创建独立 worker。Broker 等待 internal worker 的 `3001` 端口和 HTTPS 健康检查都就绪，再启动对应动态端口的 TLS TCP 中继；控制台随后自动打开 `https://<PROXY_BRIDGE_BROWSER_PUBLIC_HOST>:<动态端口>/`。
 4. 若弹窗被浏览器阻止，可进入「浏览器记录」，在运行记录上点击「远程打开」。这里也会显示用户名、URL、端口和 worker 状态。
 5. 使用该用户名和本次密码通过 worker 的 Basic Auth。密码只存在于本次凭据弹窗、用户记忆和运行 worker 的只读 secret 中，不写入 `state.json`，也不会由状态 API 返回；关闭后重新启动需设置新密码。
 6. worker 通过内部网络访问该实例的节点 SOCKS5 端口；主服务仅对 Broker 实时返回的精确 worker IP 和该代理端口组合免除代理二次认证，另一个 worker 或同网段容器不能复用此权限。
 7. 使用完后在「浏览器记录」点击「停止」。Broker 会停止并删除 worker、匿名 `/config` 运行卷与临时 secret，但保留该实例的独立 Profile、固定指纹种子和节点关联，便于下次继续。
 
-每次 worker 容器启动时都会在自己的匿名 `/config` 运行卷中动态生成自签名 HTTPS 证书，所以浏览器访问新 worker 时会提示证书不受信任。该匿名卷不会参与 WebDAV，并随 worker 删除。这只能避免链路明文传输，不能提供受信任的服务器身份。内置 Basic Auth 只是可信 LAN/VPN 内的便利防护，不是公网级访问控制。
+每次 worker 容器启动时都会在自己的匿名 `/config` 运行卷中动态生成自签名 HTTPS 证书，所以浏览器经 Broker TCP 中继访问新 worker 时会提示证书不受信任。中继只转发加密字节，不终止 TLS；该匿名卷不会参与 WebDAV，并随 worker 删除。这只能避免链路明文传输，不能提供受信任的服务器身份。内置 Basic Auth 只是可信 LAN/VPN 内的便利防护，不是公网级访问控制。
 
 **不要把 `8787` 或 `23000-23099` 直接暴露到公网。**确需公网使用时，应继续让 worker 绑定回环/私有地址，在前面部署使用受信任证书的 TLS 反向代理，并增加 SSO、MFA 或等效强认证；还应限制源地址、速率和会话时长。反向代理连接自签名上游时，应显式信任对应证书或将跳过上游校验严格限制在本机链路，不能关闭客户端到公网入口的 TLS 校验。
 
@@ -384,15 +386,34 @@ docker compose up -d --build --force-recreate browser-broker proxybridge
 
 不要在自定义镜像或 Docker API 覆盖中把该值改回 `true`；只有确认所用 fingerprint-chromium 与 labwc/Wayland 兼容并完成实际远程桌面验证后才可启用。
 
+### Worker 已正常运行，但仍提示等待 HTTPS 就绪超时
+
+旧版曾尝试让只加入 `internal=true` 网络的 worker 直接创建 Docker HostPort。部分 Docker Engine 会在 inspect 中保留 `HostConfig.PortBindings`，但 `NetworkSettings.Ports` 实际为 `null`，宿主机也没有监听该端口；此时 Selkies、Openbox 和 Chromium 日志都可能完全正常，Broker 却始终无法得到可访问入口。
+
+当前版本改由 Browser Broker 发布端口并转发到 internal worker。该修复同时修改了 Broker 代码、Compose 端口映射和网络连接，必须同步整个仓库并重新构建、强制创建服务：
+
+```bash
+docker compose up -d --build --force-recreate
+```
+
+启动实例后，Broker 日志应出现类似下面的中继记录：
+
+```text
+ProxyBridge browser relay listening on 0.0.0.0:23000 -> 172.31.254.x:3001
+```
+
+若没有该记录，检查 `docker compose config` 中 `browser-broker` 是否同时加入 `browser-workers`、`browser-ingress`，并确认存在 `23000-23099:23000-23099` 的端口映射；不要继续沿用只覆盖旧 `browser-broker` 服务的 Compose 文件。
+
 ### 远程浏览器链接打不开
 
-确认 `.env` 的 `PROXY_BRIDGE_BROWSER_HOST` 与 `PROXY_BRIDGE_BROWSER_PUBLIC_HOST` 都是宿主机实际私有 IPv4，重新创建过 Compose 服务，并检查 worker 是否占用了 `23000-23099` 内的端口：
+确认 `.env` 的 `PROXY_BRIDGE_BROWSER_HOST` 与 `PROXY_BRIDGE_BROWSER_PUBLIC_HOST` 都是宿主机实际私有 IPv4，重新创建过 Compose 服务，并检查 worker 与 Broker 中继是否已启动：
 
 ```bash
 docker ps --filter label=com.proxybridge.browser-worker=1
+docker compose logs --tail=200 browser-broker
 ```
 
-再检查防火墙是否允许当前可信客户端访问该端口。证书警告是每个 worker 动态自签名证书的预期行为；若 Basic Auth 失败，请停止并重新启动实例，使用新弹窗中生成或填写的密码。
+Broker 日志应包含分配端口对应的 `browser relay listening`。再检查防火墙是否允许当前可信客户端访问该端口。证书警告是每个 worker 动态自签名证书的预期行为；若 Basic Auth 失败，请停止并重新启动实例，使用新弹窗中生成或填写的密码。
 
 ### arm64 上浏览器很慢或无法启动
 

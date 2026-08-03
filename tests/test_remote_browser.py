@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -267,11 +268,14 @@ def running_worker_inspect(
                 browser_broker.LABEL_INSTANCE: instance_id,
                 browser_broker.LABEL_OWNER: "proxybridge",
                 browser_broker.LABEL_PROXY_PORT: str(proxy_port),
+                browser_broker.LABEL_PUBLIC_PORT: str(host_port),
             }
         },
         "State": {"Running": True, "Health": {"Status": "healthy"}},
         "NetworkSettings": {
-            "Ports": {"3001/tcp": [{"HostPort": str(host_port)}]},
+            # internal bridge 上 Docker 不会生成可用的 HostPort；公开端口来自标签
+            # 和 Broker TCP 中继，这是本次部署回归需要覆盖的真实 inspect 形状。
+            "Ports": {"3001/tcp": None},
             "Networks": {
                 "proxybridge-browser-workers": {"IPAddress": "172.31.254.10"}
             },
@@ -313,6 +317,32 @@ def owner_container_inspect(
     }
 
 
+def broker_container_inspect(
+    *,
+    network_id: str = "d" * 64,
+    broker_ip: str = "172.31.254.3",
+    bind_host: str = "127.0.0.1",
+    port_start: int = 23000,
+    port_end: int = 23001,
+) -> dict[str, object]:
+    return {
+        "Id": "b" * 64,
+        "Name": "/proxybridge-browser-broker",
+        "NetworkSettings": {
+            "Networks": {
+                "proxybridge-browser-workers": {
+                    "NetworkID": network_id,
+                    "IPAddress": broker_ip,
+                }
+            },
+            "Ports": {
+                f"{port}/tcp": [{"HostIp": bind_host, "HostPort": str(port)}]
+                for port in range(port_start, port_end + 1)
+            },
+        },
+    }
+
+
 def worker_network_inspect(
     *,
     network_id: str = "d" * 64,
@@ -342,10 +372,30 @@ class BrowserBrokerTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.engine = mock.Mock(spec=browser_broker.DockerEngineClient)
         self.engine.api_version.return_value = "1.45"
-        self.broker = browser_broker.BrowserWorkerBroker(broker_config(self.root), self.engine)
+        self.relay = mock.Mock(spec=browser_broker.WorkerTCPRelay)
+        self.relay_factory = mock.Mock(return_value=self.relay)
+        self.broker = browser_broker.BrowserWorkerBroker(
+            broker_config(self.root),
+            self.engine,
+            relay_factory=self.relay_factory,
+        )
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def test_public_relay_range_cannot_publish_broker_control_port(self) -> None:
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PROXY_BRIDGE_BROWSER_PORT_START": "8700",
+                    "PROXY_BRIDGE_BROWSER_PORT_END": "8800",
+                },
+                clear=True,
+            ),
+            self.assertRaisesRegex(browser_broker.BrokerError, "端口范围无效"),
+        ):
+            browser_broker.BrokerConfig.from_environment()
 
     def test_start_payload_rejects_path_traversal_and_invalid_login(self) -> None:
         normalized = browser_broker._validate_start_payload(valid_start_payload())
@@ -425,7 +475,10 @@ class BrowserBrokerTests(unittest.TestCase):
             self.engine,
         )
         self.engine.json_request.return_value = network
-        with mock.patch.object(alias_broker, "_inspect_container", return_value=owner):
+        with (
+            mock.patch.object(alias_broker, "_inspect_container", return_value=owner),
+            mock.patch.object(alias_broker, "_broker", return_value=broker_container_inspect()),
+        ):
             self.assertEqual(alias_broker._validated_worker_network(), network)
 
         invalid_cases: list[tuple[str, dict[str, object], dict[str, object], str]] = []
@@ -492,6 +545,33 @@ class BrowserBrokerTests(unittest.TestCase):
         ):
             wrong_proxy_broker._validated_worker_network()
 
+        self.engine.json_request.return_value = worker_network_inspect()
+        detached_broker = broker_container_inspect()
+        detached_broker["NetworkSettings"] = {"Networks": {}, "Ports": {}}
+        with (
+            mock.patch.object(
+                self.broker,
+                "_inspect_container",
+                return_value=owner_container_inspect(),
+            ),
+            mock.patch.object(self.broker, "_broker", return_value=detached_broker),
+            self.assertRaisesRegex(browser_broker.BrokerError, "Broker 容器未加入"),
+        ):
+            self.broker._validated_worker_network()
+
+        unpublished_broker = broker_container_inspect()
+        unpublished_broker["NetworkSettings"]["Ports"] = {"23000/tcp": None}
+        with (
+            mock.patch.object(
+                self.broker,
+                "_inspect_container",
+                return_value=owner_container_inspect(),
+            ),
+            mock.patch.object(self.broker, "_broker", return_value=unpublished_broker),
+            self.assertRaisesRegex(browser_broker.BrokerError, "未实际发布.*最新 compose"),
+        ):
+            self.broker._validated_worker_network()
+
     def test_publish_host_rejects_wildcard_and_public_ip_but_accepts_lan_and_tailscale(self) -> None:
         self.assertEqual(browser_broker._private_or_loopback_ipv4("127.0.0.1"), "127.0.0.1")
         self.assertEqual(browser_broker._private_or_loopback_ipv4("192.168.1.20"), "192.168.1.20")
@@ -518,6 +598,7 @@ class BrowserBrokerTests(unittest.TestCase):
                 browser_broker.LABEL_INSTANCE: "0123456789abcdef",
                 browser_broker.LABEL_OWNER: "proxybridge",
                 browser_broker.LABEL_PROXY_PORT: "21080",
+                browser_broker.LABEL_PUBLIC_PORT: "23000",
             },
         )
         self.assertIn("FILE__PASSWORD=/run/secrets/proxybridge-browser-password", payload["Env"])
@@ -525,6 +606,7 @@ class BrowserBrokerTests(unittest.TestCase):
         self.assertIn("PIXELFLUX_WAYLAND=false", payload["Env"])
         self.assertNotIn("PIXELFLUX_WAYLAND=true", payload["Env"])
         self.assertEqual(payload["HostConfig"]["NetworkMode"], "proxybridge-browser-workers")
+        self.assertNotIn("PortBindings", payload["HostConfig"])
         self.assertFalse(payload["HostConfig"]["Privileged"])
         self.assertNotIn("Init", payload["HostConfig"])
         self.assertEqual(payload["HostConfig"]["SecurityOpt"], ["no-new-privileges:true"])
@@ -576,6 +658,71 @@ class BrowserBrokerTests(unittest.TestCase):
             "ln -sfn /opt/fingerprint-chromium/chrome-wrapper",
             browser_broker.WORKER_INIT_SCRIPT,
         )
+
+    def test_internal_worker_session_uses_relay_port_label_without_docker_host_binding(self) -> None:
+        session = self.broker._session_from_inspect(running_worker_inspect())
+
+        self.assertEqual(session["status"], "running")
+        self.assertEqual(session["host_port"], 23000)
+        self.assertEqual(session["url"], "https://127.0.0.1:23000/")
+        self.assertEqual(session["worker_ip"], "172.31.254.10")
+
+    def test_tcp_relay_reports_port_conflict_without_starting_a_thread(self) -> None:
+        listener = mock.Mock(spec=socket.socket)
+        listener.bind.side_effect = OSError(browser_broker.errno.EADDRINUSE, "in use")
+        with (
+            mock.patch.object(browser_broker.socket, "socket", return_value=listener),
+            self.assertRaisesRegex(browser_broker.RelayPortInUseError, "已被占用"),
+        ):
+            browser_broker.WorkerTCPRelay(23000, "172.31.254.10")
+        listener.close.assert_called_once_with()
+
+    def test_tcp_relay_pump_forwards_bytes_and_marks_completion(self) -> None:
+        source = mock.Mock(spec=socket.socket)
+        destination = mock.Mock(spec=socket.socket)
+        source.recv.side_effect = [b"tls-record", b""]
+        finished = threading.Event()
+
+        browser_broker.WorkerTCPRelay._pump(source, destination, finished)
+
+        destination.sendall.assert_called_once_with(b"tls-record")
+        self.assertTrue(finished.is_set())
+
+    def test_tcp_relay_preflights_internal_worker_before_publishing_link(self) -> None:
+        listener = mock.Mock(spec=socket.socket)
+        upstream = mock.Mock(spec=socket.socket)
+        relay_thread = mock.Mock()
+        with (
+            mock.patch.object(browser_broker.socket, "socket", return_value=listener),
+            mock.patch.object(browser_broker.socket, "create_connection", return_value=upstream) as connect,
+            mock.patch.object(browser_broker.threading, "Thread", return_value=relay_thread),
+        ):
+            relay = browser_broker.WorkerTCPRelay(23000, "172.31.254.10")
+            relay.start()
+
+        connect.assert_called_once_with(("172.31.254.10", 3001), timeout=5.0)
+        upstream.close.assert_called_once_with()
+        relay_thread.start.assert_called_once_with()
+
+    def test_stop_without_worker_closes_stale_public_relay(self) -> None:
+        self.broker._relays["0123456789abcdef"] = self.relay
+        with (
+            mock.patch.object(self.broker, "_existing_session", return_value=None),
+            mock.patch.object(self.broker, "_remove_secret") as remove_secret,
+        ):
+            result = self.broker.stop("0123456789abcdef")
+
+        self.assertEqual(result["stopped"], 0)
+        self.relay.stop.assert_called_once_with()
+        remove_secret.assert_called_once_with("0123456789abcdef")
+
+    def test_session_reconciliation_closes_relay_after_worker_disappears(self) -> None:
+        self.broker._relays["0123456789abcdef"] = self.relay
+        with mock.patch.object(self.broker, "_list_raw", return_value=[]):
+            self.assertEqual(self.broker.sessions(), [])
+
+        self.relay.stop.assert_called_once_with()
+        self.assertEqual(self.broker._relays, {})
 
     def test_worker_listing_is_limited_by_owner_and_worker_labels(self) -> None:
         self.engine.request.return_value = b"[]"
@@ -784,6 +931,8 @@ class BrowserBrokerTests(unittest.TestCase):
         self.assertNotIn("correct-horse-battery-staple", result_text)
         self.assertNotIn("password", result)
         self.assertEqual(result["url"], "https://127.0.0.1:23000/")
+        self.relay_factory.assert_called_once_with(23000, "172.31.254.10")
+        self.relay.start.assert_called_once_with()
 
         with (
             mock.patch.object(self.broker, "_existing_session", return_value=result),
@@ -800,6 +949,7 @@ class BrowserBrokerTests(unittest.TestCase):
             remove_timeout=20.0,
         )
         remove_secret.assert_called_once_with("0123456789abcdef")
+        self.relay.stop.assert_called_once_with()
 
     def test_start_recreates_existing_worker_so_new_credentials_take_effect(self) -> None:
         old_container_id = "a" * 64
@@ -847,6 +997,7 @@ class BrowserBrokerTests(unittest.TestCase):
         unrelated_secret = sessions / "not-a-worker.password"
         valid_secret.write_text("secret", encoding="utf-8")
         unrelated_secret.write_text("keep", encoding="utf-8")
+        self.broker._relays["0123456789abcdef"] = self.relay
         with (
             mock.patch.object(self.broker, "_list_raw", return_value=[{"Id": "c" * 64}]),
             mock.patch.object(
@@ -860,6 +1011,7 @@ class BrowserBrokerTests(unittest.TestCase):
 
         self.assertEqual(removed, 1)
         stop_and_remove.assert_called_once()
+        self.relay.stop.assert_called_once_with()
         self.assertFalse(valid_secret.exists())
         self.assertTrue(unrelated_secret.exists())
 
@@ -1503,15 +1655,24 @@ class RemoteBrowserDeploymentContractTests(unittest.TestCase):
         self.assertIn("http://127.0.0.1:8765/healthz", broker)
         self.assertIn('CMD ["python", "browser_broker.py"]', broker)
 
-    def test_compose_keeps_docker_socket_out_of_web_service_and_networks_internal(self) -> None:
+    def test_compose_keeps_docker_socket_out_of_web_service_and_isolates_workers(self) -> None:
         compose = (self.root / "compose.yaml").read_text(encoding="utf-8")
         proxybridge_section, remainder = compose.split("\n  browser-broker:", 1)
         broker_section, deployment_tail = remainder.split("\nvolumes:", 1)
 
         self.assertNotIn("PROXY_BRIDGE_BROWSER_WORKER_CIDRS", compose)
         self.assertNotIn("/var/run/docker.sock", proxybridge_section)
+        self.assertNotIn("browser-ingress", proxybridge_section)
         self.assertIn("/var/run/docker.sock:/var/run/docker.sock:ro", broker_section)
-        self.assertNotRegex(broker_section, r"(?m)^    ports:")
+        self.assertRegex(broker_section, r"(?m)^    ports:")
+        self.assertIn(
+            '"${PROXY_BRIDGE_BROWSER_HOST:-127.0.0.1}:'
+            '${PROXY_BRIDGE_BROWSER_PORT_START:-23000}-'
+            '${PROXY_BRIDGE_BROWSER_PORT_END:-23099}:'
+            '${PROXY_BRIDGE_BROWSER_PORT_START:-23000}-'
+            '${PROXY_BRIDGE_BROWSER_PORT_END:-23099}"',
+            broker_section,
+        )
         data_mounts = [
             line.strip().removeprefix("- ")
             for line in proxybridge_section.splitlines()
@@ -1525,7 +1686,11 @@ class RemoteBrowserDeploymentContractTests(unittest.TestCase):
         self.assertIn('PROXY_BRIDGE_BROWSER_HOST: "${PROXY_BRIDGE_BROWSER_HOST:-127.0.0.1}"', broker_section)
         self.assertIn('PROXY_BRIDGE_BROWSER_PUBLIC_HOST: "${PROXY_BRIDGE_BROWSER_PUBLIC_HOST:-127.0.0.1}"', broker_section)
         self.assertIn('PROXY_BRIDGE_BROWSER_PROXY_HOST: "proxybridge"', broker_section)
+        self.assertIn("      - browser-workers", broker_section)
+        self.assertIn("      - browser-ingress", broker_section)
         self.assertGreaterEqual(deployment_tail.count("internal: true"), 2)
+        self.assertIn("proxybridge-browser-ingress", deployment_tail)
+        self.assertIn("internal: false", deployment_tail)
         self.assertIn('subnet: "${PROXY_BRIDGE_BROWSER_NETWORK_SUBNET:-172.31.254.0/24}"', deployment_tail)
         self.assertIn("cap_drop:\n      - ALL", broker_section)
         self.assertIn("no-new-privileges:true", broker_section)
