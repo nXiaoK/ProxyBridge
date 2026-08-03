@@ -6,6 +6,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -1794,6 +1795,68 @@ class AppRemoteBrowserTests(unittest.TestCase):
         ):
             with self.subTest(value=value):
                 self.assertEqual(app.normalize_remote_browser_url(value), "")
+
+    def test_restarted_worker_refreshes_stale_empty_session_cache_for_proxy_access(self) -> None:
+        instance_id = "0123456789abcdef"
+        broker = mock.Mock()
+        broker.sessions.return_value = [
+            {
+                "instance_id": instance_id,
+                "status": "starting",
+                "worker_ip": "172.31.254.42",
+                "proxy_port": 21080,
+            }
+        ]
+        with self.docker_browser_env(), mock.patch.object(
+            app,
+            "remote_browser_broker_client",
+            return_value=broker,
+        ):
+            generation, _operation_id = app.begin_remote_browser_start(instance_id)
+            with app.REMOTE_BROWSER_SESSION_CONDITION:
+                app.REMOTE_BROWSER_SESSION_CACHE.update(
+                    {
+                        "checked_at": time.monotonic(),
+                        "sessions": {},
+                        "error": "",
+                        "fetching": False,
+                    }
+                )
+
+            self.assertTrue(app.remote_browser_worker_client("172.31.254.42", 21080))
+            app.finish_remote_browser_start(instance_id, generation)
+            self.assertFalse(app.remote_browser_worker_client("172.31.254.43", 21080))
+            self.assertFalse(app.remote_browser_worker_client("172.31.254.42", 21081))
+
+        broker.sessions.assert_called_once_with()
+
+    def test_worker_proxy_access_without_pending_start_uses_cached_sessions(self) -> None:
+        broker = mock.Mock()
+        broker.sessions.return_value = [
+            {
+                "instance_id": "0123456789abcdef",
+                "status": "running",
+                "worker_ip": "172.31.254.42",
+                "proxy_port": 21080,
+            }
+        ]
+        with self.docker_browser_env(), mock.patch.object(
+            app,
+            "remote_browser_broker_client",
+            return_value=broker,
+        ):
+            with app.REMOTE_BROWSER_SESSION_CONDITION:
+                app.REMOTE_BROWSER_SESSION_CACHE.update(
+                    {
+                        "checked_at": time.monotonic(),
+                        "sessions": {},
+                        "error": "",
+                        "fetching": False,
+                    }
+                )
+            self.assertFalse(app.remote_browser_worker_client("172.31.254.42", 21080))
+
+        broker.sessions.assert_not_called()
 
     def test_only_exact_worker_ip_and_assigned_proxy_port_bypass_authentication(self) -> None:
         security = {

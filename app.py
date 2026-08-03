@@ -631,6 +631,14 @@ def remote_browser_start_pending(instance_id: str) -> bool:
         return REMOTE_BROWSER_PENDING_STARTS.get(instance_id) == generation
 
 
+def any_remote_browser_start_pending() -> bool:
+    with REMOTE_BROWSER_LIFECYCLE_CONDITION:
+        return any(
+            REMOTE_BROWSER_GENERATIONS.get(instance_id, 0) == generation
+            for instance_id, generation in REMOTE_BROWSER_PENDING_STARTS.items()
+        )
+
+
 def finish_remote_browser_start(instance_id: str, generation: int) -> None:
     with REMOTE_BROWSER_LIFECYCLE_CONDITION:
         if REMOTE_BROWSER_PENDING_STARTS.get(instance_id) == generation:
@@ -3398,6 +3406,25 @@ def proxy_client_allowed(value: Any, allowed_cidrs: Any = None) -> bool:
     return any(address in ipaddress.IPv4Network(network) for network in networks)
 
 
+def _remote_browser_session_allows_proxy(
+    sessions: Any,
+    address: ipaddress.IPv4Address,
+    proxy_port: int,
+) -> bool:
+    if not isinstance(sessions, dict):
+        return False
+    for session in sessions.values():
+        if session.get("status") not in REMOTE_BROWSER_LIVE_SESSION_STATUSES:
+            continue
+        try:
+            worker_ip = ipaddress.IPv4Address(str(session.get("worker_ip") or ""))
+        except ipaddress.AddressValueError:
+            continue
+        if worker_ip == address and safe_int(session.get("proxy_port"), 0) == proxy_port:
+            return True
+    return False
+
+
 def remote_browser_worker_client(value: Any, proxy_port: Any = None) -> bool:
     """只允许 Broker 报告的 worker IP 使用分配给它的节点代理端口。"""
     if not remote_browser_feature_enabled():
@@ -3410,18 +3437,14 @@ def remote_browser_worker_client(value: Any, proxy_port: Any = None) -> bool:
     if expected_port <= 0:
         return False
     sessions, _error = remote_browser_sessions()
-    if not isinstance(sessions, dict):
+    if _remote_browser_session_allows_proxy(sessions, address, expected_port):
+        return True
+    if not any_remote_browser_start_pending():
         return False
-    for session in sessions.values():
-        if session.get("status") not in REMOTE_BROWSER_LIVE_SESSION_STATUSES:
-            continue
-        try:
-            worker_ip = ipaddress.IPv4Address(str(session.get("worker_ip") or ""))
-        except ipaddress.AddressValueError:
-            continue
-        if worker_ip == address and safe_int(session.get("proxy_port"), 0) == expected_port:
-            return True
-    return False
+    # 停止后重新启动时，状态轮询可能在新 worker 创建前缓存了空快照。
+    # 仅在启动事务仍有效时绕过该 TTL 缓存一次，继续按精确 worker IP 与端口授权。
+    refreshed_sessions, _refresh_error = remote_browser_sessions(force=True)
+    return _remote_browser_session_allows_proxy(refreshed_sessions, address, expected_port)
 
 
 def register_active_proxy_client(
