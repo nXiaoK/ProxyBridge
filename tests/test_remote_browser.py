@@ -522,6 +522,8 @@ class BrowserBrokerTests(unittest.TestCase):
         )
         self.assertIn("FILE__PASSWORD=/run/secrets/proxybridge-browser-password", payload["Env"])
         self.assertNotIn(f"PASSWORD={secret}", payload["Env"])
+        self.assertIn("PIXELFLUX_WAYLAND=false", payload["Env"])
+        self.assertNotIn("PIXELFLUX_WAYLAND=true", payload["Env"])
         self.assertEqual(payload["HostConfig"]["NetworkMode"], "proxybridge-browser-workers")
         self.assertFalse(payload["HostConfig"]["Privileged"])
         self.assertNotIn("Init", payload["HostConfig"])

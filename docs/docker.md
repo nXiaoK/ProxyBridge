@@ -374,6 +374,16 @@ docker compose up -d --build --force-recreate browser-broker proxybridge
 
 更新后仍出现退出码 100 时，先检查是否实际运行了新构建的 `proxybridge-browser-broker:local`，以及是否在自定义 Compose 覆盖中再次给动态 worker 添加了 Init 包装。
 
+### Worker 日志出现 labwc Aborted，随后 HTTPS 就绪超时
+
+这表示 Worker 已通过 s6 初始化，但 fingerprint-chromium 与 LinuxServer Chromium 的 labwc/Wayland 桌面路径发生兼容性问题。ProxyBridge 现在明确设置 `PIXELFLUX_WAYLAND=false`，让动态 worker 使用 Xvfb/Openbox；远程桌面、Basic Auth、指纹启动器和节点代理功能均保持不变。更新后需要重新构建并创建 Broker 容器，已经失败的旧 worker 不能通过单纯重启修复：
+
+```bash
+docker compose up -d --build --force-recreate browser-broker proxybridge
+```
+
+不要在自定义镜像或 Docker API 覆盖中把该值改回 `true`；只有确认所用 fingerprint-chromium 与 labwc/Wayland 兼容并完成实际远程桌面验证后才可启用。
+
 ### 远程浏览器链接打不开
 
 确认 `.env` 的 `PROXY_BRIDGE_BROWSER_HOST` 与 `PROXY_BRIDGE_BROWSER_PUBLIC_HOST` 都是宿主机实际私有 IPv4，重新创建过 Compose 服务，并检查 worker 是否占用了 `23000-23099` 内的端口：

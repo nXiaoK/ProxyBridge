@@ -831,7 +831,10 @@ class BrowserWorkerBroker:
                 "PUID=10001",
                 "PGID=10001",
                 "TZ=Etc/UTC",
-                "PIXELFLUX_WAYLAND=true",
+                # false 强制使用 LinuxServer 的 Xvfb/Openbox 稳定路径；true 会
+                # 启用 labwc/Wayland，部分 fingerprint-chromium 版本可触发
+                # labwc SIGABRT，最终导致 worker HTTPS 初始化超时。
+                "PIXELFLUX_WAYLAND=false",
                 "HARDEN_DESKTOP=true",
                 "RESTART_APP=true",
                 "SELKIES_ENABLE_SHARING=false",
