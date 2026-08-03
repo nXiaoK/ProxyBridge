@@ -203,6 +203,13 @@ def console_access_url(base_url: str, token: str) -> str:
     return f"{base_url.rstrip('/')}/#{urllib.parse.urlencode({'token': token})}"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """认证后的本机后端控制请求不得携带实例凭证跳转到其他地址。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        raise urllib.error.HTTPError(newurl, code, "后端控制请求拒绝重定向", headers, fp)
+
+
 def ensure_dirs(work_root: Path) -> None:
     work_root.mkdir(parents=True, exist_ok=True)
     try:
@@ -327,6 +334,12 @@ class BackendProcess:
         self._log_stream: Any | None = None
         self._log_thread: threading.Thread | None = None
         self._lock = threading.RLock()
+        # 控制请求携带后端实例凭证，只允许直连且拒绝重定向，避免环境代理或
+        # 30x 目标收到 X-ProxyBridge-Instance。
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirectHandler(),
+        )
 
     @property
     def is_running(self) -> bool:
@@ -411,7 +424,7 @@ class BackendProcess:
                 BACKEND_INSTANCE_HEADER: self.instance_token,
             },
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with self._opener.open(request, timeout=timeout) as response:
             echoed = str(getattr(response, "headers", {}).get(BACKEND_INSTANCE_HEADER) or "")
             if echoed != self.instance_token:
                 raise RuntimeError("backend instance token mismatch")
@@ -433,7 +446,7 @@ class BackendProcess:
                 BACKEND_INSTANCE_HEADER: self.instance_token,
             },
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with self._opener.open(request, timeout=timeout) as response:
             echoed = str(getattr(response, "headers", {}).get(BACKEND_INSTANCE_HEADER) or "")
             if echoed != self.instance_token:
                 raise RuntimeError("backend instance token mismatch")

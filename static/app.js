@@ -1040,14 +1040,6 @@ function renderSync() {
   renderSyncMeta(settings);
 }
 
-async function loadSyncStatus() {
-  const result = await api("/api/sync/status");
-  appState.sync = result.settings || null;
-  appState.syncOpenssl = Boolean(result.openssl);
-  renderSync();
-  return result;
-}
-
 async function saveSyncSettings(event) {
   event.preventDefault();
   const payload = {

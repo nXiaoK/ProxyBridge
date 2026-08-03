@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -40,6 +42,40 @@ class TrayHostHelperTests(unittest.TestCase):
             backend.access_url,
             "http://127.0.0.1:18787/#token=01234567-89AB-CDEF-0123-456789ABCDEF",
         )
+
+    def test_backend_control_client_forces_direct_connections_and_rejects_redirects(self) -> None:
+        config = tray_host.BackendConfig(
+            python_executable="python3",
+            app_script=Path("/tmp/ProxyBridge/app.py"),
+            work_root=Path("/tmp/ProxyBridge/work"),
+            port=18787,
+        )
+        backend = tray_host.BackendProcess(config)
+        proxy_handlers = [
+            handler
+            for handler in backend._opener.handlers
+            if isinstance(handler, urllib.request.ProxyHandler)
+        ]
+        self.assertEqual(proxy_handlers, [])
+        self.assertTrue(
+            any(
+                isinstance(handler, tray_host._NoRedirectHandler)
+                for handler in backend._opener.handlers
+            )
+        )
+        request = urllib.request.Request(
+            backend.base_url + "/api/status",
+            headers={tray_host.BACKEND_INSTANCE_HEADER: backend.instance_token},
+        )
+        with self.assertRaises(urllib.error.HTTPError):
+            tray_host._NoRedirectHandler().redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "http://127.0.0.1:19999/capture",
+            )
 
     def test_bounded_log_pump_rotates_during_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -163,7 +199,7 @@ class TrayHostHelperTests(unittest.TestCase):
                     return FakeResponse(stop_payload, backend.instance_token)
                 raise AssertionError(f"unexpected url: {url}")
 
-            with mock.patch.object(tray_host.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with mock.patch.object(backend._opener, "open", side_effect=fake_urlopen):
                 status = backend.wait_until_ready(timeout=2.0)
                 self.assertTrue(status.get("ok"))
                 result = backend.stop_all_bridges()

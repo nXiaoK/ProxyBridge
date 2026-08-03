@@ -723,16 +723,82 @@ class BrowserBrokerTests(unittest.TestCase):
             browser_broker.WorkerTCPRelay(23000, "172.31.254.10")
         listener.close.assert_called_once_with()
 
-    def test_tcp_relay_pump_forwards_bytes_and_marks_completion(self) -> None:
+    def test_tcp_relay_pump_forwards_bytes_and_half_closes_destination(self) -> None:
         source = mock.Mock(spec=socket.socket)
         destination = mock.Mock(spec=socket.socket)
         source.recv.side_effect = [b"tls-record", b""]
         finished = threading.Event()
+        failed = threading.Event()
 
-        browser_broker.WorkerTCPRelay._pump(source, destination, finished)
+        browser_broker.WorkerTCPRelay._pump(source, destination, finished, failed)
 
         destination.sendall.assert_called_once_with(b"tls-record")
+        destination.shutdown.assert_called_once_with(socket.SHUT_WR)
         self.assertTrue(finished.is_set())
+        self.assertFalse(failed.is_set())
+
+    def test_tcp_relay_preserves_response_after_client_half_closes(self) -> None:
+        client, relay_client = socket.socketpair()
+        relay_upstream, worker = socket.socketpair()
+        relay = object.__new__(browser_broker.WorkerTCPRelay)
+        relay.listen_port = 23000
+        relay.target_host = "172.31.254.10"
+        relay.target_port = browser_broker.WORKER_HTTPS_PORT
+        relay.stopping = threading.Event()
+        relay._connection_lock = threading.Lock()
+        relay._connections = set()
+        relay._connection_slots = mock.Mock()
+        received_by_worker: list[bytes] = []
+        worker_errors: list[BaseException] = []
+
+        def run_worker() -> None:
+            try:
+                request = b""
+                while True:
+                    chunk = worker.recv(1024)
+                    if not chunk:
+                        break
+                    request += chunk
+                received_by_worker.append(request)
+                worker.sendall(b"response-after-request-eof")
+                worker.shutdown(socket.SHUT_WR)
+            except BaseException as error:
+                worker_errors.append(error)
+            finally:
+                worker.close()
+
+        worker_thread = threading.Thread(target=run_worker)
+        relay_thread = threading.Thread(target=relay._handle_client, args=(relay_client,))
+        try:
+            worker_thread.start()
+            with mock.patch.object(
+                browser_broker.socket,
+                "create_connection",
+                return_value=relay_upstream,
+            ):
+                relay_thread.start()
+                client.sendall(b"request")
+                client.shutdown(socket.SHUT_WR)
+                response = b""
+                while True:
+                    chunk = client.recv(1024)
+                    if not chunk:
+                        break
+                    response += chunk
+            relay_thread.join(timeout=2)
+            worker_thread.join(timeout=2)
+        finally:
+            client.close()
+            relay_client.close()
+            relay_upstream.close()
+            worker.close()
+
+        self.assertEqual(worker_errors, [])
+        self.assertEqual(received_by_worker, [b"request"])
+        self.assertEqual(response, b"response-after-request-eof")
+        self.assertFalse(relay_thread.is_alive())
+        self.assertFalse(worker_thread.is_alive())
+        relay._connection_slots.release.assert_called_once_with()
 
     def test_tcp_relay_preflights_internal_worker_before_publishing_link(self) -> None:
         listener = mock.Mock(spec=socket.socket)

@@ -5795,26 +5795,6 @@ def start_subscription_scheduler() -> None:
         thread.start()
 
 
-def _purge_browser_resources_for_nodes(state: dict[str, Any], node_ids: set[str]) -> dict[str, Any]:
-    """Stop browsers, drop records, and delete Profile dirs for the given node ids.
-
-    Caller must hold STATE_LOCK when mutating ``state``. Profile directory removal is
-    done here after process stop; returns summary for logging / auto-sync.
-    """
-    node_ids = {str(n) for n in node_ids if n}
-    if not node_ids:
-        return {"removed_instances": [], "killed_browsers": 0, "removed_profiles": 0}
-    snapshot = _runtime_snapshot_for_nodes(state, node_ids)
-    cleanup = _stop_runtime_for_nodes(snapshot)
-    _mark_removed_nodes_stopped(state, node_ids, cleanup["traffic_by_bridge"])
-    release_persisted_bridge_traffic(cleanup["traffic_by_bridge"])
-    return {
-        "removed_instances": [str(item.get("id") or "") for item in snapshot["browser_instances"] if item.get("id")],
-        "killed_browsers": cleanup["killed_browsers"],
-        "removed_profiles": _remove_profiles_for_nodes(node_ids),
-    }
-
-
 def delete_subscription(subscription_id: str) -> dict[str, Any]:
     with SUBSCRIPTION_LOCK:
         with SHUTDOWN_LOCK:
@@ -7687,11 +7667,6 @@ def delete_browser_instance(payload: dict[str, Any]) -> dict[str, Any]:
 FP_CHROMIUM_RELEASES_API = "https://api.github.com/repos/adryfish/fingerprint-chromium/releases"
 
 
-def _macos_arch_token() -> str:
-    # Backward-compatible alias used by older tests/call sites.
-    return host_arch_token()
-
-
 def _fingerprint_asset_arch(name: str) -> str | None:
     lowered = name.lower()
     if any(term in lowered for term in ("arm64", "aarch64")):
@@ -7781,11 +7756,6 @@ def _pick_fingerprint_asset(
             # Preserve previous behavior: first non-prerelease macOS dmg wins.
             return best
     return best
-
-
-def _pick_macos_asset(releases: list[dict[str, Any]]) -> dict[str, Any] | None:
-    # Backward-compatible wrapper around the multi-platform picker.
-    return _pick_fingerprint_asset(releases, host_os="darwin")
 
 
 def _verify_macos_binary_arch(app_path: Path) -> str | None:

@@ -121,15 +121,24 @@ class WorkerTCPRelay:
             pass
 
     @staticmethod
-    def _pump(source: socket.socket, destination: socket.socket, finished: threading.Event) -> None:
+    def _pump(
+        source: socket.socket,
+        destination: socket.socket,
+        finished: threading.Event,
+        failed: threading.Event,
+    ) -> None:
         try:
             while True:
                 data = source.recv(RELAY_BUFFER_SIZE)
                 if not data:
+                    try:
+                        destination.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
                     return
                 destination.sendall(data)
         except OSError:
-            return
+            failed.set()
         finally:
             finished.set()
 
@@ -156,23 +165,26 @@ class WorkerTCPRelay:
             if self.stopping.is_set():
                 return
             self._track(client, upstream)
-            finished = threading.Event()
+            forward_finished = threading.Event()
+            reverse_finished = threading.Event()
+            failed = threading.Event()
             forward = threading.Thread(
                 target=self._pump,
-                args=(client, upstream, finished),
+                args=(client, upstream, forward_finished, failed),
                 name=f"browser-relay-{self.listen_port}-up",
                 daemon=True,
             )
             reverse = threading.Thread(
                 target=self._pump,
-                args=(upstream, client, finished),
+                args=(upstream, client, reverse_finished, failed),
                 name=f"browser-relay-{self.listen_port}-down",
                 daemon=True,
             )
             forward.start()
             reverse.start()
-            while not self.stopping.is_set() and not finished.wait(0.5):
-                pass
+            while not self.stopping.is_set() and not failed.is_set():
+                if forward_finished.wait(0.05) and reverse_finished.is_set():
+                    break
             self._close_socket(client)
             self._close_socket(upstream)
             forward.join(timeout=2.0)
