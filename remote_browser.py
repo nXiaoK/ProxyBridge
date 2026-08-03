@@ -13,6 +13,9 @@ BROKER_RESPONSE_LIMIT = 2 * 1024 * 1024
 BROKER_IMAGE_PREPARE_TIMEOUT = 930.0
 BROKER_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~-]{32,256}")
 BROKER_INSTANCE_ID_PATTERN = re.compile(r"[a-f0-9]{16}")
+BROKER_USERNAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,32}")
+BROKER_PASSWORD_MIN_LENGTH = 10
+BROKER_PASSWORD_MAX_LENGTH = 128
 
 
 class RemoteBrowserError(RuntimeError):
@@ -165,6 +168,27 @@ class RemoteBrowserBrokerClient:
             timeout=max(self.timeout, 600.0),
             timeout_error="创建远程浏览器 Worker 超时，请检查 browser-broker 与 Worker 容器日志",
         )
+
+    def credentials(self, instance_id: str) -> dict[str, Any]:
+        """按需读取运行中 Worker 的访问凭证，不进入会话列表或持久状态。"""
+        if BROKER_INSTANCE_ID_PATTERN.fullmatch(instance_id) is None:
+            raise ValueError("浏览器实例 ID 无效")
+        result = self._request(
+            "POST",
+            "/v1/sessions/credentials",
+            {"instance_id": instance_id},
+            timeout=10.0,
+        )
+        username = str(result.get("username") or "")
+        password = str(result.get("password") or "")
+        if (
+            result.get("instance_id") != instance_id
+            or BROKER_USERNAME_PATTERN.fullmatch(username) is None
+            or not BROKER_PASSWORD_MIN_LENGTH <= len(password) <= BROKER_PASSWORD_MAX_LENGTH
+            or any(ord(char) < 32 or ord(char) == 127 for char in password)
+        ):
+            raise RemoteBrowserError("浏览器 Broker 凭证响应格式无效")
+        return dict(result)
 
     def stop(
         self,

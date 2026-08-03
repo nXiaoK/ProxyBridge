@@ -58,13 +58,18 @@ let lastCoreLogTrigger = null;
 let lastCoreUploadTrigger = null;
 let lastBrowserRecordTrigger = null;
 let lastRemoteBrowserLaunchTrigger = null;
+let lastRemoteBrowserCredentialsTrigger = null;
 let lastCoreLogTriggerKey = null;
 let lastCoreUploadTriggerKey = null;
 let lastBrowserRecordTriggerKey = null;
 let lastRemoteBrowserLaunchTriggerKey = null;
 let lastRemoteBrowserLaunchTriggerAction = null;
+let lastRemoteBrowserCredentialsTriggerKey = null;
+let lastRemoteBrowserCredentialsTriggerAction = null;
 let pendingRemoteBrowserLaunch = null;
 let remoteBrowserLaunchPromise = null;
+let viewedRemoteBrowserInstanceId = null;
+let remoteBrowserCredentialsRequestGeneration = 0;
 let pendingModalFocusKey = null;
 let coreLogRequestGeneration = 0;
 let coreLogAbortController = null;
@@ -1201,16 +1206,9 @@ function safeRemoteBrowserUrl(value) {
 }
 
 function browserInstancesForNode(nodeId) {
-  const rank = { running: 0, starting: 1, stopping: 2, stopped: 3, failed: 4 };
-  return (appState.browser_instances || [])
-    .filter((instance) => instance.node_id === nodeId)
-    .slice()
-    .sort((a, b) => {
-      const statusDiff = (rank[a.status] ?? 9) - (rank[b.status] ?? 9);
-      if (statusDiff) return statusDiff;
-      if (!!a.legacy !== !!b.legacy) return a.legacy ? -1 : 1;
-      return Number(a.created_at || 0) - Number(b.created_at || 0);
-    });
+  return browserUi.sortBrowserInstancesByRecentUse(
+    (appState.browser_instances || []).filter((instance) => instance.node_id === nodeId)
+  );
 }
 
 function runningBrowserInstancesForNode(nodeId) {
@@ -1481,6 +1479,13 @@ function render() {
     closeRemoteBrowserLaunchModal({ force: true });
   } else if (remoteBrowserEnabled() && !remoteLaunchModal.hidden) {
     renderRemoteBrowserBrokerStatus();
+  }
+  const credentialsModal = $("#remoteBrowserCredentialsModal");
+  if (credentialsModal && !credentialsModal.hidden) {
+    const viewedInstance = browserInstanceById(viewedRemoteBrowserInstanceId);
+    if (!remoteBrowserEnabled() || !viewedInstance || viewedInstance.status !== "running") {
+      closeRemoteBrowserCredentialsModal();
+    }
   }
   if (!browserEnabled() && !$("#browserRecordModal").hidden) {
     closeBrowserRecordModal();
@@ -2340,6 +2345,7 @@ function closeModal(modal) {
     && $("#coreUploadModal").hidden
     && $("#browserRecordModal").hidden
     && $("#remoteBrowserLaunchModal").hidden
+    && $("#remoteBrowserCredentialsModal").hidden
   ) {
     const shell = $(".app-shell");
     if (shell) {
@@ -2852,6 +2858,154 @@ function closeRemoteBrowserLaunchModal({ force = false } = {}) {
   return true;
 }
 
+function viewedRemoteBrowserCredentialFields() {
+  return {
+    remoteUrl: $("#remoteBrowserCredentialsUrl"),
+    username: $("#remoteBrowserCredentialsUsername"),
+    password: $("#remoteBrowserCredentialsPassword"),
+  };
+}
+
+function viewedRemoteBrowserCredentials() {
+  const credentials = browserUi.credentialFields(viewedRemoteBrowserCredentialFields());
+  credentials.remoteUrl = safeRemoteBrowserUrl(credentials.remoteUrl);
+  if (!credentials.remoteUrl || !credentials.username || !credentials.password) {
+    throw new Error("远程浏览器凭证已被清除，请重新查看");
+  }
+  return credentials;
+}
+
+function resetRemoteBrowserCredentialsContent() {
+  browserUi.clearCredentialFields(viewedRemoteBrowserCredentialFields());
+  $("#remoteBrowserCredentialsTitle").textContent = "查看远程浏览器凭证";
+  $("#remoteBrowserCredentialsMeta").textContent = "";
+  viewedRemoteBrowserInstanceId = null;
+}
+
+function closeRemoteBrowserCredentialsModal() {
+  const modal = $("#remoteBrowserCredentialsModal");
+  if (!modal || modal.hidden) return false;
+  remoteBrowserCredentialsRequestGeneration += 1;
+  closeModal(modal);
+  modal.querySelector('[role="dialog"]')?.setAttribute("aria-busy", "false");
+  if (modal.dataset.returnToBrowserRecords === "true") {
+    const recordsModal = $("#browserRecordModal");
+    recordsModal.inert = false;
+    recordsModal.removeAttribute("aria-hidden");
+  }
+  delete modal.dataset.returnToBrowserRecords;
+  resetRemoteBrowserCredentialsContent();
+
+  const trigger = lastRemoteBrowserCredentialsTrigger?.isConnected
+    ? lastRemoteBrowserCredentialsTrigger
+    : findActionTrigger(
+        lastRemoteBrowserCredentialsTriggerKey,
+        lastRemoteBrowserCredentialsTriggerAction,
+      );
+  if (trigger && !trigger.disabled) {
+    trigger.focus();
+  } else {
+    pendingModalFocusKey = lastRemoteBrowserCredentialsTriggerKey;
+  }
+  lastRemoteBrowserCredentialsTrigger = null;
+  lastRemoteBrowserCredentialsTriggerKey = null;
+  lastRemoteBrowserCredentialsTriggerAction = null;
+  return true;
+}
+
+async function showRemoteBrowserCredentials(instanceId, trigger = null) {
+  if (!remoteBrowserEnabled()) throw new Error("当前运行模式不提供远程浏览器凭证查询");
+  const instance = browserInstanceById(instanceId);
+  if (!instance) throw new Error("找不到远程浏览器记录");
+  if (instance.status !== "running") throw new Error("仅运行中的远程浏览器可以查看访问凭证");
+
+  const modal = $("#remoteBrowserCredentialsModal");
+  const recordsModal = $("#browserRecordModal");
+  resetRemoteBrowserCredentialsContent();
+  viewedRemoteBrowserInstanceId = instanceId;
+  const requestGeneration = ++remoteBrowserCredentialsRequestGeneration;
+  lastRemoteBrowserCredentialsTrigger = trigger;
+  lastRemoteBrowserCredentialsTriggerKey = trigger ? actionLockKey(trigger) : null;
+  lastRemoteBrowserCredentialsTriggerAction = trigger?.dataset?.action || null;
+  $("#remoteBrowserCredentialsTitle").textContent = `${instance.name || "远程浏览器"} 访问凭证`;
+  $("#remoteBrowserCredentialsMeta").textContent = "正在从 Browser Broker 安全读取…";
+  modal.dataset.returnToBrowserRecords = recordsModal.hidden ? "false" : "true";
+  if (!recordsModal.hidden) {
+    recordsModal.inert = true;
+    recordsModal.setAttribute("aria-hidden", "true");
+  }
+  openModal(modal);
+  modal.querySelector('[role="dialog"]')?.setAttribute("aria-busy", "true");
+  modal.querySelector('[data-action="close-remote-browser-credentials"]')?.focus();
+
+  try {
+    const result = await api("/api/browser/credentials", { instance_id: instanceId });
+    if (
+      requestGeneration !== remoteBrowserCredentialsRequestGeneration
+      || modal.hidden
+      || viewedRemoteBrowserInstanceId !== instanceId
+    ) return;
+    const remoteUrl = safeRemoteBrowserUrl(result.remote_url);
+    const username = String(result.username || "");
+    const password = String(result.password || "");
+    if (
+      !remoteUrl
+      || !/^[A-Za-z0-9._-]{1,32}$/.test(username)
+      || Array.from(password).length < 10
+      || Array.from(password).length > 128
+      || /[\x00-\x1f\x7f]/.test(password)
+    ) {
+      throw new Error("服务器返回的远程浏览器凭证格式无效");
+    }
+    browserUi.setCredentialFields(viewedRemoteBrowserCredentialFields(), {
+      remoteUrl,
+      username,
+      password,
+    });
+    $("#remoteBrowserCredentialsMeta").textContent = `${username} · ${remoteUrl}`;
+    modal.querySelector('[role="dialog"]')?.setAttribute("aria-busy", "false");
+    $("#remoteBrowserCredentialsOpen")?.focus();
+  } catch (error) {
+    if (
+      requestGeneration !== remoteBrowserCredentialsRequestGeneration
+      || modal.hidden
+      || viewedRemoteBrowserInstanceId !== instanceId
+    ) return;
+    closeRemoteBrowserCredentialsModal();
+    throw error;
+  }
+}
+
+async function copyViewedRemoteBrowserPassword() {
+  const credentials = viewedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(credentials.password, window)) {
+    throw new Error("当前环境无法复制密码，请手动选择");
+  }
+  showToast("已复制远程浏览器密码");
+}
+
+async function copyViewedRemoteBrowserUrl() {
+  const credentials = viewedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(credentials.remoteUrl, window)) {
+    throw new Error("当前环境无法复制远程链接，请手动选择");
+  }
+  showToast("已复制远程浏览器链接");
+}
+
+async function copyViewedRemoteBrowserCredentials() {
+  const credentials = viewedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(browserUi.formatCredentials(credentials), window)) {
+    throw new Error("当前环境无法复制完整凭证，请分别手动选择");
+  }
+  showToast("已复制远程浏览器完整凭证");
+}
+
+function openViewedRemoteBrowser() {
+  const credentials = viewedRemoteBrowserCredentials();
+  openRemoteBrowserUrl(credentials.remoteUrl);
+  showToast("正在打开远程浏览器");
+}
+
 function openRemoteBrowserUrl(value) {
   const remoteUrl = safeRemoteBrowserUrl(value);
   if (!remoteUrl) throw new Error("远程浏览器访问地址无效，请刷新状态后重试");
@@ -2931,6 +3085,7 @@ function renderBrowserRecords(nodeId) {
       const action = running ? "stop-browser-instance" : "launch-browser-instance";
       const actionLabel = running ? "停止" : "启动";
       const actionIcon = running ? "stop" : "browser";
+      const lastUsedAt = browserUi.browserInstanceLastUsedAt(instance);
       const savedLabel = instance.label || "";
       // Prefer in-progress draft over server value while user is editing / mid-type.
       const label =
@@ -2943,7 +3098,7 @@ function renderBrowserRecords(nodeId) {
           <header>
             <div>
               <strong>${escapeHtml(instance.name || "浏览器")}</strong>
-              <span>${remoteWorker ? "远程 Worker" : instance.legacy ? "默认浏览器" : "独立指纹"} · ${escapeHtml(formatTime(instance.created_at))}</span>
+              <span>${remoteWorker ? "远程 Worker" : instance.legacy ? "默认浏览器" : "独立指纹"} · 创建 ${escapeHtml(formatTime(instance.created_at))}</span>
               ${pillLabel ? `<span class="browser-record-label-pill" title="${escapeHtml(pillLabel)}">${escapeHtml(pillLabel)}</span>` : ""}
             </div>
             <span class="status ${escapeHtml(instance.status || "stopped")}">${escapeHtml(browserStatusLabel(instance.status))}</span>
@@ -2951,6 +3106,7 @@ function renderBrowserRecords(nodeId) {
           <div class="browser-record-grid">
             <span>指纹</span><code>${escapeHtml(instance.fingerprint_seed || "-")}</code>
             <span>Profile</span><code title="${escapeHtml(profilePath)}">${escapeHtml(compactPath(profilePath))}</code>
+            <span>最近使用</span><code>${escapeHtml(formatTime(lastUsedAt))}</code>
             <span>上次启动</span><code>${escapeHtml(formatTime(instance.last_started_at))}</code>
             ${remoteWorker
               ? `<span>Worker 状态</span><code>${escapeHtml(workerStatus)}${workerId ? ` · ${escapeHtml(workerId)}` : ""}</code>
@@ -2983,6 +3139,17 @@ function renderBrowserRecords(nodeId) {
             ><span>保存标签</span></button>
           </div>
           <div class="browser-record-actions">
+            ${remoteWorker
+              ? `<button
+                  class="row-button"
+                  type="button"
+                  data-action="view-remote-browser-credentials"
+                  data-instance="${escapeHtml(instance.id)}"
+                  aria-label="查看 ${escapeHtml(instance.name || "浏览器")} 的访问凭证"
+                  title="${instance.status === "running" ? "从 Browser Broker 按需读取当前访问账号和密码" : "停止后访问密码已销毁；重新启动时会设置新密码"}"
+                  ${instance.status === "running" ? "" : "disabled"}
+                ><span>${instance.status === "running" ? "查看凭证" : "凭证已销毁"}</span></button>`
+              : ""}
             ${remoteUrl
               ? `<button class="row-button" type="button" data-action="copy" data-text="${escapeHtml(remoteUrl)}" aria-label="复制 ${escapeHtml(instance.name || "浏览器")} 的远程链接">
                   ${icon("copy")}<span>复制链接</span>
@@ -2993,6 +3160,9 @@ function renderBrowserRecords(nodeId) {
               : ""}
             <button class="row-button ${running ? "danger" : ""}" type="button" data-action="${action}" data-node="${escapeHtml(nodeId)}" data-instance="${escapeHtml(instance.id)}" aria-label="${actionLabel} ${escapeHtml(instance.name || "浏览器")}">
               ${icon(actionIcon)}<span>${actionLabel}</span>
+            </button>
+            <button class="row-button danger" type="button" data-action="delete-browser-instance" data-instance="${escapeHtml(instance.id)}" aria-label="永久删除 ${escapeHtml(instance.name || "浏览器")} 及其 Profile">
+              ${icon("trash")}<span>删除</span>
             </button>
           </div>
         </article>
@@ -3030,6 +3200,24 @@ async function saveBrowserLabel(instanceId) {
     renderBrowserRecords(appState.browserRecordNodeId);
   }
   showToast(label ? `标签已保存：${label}` : "标签已清空");
+}
+
+async function deleteBrowserInstance(instanceId) {
+  if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
+  const instance = browserInstanceById(instanceId);
+  if (!instance) throw new Error("找不到浏览器记录");
+  const syncEnabled = Boolean(appState.sync?.enabled && appState.sync?.url);
+  const syncNotice = syncEnabled
+    ? " WebDAV 已启用，远端记录和对应 Profile 包也会自动同步删除。"
+    : "";
+  if (!window.confirm(
+    `删除「${instance.name || "浏览器"}」会先停止对应浏览器/Worker，并永久删除该记录的 Profile、Cookie 和本地存储；此操作无法恢复。${syncNotice}确定继续吗？`
+  )) return null;
+  const result = await api("/api/browser/delete", { instance_id: instanceId });
+  await loadStatus({ forceFresh: true });
+  if (appState.browserRecordNodeId) renderBrowserRecords(appState.browserRecordNodeId);
+  showToast(syncEnabled ? "浏览器记录与本地数据已删除，正在同步清理 WebDAV" : "浏览器记录与本地数据已永久删除");
+  return result;
 }
 
 function showBrowserRecords(nodeId, trigger = null) {
@@ -3322,6 +3510,8 @@ function actionLockKey(button) {
     case "stop-browser-instance":
     case "save-browser-label":
     case "open-remote-browser":
+    case "view-remote-browser-credentials":
+    case "delete-browser-instance":
       return `browser-instance:${button.dataset.instance || ""}`;
     case "test":
       return `node-test:${button.dataset.node || ""}`;
@@ -3353,6 +3543,11 @@ function actionUsesSpinner(action) {
     "open-launched-remote-browser",
     "finish-remote-browser-launch",
     "open-remote-browser",
+    "close-remote-browser-credentials",
+    "copy-viewed-remote-browser-password",
+    "copy-viewed-remote-browser-url",
+    "copy-viewed-remote-browser-credentials",
+    "open-viewed-remote-browser",
     "copy",
     "browser-records",
     "toggle-node-group",
@@ -3417,6 +3612,10 @@ async function handleAction(event) {
       await saveBrowserLabel(button.dataset.instance);
     } else if (action === "open-remote-browser") {
       openRemoteBrowserInstance(button.dataset.instance);
+    } else if (action === "view-remote-browser-credentials") {
+      await showRemoteBrowserCredentials(button.dataset.instance, button);
+    } else if (action === "delete-browser-instance") {
+      await deleteBrowserInstance(button.dataset.instance);
     } else if (action === "download-kernel") {
       await downloadKernel();
     } else if (action === "show-core-upload") {
@@ -3542,6 +3741,16 @@ async function handleAction(event) {
       openLaunchedRemoteBrowser();
     } else if (action === "finish-remote-browser-launch") {
       finishRemoteBrowserLaunch();
+    } else if (action === "close-remote-browser-credentials") {
+      closeRemoteBrowserCredentialsModal();
+    } else if (action === "copy-viewed-remote-browser-password") {
+      await copyViewedRemoteBrowserPassword();
+    } else if (action === "copy-viewed-remote-browser-url") {
+      await copyViewedRemoteBrowserUrl();
+    } else if (action === "copy-viewed-remote-browser-credentials") {
+      await copyViewedRemoteBrowserCredentials();
+    } else if (action === "open-viewed-remote-browser") {
+      openViewedRemoteBrowser();
     }
   } catch (error) {
     showToast(error.message, "error");
@@ -3599,15 +3808,17 @@ async function saveSubscriptionSettings(control) {
 
 function trapModalFocus(event) {
   if (event.key !== "Tab") return false;
-  const modal = !$("#remoteBrowserLaunchModal").hidden
-    ? $("#remoteBrowserLaunchModal")
-    : !$("#coreUploadModal").hidden
-      ? $("#coreUploadModal")
-      : !$("#browserRecordModal").hidden
-        ? $("#browserRecordModal")
-        : !$("#coreLogModal").hidden
-          ? $("#coreLogModal")
-          : null;
+  const modal = !$("#remoteBrowserCredentialsModal").hidden
+    ? $("#remoteBrowserCredentialsModal")
+    : !$("#remoteBrowserLaunchModal").hidden
+      ? $("#remoteBrowserLaunchModal")
+      : !$("#coreUploadModal").hidden
+        ? $("#coreUploadModal")
+        : !$("#browserRecordModal").hidden
+          ? $("#browserRecordModal")
+          : !$("#coreLogModal").hidden
+            ? $("#coreLogModal")
+            : null;
   if (!modal) return false;
   const dialog = modal.querySelector('[role="dialog"]');
   const focusable = [...dialog.querySelectorAll(
@@ -3939,9 +4150,16 @@ function bindEvents() {
       closeRemoteBrowserLaunchModal();
     }
   });
+  $("#remoteBrowserCredentialsModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeRemoteBrowserCredentialsModal();
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (trapModalFocus(event)) return;
-    if (event.key === "Escape" && !$("#remoteBrowserLaunchModal").hidden) {
+    if (event.key === "Escape" && !$("#remoteBrowserCredentialsModal").hidden) {
+      closeRemoteBrowserCredentialsModal();
+    } else if (event.key === "Escape" && !$("#remoteBrowserLaunchModal").hidden) {
       closeRemoteBrowserLaunchModal();
     } else if (event.key === "Escape" && !$("#coreUploadModal").hidden) {
       closeCoreUploadModal();

@@ -850,6 +850,23 @@ class BrowserWorkerBroker:
             raise BrokerError("无法写入远程浏览器临时凭证") from exc
         return host
 
+    def _read_secret(self, instance_id: str) -> str:
+        """读取运行 Worker 的临时密码；内容只允许通过认证控制接口按需返回。"""
+        local, _host = self._secret_paths(instance_id)
+        try:
+            with local.open("r", encoding="utf-8") as handle:
+                password = handle.read(129)
+                overflow = handle.read(1)
+        except (OSError, UnicodeError) as exc:
+            raise BrokerError("远程浏览器访问凭证已不存在，请重新启动该记录") from exc
+        if (
+            overflow
+            or not 10 <= len(password) <= 128
+            or any(ord(char) < 32 or ord(char) == 127 for char in password)
+        ):
+            raise BrokerError("远程浏览器访问凭证格式无效，请重新启动该记录")
+        return password
+
     def _worker_init_script_path(self) -> str:
         init_dir = self.config.control_dir / "worker-init"
         local = init_dir / "10-proxybridge-fingerprint"
@@ -1470,6 +1487,38 @@ class BrowserWorkerBroker:
             self._remove_secret(instance_id)
             return {"ok": True, "stopped": 1, "instance_id": instance_id}
 
+    def credentials(self, instance_id: str) -> dict[str, Any]:
+        """返回运行中 Worker 的当前 Basic Auth 凭证，不写入会话状态。"""
+        if INSTANCE_ID_PATTERN.fullmatch(instance_id) is None:
+            raise BrokerError("浏览器实例 ID 无效")
+        with self.lock:
+            session = self._existing_session(instance_id, timeout=5.0)
+            if not session or session.get("status") != "running" or not session.get("url"):
+                raise BrokerError("仅运行中的远程浏览器可以查看访问凭证")
+            inspect = self._inspect_container(
+                str(session.get("container_id") or ""),
+                timeout=5.0,
+            )
+            self._assert_owned_worker(inspect, instance_id=instance_id)
+            config = inspect.get("Config") if isinstance(inspect.get("Config"), dict) else {}
+            environment = config.get("Env") if isinstance(config.get("Env"), list) else []
+            username = ""
+            for item in environment:
+                text = str(item or "")
+                if text.startswith("CUSTOM_USER="):
+                    username = text.partition("=")[2]
+                    break
+            if USERNAME_PATTERN.fullmatch(username) is None:
+                raise BrokerError("远程浏览器访问用户名格式无效，请重新启动该记录")
+            password = self._read_secret(instance_id)
+            return {
+                "ok": True,
+                "instance_id": instance_id,
+                "url": str(session["url"]),
+                "username": username,
+                "password": password,
+            }
+
     def status(self) -> dict[str, Any]:
         version = self.engine.api_version()
         self._require_volume_subpath_api()
@@ -1646,6 +1695,11 @@ class BrokerHandler(BaseHTTPRequestHandler):
                         str(payload.get("instance_id") or ""),
                         str(payload.get("cancelled_operation_id") or ""),
                     ),
+                )
+            elif self.path == "/v1/sessions/credentials":
+                self._send(
+                    200,
+                    self.server.broker.credentials(str(payload.get("instance_id") or "")),
                 )
             else:
                 self._send(404, {"ok": False, "error": "接口不存在"})

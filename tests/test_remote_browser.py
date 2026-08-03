@@ -86,6 +86,52 @@ class RemoteBrowserBrokerClientTests(unittest.TestCase):
         self.assertEqual(result, {"ok": True, "url": "https://127.0.0.1:23000/"})
         self.assertGreaterEqual(opener.call_args.kwargs["timeout"], 600.0)
 
+    def test_client_reads_credentials_from_fixed_endpoint_and_validates_response(self) -> None:
+        instance_id = "0123456789abcdef"
+        response = FakeHTTPResponse(
+            json.dumps(
+                {
+                    "ok": True,
+                    "instance_id": instance_id,
+                    "url": "https://127.0.0.1:23000/",
+                    "username": "alice",
+                    "password": "correct-horse-battery-staple",
+                }
+            ).encode("utf-8")
+        )
+        with mock.patch.object(
+            remote_browser.RemoteBrowserBrokerClient,
+            "_open",
+            return_value=response,
+        ) as opener:
+            result = self.client().credentials(instance_id)
+
+        request = opener.call_args.args[0]
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(
+            request.full_url,
+            "http://browser-broker:8765/v1/sessions/credentials",
+        )
+        self.assertEqual(json.loads(request.data.decode("utf-8")), {"instance_id": instance_id})
+        self.assertEqual(result["password"], "correct-horse-battery-staple")
+
+        invalid_payloads = (
+            {"ok": True, "instance_id": "f" * 16, "username": "alice", "password": "valid-password"},
+            {"ok": True, "instance_id": instance_id, "username": "bad:user", "password": "valid-password"},
+            {"ok": True, "instance_id": instance_id, "username": "alice", "password": "short"},
+        )
+        for payload in invalid_payloads:
+            with (
+                self.subTest(payload=payload),
+                mock.patch.object(
+                    remote_browser.RemoteBrowserBrokerClient,
+                    "_open",
+                    return_value=FakeHTTPResponse(json.dumps(payload).encode("utf-8")),
+                ),
+                self.assertRaisesRegex(remote_browser.RemoteBrowserError, "凭证响应格式无效"),
+            ):
+                self.client().credentials(instance_id)
+
     def test_client_forces_direct_connections_and_rejects_redirects(self) -> None:
         with mock.patch.object(
             remote_browser.urllib.request,
@@ -951,6 +997,77 @@ class BrowserBrokerTests(unittest.TestCase):
         remove_secret.assert_called_once_with("0123456789abcdef")
         self.relay.stop.assert_called_once_with()
 
+    def test_credentials_only_returns_owned_running_worker_secret(self) -> None:
+        instance_id = "0123456789abcdef"
+        inspect = running_worker_inspect(instance_id=instance_id)
+        inspect["Config"]["Env"] = ["CUSTOM_USER=alice", "FILE__PASSWORD=/run/secret"]
+        session = {
+            "instance_id": instance_id,
+            "container_id": "c" * 64,
+            "status": "running",
+            "url": "https://127.0.0.1:23000/",
+        }
+        with (
+            mock.patch.object(self.broker, "_existing_session", return_value=session),
+            mock.patch.object(self.broker, "_inspect_container", return_value=inspect),
+            mock.patch.object(
+                self.broker,
+                "_read_secret",
+                return_value="correct-horse-battery-staple",
+            ) as read_secret,
+        ):
+            result = self.broker.credentials(instance_id)
+
+        self.assertEqual(result["username"], "alice")
+        self.assertEqual(result["password"], "correct-horse-battery-staple")
+        read_secret.assert_called_once_with(instance_id)
+
+        with (
+            mock.patch.object(
+                self.broker,
+                "_existing_session",
+                return_value={**session, "status": "stopped", "url": ""},
+            ),
+            mock.patch.object(self.broker, "_read_secret") as stopped_secret,
+            self.assertRaisesRegex(browser_broker.BrokerError, "仅运行中"),
+        ):
+            self.broker.credentials(instance_id)
+        stopped_secret.assert_not_called()
+
+        foreign = running_worker_inspect(instance_id=instance_id)
+        foreign["Config"]["Labels"][browser_broker.LABEL_OWNER] = "another-service"
+        foreign["Config"]["Env"] = ["CUSTOM_USER=alice"]
+        with (
+            mock.patch.object(self.broker, "_existing_session", return_value=session),
+            mock.patch.object(self.broker, "_inspect_container", return_value=foreign),
+            self.assertRaisesRegex(browser_broker.BrokerError, "不属于当前"),
+        ):
+            self.broker.credentials(instance_id)
+
+    def test_read_secret_rejects_missing_oversized_and_control_character_content(self) -> None:
+        secret = self.root / "session.password"
+        with mock.patch.object(
+            self.broker,
+            "_secret_paths",
+            return_value=(secret, "/control/session.password"),
+        ):
+            with self.assertRaisesRegex(browser_broker.BrokerError, "已不存在"):
+                self.broker._read_secret("0123456789abcdef")
+
+            for value in ("short", "valid-password\n", "x" * 129):
+                secret.write_text(value, encoding="utf-8")
+                with self.subTest(value_length=len(value)), self.assertRaisesRegex(
+                    browser_broker.BrokerError,
+                    "格式无效",
+                ):
+                    self.broker._read_secret("0123456789abcdef")
+
+            secret.write_text("correct-horse-battery-staple", encoding="utf-8")
+            self.assertEqual(
+                self.broker._read_secret("0123456789abcdef"),
+                "correct-horse-battery-staple",
+            )
+
     def test_start_recreates_existing_worker_so_new_credentials_take_effect(self) -> None:
         old_container_id = "a" * 64
         new_container_id = "b" * 64
@@ -1225,6 +1342,57 @@ class AppRemoteBrowserTests(unittest.TestCase):
         self.assertNotIn("password", saved["browser_instances"][0])
         self.assertEqual(saved["browser_instances"][0]["remote_username"], "alice")
         self.assertEqual(saved["browser_instances"][0]["profile_layout"], "native-v1")
+
+    def test_credentials_are_read_outside_state_locks_without_persisting_password(self) -> None:
+        password = "correct-horse-battery-staple"
+        lock_state: list[tuple[bool, bool]] = []
+
+        class FakeBroker:
+            def credentials(self, instance_id: str) -> dict[str, object]:
+                state_free = app.STATE_LOCK.acquire(blocking=False)
+                if state_free:
+                    app.STATE_LOCK.release()
+                shutdown_free = app.SHUTDOWN_LOCK.acquire(blocking=False)
+                if shutdown_free:
+                    app.SHUTDOWN_LOCK.release()
+                lock_state.append((state_free, shutdown_free))
+                return {
+                    "ok": True,
+                    "instance_id": instance_id,
+                    "url": "https://127.0.0.1:23000/",
+                    "username": "alice",
+                    "password": password,
+                }
+
+        with self.docker_browser_env():
+            app.ensure_dirs()
+            state = app.empty_state()
+            state["nodes"] = [{"id": "node-1", "name": "Test node"}]
+            instance = app.create_browser_instance_record(state, "node-1")
+            instance.update(
+                {
+                    "status": "running",
+                    "remote_worker": True,
+                    "remote_url": "https://127.0.0.1:23000/",
+                    "remote_username": "alice",
+                }
+            )
+            state["browser_instances"] = [instance]
+            app.save_state(state)
+            state_before = app.STATE_PATH.read_bytes()
+            with mock.patch.object(
+                app,
+                "remote_browser_broker_client",
+                return_value=FakeBroker(),
+            ):
+                result = app.remote_browser_credentials({"instance_id": instance["id"]})
+            state_after = app.STATE_PATH.read_bytes()
+
+        self.assertEqual(result["password"], password)
+        self.assertEqual(result["username"], "alice")
+        self.assertEqual(lock_state, [(True, True)])
+        self.assertEqual(state_after, state_before)
+        self.assertNotIn(password.encode("utf-8"), state_after)
 
     def test_invalid_worker_result_is_reclaimed_and_persisted_as_failed(self) -> None:
         class FakeBroker:
@@ -1654,6 +1822,19 @@ class RemoteBrowserDeploymentContractTests(unittest.TestCase):
         self.assertIn("EXPOSE 8765", broker)
         self.assertIn("http://127.0.0.1:8765/healthz", broker)
         self.assertIn('CMD ["python", "browser_broker.py"]', broker)
+
+    def test_frontend_exposes_delete_and_runtime_credential_controls(self) -> None:
+        html = (self.root / "static" / "index.html").read_text(encoding="utf-8")
+        frontend = (self.root / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="remoteBrowserCredentialsModal"', html)
+        self.assertIn('id="remoteBrowserCredentialsPassword"', html)
+        self.assertIn('data-action="copy-viewed-remote-browser-credentials"', html)
+        self.assertIn('data-action="delete-browser-instance"', frontend)
+        self.assertIn('data-action="view-remote-browser-credentials"', frontend)
+        self.assertIn('api("/api/browser/delete"', frontend)
+        self.assertIn('api("/api/browser/credentials"', frontend)
+        self.assertIn("browserUi.copyText(credentials.password, window)", frontend)
 
     def test_compose_keeps_docker_socket_out_of_web_service_and_isolates_workers(self) -> None:
         compose = (self.root / "compose.yaml").read_text(encoding="utf-8")

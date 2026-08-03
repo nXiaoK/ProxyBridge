@@ -149,6 +149,7 @@ GENERATED_BACKEND_INSTANCE_TOKEN = secrets.token_urlsafe(32)
 REMOTE_BROWSER_PASSWORD_MIN_LENGTH = 10
 REMOTE_BROWSER_PASSWORD_MAX_LENGTH = 128
 REMOTE_BROWSER_USERNAME_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,32}")
+BROWSER_PROFILE_PART_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
 REMOTE_BROWSER_SESSION_CACHE_TTL = 2.0
 REMOTE_BROWSER_SESSIONS_UNSET = object()
 REMOTE_BROWSER_LIVE_SESSION_STATUSES = {"running", "starting", "failed"}
@@ -1297,7 +1298,39 @@ def is_legacy_browser_profile(profile_path: Path) -> bool:
 
 
 def browser_instances_for_node(state: dict[str, Any], node_id: str) -> list[dict[str, Any]]:
-    return [item for item in state.get("browser_instances", []) if str(item.get("node_id") or "") == node_id]
+    return sorted(
+        [
+            item
+            for item in state.get("browser_instances", [])
+            if str(item.get("node_id") or "") == node_id
+        ],
+        key=browser_instance_sort_key,
+        reverse=True,
+    )
+
+
+def browser_instance_last_used_at(instance: dict[str, Any]) -> int:
+    """返回可迁移的最近使用时间：启动、停止、创建时间取最新值。"""
+    return max(
+        safe_int(instance.get("last_used_at"), 0),
+        safe_int(instance.get("last_started_at"), 0),
+        safe_int(instance.get("last_stopped_at"), 0),
+        safe_int(instance.get("created_at"), 0),
+    )
+
+
+def browser_instance_sort_key(instance: dict[str, Any]) -> tuple[int, int, str]:
+    return (
+        browser_instance_last_used_at(instance),
+        safe_int(instance.get("created_at"), 0),
+        str(instance.get("id") or ""),
+    )
+
+
+def public_browser_instances(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """状态 API 按最近使用时间倒序返回记录，不改变持久化与同步顺序。"""
+    records = [dict(item) for item in state.get("browser_instances", []) if isinstance(item, dict)]
+    return sorted(records, key=browser_instance_sort_key, reverse=True)
 
 
 def next_browser_instance_name(state: dict[str, Any], node_id: str) -> str:
@@ -1328,6 +1361,7 @@ def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[
         instance_id = new_browser_instance_id(node_id)
     profile_path = browser_instance_profile_path(node_id, instance_id)
     remote_worker = remote_browser_feature_enabled()
+    created_at = now_ts()
     return {
         "id": instance_id,
         "node_id": node_id,
@@ -1336,9 +1370,10 @@ def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[
         "status": "stopped",
         "profile_path": str(profile_path),
         "fingerprint_seed": browser_instance_seed(node_id, instance_id),
-        "created_at": now_ts(),
+        "created_at": created_at,
         "last_started_at": None,
         "last_stopped_at": None,
+        "last_used_at": created_at,
         "pid": None,
         "bridge_id": None,
         "proxy": "",
@@ -1412,6 +1447,15 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
         profile_layout = str(record.get("profile_layout") or "native-v1")
         if profile_layout not in {"native-v1", "remote-worker-v1"}:
             profile_layout = "native-v1"
+        created_at = safe_int(record.get("created_at"), now_ts())
+        last_started_at = safe_int(record.get("last_started_at"), 0) or None
+        last_stopped_at = safe_int(record.get("last_stopped_at"), 0) or None
+        last_used_at = max(
+            safe_int(record.get("last_used_at"), 0),
+            safe_int(last_started_at, 0),
+            safe_int(last_stopped_at, 0),
+            created_at,
+        )
         # Prefer explicit label; accept legacy "tag" key if present.
         label = normalize_browser_label(record.get("label") if "label" in record else record.get("tag"))
         record.update(
@@ -1426,9 +1470,10 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
                 "fingerprint_seed": safe_int(
                     record.get("fingerprint_seed"), browser_instance_seed(node_id, instance_id, legacy)
                 ),
-                "created_at": safe_int(record.get("created_at"), now_ts()),
-                "last_started_at": safe_int(record.get("last_started_at"), 0) or None,
-                "last_stopped_at": safe_int(record.get("last_stopped_at"), 0) or None,
+                "created_at": created_at,
+                "last_started_at": last_started_at,
+                "last_stopped_at": last_stopped_at,
+                "last_used_at": last_used_at,
                 "pid": safe_int(record.get("pid"), 0) or None,
                 "bridge_id": record.get("bridge_id"),
                 "proxy": str(record.get("proxy") or ""),
@@ -1487,6 +1532,7 @@ def ensure_legacy_browser_instances(state: dict[str, Any]) -> None:
         instance_id = legacy_browser_instance_id(node_id)
         if instance_id in existing_ids or not is_legacy_browser_profile(profile_path):
             continue
+        created_at = now_ts()
         instances.append(
             {
                 "id": instance_id,
@@ -1495,9 +1541,10 @@ def ensure_legacy_browser_instances(state: dict[str, Any]) -> None:
                 "status": "stopped",
                 "profile_path": str(profile_path),
                 "fingerprint_seed": browser_instance_seed(node_id, instance_id, legacy=True),
-                "created_at": now_ts(),
+                "created_at": created_at,
                 "last_started_at": None,
                 "last_stopped_at": None,
+                "last_used_at": created_at,
                 "pid": None,
                 "bridge_id": None,
                 "proxy": "",
@@ -3701,7 +3748,7 @@ def _status_payload(
             "fingerprint_chromium": fingerprint_chromium_path() if browser_enabled else None,
             "remote_browser": remote_runtime,
             "active_browsers": active_browser_node_ids_from_state(state) if browser_enabled else [],
-            "browser_instances": state.get("browser_instances", []) if browser_enabled else [],
+            "browser_instances": public_browser_instances(state) if browser_enabled else [],
             "subscriptions": state["subscriptions"],
             "nodes": [
                 public_node(node)
@@ -6794,6 +6841,7 @@ def launch_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
                 or saved_instance.get("status") != "starting"
             ):
                 raise RuntimeError("远程浏览器启动结果已失效，正在回收 worker")
+            started_at = now_ts()
             saved_instance.update(
                 {
                     "status": "running",
@@ -6808,8 +6856,9 @@ def launch_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
                     "remote_container_id": remote_container_id,
                     "remote_host_port": remote_host_port,
                     "remote_username": username,
-                    "last_started_at": now_ts(),
+                    "last_started_at": started_at,
                     "last_stopped_at": None,
+                    "last_used_at": started_at,
                     "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
                 }
             )
@@ -7037,6 +7086,7 @@ def _run_browser_launch(
             except ValueError:
                 saved_instance = dict(instance)
                 state["browser_instances"].append(saved_instance)
+            started_at = now_ts()
             saved_instance.update(
                 {
                     "status": "running",
@@ -7050,8 +7100,9 @@ def _run_browser_launch(
                     "remote_container_id": "",
                     "remote_host_port": None,
                     "remote_username": "",
-                    "last_started_at": now_ts(),
+                    "last_started_at": started_at,
                     "last_stopped_at": None,
+                    "last_used_at": started_at,
                     "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
                 }
             )
@@ -7200,7 +7251,11 @@ def stop_remote_browser_worker(
         finish_remote_browser_operation(instance_id, generation, "stop")
 
 
-def _stop_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
+def _stop_remote_browser(
+    payload: dict[str, Any],
+    *,
+    auto_upload: bool = True,
+) -> dict[str, Any]:
     node_id = str(payload.get("node_id") or "")
     instance_id = str(payload.get("instance_id") or "")
     all_instances = payload.get("all_instances") is True
@@ -7274,6 +7329,7 @@ def _stop_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
                     "remote_container_id": "",
                     "remote_host_port": None,
                     "last_stopped_at": stopped_at,
+                    "last_used_at": stopped_at,
                 }
             )
             target.pop("error", None)
@@ -7282,7 +7338,8 @@ def _stop_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
     for target_id in target_ids:
         prune_remote_browser_lifecycle(target_id)
 
-    maybe_auto_upload_browser_instances(stopped)
+    if auto_upload:
+        maybe_auto_upload_browser_instances(stopped)
     if failures:
         details = "; ".join(f"{target_id}: {error}" for target_id, error in failures)
         raise RuntimeError(f"停止部分远程浏览器失败（{len(failures)} 项）：{details}") from failures[0][1]
@@ -7335,6 +7392,7 @@ def stop_browser_instances(state: dict[str, Any], instance_ids: list[str]) -> in
                     "remote_container_id": "",
                     "remote_host_port": None,
                     "last_stopped_at": stopped_at,
+                    "last_used_at": stopped_at,
                 }
             )
     return killed
@@ -7372,7 +7430,11 @@ def stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
         return _stop_browser(payload)
 
 
-def _stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
+def _stop_browser(
+    payload: dict[str, Any],
+    *,
+    auto_upload: bool = True,
+) -> dict[str, Any]:
     # 停止某节点的指纹浏览器:只结束浏览器进程组,保留该节点已启用的本地代理端口。
     node_id = str(payload.get("node_id") or "")
     instance_id = str(payload.get("instance_id") or "")
@@ -7395,13 +7457,230 @@ def _stop_browser(payload: dict[str, Any]) -> dict[str, Any]:
             killed = stop_browser_processes_for_node(node_id, state)
         save_state(state)
     # v1.1: optional auto-upload after browser stop.
-    maybe_auto_upload_browser_instances(stopped_instance_ids)
+    if auto_upload:
+        maybe_auto_upload_browser_instances(stopped_instance_ids)
     return {
         "ok": True,
         "node_id": node_id,
         "instance_id": instance_id or None,
         "killed_browsers": killed,
         "stopped_bridges": [],
+    }
+
+
+def remote_browser_credentials(payload: dict[str, Any]) -> dict[str, Any]:
+    """按需读取运行中远程 Worker 的访问凭证，绝不写入持久状态。"""
+    if not remote_browser_feature_enabled():
+        raise RuntimeError("只有 Docker 远程浏览器模式可以查看访问凭证")
+    instance_id = str(payload.get("instance_id") or payload.get("id") or "")
+    if not instance_id:
+        raise ValueError("缺少浏览器实例 ID")
+    with STATE_LOCK:
+        state = load_state()
+        instance = find_browser_instance(state, instance_id)
+        if instance.get("remote_worker") is not True or instance.get("status") != "running":
+            raise ValueError("仅运行中的远程浏览器可以查看访问凭证")
+        instance_snapshot = dict(instance)
+
+    # Broker 网络访问必须位于 STATE_LOCK / SHUTDOWN_LOCK 外，避免 Docker Engine
+    # 暂时无响应时阻塞状态接口、停止流程或程序退出。
+    result = remote_browser_broker_client().credentials(instance_id)
+    if str(result.get("instance_id") or "") != instance_id or not result.get("username"):
+        raise RuntimeError("浏览器 Broker 返回的凭证实例无效")
+    remote_url = normalize_remote_browser_url(result.get("url"))
+    if not remote_url:
+        raise RuntimeError("浏览器 Broker 返回的远程访问地址无效")
+    username, password = validate_remote_browser_login(
+        {
+            "username": result.get("username"),
+            "password": result.get("password"),
+        }
+    )
+    return {
+        "ok": True,
+        "instance_id": instance_id,
+        "browser_name": str(instance_snapshot.get("name") or "远程浏览器"),
+        "remote_url": remote_url,
+        "username": username,
+        "password": password,
+    }
+
+
+def _validated_browser_profile_target(instance: dict[str, Any]) -> Path:
+    """只由状态中的逻辑 ID 重建删除目标，拒绝绝对路径和符号链接逃逸。"""
+    node_id = str(instance.get("node_id") or "")
+    instance_id = str(instance.get("id") or "")
+    if not node_id:
+        raise ValueError("浏览器记录缺少节点 ID")
+    if (
+        BROWSER_PROFILE_PART_PATTERN.fullmatch(instance_id) is None
+        or instance_id in {".", ".."}
+    ):
+        raise ValueError("浏览器实例 ID 无效，已拒绝删除 Profile")
+    legacy = bool(instance.get("legacy"))
+    node_root = browser_node_profile_root(node_id)
+    candidate = browser_instance_profile_path(node_id, instance_id, legacy=legacy)
+    if node_root.is_symlink() or candidate.is_symlink():
+        raise RuntimeError("浏览器 Profile 路径包含符号链接，已拒绝删除")
+    profiles_root = browser_profiles_root().resolve(strict=False)
+    resolved = candidate.resolve(strict=False)
+    if resolved == profiles_root or profiles_root not in resolved.parents:
+        raise RuntimeError("浏览器 Profile 路径越出数据目录，已拒绝删除")
+    return resolved
+
+
+def _retry_readonly_profile_removal(function: Any, path: str, error_info: Any) -> None:
+    """Windows Profile 文件可能带只读位；清除后只重试当前失败项。"""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        function(path)
+    except BaseException:
+        raise error_info[1]
+
+
+def _remove_profile_entry(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        try:
+            path.unlink()
+        except PermissionError:
+            path.chmod(stat.S_IWRITE | stat.S_IREAD)
+            path.unlink()
+        return
+    shutil.rmtree(path, onerror=_retry_readonly_profile_removal)
+
+
+def _delete_browser_profile_data(
+    instance: dict[str, Any],
+    all_instances: list[dict[str, Any]],
+) -> bool:
+    """物理删除单个实例的数据；legacy 布局保留同节点的独立实例目录。"""
+    target = _validated_browser_profile_target(instance)
+    if not target.exists():
+        return False
+    node_id = str(instance.get("node_id") or "")
+    instance_id = str(instance.get("id") or "")
+    if not instance.get("legacy"):
+        _remove_profile_entry(target)
+        node_root = target.parent
+        if node_root.is_dir() and not any(node_root.iterdir()):
+            _remove_profile_entry(node_root)
+        return True
+
+    preserve_names: set[str] = set()
+    for other in all_instances:
+        if (
+            not isinstance(other, dict)
+            or str(other.get("id") or "") == instance_id
+            or str(other.get("node_id") or "") != node_id
+            or other.get("legacy")
+        ):
+            continue
+        other_id = str(other.get("id") or "")
+        if (
+            BROWSER_PROFILE_PART_PATTERN.fullmatch(other_id) is None
+            or other_id in {".", ".."}
+        ):
+            raise ValueError("同节点浏览器实例 ID 无效，无法安全删除默认 Profile")
+        preserve_names.add(other_id)
+
+    for child in list(target.iterdir()):
+        if child.name in preserve_names:
+            continue
+        _remove_profile_entry(child)
+    if target.exists() and not any(target.iterdir()):
+        _remove_profile_entry(target)
+    return True
+
+
+def _browser_instance_delete_snapshot(instance_id: str) -> dict[str, Any]:
+    with STATE_LOCK:
+        state = load_state()
+        instance = dict(find_browser_instance(state, instance_id))
+    # 在停止进程之前先完成路径校验；恶意或损坏记录不能借删除动作影响运行时。
+    _validated_browser_profile_target(instance)
+    return instance
+
+
+def _finalize_browser_instance_delete(
+    instance_snapshot: dict[str, Any],
+) -> tuple[bool, dict[str, Any]]:
+    instance_id = str(instance_snapshot.get("id") or "")
+    with STATE_LOCK:
+        state = load_state()
+        current = dict(find_browser_instance(state, instance_id))
+        if (
+            str(current.get("node_id") or "") != str(instance_snapshot.get("node_id") or "")
+            or bool(current.get("legacy")) != bool(instance_snapshot.get("legacy"))
+        ):
+            raise RuntimeError("浏览器记录在删除期间发生变化，已取消物理删除")
+        records = [dict(item) for item in state.get("browser_instances", []) if isinstance(item, dict)]
+
+    profile_deleted = _delete_browser_profile_data(current, records)
+
+    with STATE_LOCK:
+        state = load_state()
+        current = find_browser_instance(state, instance_id)
+        if (
+            str(current.get("node_id") or "") != str(instance_snapshot.get("node_id") or "")
+            or bool(current.get("legacy")) != bool(instance_snapshot.get("legacy"))
+        ):
+            raise RuntimeError("浏览器记录在删除期间发生变化，已拒绝移除状态")
+        state["browser_instances"] = [
+            item
+            for item in state.get("browser_instances", [])
+            if not (isinstance(item, dict) and str(item.get("id") or "") == instance_id)
+        ]
+        save_state(state)
+    return profile_deleted, dict(current)
+
+
+def delete_browser_instance(payload: dict[str, Any]) -> dict[str, Any]:
+    """停止并永久删除一个浏览器记录、Profile 及其 WebDAV 远端副本。"""
+    require_browser_feature()
+    instance_id = str(payload.get("instance_id") or payload.get("id") or "")
+    if not instance_id:
+        raise ValueError("缺少浏览器实例 ID")
+
+    with BROWSER_LAUNCH_LOCK:
+        if remote_browser_feature_enabled():
+            with SHUTDOWN_LOCK:
+                if SHUTTING_DOWN.is_set():
+                    raise RuntimeError("程序正在退出，不能删除浏览器记录")
+                instance_snapshot = _browser_instance_delete_snapshot(instance_id)
+            # Broker 网络调用不能持有 SHUTDOWN_LOCK / STATE_LOCK。
+            stopped = _stop_remote_browser(
+                {"instance_id": instance_id},
+                auto_upload=False,
+            )
+            with SHUTDOWN_LOCK:
+                profile_deleted, deleted_instance = _finalize_browser_instance_delete(
+                    instance_snapshot
+                )
+        else:
+            with SHUTDOWN_LOCK:
+                if SHUTTING_DOWN.is_set():
+                    raise RuntimeError("程序正在退出，不能删除浏览器记录")
+                instance_snapshot = _browser_instance_delete_snapshot(instance_id)
+                stopped = _stop_browser(
+                    {"instance_id": instance_id},
+                    auto_upload=False,
+                )
+                profile_deleted, deleted_instance = _finalize_browser_instance_delete(
+                    instance_snapshot
+                )
+
+    mark_sync_local_change()
+    try:
+        # 全量 push 会发布不含该记录的新 state，并清理远端孤立 Profile 包。
+        get_sync_engine().maybe_auto_push(reason="删除浏览器记录")
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "instance_id": instance_id,
+        "browser_name": str(deleted_instance.get("name") or "浏览器"),
+        "profile_deleted": profile_deleted,
+        "killed_browsers": safe_int(stopped.get("killed_browsers"), 0),
     }
 
 
@@ -10756,6 +11035,7 @@ def sync_browser_instance_status(
                         "remote_container_id": "",
                         "remote_host_port": None,
                         "last_stopped_at": stopped_at,
+                        "last_used_at": stopped_at,
                     },
                 )
                 newly_stopped.append(instance_id)
@@ -10771,7 +11051,12 @@ def sync_browser_instance_status(
                     remove_browser_process_from_node_tables(process)
             changed |= apply_updates(
                 instance,
-                {"status": "stopped", "pid": None, "last_stopped_at": stopped_at},
+                {
+                    "status": "stopped",
+                    "pid": None,
+                    "last_stopped_at": stopped_at,
+                    "last_used_at": stopped_at,
+                },
             )
             newly_stopped.append(instance_id)
     if newly_stopped:
@@ -10819,11 +11104,14 @@ def json_response(
     status: int = 200,
     *,
     head_only: bool = False,
+    no_store: bool = False,
 ) -> None:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(data)))
+    if no_store:
+        handler.send_header("Cache-Control", "no-store")
     send_backend_instance_header(handler)
     handler.end_headers()
     if not head_only:
@@ -11358,6 +11646,20 @@ class AppHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/browser/stop":
                 json_response(self, stop_browser(payload))
                 log_event("停止指纹浏览器", category="浏览器")
+            elif self.path == "/api/browser/credentials":
+                result = remote_browser_credentials(payload)
+                json_response(self, result, no_store=True)
+                log_event(
+                    f"查看远程浏览器凭证:{result.get('instance_id') or ''}",
+                    category="浏览器",
+                )
+            elif self.path == "/api/browser/delete":
+                result = delete_browser_instance(payload)
+                json_response(self, result)
+                log_event(
+                    f"删除浏览器记录:{result.get('browser_name') or result.get('instance_id') or ''}",
+                    category="浏览器",
+                )
             elif self.path == "/api/browser/update":
                 result = update_browser_instance(payload)
                 label = (result.get("instance") or {}).get("label") or ""
@@ -11614,6 +11916,7 @@ def _shutdown_once() -> None:
                                 "remote_container_id": "",
                                 "remote_host_port": None,
                                 "last_stopped_at": stopped_at,
+                                "last_used_at": stopped_at,
                             }
                         )
                     save_state(shutdown_state)

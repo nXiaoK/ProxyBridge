@@ -12,6 +12,7 @@ Docker 模式适合 Linux 服务器、NAS、家庭服务器和不需要桌面壳
 - Web 控制台默认发布到宿主机 `127.0.0.1:8787`。
 - 默认 Compose 通过内部 Browser Broker 为每条运行记录创建一个独立 `lscr.io/linuxserver/chromium` worker；单容器 `docker run` 未配置 Broker 时不显示浏览器入口。
 - 每个实例使用独立 Profile、由记录派生的固定指纹、对应节点代理以及独立登录密码；停止 worker 不删除 Profile。
+- 浏览器记录按最近使用时间倒序显示；运行记录可按需查看当前凭证，所有记录都可永久删除，删除会先回收 worker 再物理删除 Profile。
 - worker 的 `/config` 是随容器删除的匿名运行卷，持久化命名卷仅挂入 `/config/browser-profile`；Selkies 的 TLS、认证和其他运行文件不会进入 Profile 或 WebDAV 快照。
 - worker 访问节点代理时，主服务只对 Broker 确认的“精确 worker IP + 分配给该实例的代理端口”免除二次认证，不会放行整个 worker 子网或其他容器。
 - 浏览器功能启用时，WebDAV 可同步已停止的浏览器 Profile；只有未配置 Broker 或显式禁用浏览器时才退回**仅订阅 / 节点同步**。
@@ -267,10 +268,11 @@ PROXY_BRIDGE_PROXY_HOST=192.168.1.20
 1. 首次使用先按第 5 节下载 Linux 指纹内核。
 2. 在节点操作列点击「浏览器」。凭据弹窗默认用户名为 `proxybridge`，前端会生成一条可复制、可修改的随机强密码；每个实例应使用不同密码。
 3. 提交后，ProxyBridge 会先确保节点代理已运行，再创建独立 worker。Broker 等待 internal worker 的 `3001` 端口和 HTTPS 健康检查都就绪，再启动对应动态端口的 TLS TCP 中继；控制台随后自动打开 `https://<PROXY_BRIDGE_BROWSER_PUBLIC_HOST>:<动态端口>/`。
-4. 若弹窗被浏览器阻止，可进入「浏览器记录」，在运行记录上点击「远程打开」。这里也会显示用户名、URL、端口和 worker 状态。
-5. 使用该用户名和本次密码通过 worker 的 Basic Auth。密码只存在于本次凭据弹窗、用户记忆和运行 worker 的只读 secret 中，不写入 `state.json`，也不会由状态 API 返回；关闭后重新启动需设置新密码。
+4. 若弹窗被浏览器阻止，可进入「浏览器记录」，在运行记录上点击「远程打开」。这里也会显示用户名、URL、端口和 worker 状态，并可点击「查看凭证」重新查询当前链接、用户名与密码。
+5. 使用该用户名和本次密码通过 worker 的 Basic Auth。密码只存在于前端当前查看窗口和运行 worker 的只读 secret 中；查询使用认证后的管理 API，响应禁止缓存，复制也只在当前页面完成。密码不写入 `state.json`、状态 API、日志或 WebDAV；停止后 secret 被销毁，重新启动需设置新密码。
 6. worker 通过内部网络访问该实例的节点 SOCKS5 端口；主服务仅对 Broker 实时返回的精确 worker IP 和该代理端口组合免除代理二次认证，另一个 worker 或同网段容器不能复用此权限。
 7. 使用完后在「浏览器记录」点击「停止」。Broker 会停止并删除 worker、匿名 `/config` 运行卷与临时 secret，但保留该实例的独立 Profile、固定指纹种子和节点关联，便于下次继续。
+8. 不再需要记录时点击「删除」。无论记录是否运行，后端都会先确认 worker 已停止，再物理删除 Profile 和状态记录；WebDAV 已启用时会排队全量上传，远端状态与对应 Profile 包也会被清理。此操作不可恢复。
 
 每次 worker 容器启动时都会在自己的匿名 `/config` 运行卷中动态生成自签名 HTTPS 证书，所以浏览器经 Broker TCP 中继访问新 worker 时会提示证书不受信任。中继只转发加密字节，不终止 TLS；该匿名卷不会参与 WebDAV，并随 worker 删除。这只能避免链路明文传输，不能提供受信任的服务器身份。内置 Basic Auth 只是可信 LAN/VPN 内的便利防护，不是公网级访问控制。
 

@@ -139,6 +139,27 @@
     ].join("\n");
   }
 
+  function browserInstanceLastUsedAt(instance) {
+    return Math.max(
+      Number(instance?.last_used_at || 0) || 0,
+      Number(instance?.last_started_at || 0) || 0,
+      Number(instance?.last_stopped_at || 0) || 0,
+      Number(instance?.created_at || 0) || 0,
+    );
+  }
+
+  function sortBrowserInstancesByRecentUse(instances) {
+    return (Array.isArray(instances) ? instances : [])
+      .slice()
+      .sort((a, b) => {
+        const usedDiff = browserInstanceLastUsedAt(b) - browserInstanceLastUsedAt(a);
+        if (usedDiff) return usedDiff;
+        const createdDiff = (Number(b?.created_at || 0) || 0) - (Number(a?.created_at || 0) || 0);
+        if (createdDiff) return createdDiff;
+        return String(b?.id || "").localeCompare(String(a?.id || ""));
+      });
+  }
+
   return Object.freeze({
     safeRemoteBrowserUrl,
     cssEscape,
@@ -148,5 +169,7 @@
     clearCredentialFields,
     setCredentialView,
     formatCredentials,
+    browserInstanceLastUsedAt,
+    sortBrowserInstancesByRecentUse,
   });
 });

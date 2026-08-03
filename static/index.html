@@ -818,7 +818,7 @@
               <span class="remote-browser-launch-success-mark" aria-hidden="true"></span>
               <div>
                 <h3 id="remoteBrowserLaunchSuccessTitle">远程浏览器已就绪</h3>
-                <p id="remoteBrowserLaunchSuccessDescription">密码只保留在当前页面中。请复制并妥善保存；点击“完成并清除”或关闭窗口后无法找回。</p>
+                <p id="remoteBrowserLaunchSuccessDescription">密码不会写入状态或同步数据；Worker 运行期间可从“浏览器记录”再次查看，停止后会立即销毁。</p>
               </div>
             </div>
             <div class="remote-browser-success-fields">
@@ -846,6 +846,55 @@
             </footer>
           </section>
         </form>
+      </section>
+    </div>
+
+    <!-- ============ Docker 远程浏览器凭证查看弹窗 ============ -->
+    <div class="modal-backdrop" id="remoteBrowserCredentialsModal" hidden>
+      <section class="remote-browser-launch-modal" role="dialog" aria-modal="true" aria-labelledby="remoteBrowserCredentialsTitle" aria-describedby="remoteBrowserCredentialsDescription" tabindex="-1">
+        <header class="modal-head">
+          <div>
+            <h2 id="remoteBrowserCredentialsTitle">查看远程浏览器凭证</h2>
+            <p id="remoteBrowserCredentialsMeta" class="modal-subtitle"></p>
+          </div>
+          <button class="icon-button" type="button" data-action="close-remote-browser-credentials" aria-label="关闭并清除远程浏览器凭证" title="关闭并清除">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </header>
+        <div class="remote-browser-launch-form">
+          <section class="remote-browser-launch-success">
+            <div class="remote-browser-launch-success-head">
+              <span class="remote-browser-launch-success-mark" aria-hidden="true"></span>
+              <div>
+                <h3>运行期访问凭证</h3>
+                <p id="remoteBrowserCredentialsDescription">凭证由 Browser Broker 从当前运行的 Worker 按需读取，不会进入状态文件或 WebDAV；关闭本窗口会立即清除页面字段。</p>
+              </div>
+            </div>
+            <div class="remote-browser-success-fields">
+              <label>
+                <span>远程链接</span>
+                <input id="remoteBrowserCredentialsUrl" type="url" inputmode="url" autocomplete="off" spellcheck="false" readonly>
+              </label>
+              <label>
+                <span>访问用户名</span>
+                <input id="remoteBrowserCredentialsUsername" type="text" autocomplete="off" spellcheck="false" readonly>
+              </label>
+              <label>
+                <span>访问密码</span>
+                <input id="remoteBrowserCredentialsPassword" type="text" autocomplete="off" spellcheck="false" readonly>
+              </label>
+            </div>
+            <div class="remote-browser-success-copy-actions" aria-label="复制当前远程浏览器凭证">
+              <button class="row-button" type="button" data-action="copy-viewed-remote-browser-password"><span>复制密码</span></button>
+              <button class="row-button" type="button" data-action="copy-viewed-remote-browser-url"><span>复制链接</span></button>
+              <button class="row-button" type="button" data-action="copy-viewed-remote-browser-credentials"><span>复制完整凭证</span></button>
+            </div>
+            <footer class="remote-browser-launch-actions remote-browser-success-actions">
+              <button class="row-button" type="button" data-action="close-remote-browser-credentials"><span>关闭并清除</span></button>
+              <button class="primary-button" id="remoteBrowserCredentialsOpen" type="button" data-action="open-viewed-remote-browser"><span>打开远程浏览器</span></button>
+            </footer>
+          </section>
+        </div>
       </section>
     </div>
 

@@ -125,3 +125,27 @@ test("escapes malformed persisted instance IDs before using them in a CSS select
   assert.equal(escaped.includes("\\]"), true);
   assert.equal(escaped.includes("\\["), true);
 });
+
+test("sorts browser records by most recent use with migration fallbacks", () => {
+  const records = [
+    { id: "created", created_at: 500 },
+    { id: "started", created_at: 100, last_started_at: 900 },
+    { id: "stopped", created_at: 200, last_stopped_at: 800 },
+    { id: "explicit", created_at: 50, last_used_at: 1000, last_started_at: 60 },
+  ];
+
+  assert.deepEqual(
+    browserUi.sortBrowserInstancesByRecentUse(records).map((item) => item.id),
+    ["explicit", "started", "stopped", "created"],
+  );
+  assert.deepEqual(records.map((item) => item.id), ["created", "started", "stopped", "explicit"]);
+  assert.equal(
+    browserUi.browserInstanceLastUsedAt({
+      created_at: 100,
+      last_started_at: 300,
+      last_stopped_at: 400,
+      last_used_at: 200,
+    }),
+    400,
+  );
+});

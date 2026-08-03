@@ -648,7 +648,7 @@ Docker 远程模式只接受 `proxybridge-data` 命名卷中 `/data/fingerprint-
 - `id`、`node_id`、名称和标签。
 - 独立 Profile 目录。
 - `running` / `starting` / `stopping` / `stopped` / `failed` 状态。
-- 可恢复的启动次数和更新时间。
+- 可恢复的启动次数，以及创建、启动、停止和 `last_used_at` 时间；状态 API 与前端按最近使用时间倒序投影。
 - Docker 记录还包含 `remote_worker`、`remote_url`、worker 容器 ID、宿主端口和用户名；新记录继续使用与桌面浏览器一致的 `native-v1` Profile 布局，旧版嵌套 Profile 目录只作为兼容布局读取。密码绝不能写入记录或状态 API。
 
 同一节点可存在多个历史记录，但运行时表必须阻止同一实例重复启动。
@@ -671,9 +671,13 @@ Docker 远程浏览器启动时：
 4. worker 的 `/config` 是随容器删除的匿名卷；只有当前 Profile 通过命名卷 `volume-subpath` 读写挂到 `/config/browser-profile`，指纹内核子目录只读挂到 `/opt/fingerprint-chromium`。Selkies TLS、认证与 nginx 运行文件不会进入 Profile 或 WebDAV 快照。
 5. worker 使用该节点的内部 SOCKS5 端口；主服务查询 Broker 会话，只对“精确 worker IP + 分配给该实例的代理端口”组合免除代理二次认证，不按整个 worker CIDR 放行。
 6. LinuxServer Selkies 在匿名 `/config` 中动态生成自签名 HTTPS，并通过 `CUSTOM_USER` / `FILE__PASSWORD` 开启 Basic Auth。Broker 等到容器运行、`3001` 端口可连接且 Docker health 为 `healthy` 后才返回。
-7. Broker 返回 `remote_url` 后，前端打开链接；运行记录提供再次打开与停止入口，并显示用户名、URL、端口和 worker 状态。
+7. Broker 返回 `remote_url` 后，前端打开链接；运行记录提供再次打开、查看凭证与停止入口，并显示用户名、URL、端口和 worker 状态。
 
 停止本机浏览器时，只有进程确认退出后才能从实例表和节点表删除句柄。停止远程实例采用 generation 失效与两阶段提交：先在锁内标记 `stopping`，再在锁外请求 Broker 停止，防止并发启动结果把实例恢复为 `running`。Broker 停止并删除 worker、匿名 `/config` 运行卷和临时 secret，但保留 Profile 与稳定指纹种子；下次启动必须设置新密码。任何运行中的 Profile 都不允许参与 WebDAV 上传。Broker 启动时会回收上次异常退出遗留的带所有权标签 worker，Compose 为主服务和 Broker 都配置 3 分钟 `stop_grace_period`，用于完成并行回收与 Profile 落盘。
+
+查看凭证只适用于 `running` 的远程实例：认证后的主服务 API 在状态锁外调用 Broker，Broker 重新校验 worker 所有权标签，从容器 `CUSTOM_USER` 与私有运行期 secret 读取凭证。密码响应使用 `Cache-Control: no-store`，前端关闭查看窗口立即清空字段，且复制流程不得调用会把密码回传服务端的 `/api/clipboard`。
+
+单条删除在所有平台使用两阶段流程：先在 `BROWSER_LAUNCH_LOCK` 下停止本机进程或远程 worker，再由经过校验的节点/实例 ID 重建 Profile 路径并物理删除，最后移除状态记录。不能信任状态中的绝对 `profile_path`；legacy 节点级 Profile 删除还必须保留同节点其他实例子目录。成功后标记本地同步变更并排队 WebDAV 全量 push，使远端 state 与孤立 Profile 包同步删除。
 
 ### 16.4 Docker 远程访问安全边界
 
@@ -731,7 +735,7 @@ http://127.0.0.1:8787/#token=...
 | 内核安装 | `/api/cores/upload`（`application/octet-stream`，不是 JSON） |
 | 设置 | `/api/settings/subscriptions`、`speed-test`、`logs`、`network` |
 | 诊断 | `/api/diagnostics/run` |
-| 浏览器 | `/api/browser/launch`、`stop`、`update`、`download-kernel` |
+| 浏览器 | `/api/browser/launch`、`stop`、`delete`、`credentials`、`update`、`download-kernel` |
 | 日志 | `/api/logs/clear`、`/api/system/logs/clear` |
 | 代理池 | `/api/pool/token/rotate`、`feedback`、`exclude` |
 | 客户端 | `/api/network/clients/kick` |
