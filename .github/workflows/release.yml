@@ -216,6 +216,8 @@ jobs:
     env:
       # GITHUB_TOKEN 是 GitHub 为本次任务签发的短期令牌，只用于当前仓库 Release。
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 发布 job 只下载产物、不 checkout 源码；显式仓库名避免 gh 依赖本地 .git。
+      GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.metadata.outputs.tag }}
       RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
       SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
