@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -190,6 +191,59 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertEqual(state["browser_instances"][0]["status"], "stopped")
         self.assertTrue((self.profiles / "nodehash" / "inst1" / "Default" / "Cookies").exists())
 
+    def test_convenience_pull_preserves_unuploaded_local_browser_record(self):
+        self.engine.push()
+        local_record = {
+            "id": "local-new-browser",
+            "node_id": "n1",
+            "name": "浏览器 2",
+            "status": "stopped",
+            "legacy": False,
+        }
+        with self.lock:
+            state = self._load()
+            state["browser_instances"].append(dict(local_record))
+            self._save(state)
+        self.engine.mark_local_change()
+
+        result = self.engine.pull(preserve_local_changes=True)
+
+        self.assertTrue(result["skipped"])
+        self.assertEqual(result["reason"], "local_changes_pending")
+        saved_ids = {item["id"] for item in self._load()["browser_instances"]}
+        self.assertEqual(saved_ids, {"inst1", "local-new-browser"})
+
+        manual = self.engine.pull()
+        self.assertTrue(manual["ok"])
+        self.assertNotIn(
+            "local-new-browser",
+            {item["id"] for item in self._load()["browser_instances"]},
+        )
+
+        with self.lock:
+            state = self._load()
+            state["browser_instances"].append(dict(local_record))
+            self._save(state)
+        self.engine.mark_local_change()
+        forced = self.engine.pull(force=True, preserve_local_changes=True)
+        self.assertTrue(forced["ok"])
+        self.assertNotIn(
+            "local-new-browser",
+            {item["id"] for item in self._load()["browser_instances"]},
+        )
+
+    def test_push_rejects_disabled_sync_without_touching_remote(self):
+        state = self._load()
+        state["settings"]["webdav"]["enabled"] = False
+        self._save(state)
+        client_factory = mock.Mock(side_effect=AssertionError("remote client must not be created"))
+        self.engine.client_factory = client_factory
+
+        with self.assertRaisesRegex(ValueError, "请先启用并配置 WebDAV"):
+            self.engine.push()
+
+        client_factory.assert_not_called()
+
     def test_pull_rejects_tampered_profile_hash(self):
         self.engine.push()
         client, manifest = self._remote_manifest()
@@ -324,6 +378,86 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertTrue(all(result["ok"] for result in results))
         self.assertEqual(max_active, 1)
+
+    def test_auto_push_queued_while_worker_is_busy(self):
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls: list[list[str] | None] = []
+
+        def push(*, instance_ids=None):
+            calls.append(instance_ids)
+            if len(calls) == 1:
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+            if len(calls) == 2:
+                finished.set()
+            return {"ok": True}
+
+        with mock.patch.object(self.engine, "push", side_effect=push):
+            self.engine.maybe_auto_push(reason="first")
+            self.assertTrue(started.wait(timeout=1))
+            self.engine.maybe_auto_push(reason="second")
+            release.set()
+            self.assertTrue(finished.wait(timeout=2))
+
+        self.assertEqual(calls, [None, None])
+
+    def test_auto_profile_uploads_merge_while_worker_is_busy(self):
+        state = self._load()
+        state["settings"]["webdav"]["auto_upload_on_browser_stop"] = True
+        self._save(state)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls: list[list[str] | None] = []
+
+        def push(*, instance_ids=None):
+            calls.append(instance_ids)
+            if len(calls) == 1:
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+            if len(calls) == 2:
+                finished.set()
+            return {"ok": True}
+
+        with mock.patch.object(self.engine, "push", side_effect=push):
+            self.engine.maybe_auto_upload_instance("inst1")
+            self.assertTrue(started.wait(timeout=1))
+            self.engine.maybe_auto_upload_instance("inst2")
+            self.engine.maybe_auto_upload_instance("inst3")
+            release.set()
+            self.assertTrue(finished.wait(timeout=2))
+
+        self.assertEqual(calls, [["inst1"], ["inst2", "inst3"]])
+
+    def test_full_auto_push_supersedes_queued_profile_uploads(self):
+        state = self._load()
+        state["settings"]["webdav"]["auto_upload_on_browser_stop"] = True
+        self._save(state)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        calls: list[list[str] | None] = []
+
+        def push(*, instance_ids=None):
+            calls.append(instance_ids)
+            if len(calls) == 1:
+                started.set()
+                self.assertTrue(release.wait(timeout=2))
+            if len(calls) == 2:
+                finished.set()
+            return {"ok": True}
+
+        with mock.patch.object(self.engine, "push", side_effect=push):
+            self.engine.maybe_auto_upload_instance("inst1")
+            self.assertTrue(started.wait(timeout=1))
+            self.engine.maybe_auto_upload_instance("inst2")
+            self.engine.maybe_auto_push(reason="state changed")
+            release.set()
+            self.assertTrue(finished.wait(timeout=2))
+
+        self.assertEqual(calls, [["inst1"], None])
 
     def test_push_fails_closed_when_manifest_cannot_be_read(self):
         self.engine.push()
@@ -549,6 +683,33 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         remote_state = json.loads(self.store.files[self._remote_state_url(client, manifest)].decode("utf-8"))
         self.assertNotIn("local-node", {item["id"] for item in remote_state["nodes"]})
 
+    def test_remote_worker_compat_layout_syncs_only_chromium_profile(self):
+        root = self.profiles / "nodehash" / "inst1"
+        chromium_profile = root / "chromium-profile"
+        chromium_profile.mkdir()
+        (root / "Default").replace(chromium_profile / "Default")
+        (root / "GPUCache").replace(chromium_profile / "GPUCache")
+        (root / "selkies-tls.key").write_text("must-not-sync", encoding="utf-8")
+        with self.lock:
+            state = self._load()
+            state["browser_instances"][0]["profile_layout"] = "remote-worker-v1"
+            self._save(state)
+
+        self.engine.push()
+        client, manifest = self._remote_manifest()
+        archive = self.store.files[self._remote_profile_url(client, manifest, "inst1")]
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as package:
+            names = set(package.getnames())
+        self.assertIn("Default/Cookies", names)
+        self.assertNotIn("selkies-tls.key", names)
+        self.assertFalse(any(name.startswith("chromium-profile/") for name in names))
+
+        shutil.rmtree(chromium_profile)
+        result = self.engine.pull(force=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual((chromium_profile / "Default" / "Cookies").read_bytes(), b"cookie-data")
+        self.assertEqual((root / "selkies-tls.key").read_text(encoding="utf-8"), "must-not-sync")
+
     def test_subscription_only_push_rejects_tampered_remote_state(self):
         self.engine.push()
         client, manifest = self._remote_manifest()
@@ -698,6 +859,105 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertNotIn("encrypt_password", pub)
         self.assertIn("insecure_ssl", pub)
 
+    def test_url_userinfo_is_migrated_and_removed_from_public_settings(self):
+        raw = {
+            "url": "https://alice%40home:p%3Ass@[fd00::20]:8443/dav?folder=one",
+            "username": "",
+            "password": "",
+            "last_error": "failed https://alice%40home:p%3Ass@[fd00::20]:8443/dav",
+        }
+
+        cfg = webdav_sync.normalize_webdav_settings(raw)
+        public = webdav_sync.public_webdav_settings(cfg)
+
+        self.assertEqual(cfg["url"], "https://[fd00::20]:8443/dav?folder=one")
+        self.assertEqual(cfg["username"], "alice@home")
+        self.assertEqual(cfg["password"], "p:ss")
+        self.assertEqual(public["url"], cfg["url"])
+        self.assertNotIn("alice", public["last_error"])
+        self.assertNotIn("p%3Ass", public["last_error"])
+
+    def test_nested_url_userinfo_is_redacted_from_settings_and_errors(self):
+        nested = "https://dav.test/base?next=https://alice:top-secret@evil.test/path"
+        cfg = webdav_sync.normalize_webdav_settings(
+            {"url": nested, "last_error": f"redirect failed: {nested}"}
+        )
+        public = webdav_sync.public_webdav_settings(cfg)
+
+        self.assertNotIn("alice", cfg["url"])
+        self.assertNotIn("top-secret", cfg["url"])
+        self.assertNotIn("alice", public["last_error"])
+        self.assertNotIn("top-secret", public["last_error"])
+        self.assertIn("next=https://evil.test/path", public["url"])
+
+    def test_explicit_webdav_credentials_override_url_userinfo(self):
+        cfg = webdav_sync.normalize_webdav_settings(
+            {
+                "url": "https://url-user:url-pass@dav.test/base",
+                "username": "settings-user",
+                "password": "settings-pass",
+            }
+        )
+
+        self.assertEqual(cfg["url"], "https://dav.test/base")
+        self.assertEqual(cfg["username"], "settings-user")
+        self.assertEqual(cfg["password"], "settings-pass")
+
+    def test_update_settings_can_clear_credentials_from_userinfo_url(self):
+        result = self.engine.update_settings(
+            {
+                "url": "https://url-user:url-pass@dav.test/base",
+                "username": "",
+                "password": "",
+                "clear_password": True,
+            }
+        )
+        stored = self._load()["settings"]["webdav"]
+
+        self.assertEqual(result["url"], "https://dav.test/base")
+        self.assertEqual(result["username"], "")
+        self.assertFalse(result["password_set"])
+        self.assertEqual(stored["url"], "https://dav.test/base")
+        self.assertEqual(stored["username"], "")
+        self.assertEqual(stored["password"], "")
+
+    def test_webdav_client_strips_url_userinfo_and_validates_ports(self):
+        client = webdav_sync.WebDAVClient(
+            "https://alice%40home:p%3Ass@[fd00::20]:8443/dav"
+        )
+        self.assertEqual(client.base, "https://[fd00::20]:8443/dav")
+        self.assertEqual(client.username, "alice@home")
+        self.assertEqual(client.password, "p:ss")
+
+        for url in ("https://dav.test:bad/base", "https://dav.test:70000/base"):
+            with self.subTest(url=url), self.assertRaisesRegex(ValueError, "端口"):
+                webdav_sync.WebDAVClient(url)
+
+    def test_webdav_request_errors_redact_url_credentials(self):
+        client = webdav_sync.WebDAVClient("https://dav.test/base")
+        secret_url = "https://alice:top,secret;value@dav.test/private"
+        client._opener = mock.Mock()
+        client._opener.open.side_effect = webdav_sync.urllib.error.URLError(
+            f"cannot reach {secret_url}"
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            client.request("GET", secret_url)
+
+        message = str(caught.exception)
+        self.assertNotIn("alice", message)
+        self.assertNotIn("top,secret;value", message)
+        self.assertIn("https://dav.test/private", message)
+
+    def test_sync_failure_state_redacts_url_credentials(self):
+        secret_url = "https://alice:top-secret@dav.test/private"
+
+        cfg = self.engine._record_sync_failure(f"failed {secret_url}", "上传失败")
+
+        self.assertNotIn("alice", cfg["last_error"])
+        self.assertNotIn("top-secret", cfg["last_error"])
+        self.assertNotIn("alice", self._load()["settings"]["webdav"]["last_error"])
+
     def test_insecure_ssl_client_builds(self):
         client = webdav_sync.WebDAVClient(
             "https://example.invalid/dav",
@@ -707,6 +967,36 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         )
         self.assertTrue(client.insecure_ssl)
         self.assertIsNotNone(client._opener)
+
+    def test_webdav_redirects_stay_on_same_origin(self):
+        handler = webdav_sync._WebDAVRedirectHandler()
+        request = webdav_sync.urllib.request.Request(
+            "https://nas.local:8443/dav/a",
+            headers={"Authorization": "Basic secret"},
+        )
+
+        redirected = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "https://nas.local:8443/dav/b",
+        )
+        self.assertEqual(redirected.full_url, "https://nas.local:8443/dav/b")
+
+        for target in ("https://other.local:8443/dav/b", "http://nas.local:8443/dav/b"):
+            with self.subTest(target=target), self.assertRaisesRegex(
+                webdav_sync.urllib.error.HTTPError,
+                "跨源|降级",
+            ):
+                handler.redirect_request(request, None, 302, "Found", {}, target)
+
+    def test_webdav_keeps_private_nas_urls_supported(self):
+        for url in ("https://192.168.1.20/dav", "http://[fd00::20]/dav"):
+            with self.subTest(url=url):
+                client = webdav_sync.WebDAVClient(url)
+                self.assertEqual(client.base, url)
 
     def test_apply_remote_state_lww(self):
         local = {

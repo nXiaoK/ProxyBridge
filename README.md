@@ -9,9 +9,20 @@
 - 尝试解析 Clash/Mihomo YAML 中的 `proxies`。
 - 为节点生成本地代理端口,同一端口同时支持 SOCKS5 与 HTTP/HTTPS CONNECT；默认仅本机可用，也可在设置中按需共享给局域网设备。
 - HTTP 代理模式支持普通 HTTP 请求和 HTTPS CONNECT,兼容不支持 SOCKS5 的软件。
-- 普通协议走 `sing-box`，`VLESS + XHTTP` 自动走 `xray` fallback。
+- 节点可选择 `sing-box` 或 `xray`；双核心兼容节点可记忆偏好，并在首选核心启动失败时按设置尝试备用核心。
 - 菜单栏 App 默认不内置 `sing-box` / `xray`，首次运行时会自动下载到用户数据目录;也可构建时选择内置核心。
-- 桌面/普通无壳模式下，节点操作列可启动**独立指纹浏览器**(每节点独立指纹 + 独立 Profile),并自动绑定该节点的本地代理；Docker 模式会完整关闭该能力。
+- GitHub 下载缓慢或不可用时，可在别的电脑下载官方 Release，通过控制台「本地导入」上传并安装 `sing-box`、`xray` 或 fingerprint-chromium。
+- 桌面/普通无壳模式可启动本机**独立指纹浏览器**；默认 Docker Compose 则为每条浏览器记录动态创建一个可通过 HTTPS 链接访问的隔离 worker，同样使用独立指纹、独立 Profile 和对应节点代理。
+- macOS、Windows 与 Docker 的浏览器记录按最近使用时间倒序显示，并可单条永久删除记录及 Profile；Docker 运行记录还能从 Broker 按需查看当前访问账号和密码。
+- 测速结果显示年龄与过期状态，支持延迟/成功率排序、探测目标轮换，以及 3–5 路有界并发的可取消批量测速。
+- 订阅可配置周期自动刷新；请求使用 `ETag` / `Last-Modified`，失败时保留旧节点并指数退避，成功后报告节点增删改 diff。
+- 订阅页支持一次刷新全部 URL 订阅，任务可取消并显示逐项结果；每个订阅保留最近 20 次成功、304、失败或取消历史。取消会停止调度后续订阅，已经发出的当前请求会完成并保留真实结果。
+- 默认只允许订阅 URL 解析到公网地址；使用 TUN fake-IP（如 `198.18.0.0/15`）或可信局域网订阅时，可在订阅页显式开启“允许非公网订阅地址”。
+- 局域网代理支持 Basic 或 Token 认证、IP/CIDR 白名单、连接数上限、客户端列表与一键断开。
+- 智能代理池支持延迟/健康策略、健康评分、熔断自动恢复和单节点临时排除。
+- 智能网关提供固定 SOCKS5/HTTP 入口（默认 `21000`），按健康、延迟、轮询或随机策略从就绪代理池选择节点；隧道建立后不迁移。
+- 日志中心支持服务端分页、总数、CSV/JSON 导出、按日/大小轮转、保留周期和磁盘配额。
+- 诊断中心检查核心、端口、数据目录、GitHub、WebDAV、代理出口及 DNS/WebRTC 风险；联网项目默认关闭并明确列出目标。
 
 ## 运行要求
 
@@ -23,21 +34,23 @@
 ### 无壳跨平台 Web 控制台
 - Python 3.10+
 - macOS / Linux / Windows
-- 首次运行需要能访问 GitHub，用于自动下载 `sing-box` / `xray`
+- 首次运行需要能访问 GitHub 自动下载 `sing-box` / `xray`，或提前在其他电脑下载官方包后通过控制台本地导入
 - 指纹浏览器一键下载依赖上游是否发布对应平台包；也可手动设置 `PROXY_BRIDGE_FP_CHROMIUM`
 
 ### Docker
-- Docker Engine 24+ / Docker Compose v2（推荐）
-- 当前支持 `linux/amd64` 与 `linux/arm64`
-- Web 控制台与代理端口通过宿主机回环地址访问
-- 不安装或启用指纹浏览器；WebDAV 仅同步订阅 / 节点
+- Docker Engine API 1.45+（通常为 Docker Engine 26+）/ Docker Compose v2；远程浏览器依赖命名卷 `volume-subpath`
+- 主服务支持 `linux/amd64` 与 `linux/arm64`；远程浏览器 worker 当前固定为 `linux/amd64`
+- `arm64` 宿主机运行远程浏览器需要 Docker 的 amd64 仿真，性能较低，且不保证 GPU 加速可用
+- Web 控制台、代理端口和远程浏览器端口默认仅通过宿主机回环地址访问
+- 首次使用远程浏览器需从控制台下载 Linux 指纹内核；已停止的 Docker 浏览器 Profile 可参与 WebDAV 同步
 
-## Windows / Linux 文档入口
+## 文档入口
 
-完整安装与使用教程（双击 exe、托盘、无壳控制台、开机自启、systemd、排障）：
+安装、部署、排障与开发资料：
 
 - [Windows / Linux 安装与使用教程](docs/windows-linux-install.md)
 - [Docker 运行教程](docs/docker.md)
+- [开发文档：架构、API、测试与扩展](doc/development-guide.md)
 
 快速选择：
 
@@ -94,11 +107,11 @@ outputs/ProxyBridgeMenuBar.app
 - 右键点击 `PB`：打开快捷菜单。
 - 控制台里可以导入订阅、筛选节点、启动并复制 SOCKS5 或 HTTP/HTTPS 代理地址、停止端口。
 - 节点操作列的 `浏览器` 按钮会用**指纹内核**(fingerprint-chromium)创建/复用该节点专属 Profile,底层伪造整套浏览器指纹,并绑定该节点本地代理。若节点还未启动本地代理,会先自动启动;若指纹内核缺失,会提示先下载。
-- 每个节点都有 `测试` / `重测`，会临时启动该节点并通过 SOCKS5 访问 `cp.cloudflare.com/generate_204`，显示真实可通信状态和延迟。
-- `测试可见节点` 会按当前筛选结果批量测试。
+- 每个节点都有 `测试` / `重测`，会临时启动该节点并通过 SOCKS5 访问设置中的探测目标，显示通信状态、延迟、成功率、结果年龄与过期状态。
+- `测试可见节点` 会按当前筛选结果使用 3–5 路有界并发批量测试，支持逐项结果、失败重试和取消；单次上限 500 个节点。
 - 控制台底部的 `连接日志` 会显示通过本地代理的 CONNECT/HTTP 目标、客户端本地端口、使用节点、代理协议、上下行流量、耗时和成功/失败状态。
 - 运行中的每个本地代理卡片会显示累计上行、下行和合计流量,并分别展示 SOCKS5 URL 与 HTTP/HTTPS 代理 URL。
-- 连接日志支持关键词搜索、按节点筛选和按状态筛选。
+- 连接日志支持关键词搜索、按节点/状态筛选、分页，以及 CSV/JSON 导出。
 - 控制台侧边栏「通用设置」可开启**局域网共享**；开关会立即重绑正在运行的代理端口，并展示局域网设备可直接使用的 SOCKS5 / HTTP 地址。
 
 连接日志记录的是本地代理层能看到的目标域名/IP 与端口；HTTPS 通过 CONNECT 建立隧道,内容不会被解密，第一版也不会自动识别 macOS 进程名。
@@ -113,9 +126,30 @@ outputs/ProxyBridgeMenuBar.app
 
 - 每个节点从 `node_id` 确定性派生固定的 `--fingerprint` 种子——**同一节点每次启动指纹完全一致(环境可恢复),不同节点指纹互不相同(避免被网站关联为同一设备)**。
 - 时区(`--timezone`)与语言(`--lang` / `--accept-lang`)按节点地区自动匹配,使浏览器时区/语言与代理出口地区一致,降低不一致被风控识别的概率。
-- 使用代理时强制 `--disable-non-proxied-udp`,防止 WebRTC 通过 STUN 泄漏真实 IP。
+- 使用代理时强制 `--webrtc-ip-handling-policy=disable_non_proxied_udp`，阻止非代理 UDP 候选。
 
-指纹内核约 150–250MB,可点击控制台顶部的 `下载指纹内核` 一键安装(按本机架构从 GitHub Releases 下载并去除 Gatekeeper 隔离属性),或手动下载后用环境变量 `PROXY_BRIDGE_FP_CHROMIUM` 指向 Chromium 可执行文件。由于该内核并非每个版本都发布 macOS 包,如自动下载未命中可稍后重试或手动放置。
+指纹内核约 150–250MB,可点击控制台侧边栏底部的 `下载指纹内核` 一键安装(按本机架构从 GitHub Releases 下载并去除 Gatekeeper 隔离属性)，也可点击旁边的 `本地导入` 上传完整发布包，或手动下载后用环境变量 `PROXY_BRIDGE_FP_CHROMIUM` 指向 Chromium 可执行文件。由于该内核并非每个版本都发布 macOS 包,如自动下载未命中可稍后重试或使用本地导入。
+
+## 本地导入代理与指纹内核
+
+当 NAS、服务器或当前电脑访问 GitHub Releases 很慢时，可先在网络正常的电脑上下载官方文件，再打开 ProxyBridge 控制台侧边栏底部的「本地导入」：
+
+1. 选择 `sing-box`、`Xray` 或 `fingerprint-chromium`。
+2. 选择未经改名的官方 Release 文件；页面会显示当前目标 OS/架构和支持格式。
+3. 可选填写官方提供的 64 位 SHA-256；留空时服务端仍会计算实际 SHA-256 并在成功结果中返回。
+4. 停止正在使用目标代理核心的本地代理；替换指纹内核前需停止所有浏览器实例，然后上传并安装。
+
+常见 Linux amd64 文件名示例：
+
+| 目标 | 文件示例 | 支持格式 |
+|---|---|---|
+| sing-box | `sing-box-1.13.15-linux-amd64-glibc.tar.gz` | `.tar.gz`、`.tgz`、`.zip` |
+| Xray | `Xray-linux-64.zip` | `.zip` |
+| fingerprint-chromium | `fingerprint-chromium_linux_x64.zip`（以实际上游文件名为准） | `.zip`、`.tar.gz`、`.tgz`、`.tar.xz`、`.tar`；macOS 另支持 `.dmg` |
+
+必须保留官方文件名，因为后端会用其中的系统与 CPU 架构标记拒绝错误平台包。Docker 远程浏览器固定使用 Linux x86_64 指纹包，上传的必须是包含可执行 `chrome-wrapper` 及相邻资源的完整目录包，不能只上传单个 `chrome`，也不支持 `.7z`。单个上传文件最大 2 GiB，解压后总大小最大 4 GiB；文件按 1 MiB 分块写入私有暂存目录，不会整体读入服务端内存。
+
+本地导入只验证文件结构、平台、可执行性及可选校验值，不能证明发布来源。只应从 sing-box、Xray 和 fingerprint-chromium 的可信官方 Release 获取文件。
 
 如果 App 是从本项目的 `outputs/` 目录启动，首次运行会尝试迁移旧 Web 版的 `work/state.json`。
 
@@ -154,11 +188,13 @@ python3 app.py --port 8790 --workdir ~/.proxybridge --open
 python app.py --port 8790 --workdir $env:APPDATA\ProxyBridge --open
 ```
 
-打开：
+启动后使用终端打印的完整认证地址，例如：
 
 ```text
-http://127.0.0.1:8787
+Proxy Bridge console: http://127.0.0.1:8787/#token=...
 ```
+
+`--open` 会直接打开这个地址。页面接收令牌后会立即清除地址栏中的 fragment，并将令牌仅保存在当前标签页的会话状态中；刷新当前标签页仍可使用，另开标签页时需重新使用启动输出中的完整地址。
 
 常用环境变量 / 参数：
 
@@ -175,31 +211,66 @@ http://127.0.0.1:8787
 说明：
 
 - 无壳模式与菜单栏 App 共用同一套 `app.py` 后端与 `static/` 前端。
-- 代理核心会按当前操作系统/架构从 GitHub Releases 自动选择 Linux / Windows / macOS 包。
+- 代理核心会按当前操作系统/架构从 GitHub Releases 自动选择 Linux / Windows / macOS 包；下载受阻时可通过控制台「本地导入」安装同一官方包。
 - 指纹浏览器若上游未提供当前平台安装包，可手动下载后通过 `PROXY_BRIDGE_FP_CHROMIUM` 指向可执行文件。
 - 管理控制台默认仅本机访问；局域网共享开关只影响本地代理端口，不会把控制台暴露到局域网。
+- 除 Docker 健康检查使用的 `HEAD /api/status` 外，管理 API 都需要当前后端实例令牌；直接打开不含 `#token=...` 的裸地址无法执行管理操作。
+
+脚本调用管理 API 时，可在启动后端前设置自选的高强度 `PROXY_BRIDGE_INSTANCE_TOKEN`，并在每个请求中发送同一个令牌：
+
+```bash
+export PROXY_BRIDGE_INSTANCE_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+python3 app.py &
+curl --retry 10 --retry-connrefused \
+  -H "X-ProxyBridge-Instance: ${PROXY_BRIDGE_INSTANCE_TOKEN}" \
+  http://127.0.0.1:8787/api/status
+```
+
+上述命令在 shell 中生成随机值，实际令牌不会写入命令历史。令牌应按密码保护，不要放入 URL query、公开日志或代码仓库。未显式设置时，后端每次启动都会生成新令牌，并只通过启动时打印的 URL fragment 交付。
 
 ## Docker 运行
 
-Docker 模式直接提供 Web 控制台和本地代理，不包含托盘、系统浏览器调用或指纹浏览器功能。
+默认 Compose 同时提供 Web 控制台、本地代理和远程指纹浏览器。浏览器不在主容器内运行：内部 Browser Broker 会为每条运行记录创建一个 `lscr.io/linuxserver/chromium` worker，并把该记录的固定指纹、独立 Profile 和节点 SOCKS5 代理交给它。未配置 Broker 的单容器 `docker run` 仍保持禁用浏览器的安全行为。
 
 ```bash
 docker compose up -d --build
+docker compose logs --tail=50 proxybridge
 ```
 
-打开：
+从最新启动日志中复制完整的 `Proxy Bridge console:` 地址，不要只打开裸端口地址：
 
 ```text
-http://127.0.0.1:8787
+Proxy Bridge console: http://127.0.0.1:8787/#token=...
 ```
 
 Compose 默认：
 
-- 使用 `proxybridge-data` 命名卷持久化 `/data`。
+- 使用 `proxybridge-data` 命名卷持久化 `/data`。远程浏览器通过 Docker Engine API 1.45+ 的 `volume-subpath` 只挂载对应 Profile 与指纹内核，因此此模式不支持把 `/data` 改为宿主机 bind mount。
 - Web 控制台默认仅发布到宿主机 `127.0.0.1:8787`；可通过 `.env` 中的 `PROXY_BRIDGE_CONSOLE_HOST=<宿主机局域网 IPv4>` 精确开放给局域网。
 - 代理端口范围发布为 `127.0.0.1:21080-21179`，容器内自动分配也限制在相同范围。
-- 首次启动自动下载 Linux 版 `sing-box` / `xray` 到数据卷。
-- WebDAV 页面显示「仅订阅 / 节点」；上传不会删除远端已有浏览器 Profile，拉取也不会处理本地 Profile。
+- 首次启动自动下载 Linux 版 `sing-box` / `xray` 到数据卷；下载受阻时可从控制台上传官方包替代。
+- 每个浏览器实例从 `23000-23099` 动态占用一个 Broker TLS TCP 中继端口；默认只绑定宿主机 `127.0.0.1`。worker 仍只加入 internal 网络，不直接发布 HostPort，也不能借入口网络绕过节点代理出网。
+- worker 的 `/config` 使用随容器删除的匿名运行卷，只有 `/config/browser-profile` 指向持久化 Profile；Selkies 的 TLS、认证和其他运行文件不会进入 WebDAV Profile。
+- 每个 worker 只能免认证连接分配给自己的节点代理端口；主服务按 Broker 返回的精确 worker IP 与代理端口配对校验，不信任整个 worker 子网。
+- 浏览器功能启用时，WebDAV 可同步已停止的 Docker 浏览器 Profile；禁用 Broker 后才退回「仅订阅 / 节点」。
+- Broker 启动时会回收上次异常退出遗留的 worker；Compose 为主服务和 Broker 都保留 3 分钟停止宽限期，以完成 worker 回收与 Profile 落盘。
+
+首次使用时，先在控制台点击「下载指纹内核」，或通过「本地导入」上传 Linux x86_64 完整发布包，等待内核保存到 `/data/fingerprint-chromium/`。然后在节点行点击「浏览器」：弹窗默认用户名为 `proxybridge`，并在本地生成可复制、可修改的随机强密码；提交后会创建独立 worker，并自动打开返回的远程链接。第一次创建前还需拉取较大的 `lscr.io/linuxserver/chromium:latest` Worker 镜像；控制台会提示镜像是否已经缓存，网络受阻时可按 Docker 文档使用 `docker pull` 或在其他电脑 `docker save` 后到服务器 `docker load`。运行中的「浏览器记录」可再次「远程打开」「查看凭证」或「停止」；停止后凭证 secret 立即销毁。密码不会写入状态文件、状态 API 或 WebDAV。单条记录的「删除」会先停止 worker，再永久删除本地 Profile 和状态记录。
+
+若要让同一可信局域网或 VPN 中的其他电脑直接打开控制台和浏览器链接，在仓库根目录创建 `.env`，三项均填写 Docker 宿主机的同一个私有 IPv4：
+
+```dotenv
+# Web 控制台发布地址；只填宿主机明确的私有 IPv4，不能填 0.0.0.0。
+PROXY_BRIDGE_CONSOLE_HOST=192.168.1.20
+# Browser Broker HTTPS 中继的宿主机绑定地址；只允许回环或宿主机明确的私有 IPv4。
+PROXY_BRIDGE_BROWSER_HOST=192.168.1.20
+# 控制台生成浏览器链接时使用的地址；通常必须与上一项相同。
+PROXY_BRIDGE_BROWSER_PUBLIC_HOST=192.168.1.20
+```
+
+重新创建服务后，只在宿主机防火墙中向可信网段开放 TCP `8787` 和 `23000-23099`。每个 worker 会在本次容器的匿名 `/config` 运行卷中动态生成自签名证书，浏览器首次访问会显示证书警告；内置 Basic Auth 只适合作为可信 LAN/VPN 内的便利防护。**不得把这些端口直接发布到公网**；公网访问必须在前面部署使用受信任证书的 TLS 反向代理，并增加 SSO 或等效的强认证。
+
+> Browser Broker 挂载了 `/var/run/docker.sock`。即使 Compose 标记为 `:ro`，Docker API 仍可创建/删除容器及挂载宿主机路径，权限事实上接近宿主机 root。不要在不可信或多租户 Docker 主机上部署，也不要把 Broker 控制网络或凭证卷暴露给其他容器。
 
 完整的 `docker run`、端口扩容、数据卷、离线核心、SSH 隧道和排障步骤见 [`docs/docker.md`](docs/docker.md)。
 
@@ -281,6 +352,12 @@ python -m desktop.tray_host --port 18787
 .\scripts\build_windows_exe.ps1
 ```
 
+如果 `python` 被 Windows 的 Microsoft Store 执行别名拦截，可显式指定真实解释器路径：
+
+```powershell
+.\scripts\build_windows_exe.ps1 -Python "C:\Users\<用户名>\AppData\Local\Programs\Python\Python312\python.exe"
+```
+
 构建产物：
 
 ```text
@@ -335,10 +412,11 @@ Windows 额外可用快捷方式脚本（桌面 + 开机启动）：
 
 默认情况下，所有代理端口都只监听 `127.0.0.1`，其他局域网设备无法连接。在控制台侧边栏进入 **「通用设置」**，开启 **「允许局域网设备连接本地代理」** 后：
 
-- 外层 SOCKS5 / HTTP 代理会监听 `0.0.0.0`，但只接受本机与 RFC1918 私有 IPv4 来源（`10/8`、`172.16/12`、`192.168/16`）；设置页会优先显示物理网卡的私有 IP 和可复制地址。
+- 外层 SOCKS5 / HTTP 代理会监听 `0.0.0.0`；默认白名单仅包含本机与 RFC1918 私有 IPv4，也可在设置中配置最多 32 条 IP/CIDR。
 - 正在运行的代理会立即重新绑定，无需重启 App；切换时已有代理连接会中断并需重新连接。
 - 管理控制台及管理 API 仍只监听 `127.0.0.1`，不会向局域网开放。
-- 代理端口当前没有用户名或密码；可达本机的私有网络/VPN 客户端都可能使用。请只在可信网络开启，并留意 macOS 防火墙是否允许入站连接。
+- 可选择无认证、用户名密码或 Token；SOCKS5 使用 RFC 1929 用户名密码认证，HTTP 代理接受 Basic/Bearer 凭据。
+- 可设置全局活动连接上限；设置页显示当前客户端、来源 IP、代理和连接时长，并支持一键断开。
 
 关闭开关后，运行中的代理会立即恢复为仅本机监听。
 
@@ -346,7 +424,7 @@ Windows 额外可用快捷方式脚本（桌面 + 开机启动）：
 
 桌面/普通无壳模式支持同步**订阅 / 节点**与**指纹浏览器 Profile**（Cookie、LocalStorage 等），用于换机接力。
 
-Docker / 禁用浏览器模式会自动切换为**仅订阅 / 节点同步**：不会打包、下载或删除 Profile；如果相同远端目录中已有桌面版浏览器数据，Docker 上传会验证并保留它们。
+默认 Docker Compose 的远程浏览器也支持同步**订阅 / 节点**与**已停止的浏览器 Profile**。只有未配置 Broker 或显式禁用浏览器的 Docker/其他模式才会切换为**仅订阅 / 节点同步**：不会打包、下载或删除 Profile；如果相同远端目录中已有浏览器数据，上传会验证并保留它们。
 
 控制台侧边栏 **「WebDAV 同步」**：
 
@@ -361,11 +439,12 @@ Docker / 禁用浏览器模式会自动切换为**仅订阅 / 节点同步**：�
 - 运行中的浏览器**不会**被上传；请先关闭再同步。
 - 不要两边同时打开同一浏览器实例。
 - **删除订阅**会停止并删除关联节点的指纹浏览器记录与本地 Profile；WebDAV 已启用时会**自动全量上传**，远端 `state` 与多余 `profiles/*.tar.gz` 一并清理。
-- 打开节点 **浏览器记录** 时（WebDAV 已启用）会先**自动拉取**一次远端。
-- 浏览器记录支持 **标签**（如「访问 xx 的浏览器」）；保存标签会标记本地变更并尝试同步。
-- 关闭浏览器窗口或点「停止」（且开启「关闭后自动上传」）会**自动上传**该 Profile（含标签）。
+- 在 macOS、Windows 或 Docker 的 **浏览器记录** 中单条点击「删除」，会先停止对应进程/worker，再永久删除该记录及本地 Profile；WebDAV 已启用时同样自动全量上传并清理远端记录与 Profile 包。
+- 打开节点 **浏览器记录** 时（WebDAV 已启用）会先**自动拉取**一次远端；若检测到本地未上传变更，会保留本地记录并提示先上传，避免旧远端快照覆盖新记录。
+- 浏览器记录按最近创建、启动或停止时间倒序显示，并支持 **标签**（如「访问 xx 的浏览器」）；保存标签会标记本地变更并尝试同步。
+- 本机浏览器窗口退出、在控制台点浏览器「停止」，或在「本地代理」停止关联节点（且开启「关闭后自动上传」）会**自动上传**该 Profile（含标签）；远程 worker 关闭网页标签不等于停止实例，需在「浏览器记录」中点击「停止」。
 - 拉取时以远端为权威：本机多出来的订阅/节点/浏览器记录会被移除，对应本地 Profile 目录也会清理。
-- Docker / 禁用浏览器模式下，上述覆盖与清理只适用于订阅和节点，本地浏览器记录/Profile 保持不变。
+- 未配置 Broker 或显式禁用浏览器时，上述覆盖与清理只适用于订阅和节点，本地浏览器记录/Profile 保持不变。
 - 可选：关闭浏览器后自动上传、启动时检查远端更新、**忽略 SSL 证书**（过期/自签）。
 - 可选：PBENC2 端到端加密（PBKDF2 + OpenSSL AES-256-CBC + HMAC 完整性校验）；本机需有 `openssl`。仍可读取旧 PBENC1 数据，新上传统一使用 PBENC2。
 - 冲突策略为远端后写覆盖（LWW），并记录设备 ID。
@@ -400,8 +479,29 @@ curl -sS "http://127.0.0.1:8787/pool/<token>/get?strategy=random&protocol=socks5
 - `list.json` / `proxies.txt` 返回**可发现**成员，可能短暂包含尚未就绪的 `starting` 端口。
 - `/get` 默认只返回**已就绪**端口（`running` 且本地代理进程活跃）；需要包含启动中成员时可加 `?include_starting=1`。
 - `proxies.txt` 默认每个成员输出 socks5 一行 + http 一行；可用 `?protocol=socks5` 或 `http` 收窄。
+- `/get` 支持 `random`、`round_robin`、`health` 和 `latency` 策略；健康策略综合 EWMA 延迟、测速成功率和连续失败。
+- 连续失败会打开熔断器，冷却后仅放行一次 half-open 探测；成功后自动恢复。控制台也可将单个成员临时排除最多 7 天。
 - 轮换密钥后旧链接立即失效（控制台「轮换密钥」，或 `POST /api/pool/token/rotate`）。
 - 代理池 HTTP 接口和管理控制台始终只监听 `127.0.0.1`；即使开启局域网共享，远端设备也只能使用设置页列出的直连代理地址。access log 会脱敏 path 中的 token。
+
+### 智能网关
+
+在「本地代理」页启用智能网关后，会创建一个稳定入口（默认 `21000`），客户端只需配置一次 SOCKS5 或 HTTP 地址。每个新连接根据所选策略从健康且已就绪的代理池成员中选择；连接建立后保持该节点，节点失败只影响当前连接。网关会把连接失败反馈给代理池熔断器，不重复计入普通 Bridge 流量。
+
+网关端口必须与普通代理端口不同，并遵循当前局域网监听和认证设置。Docker Compose 当前只发布动态代理端口范围，没有独立的 `21000` 映射，因此 Docker 模式会明确禁用智能网关；如需使用，请在宿主机模式运行或自行规划并发布固定端口后再扩展配置。
+
+## 诊断中心
+
+控制台侧边栏 **「诊断中心」** 默认只运行本地检查：
+
+- 读取 `sing-box` / `xray` 版本并核验可执行性。
+- 检查控制台和活动代理是否真实监听，以及 Docker 代理端口是否处于发布范围。
+- 检查工作目录、运行目录、状态文件的读写权限、POSIX 权限和剩余磁盘空间。
+- 在当前浏览器采集 WebRTC ICE 候选；不配置第三方 STUN，无候选时只报告“可能被隐藏”，不会误判为安全。
+
+勾选 **「包含网络检查」** 后，才会额外访问固定的 `api.github.com`、已配置的 WebDAV，以及经所选 SOCKS5 代理访问 `api.ipify.org`。WebDAV URL 不是 HTTPS 或关闭证书校验时，诊断会报告风险但不会发送账号凭据。出口 IP、LAN 地址和诊断结果不会写入状态文件。
+
+DNS 项验证 ProxyBridge 把诊断域名交给 SOCKS5 远端解析；它无法观察操作系统或其他浏览器请求，因此只作为风险提示，不能替代系统级抓包或专用泄漏测试。
 
 ## 数据位置
 
@@ -415,3 +515,19 @@ Web 控制台模式：
 状态保存采用临时文件 + `fsync` + 原子替换；主状态损坏或缺失时会尝试读取 `.bak`，两者都不可用时会拒绝以空状态启动，避免静默丢失数据。数据目录权限为 `0700`，状态与运行日志等敏感文件为 `0600`。
 
 第一版会把节点参数保存在本地明文状态文件中。后续版本建议接入 macOS Keychain。
+
+## 测试
+
+本地离线验证与 CI 的核心命令：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+node --check static/auth.js
+node --check static/diagnostics.js
+node --check static/browser-ui.js
+node --check static/core-upload.js
+node --check static/app.js
+node --test tests/test_frontend_*.js
+bash -n scripts/*.sh
+git diff --check
+```

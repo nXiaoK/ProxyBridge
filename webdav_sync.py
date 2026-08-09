@@ -50,11 +50,18 @@ MAX_STATE_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_SYNC_ITEMS = 100_000
 MAX_HTTP_ERROR_BYTES = 64 * 1024
+WEBDAV_REDIRECT_LIMIT = 5
 PBENC1_MAGIC = b"PBENC1"
 PBENC2_MAGIC = b"PBENC2"
 PBENC2_SALT_BYTES = 16
 PBENC2_TAG_BYTES = 32
 PBENC2_KDF_ITERATIONS = 200_000
+URL_IN_TEXT_PATTERN = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
+URL_USERINFO_PATTERN = re.compile(r"(https?://)[^/?#\s<>'\"]*@", re.IGNORECASE)
+AUTHORIZATION_IN_TEXT_PATTERN = re.compile(
+    r"\b((?:proxy-)?authorization)\s*:\s*[^\r\n,;；，]+",
+    re.IGNORECASE,
+)
 
 # Chromium profile noise that is large and/or unsafe to copy while hot.
 PROFILE_EXCLUDE_DIR_NAMES = {
@@ -106,6 +113,48 @@ def _default_log(message: str, level: str = "info", category: str = "同步") ->
     print(f"[{level}] [{category}] {message}", flush=True)
 
 
+def _redact_url_userinfo(value: str) -> str:
+    raw = str(value or "")
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        match = re.match(r"(https?://)([^/?#]*)(.*)\Z", raw, re.IGNORECASE | re.DOTALL)
+        if match and "@" in match.group(2):
+            raw = f"{match.group(1)}{match.group(2).rsplit('@', 1)[1]}{match.group(3)}"
+        return URL_USERINFO_PATTERN.sub(r"\1", raw)
+    if "@" in parsed.netloc:
+        netloc = parsed.netloc.rsplit("@", 1)[1]
+        raw = urllib.parse.urlunsplit(
+            (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+        )
+    return URL_USERINFO_PATTERN.sub(r"\1", raw)
+
+
+def redact_sensitive_text(value: Any) -> str:
+    text = str(value or "")
+    text = AUTHORIZATION_IN_TEXT_PATTERN.sub(r"\1: ***", text)
+    text = URL_USERINFO_PATTERN.sub(r"\1", text)
+    return URL_IN_TEXT_PATTERN.sub(lambda match: _redact_url_userinfo(match.group(0)), text)
+
+
+def _normalized_webdav_url(value: Any) -> tuple[str, str, str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return "", "", ""
+    safe_url = _redact_url_userinfo(raw)
+    try:
+        parsed = urllib.parse.urlsplit(raw)
+    except ValueError:
+        return safe_url, "", ""
+    if "@" not in parsed.netloc:
+        return safe_url, "", ""
+    username = urllib.parse.unquote(parsed.username or "")
+    password = urllib.parse.unquote(parsed.password or "")
+    if any(ord(char) < 32 for char in username + password):
+        return safe_url, "", ""
+    return safe_url, username, password
+
+
 def new_device_id() -> str:
     return secrets.token_hex(8)
 
@@ -141,9 +190,14 @@ def normalize_webdav_settings(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return base
     base.update({k: raw.get(k, base[k]) for k in base})
-    base["url"] = str(base.get("url") or "").strip()
+    safe_url, embedded_username, embedded_password = _normalized_webdav_url(base.get("url"))
+    base["url"] = safe_url
     base["username"] = str(base.get("username") or "").strip()
     base["password"] = str(base.get("password") or "")
+    if not base["username"] and embedded_username:
+        base["username"] = embedded_username
+    if not base["password"] and embedded_password:
+        base["password"] = embedded_password
     try:
         base["remote_root"] = _normalize_remote_root(base.get("remote_root"))
     except ValueError:
@@ -168,8 +222,8 @@ def normalize_webdav_settings(raw: Any) -> dict[str, Any]:
             except (TypeError, ValueError):
                 base[key] = None
     base["last_applied_state_sha256"] = str(base.get("last_applied_state_sha256") or "").strip().lower()
-    base["last_error"] = str(base.get("last_error") or "")
-    base["last_status"] = str(base.get("last_status") or "")
+    base["last_error"] = redact_sensitive_text(base.get("last_error"))
+    base["last_status"] = redact_sensitive_text(base.get("last_status"))
     return base
 
 
@@ -252,17 +306,6 @@ def remote_is_already_latest(cfg: dict[str, Any], manifest: dict[str, Any]) -> b
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _normalize_remote_root(value: Any) -> str:
@@ -600,6 +643,13 @@ def sanitize_browser_instance_for_sync(instance: dict[str, Any]) -> dict[str, An
     record["pid"] = None
     record["bridge_id"] = None
     record["proxy"] = ""
+    # 远程 worker 的地址、容器和用户名都是本机运行时信息；跨设备只同步 Profile
+    # 布局与固定指纹，不传播可能失效或由远端状态注入的访问链接。
+    record["remote_worker"] = False
+    record["remote_url"] = ""
+    record["remote_container_id"] = ""
+    record["remote_host_port"] = None
+    record["remote_username"] = ""
     # Keep free-text label/tag for cross-machine notes (e.g. 访问 xx 的浏览器).
     label = str(record.get("label") or record.get("tag") or "").strip()
     if len(label) > 120:
@@ -828,6 +878,34 @@ def _serialized_sync_operation(method: Callable[..., Any]) -> Callable[..., Any]
     return wrapped
 
 
+class _WebDAVRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = WEBDAV_REDIRECT_LIMIT
+
+    @staticmethod
+    def _origin(url: str) -> tuple[str, str, int]:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise urllib.error.HTTPError(url, 403, "WebDAV 重定向目标必须是 HTTP(S) URL", {}, None)
+        try:
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise urllib.error.HTTPError(url, 403, "WebDAV 重定向端口无效", {}, None) from exc
+        return parsed.scheme, parsed.hostname.lower(), port
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> Any:
+        old_origin = self._origin(req.full_url)
+        new_origin = self._origin(newurl)
+        if old_origin != new_origin:
+            raise urllib.error.HTTPError(
+                newurl,
+                403,
+                "WebDAV 拒绝跨源或协议降级重定向",
+                headers,
+                fp,
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class WebDAVClient:
     """Minimal WebDAV client (Basic auth) using urllib."""
 
@@ -843,22 +921,47 @@ class WebDAVClient:
         raw = (base_url or "").strip()
         if not raw:
             raise ValueError("WebDAV URL 不能为空")
-        parsed = urllib.parse.urlsplit(raw)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        safe_url, embedded_username, embedded_password = _normalized_webdav_url(raw)
+        try:
+            parsed = urllib.parse.urlsplit(safe_url)
+            parsed_port = parsed.port
+        except ValueError as exc:
+            raise ValueError("WebDAV URL 主机或端口无效") from exc
+        if (
+            parsed.scheme.lower() not in {"http", "https"}
+            or not parsed.netloc
+            or not parsed.hostname
+            or any(ord(char) < 32 for char in safe_url)
+        ):
             raise ValueError("WebDAV URL 必须是 http(s)://host[/path]")
         # Normalize trailing slash off for join logic; collections use explicit slash.
         path = parsed.path or "/"
-        self.base = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path.rstrip("/"), "", ""))
-        self.username = username or ""
-        self.password = password or ""
+        netloc = parsed.hostname
+        if ":" in netloc and not netloc.startswith("["):
+            netloc = f"[{netloc}]"
+        if parsed_port is not None:
+            netloc = f"{netloc}:{parsed_port}"
+        self.base = urllib.parse.urlunsplit(
+            (parsed.scheme.lower(), netloc, path.rstrip("/"), "", "")
+        )
+        self.username = username or embedded_username
+        self.password = password or embedded_password
         self.timeout = timeout
         self.insecure_ssl = bool(insecure_ssl)
         if self.insecure_ssl:
             # Allow expired / self-signed certificates (user opt-in).
             ctx = ssl._create_unverified_context()
-            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+            self._opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(context=ctx),
+                _WebDAVRedirectHandler(),
+            )
         else:
-            self._opener = urllib.request.build_opener(urllib.request.HTTPSHandler())
+            self._opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}),
+                urllib.request.HTTPSHandler(),
+                _WebDAVRedirectHandler(),
+            )
 
     def _auth_header(self) -> str | None:
         if not self.username and not self.password:
@@ -906,6 +1009,7 @@ class WebDAVClient:
         read_body: bool = True,
     ) -> tuple[int, dict[str, str], bytes]:
         req_headers = dict(headers or {})
+        safe_url = _redact_url_userinfo(url)
         auth = self._auth_header()
         if auth:
             req_headers["Authorization"] = auth
@@ -917,7 +1021,8 @@ class WebDAVClient:
                 body = self._read_limited(response, max_body_bytes) if read_body else b""
                 if allow_statuses is not None and int(status) not in allow_statuses:
                     message = body.decode("utf-8", "ignore")[:300] if body else "unexpected status"
-                    raise RuntimeError(f"WebDAV {method} {url} 失败 ({status}): {message}")
+                    message = redact_sensitive_text(message)
+                    raise RuntimeError(f"WebDAV {method} {safe_url} 失败 ({status}): {message}")
                 return int(status), resp_headers, body
         except urllib.error.HTTPError as exc:
             body = (
@@ -930,9 +1035,10 @@ class WebDAVClient:
                 resp_headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
                 return status, resp_headers, body
             message = body.decode("utf-8", "ignore")[:300] if body else str(exc)
-            raise RuntimeError(f"WebDAV {method} {url} 失败 ({status}): {message}") from exc
+            message = redact_sensitive_text(message)
+            raise RuntimeError(f"WebDAV {method} {safe_url} 失败 ({status}): {message}") from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"WebDAV 连接失败: {exc}") from exc
+            raise RuntimeError(f"WebDAV 连接失败: {redact_sensitive_text(exc)}") from exc
 
     def ensure_collection(self, url: str) -> None:
         collection_url = url if url.endswith("/") else url + "/"
@@ -1073,7 +1179,11 @@ class SyncEngine:
         self.log = log or _default_log
         self.client_factory = client_factory or self._default_client
         self._operation_lock = threading.RLock()
-        self._bg_lock = threading.Lock()
+        self._auto_queue_lock = threading.Lock()
+        self._auto_worker_running = False
+        self._auto_full_push_pending = False
+        self._auto_instance_ids: set[str] = set()
+        self._auto_reasons: list[str] = []
 
     def _default_client(self, cfg: dict[str, Any]) -> WebDAVClient:
         return WebDAVClient(
@@ -1104,7 +1214,18 @@ class SyncEngine:
             state = self.load_state()
             cfg = self.get_settings(state)
             if "url" in payload:
-                cfg["url"] = str(payload.get("url") or "").strip()
+                safe_url, embedded_username, embedded_password = _normalized_webdav_url(
+                    payload.get("url")
+                )
+                cfg["url"] = safe_url
+                if "username" not in payload and not cfg.get("username"):
+                    cfg["username"] = embedded_username
+                if (
+                    "password" not in payload
+                    and not payload.get("clear_password")
+                    and not cfg.get("password")
+                ):
+                    cfg["password"] = embedded_password
             if "username" in payload:
                 cfg["username"] = str(payload.get("username") or "").strip()
             if "password" in payload:
@@ -1260,7 +1381,12 @@ class SyncEngine:
         node_id = str(instance.get("node_id") or "")
         instance_id = str(instance.get("id") or "")
         legacy = bool(instance.get("legacy"))
-        return self._safe_profile_path(node_id, instance_id, legacy)
+        root = self._safe_profile_path(node_id, instance_id, legacy)
+        # 早期远程 worker 记录把真正的 Chromium Profile 放在兼容子目录。
+        # 只同步该子目录，避免把旧 Selkies TLS/认证运行文件打包或恢复。
+        if str(instance.get("profile_layout") or "native-v1") == "remote-worker-v1":
+            return root / "chromium-profile"
+        return root
 
     def _collect_pushable_profiles(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -1270,7 +1396,7 @@ class SyncEngine:
             instance_id = str(instance.get("id") or "")
             if not instance_id:
                 continue
-            if instance.get("status") in {"running", "starting"} or self.browser_runtime_is_active(instance_id):
+            if instance.get("status") in {"running", "starting", "stopping"} or self.browser_runtime_is_active(instance_id):
                 continue
             path = self._profile_path_for(instance)
             if path.exists() and path.is_dir():
@@ -1278,11 +1404,12 @@ class SyncEngine:
         return result
 
     def _record_sync_failure(self, message: str, status: str) -> dict[str, Any]:
+        safe_message = redact_sensitive_text(message)
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
-            cfg["last_error"] = message
-            cfg["last_status"] = status
+            cfg["last_error"] = safe_message
+            cfg["last_status"] = redact_sensitive_text(status)
             state["settings"]["webdav"] = cfg
             self.save_state(state)
             return cfg
@@ -1298,7 +1425,7 @@ class SyncEngine:
             state = self.load_state()
             cfg = self.get_settings(state)
             self._require_cfg(cfg)
-            if not cfg.get("enabled") and not cfg.get("url"):
+            if not cfg.get("enabled") or not cfg.get("url"):
                 raise ValueError("请先启用并配置 WebDAV")
 
             local_instance_ids: set[str] = set()
@@ -1320,7 +1447,7 @@ class SyncEngine:
                     for item in state.get("browser_instances", [])
                     if isinstance(item, dict)
                     and (
-                        item.get("status") in {"running", "starting"}
+                        item.get("status") in {"running", "starting", "stopping"}
                         or self.browser_runtime_is_active(str(item.get("id") or ""))
                     )
                 ]
@@ -1582,7 +1709,12 @@ class SyncEngine:
         }
 
     @_serialized_sync_operation
-    def pull(self, *, force: bool = False) -> dict[str, Any]:
+    def pull(
+        self,
+        *,
+        force: bool = False,
+        preserve_local_changes: bool = False,
+    ) -> dict[str, Any]:
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
@@ -1590,6 +1722,35 @@ class SyncEngine:
             local_last_change = cfg.get("last_local_change_at")
             local_device = cfg.get("device_id")
             local_state_fingerprint = self._local_state_fingerprint(state)
+
+        # The browser-record modal performs a convenience pull before opening. Never
+        # let that implicit pull erase a newly-created local record while its async
+        # stop upload is still queued/failed/disabled. Explicit sync-page pulls keep
+        # the existing remote-authoritative behavior (preserve_local_changes=False),
+        # and force=True always remains an intentional override.
+        if (
+            preserve_local_changes
+            and not force
+            and local_last_change
+            and not str(cfg.get("last_applied_state_sha256") or "")
+        ):
+            status = "检测到本地未上传变更，已跳过浏览器记录自动拉取"
+            self.log(status, level="warn", category="同步")
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "local_changes_pending",
+                "status": status,
+                "downloaded_profiles": [],
+                "skipped_running": [],
+                "skipped_unchanged": [],
+                "purged_local_profiles": [],
+                "errors": [],
+                "conflict_warning": "",
+                "manifest": None,
+                "applied": {"subscriptions": 0, "nodes": 0, "browser_instances": 0},
+                "settings": self.public_settings(cfg),
+            }
 
         client = self.client_factory(cfg)
         urls = self._remote_urls(client, cfg)
@@ -1694,7 +1855,7 @@ class SyncEngine:
                 if isinstance(item, dict)
             }
             for instance_id, local in local_instances.items():
-                if local.get("status") in {"running", "starting"} or self.browser_runtime_is_active(instance_id):
+                if local.get("status") in {"running", "starting", "stopping"} or self.browser_runtime_is_active(instance_id):
                     skipped_running.append(instance_id)
 
             for instance_id, expected_hash in profile_hashes.items():
@@ -1702,7 +1863,7 @@ class SyncEngine:
                 expected_hash = _validate_sha256(expected_hash, f"Profile {instance_id} SHA-256")
                 local = local_instances.get(instance_id)
                 if local and (
-                    local.get("status") in {"running", "starting"}
+                    local.get("status") in {"running", "starting", "stopping"}
                     or self.browser_runtime_is_active(instance_id)
                 ):
                     if instance_id not in skipped_running:
@@ -1710,11 +1871,7 @@ class SyncEngine:
                     continue
                 try:
                     meta = remote_instances[instance_id]
-                    dest = self._safe_profile_path(
-                        str(meta.get("node_id") or ""),
-                        instance_id,
-                        bool(meta.get("legacy")),
-                    )
+                    dest = self._profile_path_for(meta)
                     if dest.exists():
                         try:
                             # Cheap skip: if a marker hash file matches.
@@ -1791,7 +1948,7 @@ class SyncEngine:
                     if isinstance(item, dict)
                     and item.get("id")
                     and (
-                        item.get("status") in {"running", "starting"}
+                        item.get("status") in {"running", "starting", "stopping"}
                         or self.browser_runtime_is_active(str(item.get("id") or ""))
                     )
                 ]
@@ -1818,7 +1975,8 @@ class SyncEngine:
                     continue
                 iid = str(record.get("id") or "")
                 if iid and (
-                    record.get("status") in {"running", "starting"} or self.browser_runtime_is_active(iid)
+                    record.get("status") in {"running", "starting", "stopping"}
+                    or self.browser_runtime_is_active(iid)
                 ):
                     skipped_running.append(iid)
                     continue
@@ -1949,52 +2107,72 @@ class SyncEngine:
         """
         if not self.sync_browser_data or not instance_id:
             return
-        if not self._bg_lock.acquire(blocking=False):
-            return
-
-        def worker() -> None:
-            try:
-                with self.state_lock:
-                    state = self.load_state()
-                    cfg = self.get_settings(state)
-                    if (
-                        not cfg.get("enabled")
-                        or not cfg.get("url")
-                        or not cfg.get("auto_upload_on_browser_stop")
-                    ):
-                        return
-                self.log(f"浏览器已关闭，自动上传 Profile {instance_id[:12]}…", category="同步")
-                self.push(instance_ids=[instance_id])
-            except Exception as exc:
-                self.log(f"自动上传浏览器 Profile 失败: {exc}", level="warn", category="同步")
-            finally:
-                self._bg_lock.release()
-
-        threading.Thread(target=worker, name="webdav-auto-upload", daemon=True).start()
+        self._enqueue_auto_sync(instance_id=instance_id)
 
     def maybe_auto_push(self, *, reason: str = "") -> None:
         """Fire-and-forget full push when WebDAV is enabled (e.g. after subscription delete)."""
-        if not self._bg_lock.acquire(blocking=False):
-            # Another sync is running; still mark dirty via last_local_change already done.
-            self.log("自动同步跳过：已有同步任务进行中", level="warn", category="同步")
-            return
+        self._enqueue_auto_sync(full_push=True, reason=reason)
 
-        def worker() -> None:
+    def _enqueue_auto_sync(
+        self,
+        *,
+        full_push: bool = False,
+        instance_id: str = "",
+        reason: str = "",
+    ) -> None:
+        start_worker = False
+        with self._auto_queue_lock:
+            if full_push:
+                self._auto_full_push_pending = True
+                self._auto_instance_ids.clear()
+            elif instance_id and not self._auto_full_push_pending:
+                self._auto_instance_ids.add(instance_id)
+            if reason and reason not in self._auto_reasons:
+                self._auto_reasons.append(reason)
+            if not self._auto_worker_running:
+                self._auto_worker_running = True
+                start_worker = True
+        if start_worker:
+            threading.Thread(target=self._drain_auto_sync_queue, name="webdav-auto-sync", daemon=True).start()
+
+    def _take_auto_sync_job(self) -> tuple[bool, list[str], list[str]] | None:
+        with self._auto_queue_lock:
+            if not self._auto_full_push_pending and not self._auto_instance_ids:
+                self._auto_worker_running = False
+                return None
+            full_push = self._auto_full_push_pending
+            instance_ids = [] if full_push else sorted(self._auto_instance_ids)
+            reasons = list(self._auto_reasons)
+            self._auto_full_push_pending = False
+            self._auto_instance_ids.clear()
+            self._auto_reasons.clear()
+            return full_push, instance_ids, reasons
+
+    def _drain_auto_sync_queue(self) -> None:
+        while True:
+            job = self._take_auto_sync_job()
+            if job is None:
+                return
+            full_push, instance_ids, reasons = job
             try:
                 with self.state_lock:
                     state = self.load_state()
                     cfg = self.get_settings(state)
                     if not cfg.get("enabled") or not cfg.get("url"):
-                        return
-                label = f"（{reason}）" if reason else ""
-                self.log(f"自动上传到 WebDAV{label}", category="同步")
-                self.push()
+                        continue
+                    if not full_push and not cfg.get("auto_upload_on_browser_stop"):
+                        continue
+                if full_push:
+                    label = f"（{'、'.join(reasons)}）" if reasons else ""
+                    self.log(f"自动上传到 WebDAV{label}", category="同步")
+                    self.push()
+                else:
+                    preview = "、".join(item[:12] for item in instance_ids[:3])
+                    suffix = "…" if len(instance_ids) > 3 else ""
+                    self.log(f"浏览器已关闭，自动上传 Profile {preview}{suffix}", category="同步")
+                    self.push(instance_ids=instance_ids)
             except Exception as exc:
                 self.log(f"自动上传失败: {exc}", level="warn", category="同步")
-            finally:
-                self._bg_lock.release()
-
-        threading.Thread(target=worker, name="webdav-auto-push", daemon=True).start()
 
     def maybe_check_on_startup(self) -> None:
         def worker() -> None:

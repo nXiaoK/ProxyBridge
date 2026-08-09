@@ -329,9 +329,17 @@ enum ProxyBridgeError: LocalizedError {
 final class BridgeAPI {
     private static let instanceHeader = "X-ProxyBridge-Instance"
     let baseURL: URL
+    let instanceToken: String
 
-    init(port: Int) {
+    init(port: Int, instanceToken: String) {
         self.baseURL = URL(string: "http://127.0.0.1:\(port)")!
+        self.instanceToken = instanceToken
+    }
+
+    var consoleURL: URL {
+        var components = URLComponents(url: baseURL.appendingPathComponent("/"), resolvingAgainstBaseURL: false)!
+        components.fragment = "token=\(instanceToken)"
+        return components.url!
     }
 
     func getStatus(completion: @escaping (Result<StatusPayload, Error>) -> Void) {
@@ -414,6 +422,7 @@ final class BridgeAPI {
         var request = URLRequest(url: baseURL.appendingPathComponent(cleanPath))
         request.httpMethod = method
         request.timeoutInterval = timeout
+        request.addValue(instanceToken, forHTTPHeaderField: Self.instanceHeader)
         if let body {
             request.addValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = try? JSONSerialization.data(withJSONObject: body)
@@ -428,16 +437,15 @@ final class BridgeAPI {
                 completion(.failure(NSError(domain: "ProxyBridge", code: -1, userInfo: [NSLocalizedDescriptionKey: "没有收到后端响应"])))
                 return
             }
-            if let expectedInstanceToken {
-                guard let http = response as? HTTPURLResponse,
-                      http.value(forHTTPHeaderField: Self.instanceHeader) == expectedInstanceToken else {
-                    completion(.failure(NSError(
-                        domain: "ProxyBridge",
-                        code: -2,
-                        userInfo: [NSLocalizedDescriptionKey: "后端实例校验失败"]
-                    )))
-                    return
-                }
+            let responseToken = expectedInstanceToken ?? self.instanceToken
+            guard let http = response as? HTTPURLResponse,
+                  http.value(forHTTPHeaderField: Self.instanceHeader) == responseToken else {
+                completion(.failure(NSError(
+                    domain: "ProxyBridge",
+                    code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "后端实例校验失败"]
+                )))
+                return
             }
             if let http = response as? HTTPURLResponse, http.statusCode >= 400 {
                 if let apiError = try? JSONDecoder().decode(APIError.self, from: data) {
@@ -461,12 +469,15 @@ struct GenericOK: Decodable {
     let ok: Bool?
 }
 
-final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
+final class ConsoleWindowController: NSWindowController, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate {
     private let webView: WKWebView
     private let backendURL: URL
+    private let onWindowPresenceChanged: (Bool) -> Void
+    private(set) var hasOpenWindow = false
 
-    init(backendURL: URL) {
+    init(backendURL: URL, onWindowPresenceChanged: @escaping (Bool) -> Void) {
         self.backendURL = backendURL
+        self.onWindowPresenceChanged = onWindowPresenceChanged
         let configuration = WKWebViewConfiguration()
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
         // Tag the WebView so the web UI can detect the native shell and hide
@@ -487,7 +498,10 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
         window.minSize = NSSize(width: 1040, height: 640)
         window.center()
         super.init(window: window)
+        window.delegate = self
+        window.isReleasedWhenClosed = false
         webView.navigationDelegate = self
+        webView.uiDelegate = self
         webView.autoresizingMask = [.width, .height]
         webView.frame = window.contentView?.bounds ?? .zero
         window.contentView = webView
@@ -498,7 +512,11 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
     }
 
     func showAndReloadIfNeeded() {
+        reportWindowPresence(true)
         showWindow(nil)
+        if window?.isMiniaturized == true {
+            window?.deminiaturize(nil)
+        }
         window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         if webView.url == nil {
@@ -506,6 +524,15 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
         } else {
             webView.reload()
         }
+    }
+
+    func restoreAndFocus() {
+        guard hasOpenWindow else { return }
+        if window?.isMiniaturized == true {
+            window?.deminiaturize(nil)
+        }
+        window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     func reload() {
@@ -520,6 +547,39 @@ final class ConsoleWindowController: NSWindowController, WKNavigationDelegate {
         webView.stopLoading()
         webView.load(URLRequest(url: URL(string: "about:blank")!))
         close()
+        reportWindowPresence(false)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        // 最小化不会触发此回调，因此窗口仍存在时 Dock 图标会继续保留。
+        reportWindowPresence(false)
+    }
+
+    private func reportWindowPresence(_ isOpen: Bool) {
+        guard hasOpenWindow != isOpen else { return }
+        hasOpenWindow = isOpen
+        onWindowPresenceChanged(isOpen)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        runJavaScriptConfirmPanelWithMessage message: String,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping (Bool) -> Void
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "确认操作"
+        alert.informativeText = message
+        alert.addButton(withTitle: "确认")
+        alert.addButton(withTitle: "取消")
+        if let window {
+            alert.beginSheetModal(for: window) { response in
+                completionHandler(response == .alertFirstButtonReturn)
+            }
+        } else {
+            completionHandler(alert.runModal() == .alertFirstButtonReturn)
+        }
     }
 }
 
@@ -589,6 +649,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
             self?.refreshNow()
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard backendIsReady, consoleWindowController?.hasOpenWindow == true else { return false }
+        consoleWindowController?.restoreAndFocus()
+        return true
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        false
     }
 
     // 安装标准主菜单。菜单栏 App(.accessory)默认没有主菜单,导致控制台窗口里
@@ -711,8 +781,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.popUpMenu(statusMenu)
             return
         }
-        if consoleWindowController == nil {
-            consoleWindowController = ConsoleWindowController(backendURL: URL(string: "http://127.0.0.1:\(backendPort)")!)
+        if consoleWindowController == nil, let api {
+            consoleWindowController = ConsoleWindowController(
+                backendURL: api.consoleURL,
+                onWindowPresenceChanged: { [weak self] isOpen in
+                    self?.consoleWindowPresenceChanged(isOpen)
+                }
+            )
         }
         consoleWindowController?.showAndReloadIfNeeded()
     }
@@ -720,6 +795,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func invalidateConsole() {
         consoleWindowController?.invalidateAndClose()
         consoleWindowController = nil
+    }
+
+    private func consoleWindowPresenceChanged(_ isOpen: Bool) {
+        guard !terminationRequested() else { return }
+        if isOpen {
+            reconcileActivationPolicy()
+            return
+        }
+        // 等 AppKit 完成窗口关闭通知后再隐藏 Dock；执行时读取最新窗口状态，
+        // 避免快速关闭并重新打开时被上一轮关闭回调切回 accessory。
+        DispatchQueue.main.async { [weak self] in
+            self?.reconcileActivationPolicy()
+        }
+    }
+
+    private func reconcileActivationPolicy() {
+        guard !terminationRequested() else { return }
+        // Info.plist 保持 LSUIElement=true，让无窗口时维持纯菜单栏形态；
+        // 控制台窗口存在期间临时切到 regular，使应用图标出现在 Dock。
+        let visible = consoleWindowController?.hasOpenWindow == true
+        let activationPolicy: NSApplication.ActivationPolicy = visible ? .regular : .accessory
+        guard NSApp.activationPolicy() != activationPolicy else { return }
+        if !NSApp.setActivationPolicy(activationPolicy) {
+            NSLog("ProxyBridge: 无法切换应用激活策略以更新 Dock 图标")
+        }
     }
 
     private func resourceBridgeScript() -> URL? {
@@ -1278,8 +1378,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 rebuildMenu()
                 return
             }
-            let candidateAPI = BridgeAPI(port: backendPort)
             let instanceToken = UUID().uuidString
+            let candidateAPI = BridgeAPI(port: backendPort, instanceToken: instanceToken)
 
             let process = Process()
             process.executableURL = pythonExecutable

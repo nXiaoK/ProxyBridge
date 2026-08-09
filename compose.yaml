@@ -14,11 +14,28 @@ services:
       PROXY_BRIDGE_CONSOLE_HOST: "${PROXY_BRIDGE_CONSOLE_HOST:-127.0.0.1}"
       PROXY_BRIDGE_PROXY_PORT_START: "21080"
       PROXY_BRIDGE_PROXY_PORT_END: "21179"
+      # 远程浏览器只通过内部控制网络调用 Broker；不要改成宿主机或公网地址。
+      PROXY_BRIDGE_BROWSER_BROKER_URL: "http://browser-broker:8765"
+      # Broker 随机凭证通过只读命名卷交付，禁止映射到 Web 根目录或宿主机公开目录。
+      PROXY_BRIDGE_BROWSER_BROKER_TOKEN_FILE: "/run/proxybridge-browser/token"
+      # worker 在内部网络中使用此服务名连接节点代理端口。
+      PROXY_BRIDGE_BROWSER_PROXY_HOST: "proxybridge"
     ports:
       - "${PROXY_BRIDGE_CONSOLE_HOST:-127.0.0.1}:8787:8787"
       - "${PROXY_BRIDGE_PROXY_HOST:-127.0.0.1}:21080-21179:21080-21179"
     volumes:
+      # 远程浏览器依赖 Docker Engine API 1.45+ 的命名卷子路径挂载；不能改为宿主机 bind mount。
       - proxybridge-data:/data
+      - proxybridge-browser-control:/run/proxybridge-browser:ro
+    depends_on:
+      browser-broker:
+        condition: service_healthy
+    networks:
+      default: {}
+      browser-control: {}
+      browser-workers:
+        aliases:
+          - proxybridge
     read_only: true
     tmpfs:
       - /tmp:size=256m,mode=1777
@@ -26,8 +43,83 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    stop_grace_period: 15s
+    # 关机需等待正在创建的 worker 完成回收与 Profile 落盘；超时后 Docker 才发送 SIGKILL。
+    stop_grace_period: 3m
+
+  browser-broker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.broker
+    image: proxybridge-browser-broker:local
+    container_name: proxybridge-browser-broker
+    hostname: proxybridge-browser-broker
+    restart: unless-stopped
+    environment:
+      # Broker 只管理带 ProxyBridge 标签的 worker，owner 名称必须与主服务容器名一致。
+      PROXY_BRIDGE_OWNER_CONTAINER: "proxybridge"
+      # worker 网络名称固定，便于 Broker 创建的临时容器加入同一隔离网络。
+      PROXY_BRIDGE_BROWSER_NETWORK: "proxybridge-browser-workers"
+      # 默认 worker 为 LinuxServer Selkies Chromium；如覆盖镜像，必须兼容其启动与认证变量。
+      PROXY_BRIDGE_BROWSER_WORKER_IMAGE: "${PROXY_BRIDGE_BROWSER_WORKER_IMAGE:-lscr.io/linuxserver/chromium:latest}"
+      # 访问端口只绑定回环或宿主机明确的私有 IPv4；局域网访问时需在 .env 同时设置两项。
+      PROXY_BRIDGE_BROWSER_HOST: "${PROXY_BRIDGE_BROWSER_HOST:-127.0.0.1}"
+      # 该地址只用于生成用户看到的链接，通常与上一项相同，不能填 0.0.0.0。
+      PROXY_BRIDGE_BROWSER_PUBLIC_HOST: "${PROXY_BRIDGE_BROWSER_PUBLIC_HOST:-127.0.0.1}"
+      # 每个运行实例占用一个 HTTPS 端口；扩大范围时同时调整宿主机防火墙规则。
+      PROXY_BRIDGE_BROWSER_PORT_START: "${PROXY_BRIDGE_BROWSER_PORT_START:-23000}"
+      PROXY_BRIDGE_BROWSER_PORT_END: "${PROXY_BRIDGE_BROWSER_PORT_END:-23099}"
+      # 限制同时运行的浏览器数量，避免内存与 CPU 被耗尽。
+      PROXY_BRIDGE_BROWSER_MAX_SESSIONS: "${PROXY_BRIDGE_BROWSER_MAX_SESSIONS:-10}"
+      # 单个 worker 的内存上限，单位为字节；默认 2 GiB，过低可能导致 Chromium 崩溃。
+      PROXY_BRIDGE_BROWSER_MEMORY_BYTES: "${PROXY_BRIDGE_BROWSER_MEMORY_BYTES:-2147483648}"
+      # 单个 worker 的 CPU 上限使用 Docker NanoCPUs；10 亿表示 1 个 CPU 核，默认 2 核。
+      PROXY_BRIDGE_BROWSER_NANO_CPUS: "${PROXY_BRIDGE_BROWSER_NANO_CPUS:-2000000000}"
+      # 单个 worker 的进程数上限；Chromium 多进程架构需要保留足够余量。
+      PROXY_BRIDGE_BROWSER_PIDS_LIMIT: "${PROXY_BRIDGE_BROWSER_PIDS_LIMIT:-512}"
+      # 单个 worker 的 /dev/shm 大小，单位为字节；默认 1 GiB，过低会造成页面或标签崩溃。
+      PROXY_BRIDGE_BROWSER_SHM_BYTES: "${PROXY_BRIDGE_BROWSER_SHM_BYTES:-1073741824}"
+      # worker 使用此内部服务名访问 ProxyBridge 节点代理，不得改成 127.0.0.1。
+      PROXY_BRIDGE_BROWSER_PROXY_HOST: "proxybridge"
+    volumes:
+      # Broker 独占 Docker Socket；主 Web 服务不直接获得宿主机级 Docker 权限。
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - proxybridge-browser-control:/control
+    ports:
+      # worker 保持在 internal 网络；此映射只把 Broker 的 TLS TCP 中继发布到指定宿主机私有地址。端口起止值必须与上方 Broker 环境变量一致。
+      - "${PROXY_BRIDGE_BROWSER_HOST:-127.0.0.1}:${PROXY_BRIDGE_BROWSER_PORT_START:-23000}-${PROXY_BRIDGE_BROWSER_PORT_END:-23099}:${PROXY_BRIDGE_BROWSER_PORT_START:-23000}-${PROXY_BRIDGE_BROWSER_PORT_END:-23099}"
+    networks:
+      - browser-control
+      - browser-workers
+      - browser-ingress
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Broker 会并行优雅停止 worker，只有超时/失败时才强制删除；需给初始化请求留出回收时间。
+    stop_grace_period: 3m
 
 volumes:
   proxybridge-data:
     name: proxybridge-data
+  proxybridge-browser-control:
+    name: proxybridge-browser-control
+
+networks:
+  browser-control:
+    name: proxybridge-browser-control
+    internal: true
+  browser-workers:
+    name: proxybridge-browser-workers
+    internal: true
+    ipam:
+      config:
+        # worker 子网可通过 .env 修改；必须是无地址冲突的 RFC1918 IPv4 子网。代理免认证按精确 worker IP 与实例端口匹配，不使用整个子网白名单。
+        - subnet: "${PROXY_BRIDGE_BROWSER_NETWORK_SUBNET:-172.31.254.0/24}"
+  browser-ingress:
+    name: proxybridge-browser-ingress
+    driver: bridge
+    # 只有 Broker 加入此非 internal 网络，Docker 才能建立宿主机端口映射；worker 禁止加入，避免绕过节点代理直接出网。
+    internal: false

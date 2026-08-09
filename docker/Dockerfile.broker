@@ -1,0 +1,20 @@
+FROM python:3.12-slim
+
+# Broker 不安装第三方运行依赖；关闭字节码并启用无缓冲日志，便于容器健康检查与排障。
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY browser_broker.py ./
+
+# /control 必须由 Compose 的私有命名卷提供，用于 Broker token、临时密码和初始化脚本。
+VOLUME ["/control"]
+EXPOSE 8765
+STOPSIGNAL SIGTERM
+
+# 健康检查只访问容器内无敏感信息的就绪端点，不对宿主机发布 Broker 端口。
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=6 \
+  CMD ["python", "-c", "import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8765/healthz', timeout=2).close()"]
+
+CMD ["python", "browser_broker.py"]

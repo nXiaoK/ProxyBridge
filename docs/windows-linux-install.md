@@ -44,7 +44,7 @@ ProxyBridge 在 Windows / Linux 上提供两种形态：
 #### 前提
 
 - Windows 10/11 x64（常见）
-- 能访问 GitHub（首次自动下载 `sing-box` / `xray`）
+- 能访问 GitHub 自动下载 `sing-box` / `xray`，或可在别的电脑下载官方包后从控制台本地导入
 - 不强制预装 Python
 
 #### 步骤
@@ -60,9 +60,9 @@ ProxyBridge 在 Windows / Linux 上提供两种形态：
 4. 若 Windows SmartScreen 提示“未知发布者”：
    - 点 **更多信息**
    - 再点 **仍要运行**
-5. 看到托盘图标后，浏览器会自动打开控制台：
+5. 看到托盘图标后，浏览器会自动打开带当前实例令牌的控制台，地址形如：
    ```text
-   http://127.0.0.1:18787
+   http://127.0.0.1:18787/#token=...
    ```
 6. 在控制台中：
    - 导入订阅
@@ -139,10 +139,10 @@ python -m desktop.tray_host --port 18787
 python app.py --port 8787 --open
 ```
 
-浏览器打开：
+`--open` 会自动打开认证地址，终端也会打印类似下面的启动行：
 
 ```text
-http://127.0.0.1:8787
+Proxy Bridge console: http://127.0.0.1:8787/#token=...
 ```
 
 #### 开机自启（源码模式）
@@ -162,6 +162,12 @@ python -m desktop.tray_host --disable-autostart
 ```powershell
 cd C:\path\to\ProxyBridge
 .\scripts\build_windows_exe.ps1
+```
+
+如果 `python` 命中了 Microsoft Store 的 `WindowsApps\python.exe` 执行别名，请改用真实 Python 路径：
+
+```powershell
+.\scripts\build_windows_exe.ps1 -Python "C:\Users\<用户名>\AppData\Local\Programs\Python\Python312\python.exe"
 ```
 
 成功后产物：
@@ -213,16 +219,16 @@ outputs\windows\release\ProxyBridge.exe
 A: 查看 `%APPDATA%\ProxyBridge\tray-host.log` 与 `tray-backend.log`。
 
 **Q: 控制台打不开？**  
-A: 确认托盘还在；浏览器访问 `http://127.0.0.1:18787`。若端口被占用，程序会尝试换端口，以日志为准。
+A: 确认托盘还在，然后用托盘菜单的 **打开控制台** 重新进入，不要手动输入裸地址。若端口被占用，程序会尝试换端口，以日志为准。
 
 **Q: 提示已有实例在运行？**  
 A: 默认单实例。先退出旧托盘，或（源码模式）加 `--allow-multiple`。
 
 **Q: 首次很慢？**  
-A: 正在下载 `sing-box` / `xray`。需能访问 GitHub。
+A: 通常是在从 GitHub 下载 `sing-box` / `xray`。如果当前网络几乎无法完成下载，可在别的电脑取得保留官方文件名的 Windows x64 Release 包（如 `sing-box-版本-windows-amd64.zip`、`Xray-windows-64.zip`），再点击控制台侧边栏底部「本地导入」上传；替换前先停止使用对应核心的本地代理。
 
 **Q: 指纹浏览器下载失败？**  
-A: 上游不一定每次都发 Windows 包。可手动下载后设置：
+A: 上游不一定每次都发 Windows 包。若已有匹配 Windows/x86_64 的完整 `.zip` 发布包，可用控制台「本地导入」安装；也可手动下载后设置：
 
 ```powershell
 $env:PROXY_BRIDGE_FP_CHROMIUM="C:\path\to\chrome.exe"
@@ -249,7 +255,7 @@ A:
 
 - 图形桌面会话（`DISPLAY` 或 `WAYLAND_DISPLAY`）
 - Python 3.10+
-- 能访问 GitHub
+- 能访问 GitHub 自动下载核心，或可从控制台本地导入预先下载的官方包
 
 #### Debian / Ubuntu 依赖示例
 
@@ -273,10 +279,10 @@ scripts/run_tray.sh
 python3 -m desktop.tray_host --port 18787
 ```
 
-默认会打开：
+默认会打开带当前实例令牌的地址，形如：
 
 ```text
-http://127.0.0.1:18787
+http://127.0.0.1:18787/#token=...
 ```
 
 #### 开机自启
@@ -319,11 +325,13 @@ source .venv/bin/activate
 python3 app.py --port 8787 --workdir ~/.local/share/ProxyBridge
 ```
 
-本机浏览器打开：
+终端会打印完整认证地址：
 
 ```text
-http://127.0.0.1:8787
+Proxy Bridge console: http://127.0.0.1:8787/#token=...
 ```
+
+复制 `Proxy Bridge console:` 后面的完整地址。页面接收令牌后会立即清除地址栏 fragment，并将令牌仅保存在当前标签页的会话状态中；刷新当前标签页仍可使用，新标签页需重新使用启动输出中的地址。
 
 若要从另一台机器访问控制台，不建议直接把管理口暴露到公网。  
 更稳妥：
@@ -332,9 +340,9 @@ http://127.0.0.1:8787
   ```bash
   ssh -L 8787:127.0.0.1:8787 user@server
   ```
-- 然后本机打开 `http://127.0.0.1:8787`
+- 然后在本机打开服务端启动输出中的完整认证地址；其 `127.0.0.1:8787` 部分会通过隧道转发
 
-管理 API 默认按 loopback Host 校验；局域网共享开关只影响**代理端口**，不会把控制台自动开放到局域网。
+管理 API 默认按 loopback Host 校验，并要求当前后端实例令牌；局域网共享开关只影响**代理端口**，不会把控制台自动开放到局域网。
 
 #### systemd 用户服务示例（可选）
 
@@ -454,13 +462,15 @@ rm -rf ~/.local/share/ProxyBridge
 3. **复制代理地址**
    - 给系统代理、浏览器插件、终端工具使用
 4. **测试节点**
-   - 单节点或批量测试可见节点
+   - 单节点或 3–5 路有界并发批量测试；可取消、失败重试并查看结果年龄
 5. **连接日志**
-   - 看访问目标、流量、成功/失败
+   - 看访问目标、流量、成功/失败，按条件分页并导出 CSV/JSON
 6. **局域网共享**
-   - 仅在可信网络开启
+   - 配置 Basic/Token、IP/CIDR、连接上限并管理当前客户端
 7. **WebDAV 同步**（可选）
    - 多设备同步订阅与浏览器 Profile
+8. **诊断中心**
+   - 先运行本地核心/端口/权限检查；确认目标后再勾选网络检查
 
 ---
 
@@ -509,6 +519,7 @@ python3 -m desktop.tray_host --enable-autostart
 | `PROXY_BRIDGE_PORT` | 控制台端口 |
 | `PROXY_BRIDGE_HOST` | 控制台绑定地址，默认 `127.0.0.1` |
 | `PROXY_BRIDGE_WORKDIR` | 数据目录 |
+| `PROXY_BRIDGE_INSTANCE_TOKEN` | 可选的管理 API 实例令牌；自动化场景可设置高强度随机值，普通使用留空即可 |
 | `PROXY_BRIDGE_SING_BOX` | 手动指定 sing-box |
 | `PROXY_BRIDGE_XRAY` | 手动指定 xray |
 | `PROXY_BRIDGE_FP_CHROMIUM` | 手动指定指纹 Chromium |
@@ -518,6 +529,8 @@ python3 -m desktop.tray_host --enable-autostart
 ## 6. 安全建议
 
 - 管理控制台默认仅本机访问，保持这样更安全
+- 管理 API 除 `HEAD /api/status` 健康检查外都要求 `X-ProxyBridge-Instance` 请求头；脚本调用时使用与 `PROXY_BRIDGE_INSTANCE_TOKEN` 相同的随机值
+- 实例令牌主要防止本机跨站或误调用，不是多用户远程登录；不要公开带 `#token=...` 的启动地址或日志
 - 代理端口若开启局域网共享，等于局域网内人人可走你的代理；只在可信网络使用
 - 状态文件含节点参数，注意数据目录权限
 - 不要把 `ProxyBridge` 数据目录同步到公开网盘明文共享
@@ -548,6 +561,7 @@ python3 -m desktop.tray_host --enable-autostart
 - [ ] 浏览器能打开控制台
 - [ ] 能导入订阅并启动一个节点
 - [ ] 本机可用 SOCKS5/HTTP 访问外网测试地址
+- [ ] 诊断中心本地检查能返回逐项结果
 - [ ] 托盘“开机自启”可开关
 - [ ] “退出”后后端进程结束
 
@@ -557,4 +571,5 @@ python3 -m desktop.tray_host --enable-autostart
 - [ ] 控制台可打开
 - [ ] 节点可启动/停止/测速
 - [ ] 日志目录有 `tray-*.log` 或系统日志可见
+- [ ] 诊断中心能识别核心、端口与数据目录状态
 - [ ] 退出后端口释放

@@ -21,7 +21,8 @@ WORKDIR /app
 COPY docker/requirements.txt /tmp/requirements.txt
 RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY --chown=proxybridge:proxybridge app.py webdav_sync.py ./
+# remote_browser.py 仅包含主服务访问内部 Browser Broker 所需的受限客户端。
+COPY --chown=proxybridge:proxybridge app.py webdav_sync.py remote_browser.py ./
 COPY --chown=proxybridge:proxybridge static ./static
 
 RUN mkdir -p /data && chown proxybridge:proxybridge /data
@@ -31,7 +32,8 @@ VOLUME ["/data"]
 EXPOSE 8787
 STOPSIGNAL SIGTERM
 
+# 本机健康检查忽略 HTTP_PROXY，避免容器环境代理影响 localhost 就绪判断。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-  CMD ["python", "-c", "import os, urllib.request; p=os.environ.get('PROXY_BRIDGE_PORT','8787'); r=urllib.request.Request('http://127.0.0.1:'+p+'/api/status', method='HEAD', headers={'Host':'127.0.0.1:'+p}); urllib.request.urlopen(r, timeout=3).close()"]
+  CMD ["python", "-c", "import os, urllib.request; p=os.environ.get('PROXY_BRIDGE_PORT','8787'); r=urllib.request.Request('http://127.0.0.1:'+p+'/api/status', method='HEAD', headers={'Host':'127.0.0.1:'+p}); urllib.request.build_opener(urllib.request.ProxyHandler({})).open(r, timeout=3).close()"]
 
 CMD ["python", "app.py"]

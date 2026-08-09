@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import io
 import json
 import os
 import socket
@@ -6,8 +8,10 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import app
 from app import Socks5LogProxy, parse_link, parse_subscription_payload, read_exact, sing_box_config
@@ -173,6 +177,332 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(app._pick_fingerprint_asset(releases, "darwin")["url"], "https://example/mac.dmg")
         self.assertEqual(app._pick_fingerprint_asset(releases, "windows")["url"], "https://example/win.zip")
         self.assertEqual(app._pick_fingerprint_asset(releases, "linux")["url"], "https://example/linux.zip")
+
+    def test_fingerprint_asset_picker_preserves_integrity_metadata(self):
+        releases = [
+            {
+                "tag_name": "v1",
+                "assets": [
+                    {
+                        "name": "fingerprint-chromium_linux_x64.zip",
+                        "browser_download_url": "https://example/linux.zip",
+                        "size": 123,
+                        "digest": f"sha256:{'a' * 64}",
+                    }
+                ],
+            }
+        ]
+
+        asset = app._pick_fingerprint_asset(releases, "linux")
+        self.assertEqual(asset["size"], 123)
+        self.assertEqual(asset["digest"], f"sha256:{'a' * 64}")
+        self.assertEqual(asset["browser_download_url"], "https://example/linux.zip")
+
+    def test_download_asset_retries_atomically_and_validates_digest(self):
+        payload = b"verified payload"
+        digest = hashlib.sha256(payload).hexdigest()
+
+        class FakeResponse(io.BytesIO):
+            def __init__(self) -> None:
+                super().__init__(payload)
+                self.headers = {"Content-Length": str(len(payload))}
+
+            def geturl(self) -> str:
+                return "https://cdn.example/asset.zip"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                self.close()
+
+        asset = {
+            "name": "asset.zip",
+            "browser_download_url": "https://example/asset.zip",
+            "size": len(payload),
+            "digest": f"sha256:{digest}",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "asset.zip"
+            target.write_bytes(b"previous")
+            with mock.patch.object(
+                app,
+                "_open_https_url",
+                side_effect=[urllib.error.URLError("temporary"), FakeResponse()],
+            ) as opener:
+                app._download_asset(asset, target, retry_count=2, retry_backoff=0)
+
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(list(target.parent.glob("*.part")), [])
+            self.assertEqual(opener.call_count, 2)
+
+    def test_download_asset_rejects_bad_digest_without_replacing_target(self):
+        payload = b"tampered"
+
+        class FakeResponse(io.BytesIO):
+            def __init__(self) -> None:
+                super().__init__(payload)
+                self.headers = {"Content-Length": str(len(payload))}
+
+            def geturl(self) -> str:
+                return "https://example/asset.zip"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                self.close()
+
+        asset = {
+            "name": "asset.zip",
+            "browser_download_url": "https://example/asset.zip",
+            "digest": f"sha256:{'0' * 64}",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "asset.zip"
+            target.write_bytes(b"previous")
+            with mock.patch.object(app, "_open_https_url", return_value=FakeResponse()):
+                with self.assertRaisesRegex(RuntimeError, "SHA-256"):
+                    app._download_asset(asset, target, retry_count=1, retry_backoff=0)
+
+            self.assertEqual(target.read_bytes(), b"previous")
+            self.assertEqual(list(target.parent.glob("*.part")), [])
+
+    def test_download_asset_rejects_unsafe_name_and_http_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaisesRegex(RuntimeError, "名称不安全"):
+                app._safe_asset_name({"name": "../asset.zip"})
+            with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+                app._download_asset(
+                    {"name": "asset.zip", "browser_download_url": "http://example/asset.zip"},
+                    Path(temp_dir) / "asset.zip",
+                    retry_count=1,
+                )
+
+    def test_https_redirect_handler_rejects_protocol_downgrade(self):
+        handler = app._HTTPSOnlyRedirectHandler()
+        request = app.urllib.request.Request("https://github.com/asset")
+
+        with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "http://objects.example/asset",
+            )
+
+    def test_download_asset_enforces_limit_without_length_metadata(self):
+        payload = b"12345"
+
+        class FakeResponse(io.BytesIO):
+            headers = {}
+
+            def geturl(self) -> str:
+                return "https://example/asset.zip"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                self.close()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "asset.zip"
+            target.write_bytes(b"previous")
+            with (
+                mock.patch.object(app, "DOWNLOAD_RESPONSE_LIMIT", 4),
+                mock.patch.object(app, "_open_https_url", return_value=FakeResponse(payload)),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "超过 4 字节限制"):
+                    app._download_asset(
+                        {"name": "asset.zip", "browser_download_url": "https://example/asset.zip"},
+                        target,
+                        retry_count=1,
+                    )
+
+            self.assertEqual(target.read_bytes(), b"previous")
+            self.assertEqual(list(target.parent.glob("*.part")), [])
+
+    def test_fingerprint_picker_sorts_releases_and_accepts_darwin_name(self):
+        releases = [
+            {
+                "tag_name": "old",
+                "published_at": "2025-01-01T00:00:00Z",
+                "assets": [
+                    {
+                        "name": "fingerprint-chromium_macos.dmg",
+                        "browser_download_url": "https://example/old.dmg",
+                    }
+                ],
+            },
+            {
+                "tag_name": "new",
+                "published_at": "2026-01-01T00:00:00Z",
+                "assets": [
+                    {
+                        "name": "fingerprint-chromium_darwin.dmg",
+                        "browser_download_url": "https://example/new.dmg",
+                    }
+                ],
+            },
+        ]
+
+        asset = app._pick_fingerprint_asset(releases, "darwin")
+        self.assertEqual(asset["tag"], "new")
+        self.assertEqual(asset["url"], "https://example/new.dmg")
+
+    def test_install_path_replacement_restores_previous_target_on_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "Chromium.app"
+            staged = root / ".Chromium.app.install"
+            target.mkdir()
+            staged.mkdir()
+            (target / "old").write_text("old", encoding="utf-8")
+            (staged / "new").write_text("new", encoding="utf-8")
+            original_replace = Path.replace
+
+            def fail_staged_replace(path: Path, destination: Path):
+                if path == staged:
+                    raise OSError("copy interrupted")
+                return original_replace(path, destination)
+
+            with mock.patch.object(Path, "replace", autospec=True, side_effect=fail_staged_replace):
+                with self.assertRaisesRegex(OSError, "copy interrupted"):
+                    app._replace_installed_path(staged, target)
+
+            self.assertEqual((target / "old").read_text(encoding="utf-8"), "old")
+            self.assertFalse((target / "new").exists())
+
+    def test_install_executable_preserves_previous_binary_on_copy_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "downloaded-core"
+            target = root / "bin" / "core"
+            source.write_bytes(b"new-core")
+            target.parent.mkdir()
+            target.write_bytes(b"old-core")
+
+            def partial_copy(_source: Path, destination: Path) -> None:
+                destination.write_bytes(b"partial")
+                raise OSError("copy interrupted")
+
+            with mock.patch.object(app.shutil, "copy2", side_effect=partial_copy):
+                with self.assertRaisesRegex(OSError, "copy interrupted"):
+                    app._install_executable(source, target)
+
+            self.assertEqual(target.read_bytes(), b"old-core")
+            self.assertEqual(list(target.parent.glob("*.install-*")), [])
+
+    def test_install_transaction_rejects_duplicate_targets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "core"
+            first = root / ".core.first"
+            second = root / ".core.second"
+            target.write_bytes(b"old")
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+
+            with self.assertRaisesRegex(ValueError, "目标不能重复"):
+                app._replace_install_files([(first, target), (second, target)])
+
+            self.assertEqual(target.read_bytes(), b"old")
+            self.assertEqual(first.read_bytes(), b"first")
+            self.assertEqual(second.read_bytes(), b"second")
+            self.assertEqual(list(root.glob("*.backup-*")), [])
+
+    def test_core_install_rolls_back_binary_when_metadata_commit_fails(self):
+        old_work_root = app.WORK_ROOT
+        old_download_asset = app._download_asset
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                app.WORK_ROOT = Path(temp_dir)
+                app.ensure_dirs()
+                target = app.proxy_core_bin_dir() / ("sing-box.exe" if os.name == "nt" else "sing-box")
+                version_path = app.proxy_core_root() / "sing-box.version"
+                target.write_bytes(b"old-core")
+                version_path.write_text("v-old\nold.zip\n", encoding="utf-8")
+
+                def fake_download(_asset: dict, archive_path: Path) -> None:
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr(target.name, b"new-core")
+
+                original_replace = Path.replace
+
+                def fail_metadata_commit(path: Path, destination: Path):
+                    if path.name.startswith(".sing-box.version.install-") and destination == version_path:
+                        raise OSError("metadata commit failed")
+                    return original_replace(path, destination)
+
+                app._download_asset = fake_download
+                with mock.patch.object(Path, "replace", autospec=True, side_effect=fail_metadata_commit):
+                    with self.assertRaisesRegex(OSError, "metadata commit failed"):
+                        app._install_core_from_asset(
+                            "sing-box",
+                            {
+                                "name": "sing-box-test.zip",
+                                "browser_download_url": "https://example/sing-box.zip",
+                            },
+                            "v-new",
+                        )
+
+                self.assertEqual(target.read_bytes(), b"old-core")
+                self.assertEqual(version_path.read_text(encoding="utf-8"), "v-old\nold.zip\n")
+                self.assertEqual(list(app.proxy_core_root().rglob("*.install-*")), [])
+                self.assertEqual(list(app.proxy_core_root().rglob("*.backup-*")), [])
+        finally:
+            app.WORK_ROOT = old_work_root
+            app._download_asset = old_download_asset
+
+    def test_github_json_retries_and_caps_response(self):
+        payload = json.dumps({"ok": True}).encode("utf-8")
+
+        class FakeResponse(io.BytesIO):
+            def __init__(self, data: bytes, declared_size=None) -> None:
+                super().__init__(data)
+                self.headers = {}
+                if declared_size is not None:
+                    self.headers["Content-Length"] = str(declared_size)
+
+            def geturl(self) -> str:
+                return "https://api.github.com/example"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                self.close()
+
+        with mock.patch.object(
+            app,
+            "_open_https_url",
+            side_effect=[urllib.error.URLError("temporary"), FakeResponse(payload)],
+        ) as opener:
+            result = app._github_json(
+                "https://api.github.com/example",
+                retry_count=2,
+                retry_backoff=0,
+            )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(opener.call_count, 2)
+
+        with (
+            mock.patch.object(app, "GITHUB_JSON_RESPONSE_LIMIT", 4),
+            mock.patch.object(app, "_open_https_url", return_value=FakeResponse(b"{}", declared_size=5)),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "响应过大"):
+                app._github_json("https://api.github.com/example", retry_count=1)
+
+        with mock.patch.object(
+            app,
+            "_open_https_url",
+            return_value=FakeResponse(payload, declared_size=len(payload) + 1),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "响应长度不匹配"):
+                app._github_json("https://api.github.com/example", retry_count=1)
 
     def test_xray_runtime_install_only_requires_binary(self):
         old_work_root = app.WORK_ROOT
@@ -981,6 +1311,16 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(app.runtime_log_backup_path(log_path, 2).read_bytes(), b"older")
             self.assertEqual(app.runtime_log_backup_path(log_path, 1).stat().st_mode & 0o777, 0o600)
 
+    def test_runtime_log_pump_rotates_while_stream_is_writing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "bridge.log"
+            app.pump_runtime_log(io.BytesIO(b"abcdefghijk"), log_path, max_bytes=5, backup_count=2)
+
+            self.assertEqual(log_path.read_bytes(), b"k")
+            self.assertEqual(app.runtime_log_backup_path(log_path, 1).read_bytes(), b"fghij")
+            self.assertEqual(app.runtime_log_backup_path(log_path, 2).read_bytes(), b"abcde")
+            self.assertLessEqual(log_path.stat().st_size, 5)
+
     def test_start_bridge_cleans_process_table_when_core_exits_immediately(self):
         old_work_root = app.WORK_ROOT
         old_runtime_root = app.RUNTIME_ROOT
@@ -1074,6 +1414,7 @@ class ParserTests(unittest.TestCase):
                 node_name: str,
                 listen_port: int,
                 upstream_port: int,
+                security=None,
             ) -> None:
                 self.listen_port = listen_port
                 self.started = False

@@ -273,6 +273,8 @@ cp "$ICON_PATH" "$RESOURCES_DIR/AppIcon.icns"
 # Backend Python modules (app.py plus any sibling packages it imports at startup).
 cp "$ROOT_DIR/app.py" "$BRIDGE_DIR/app.py"
 cp "$ROOT_DIR/webdav_sync.py" "$BRIDGE_DIR/webdav_sync.py"
+# 主模块会导入远程浏览器 Broker 客户端；菜单栏包需保留该同级模块。
+cp "$ROOT_DIR/remote_browser.py" "$BRIDGE_DIR/remote_browser.py"
 ditto "$ROOT_DIR/static" "$BRIDGE_DIR/static"
 vendor_python_dependencies
 if [[ "$BUNDLE_CORES" == "1" ]]; then

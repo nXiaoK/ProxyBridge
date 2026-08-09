@@ -1,7 +1,8 @@
 const appState = {
   cores: {},
-  features: { browser: true, browser_profile_sync: true, docker: false },
+  features: { browser: true, browser_profile_sync: true, remote_browser: false, docker: false },
   runtime: { mode: "headless", docker: false },
+  remoteBrowser: { configured: false, available: false, active_sessions: 0, error: "" },
   platform: null,
   fingerprint_chromium: null,
   active_browsers: [],
@@ -10,8 +11,15 @@ const appState = {
   nodes: [],
   bridges: [],
   tests: {},
+  speedTest: { settings: null, tasks: [] },
+  subscriptionSettings: { allow_non_public_urls: false },
+  subscriptionRefresh: { tasks: [] },
+  smartGateway: null,
   requestLogs: [],
   systemLogs: [],
+  logCenter: { settings: null, storage: null, request_total: 0, system_total: 0 },
+  requestLogPage: { page: 1, page_count: 1, total: 0, filtered_total: 0, limit: 50, loaded: false },
+  systemLogPage: { page: 1, page_count: 1, total: 0, filtered_total: 0, limit: 50, loaded: false },
   pool: null,
   network: null,
   networkStatus: "loading",
@@ -20,6 +28,7 @@ const appState = {
     protocol: "all",
     region: "all",
     subscription: "all",
+    sort: "name",
     search: "",
   },
   // groupId -> true 表示折叠；缺省为展开。
@@ -36,22 +45,45 @@ const appState = {
   browserRecordNodeId: null,
   sync: null,
   syncOpenssl: null,
+  diagnostics: { result: null, webrtc: null, running: false },
 };
+
+const managementAuth = window.ProxyBridgeAuth;
+const browserUi = window.ProxyBridgeBrowserUi;
+const coreUploadClient = window.ProxyBridgeCoreUpload;
+let managementToken = managementAuth.loadManagementToken(window);
 
 const $ = (selector) => document.querySelector(selector);
 let lastCoreLogTrigger = null;
+let lastCoreUploadTrigger = null;
 let lastBrowserRecordTrigger = null;
+let lastRemoteBrowserLaunchTrigger = null;
+let lastRemoteBrowserCredentialsTrigger = null;
 let lastCoreLogTriggerKey = null;
+let lastCoreUploadTriggerKey = null;
 let lastBrowserRecordTriggerKey = null;
+let lastRemoteBrowserLaunchTriggerKey = null;
+let lastRemoteBrowserLaunchTriggerAction = null;
+let lastRemoteBrowserCredentialsTriggerKey = null;
+let lastRemoteBrowserCredentialsTriggerAction = null;
+let pendingRemoteBrowserLaunch = null;
+let remoteBrowserLaunchPromise = null;
+let viewedRemoteBrowserInstanceId = null;
+let remoteBrowserCredentialsRequestGeneration = 0;
 let pendingModalFocusKey = null;
 let coreLogRequestGeneration = 0;
 let coreLogAbortController = null;
 let kernelDownloadPromise = null;
+let coreUploadPromise = null;
 let statusRequestPromise = null;
 let statusAbortController = null;
 let statusPollTimer = null;
 let syncOperationPromise = null;
 let networkSettingsSavePromise = null;
+let logPageRequestGeneration = 0;
+let logFilterTimer = null;
+let logSettingsHydrated = false;
+let logSettingsDirty = false;
 const actionInFlight = new Set();
 const renderSignatures = new Map();
 
@@ -60,10 +92,14 @@ const STATUS_POLL_VISIBLE_MS = 3_500;
 const STATUS_POLL_HIDDEN_MS = 30_000;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
-const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "settings", "sync"];
+const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "settings", "sync", "diagnostics"];
 
 function browserEnabled() {
   return appState.features?.browser !== false;
+}
+
+function remoteBrowserEnabled() {
+  return appState.features?.remote_browser === true;
 }
 
 function dockerRuntime() {
@@ -83,6 +119,11 @@ function setActiveView(view) {
   });
   renderActiveView({ force: true });
   applyActionInFlightState();
+  if (view === "logs") {
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
+  } else if (view === "system") {
+    loadLogPage("system").catch((error) => showToast(error.message, "error"));
+  }
 }
 
 // 更新单个侧边栏计数徽标;为 0 时通过 data-zero 隐藏,避免视觉噪音。
@@ -98,8 +139,8 @@ function renderNav() {
   setNavCount("navCountNodes", appState.nodes.length);
   setNavCount("navCountSubs", appState.subscriptions.length);
   setNavCount("navCountBridges", runningBridges().length);
-  setNavCount("navCountLogs", (appState.requestLogs || []).length);
-  setNavCount("navCountSystem", (appState.systemLogs || []).length);
+  setNavCount("navCountLogs", Number(appState.logCenter?.request_total ?? appState.requestLogs.length));
+  setNavCount("navCountSystem", Number(appState.logCenter?.system_total ?? appState.systemLogs.length));
 }
 
 function escapeHtml(value) {
@@ -171,20 +212,106 @@ function subscriptionIndexByNodeId() {
 }
 
 async function api(path, body = null, { signal } = {}) {
-  const options = body
-    ? {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }
-    : {};
+  const headers = {};
+  if (managementToken) headers[managementAuth.headerName] = managementToken;
+  const options = { headers };
+  if (body) {
+    options.method = "POST";
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(body);
+  }
   if (signal) options.signal = signal;
   const response = await fetch(path, options);
+  const responseToken = response.headers.get(managementAuth.headerName) || "";
+  if (!managementAuth.validateResponseToken(window, managementToken, responseToken)) {
+    managementToken = "";
+    throw new Error("管理 API 凭证已失效，请从启动入口重新打开控制台");
+  }
   const payload = await response.json();
   if (!response.ok || payload.error) {
     throw new Error(payload.error || `HTTP ${response.status}`);
   }
   return payload;
+}
+
+function logQueryParams(kind, { includePage = true, format = "" } = {}) {
+  const params = new URLSearchParams({ kind });
+  if (includePage) {
+    const pageState = kind === "request" ? appState.requestLogPage : appState.systemLogPage;
+    params.set("page", String(pageState.page || 1));
+    params.set("limit", String(pageState.limit || 50));
+  }
+  if (kind === "request") {
+    const filters = appState.logFilters;
+    if (filters.search.trim()) params.set("search", filters.search.trim());
+    if (filters.node !== "all") params.set("node", filters.node);
+    if (filters.status !== "all") params.set("status", filters.status);
+  } else {
+    const filters = appState.systemLogFilters;
+    if (filters.search.trim()) params.set("search", filters.search.trim());
+    if (filters.level !== "all") params.set("level", filters.level);
+  }
+  if (format) params.set("format", format);
+  return params;
+}
+
+async function loadLogPage(kind) {
+  const generation = ++logPageRequestGeneration;
+  const payload = await api(`/api/logs?${logQueryParams(kind)}`);
+  if (generation !== logPageRequestGeneration) return;
+  const pageState = {
+    page: Number(payload.page || 1),
+    page_count: Number(payload.page_count || 1),
+    total: Number(payload.total || 0),
+    filtered_total: Number(payload.filtered_total || 0),
+    limit: Number(payload.limit || 50),
+    loaded: true,
+  };
+  if (kind === "request") {
+    appState.requestLogs = payload.items || [];
+    appState.requestLogPage = pageState;
+    renderLogFilters();
+    renderRequestLogs();
+  } else {
+    appState.systemLogs = payload.items || [];
+    appState.systemLogPage = pageState;
+    renderSystemLogs();
+  }
+}
+
+function scheduleLogPageLoad(kind) {
+  window.clearTimeout(logFilterTimer);
+  logFilterTimer = window.setTimeout(() => {
+    const pageState = kind === "request" ? appState.requestLogPage : appState.systemLogPage;
+    pageState.page = 1;
+    loadLogPage(kind).catch((error) => showToast(error.message, "error"));
+  }, 240);
+}
+
+async function downloadLogExport(kind, format) {
+  const headers = {};
+  if (managementToken) headers[managementAuth.headerName] = managementToken;
+  const response = await fetch(`/api/logs/export?${logQueryParams(kind, { includePage: false, format })}`, { headers });
+  const responseToken = response.headers.get(managementAuth.headerName) || "";
+  if (!managementAuth.validateResponseToken(window, managementToken, responseToken)) {
+    managementToken = "";
+    throw new Error("管理 API 凭证已失效，请从启动入口重新打开控制台");
+  }
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || `HTTP ${response.status}`);
+  }
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const match = disposition.match(/filename="([A-Za-z0-9._-]+)"/);
+  const filename = match?.[1] || `proxybridge-${kind}-logs.${format}`;
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 function showToast(message, kind = "ok") {
@@ -206,9 +333,153 @@ function formatTime(seconds) {
   });
 }
 
+function formatDuration(seconds) {
+  const value = Math.max(0, Number(seconds || 0));
+  if (value < 60) return `${Math.round(value)} 秒`;
+  if (value < 3600) return `${Math.round(value / 60)} 分钟`;
+  if (value < 86400) return `${Math.round(value / 3600)} 小时`;
+  return `${Math.round(value / 86400)} 天`;
+}
+
+function diagnosticStatusLabel(status) {
+  return { ok: "正常", warn: "警告", error: "错误", skipped: "跳过" }[status] || "未知";
+}
+
+function diagnosticDetailsText(details) {
+  if (!details || typeof details !== "object" || !Object.keys(details).length) return "";
+  return JSON.stringify(details, null, 2);
+}
+
+function renderDiagnosticBridgeOptions() {
+  const select = $("#diagnosticsBridgeSelect");
+  if (!select) return;
+  const previous = select.value;
+  const bridges = (appState.bridges || []).filter(
+    (bridge) => ["running", "starting"].includes(bridge.status) && Number(bridge.port) > 0
+  );
+  select.innerHTML = [
+    '<option value="">自动选择运行中的代理</option>',
+    ...bridges.map((bridge) => (
+      `<option value="${escapeHtml(bridge.id)}">${escapeHtml(bridge.node_name || "未命名节点")} · ${escapeHtml(bridge.core || "core")} · ${Number(bridge.port)}</option>`
+    )),
+  ].join("");
+  if ([...select.options].some((option) => option.value === previous)) select.value = previous;
+  select.disabled = !$("#diagnosticsNetworkEnabled")?.checked || !bridges.length;
+}
+
+function renderDiagnostics() {
+  renderDiagnosticBridgeOptions();
+  const container = $("#diagnosticsResults");
+  const statusLine = $("#diagnosticsStatusLine");
+  if (!container || !statusLine) return;
+  const backendResults = appState.diagnostics.result?.results || [];
+  const webrtc = appState.diagnostics.webrtc
+    ? [{
+        id: "webrtc",
+        label: "WebRTC 泄漏风险",
+        category: "browser",
+        latency_ms: appState.diagnostics.webrtc.latency_ms || 0,
+        ...appState.diagnostics.webrtc,
+      }]
+    : [];
+  const results = [...backendResults, ...webrtc];
+  if (!results.length) {
+    statusLine.textContent = appState.diagnostics.running ? "正在检查" : "尚未运行";
+    container.innerHTML = `<div class="settings-empty">${appState.diagnostics.running ? "正在运行逐项检查…" : "运行诊断后在此显示逐项结果"}</div>`;
+    return;
+  }
+  const counts = { ok: 0, warn: 0, error: 0, skipped: 0 };
+  results.forEach((result) => { counts[result.status] = (counts[result.status] || 0) + 1; });
+  statusLine.textContent = `正常 ${counts.ok} · 警告 ${counts.warn} · 错误 ${counts.error} · 跳过 ${counts.skipped}`;
+  container.innerHTML = results.map((result) => {
+    const detailText = diagnosticDetailsText(result.details);
+    return `
+      <article class="diagnostic-result is-${escapeHtml(result.status)}">
+        <span class="diagnostic-status-mark" aria-hidden="true"></span>
+        <div class="diagnostic-result-copy">
+          <div class="diagnostic-result-head">
+            <strong>${escapeHtml(result.label)}</strong>
+            <span class="diagnostic-status-label">${diagnosticStatusLabel(result.status)}</span>
+            <span class="diagnostic-latency">${Number(result.latency_ms || 0)} ms</span>
+          </div>
+          <p>${escapeHtml(result.message)}</p>
+          ${detailText ? `<details class="diagnostic-details"><summary>查看详情</summary><pre>${escapeHtml(detailText)}</pre></details>` : ""}
+        </div>
+      </article>`;
+  }).join("");
+}
+
+async function runWebrtcDiagnostic() {
+  const started = performance.now();
+  try {
+    const result = await window.ProxyBridgeDiagnostics.collectWebrtcCandidates();
+    return { ...result, latency_ms: Math.max(0, Math.round(performance.now() - started)) };
+  } catch (error) {
+    return {
+      status: "error",
+      message: `WebRTC 检查失败（${error?.name || "Error"}）`,
+      details: {},
+      latency_ms: Math.max(0, Math.round(performance.now() - started)),
+    };
+  }
+}
+
+async function runDiagnostics({ webrtcOnly = false } = {}) {
+  if (appState.diagnostics.running) return;
+  appState.diagnostics.running = true;
+  if (!webrtcOnly) appState.diagnostics.result = null;
+  appState.diagnostics.webrtc = null;
+  renderDiagnostics();
+  const runButton = $("#diagnosticsRunButton");
+  const webrtcButton = $("#diagnosticsWebrtcButton");
+  runButton.disabled = true;
+  webrtcButton.disabled = true;
+  runButton.setAttribute("aria-busy", "true");
+  webrtcButton.setAttribute("aria-busy", "true");
+  runButton.classList.add("is-busy");
+  try {
+    const webrtcPromise = runWebrtcDiagnostic();
+    const backendPromise = webrtcOnly
+      ? Promise.resolve(null)
+      : api("/api/diagnostics/run", {
+          network: Boolean($("#diagnosticsNetworkEnabled")?.checked),
+          bridge_id: $("#diagnosticsBridgeSelect")?.value || "",
+        });
+    const [backendSettlement, webrtcSettlement] = await Promise.allSettled([backendPromise, webrtcPromise]);
+    if (!webrtcOnly) {
+      appState.diagnostics.result = backendSettlement.status === "fulfilled"
+        ? backendSettlement.value
+        : window.ProxyBridgeDiagnostics.failedBackendResult(backendSettlement.reason);
+    }
+    appState.diagnostics.webrtc = webrtcSettlement.status === "fulfilled"
+      ? webrtcSettlement.value
+      : {
+          status: "error",
+          message: `WebRTC 检查失败（${webrtcSettlement.reason?.name || "Error"}）`,
+          details: {},
+          latency_ms: 0,
+        };
+    if (!webrtcOnly && backendSettlement.status === "rejected") {
+      showToast(backendSettlement.reason?.message || "诊断请求失败", "error");
+    } else {
+      showToast(webrtcOnly ? "WebRTC 检查完成" : "诊断完成");
+    }
+  } finally {
+    appState.diagnostics.running = false;
+    runButton.disabled = false;
+    webrtcButton.disabled = false;
+    runButton.removeAttribute("aria-busy");
+    webrtcButton.removeAttribute("aria-busy");
+    runButton.classList.remove("is-busy");
+    renderDiagnostics();
+  }
+}
+
 // 通用网络设置表单：与 WebDAV 表单一样，状态轮询不能覆盖尚未保存的开关。
 let networkFormHydrated = false;
 let networkFormDirty = false;
+let speedTestFormHydrated = false;
+let speedTestFormDirty = false;
 
 function markNetworkFormDirty() {
   networkFormDirty = true;
@@ -219,7 +490,27 @@ function applyNetworkSettingsToForm(network, { force = false } = {}) {
   const allowLan = $("#allowLan");
   if (!allowLan) return;
   allowLan.checked = Boolean(network?.allow_lan);
+  const security = network?.security || {};
+  $("#lanAuthMode").value = security.auth_mode || "none";
+  $("#lanUsername").value = security.username || "";
+  $("#lanPassword").value = "";
+  $("#lanToken").value = "";
+  $("#lanToken").placeholder = security.token_configured
+    ? "已配置，留空保持不变"
+    : "至少 16 个字符";
+  $("#lanAllowedCidrs").value = (security.allowed_cidrs || []).join("\n");
+  $("#lanMaxConnections").value = Number(security.max_connections || 128);
+  syncLanAuthFields();
   networkFormHydrated = true;
+}
+
+function syncLanAuthFields() {
+  const mode = $("#lanAuthMode")?.value || "none";
+  const basic = mode === "basic";
+  const token = mode === "token";
+  $("#lanUsernameField").hidden = !basic;
+  $("#lanPasswordField").hidden = !basic;
+  $("#lanTokenField").hidden = !token;
 }
 
 function networkLanAddresses(network) {
@@ -408,6 +699,29 @@ function renderNetworkProxyList(network, networkStatus) {
     .join("");
 }
 
+function renderNetworkClients(network) {
+  const list = $("#networkClientList");
+  const count = $("#networkClientCount");
+  if (!list || !count) return;
+  const clients = Array.isArray(network?.clients) ? network.clients : [];
+  count.textContent = `${clients.length} 个连接`;
+  if (!clients.length) {
+    list.innerHTML = `<div class="settings-empty">暂无活动连接</div>`;
+    return;
+  }
+  list.innerHTML = clients.map((client) => {
+    const endpoint = `${client.address || "未知"}:${client.port || "-"}`;
+    return `
+      <div class="network-client-row">
+        <div>
+          <strong>${escapeHtml(client.node_name || "本地代理")}</strong>
+          <span>${escapeHtml(endpoint)} · ${escapeHtml(String(client.protocol || "detecting").toUpperCase())} · ${escapeHtml(formatDuration(Math.max(0, Math.floor(Date.now() / 1000) - Number(client.connected_at || 0))))}</span>
+        </div>
+        <button class="row-button danger" type="button" data-action="kick-client" data-id="${escapeHtml(client.id || "")}">踢出</button>
+      </div>`;
+  }).join("");
+}
+
 function networkSettingsRenderSnapshot() {
   const network = appState.network;
   return {
@@ -416,7 +730,11 @@ function networkSettingsRenderSnapshot() {
     listen_host: network?.listen_host || "",
     configurable: network?.configurable ?? true,
     docker_managed: network?.docker_managed === true,
+    security: network?.security || null,
+    clients: network?.clients || [],
     lan_addresses: networkLanAddresses(network),
+    speed_test: appState.speedTest?.settings || null,
+    logs: appState.logCenter || null,
     proxies: networkProxyEntries(network).map((entry) => ({
       bridge_id: entry.bridge_id,
       node_name: entry.node_name,
@@ -429,11 +747,23 @@ function networkSettingsRenderSnapshot() {
 
 function syncNetworkSettingsControlState() {
   const unavailable = !networkFormHydrated || !appState.network;
-  const runtimeManaged = appState.network?.configurable === false;
-  const disabled = unavailable || runtimeManaged || Boolean(networkSettingsSavePromise);
-  [$("#allowLan"), $("#networkSaveButton")].filter(Boolean).forEach((control) => {
+  const disabled = unavailable || Boolean(networkSettingsSavePromise);
+  const controls = [
+    $("#allowLan"),
+    $("#lanAuthMode"),
+    $("#lanUsername"),
+    $("#lanPassword"),
+    $("#lanToken"),
+    $("#lanAllowedCidrs"),
+    $("#lanMaxConnections"),
+    $("#networkSaveButton"),
+  ].filter(Boolean);
+  controls.forEach((control) => {
     control.disabled = disabled;
   });
+  if (appState.network?.range_configurable === false && $("#allowLan")) {
+    $("#allowLan").disabled = true;
+  }
 }
 
 function renderNetworkSettings() {
@@ -468,9 +798,11 @@ function renderNetworkSettings() {
   }
   const shareWarning = $("#networkShareWarning p");
   if (shareWarning) {
+    const authMode = network?.security?.auth_mode || "none";
+    const authLabel = authMode === "basic" ? "用户名和密码" : authMode === "token" ? "Token" : "无认证";
     shareWarning.textContent = dockerManaged
-      ? "请保持管理端口只发布到宿主机 127.0.0.1。代理端口也默认映射到宿主机回环地址；若改成 0.0.0.0，将允许其他设备连接且当前没有用户名或密码。"
-      : "请仅在可信网络开启。代理端口没有用户名或密码，同一局域网或可达本机的私有 IPv4 / VPN 设备可能直接使用你的代理。Proxy Bridge 控制台不会因此对外开放。";
+      ? `请保持管理端口只发布到宿主机 127.0.0.1。代理端口当前使用${authLabel}，并受 IP/CIDR 白名单与连接数上限保护。`
+      : `请仅在可信网络开启。代理端口当前使用${authLabel}，并受 IP/CIDR 白名单与连接数上限保护。Proxy Bridge 控制台不会因此对外开放。`;
   }
 
   const statusLine = $("#settingsStatusLine");
@@ -507,6 +839,65 @@ function renderNetworkSettings() {
   }
 
   renderNetworkProxyList(network, networkStatus);
+  renderNetworkClients(network);
+  const speedSettings = appState.speedTest?.settings;
+  if (speedSettings && (!speedTestFormHydrated || !speedTestFormDirty)) {
+    $("#speedTestTargets").value = (speedSettings.targets || []).join("\n");
+    $("#speedTestRotation").value = speedSettings.rotation || "round_robin";
+    $("#speedTestStaleMinutes").value = Math.max(1, Math.round(Number(speedSettings.stale_after_seconds || 21600) / 60));
+    $("#speedTestConcurrency").value = Number(speedSettings.batch_concurrency || 3);
+    $("#speedTestRetries").value = Number(speedSettings.retry_failures || 0);
+    speedTestFormHydrated = true;
+  }
+  const logSettings = appState.logCenter?.settings;
+  if (logSettings && (!logSettingsHydrated || !logSettingsDirty)) {
+    $("#logRetentionDays").value = Number(logSettings.retention_days || 14);
+    $("#logMaxFileMiB").value = Math.round(Number(logSettings.max_file_bytes || 8388608) / 1048576);
+    $("#logDiskQuotaMiB").value = Math.round(Number(logSettings.disk_quota_bytes || 134217728) / 1048576);
+    logSettingsHydrated = true;
+  }
+  const storage = appState.logCenter?.storage;
+  if ($("#logStorageUsage")) {
+    $("#logStorageUsage").textContent = storage
+      ? `${formatBytes(storage.used_bytes)} / ${formatBytes(storage.quota_bytes)} · ${Number(storage.file_count || 0)} 个文件`
+      : "—";
+  }
+}
+
+async function saveSpeedTestSettings(event) {
+  event.preventDefault();
+  const targets = $("#speedTestTargets").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+  const payload = {
+    targets,
+    rotation: $("#speedTestRotation").value,
+    stale_after_seconds: Number($("#speedTestStaleMinutes").value || 360) * 60,
+    batch_concurrency: Number($("#speedTestConcurrency").value || 3),
+    retry_failures: Number($("#speedTestRetries").value || 0),
+  };
+  const result = await api("/api/settings/speed-test", payload);
+  appState.speedTest.settings = result.settings;
+  speedTestFormDirty = false;
+  renderNetworkSettings();
+  showToast("测速设置已保存");
+}
+
+async function saveLogSettings(event) {
+  event.preventDefault();
+  const result = await api("/api/settings/logs", {
+    retention_days: Number($("#logRetentionDays").value),
+    max_file_bytes: Number($("#logMaxFileMiB").value) * 1048576,
+    disk_quota_bytes: Number($("#logDiskQuotaMiB").value) * 1048576,
+  });
+  const saved = result.settings || {};
+  appState.logCenter.settings = {
+    retention_days: saved.retention_days,
+    max_file_bytes: saved.max_file_bytes,
+    disk_quota_bytes: saved.disk_quota_bytes,
+  };
+  if (saved.storage) appState.logCenter.storage = saved.storage;
+  logSettingsDirty = false;
+  renderNetworkSettings();
+  showToast(`日志设置已保存，清理 ${Number(saved.cleanup?.deleted_files || 0)} 个文件`);
 }
 
 function setNetworkSettingsBusy(busy, trigger = null) {
@@ -535,11 +926,20 @@ async function withNetworkSettingsSave(task, trigger = null) {
 
 async function saveNetworkSettings(event) {
   event.preventDefault();
-  if (appState.network?.configurable === false) {
-    throw new Error("Docker 模式下网络范围由端口映射管理");
-  }
-  const allowLan = Boolean($("#allowLan")?.checked);
-  const result = await api("/api/settings/network", { allow_lan: allowLan });
+  const allowLan = appState.network?.range_configurable === false
+    ? true
+    : Boolean($("#allowLan")?.checked);
+  const result = await api("/api/settings/network", {
+    allow_lan: allowLan,
+    lan_security: {
+      auth_mode: $("#lanAuthMode").value,
+      username: $("#lanUsername").value,
+      password: $("#lanPassword").value,
+      token: $("#lanToken").value,
+      allowed_cidrs: $("#lanAllowedCidrs").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean),
+      max_connections: Number($("#lanMaxConnections").value),
+    },
+  });
   appState.network = result.network || { ...(appState.network || {}), allow_lan: allowLan };
   appState.networkStatus = "ready";
   networkFormDirty = false;
@@ -638,14 +1038,6 @@ function renderSync() {
   const autoUpload = $("#syncAutoUpload");
   if (autoUpload) autoUpload.disabled = !browserSyncEnabled;
   renderSyncMeta(settings);
-}
-
-async function loadSyncStatus() {
-  const result = await api("/api/sync/status");
-  appState.sync = result.settings || null;
-  appState.syncOpenssl = Boolean(result.openssl);
-  renderSync();
-  return result;
 }
 
 async function saveSyncSettings(event) {
@@ -797,27 +1189,29 @@ function nodeById(nodeId) {
   return appState.nodes.find((node) => node.id === nodeId);
 }
 
+function browserInstanceById(instanceId) {
+  return (appState.browser_instances || []).find((instance) => instance.id === instanceId) || null;
+}
+
+function safeRemoteBrowserUrl(value) {
+  return browserUi.safeRemoteBrowserUrl(value, URL);
+}
+
 function browserInstancesForNode(nodeId) {
-  const rank = { running: 0, starting: 1, stopped: 2, failed: 3 };
-  return (appState.browser_instances || [])
-    .filter((instance) => instance.node_id === nodeId)
-    .slice()
-    .sort((a, b) => {
-      const statusDiff = (rank[a.status] ?? 9) - (rank[b.status] ?? 9);
-      if (statusDiff) return statusDiff;
-      if (!!a.legacy !== !!b.legacy) return a.legacy ? -1 : 1;
-      return Number(a.created_at || 0) - Number(b.created_at || 0);
-    });
+  return browserUi.sortBrowserInstancesByRecentUse(
+    (appState.browser_instances || []).filter((instance) => instance.node_id === nodeId)
+  );
 }
 
 function runningBrowserInstancesForNode(nodeId) {
-  return browserInstancesForNode(nodeId).filter((instance) => ["running", "starting"].includes(instance.status));
+  return browserInstancesForNode(nodeId).filter((instance) => ["running", "starting", "stopping"].includes(instance.status));
 }
 
 function browserStatusLabel(status) {
   const labels = {
     running: "运行中",
     starting: "启动中",
+    stopping: "停止中",
     stopped: "已停止",
     failed: "失败",
   };
@@ -864,7 +1258,10 @@ function renderActiveView({ force = false } = {}) {
           subscriptions: appState.subscriptions,
           bridges: appState.bridges,
           tests: appState.tests,
+          speedTest: appState.speedTest,
           browserEnabled: browserEnabled(),
+          remoteBrowserEnabled: remoteBrowserEnabled(),
+          remoteBrowser: appState.remoteBrowser,
           activeBrowsers: appState.active_browsers,
           browserInstances: appState.browser_instances,
           filters: appState.filters,
@@ -878,12 +1275,26 @@ function renderActiveView({ force = false } = {}) {
       );
       break;
     case "subscriptions":
-      renderWhenChanged("subscriptions", appState.subscriptions, renderSubscriptions, force);
+      renderWhenChanged(
+        "subscriptions",
+        {
+          subscriptions: appState.subscriptions,
+          settings: appState.subscriptionSettings,
+          refresh: appState.subscriptionRefresh,
+        },
+        renderSubscriptions,
+        force
+      );
       break;
     case "bridges":
       renderWhenChanged(
         "bridges",
-        { bridges: appState.bridges, pool: appState.pool },
+        {
+          bridges: appState.bridges,
+          pool: appState.pool,
+          smartGateway: appState.smartGateway,
+          docker: dockerRuntime(),
+        },
         () => {
           renderPool();
           renderBridges();
@@ -894,7 +1305,7 @@ function renderActiveView({ force = false } = {}) {
     case "logs":
       renderWhenChanged(
         "logs",
-        { logs: appState.requestLogs, filters: appState.logFilters },
+        { logs: appState.requestLogs, filters: appState.logFilters, nodes: appState.nodes },
         () => {
           renderLogFilters();
           renderRequestLogs();
@@ -926,6 +1337,14 @@ function renderActiveView({ force = false } = {}) {
         force
       );
       break;
+    case "diagnostics":
+      renderWhenChanged(
+        "diagnostics",
+        { diagnostics: appState.diagnostics, bridges: appState.bridges },
+        renderDiagnostics,
+        force
+      );
+      break;
     default:
       break;
   }
@@ -949,8 +1368,19 @@ async function loadStatus({ forceFresh = false } = {}) {
   const request = (async () => {
     try {
       const status = await api("/api/status", null, { signal: controller.signal });
-      appState.features = status.features || { browser: true, browser_profile_sync: true, docker: false };
+      appState.features = status.features || {
+        browser: true,
+        browser_profile_sync: true,
+        remote_browser: false,
+        docker: false,
+      };
       appState.runtime = status.runtime || { mode: status.platform?.shell_mode || "headless", docker: false };
+      appState.remoteBrowser = status.remote_browser || {
+        configured: false,
+        available: false,
+        active_sessions: 0,
+        error: "",
+      };
       appState.platform = status.platform || null;
       appState.cores = status.cores || {};
       appState.fingerprint_chromium = status.fingerprint_chromium || null;
@@ -960,8 +1390,17 @@ async function loadStatus({ forceFresh = false } = {}) {
       appState.nodes = status.nodes || [];
       appState.bridges = status.bridges || [];
       appState.tests = status.tests || {};
-      appState.requestLogs = status.request_logs || [];
-      appState.systemLogs = status.system_logs || [];
+      appState.speedTest = status.speed_test || { settings: null, tasks: [] };
+      appState.subscriptionSettings = status.subscription_settings || { allow_non_public_urls: false };
+      appState.subscriptionRefresh = status.subscription_refresh || { tasks: [] };
+      appState.smartGateway = status.smart_gateway || null;
+      appState.logCenter = status.logs || appState.logCenter;
+      if (appState.activeView !== "logs" || !appState.requestLogPage.loaded) {
+        appState.requestLogs = status.request_logs || [];
+      }
+      if (appState.activeView !== "system" || !appState.systemLogPage.loaded) {
+        appState.systemLogs = status.system_logs || [];
+      }
       appState.pool = status.pool || null;
       if (status.network && typeof status.network === "object") {
         appState.network = status.network;
@@ -1001,8 +1440,8 @@ function render() {
       nodes: appState.nodes.length,
       subscriptions: appState.subscriptions.length,
       bridges: runningBridges().length,
-      logs: (appState.requestLogs || []).length,
-      system: (appState.systemLogs || []).length,
+      logs: Number(appState.logCenter?.request_total ?? appState.requestLogs.length),
+      system: Number(appState.logCenter?.system_total ?? appState.systemLogs.length),
     },
     renderNav
   );
@@ -1011,7 +1450,8 @@ function render() {
     {
       cores: appState.cores,
       fingerprint: appState.fingerprint_chromium,
-      busy: Boolean(kernelDownloadPromise),
+      downloadBusy: Boolean(kernelDownloadPromise),
+      uploadBusy: Boolean(coreUploadPromise),
       browserEnabled: browserEnabled(),
     },
     renderCores
@@ -1019,6 +1459,25 @@ function render() {
   const brandSubtitle = $("#brandSubtitle");
   if (brandSubtitle) {
     brandSubtitle.textContent = dockerRuntime() ? "Docker 控制台 · 订阅节点" : "订阅节点 · 本地代理";
+  }
+  const remoteLaunchModal = $("#remoteBrowserLaunchModal");
+  const remoteLaunchHasCredentials = !$("#remoteBrowserLaunchSuccess").hidden;
+  if (
+    !remoteBrowserEnabled()
+    && !remoteLaunchModal.hidden
+    && !remoteBrowserLaunchPromise
+    && !remoteLaunchHasCredentials
+  ) {
+    closeRemoteBrowserLaunchModal({ force: true });
+  } else if (remoteBrowserEnabled() && !remoteLaunchModal.hidden) {
+    renderRemoteBrowserBrokerStatus();
+  }
+  const credentialsModal = $("#remoteBrowserCredentialsModal");
+  if (credentialsModal && !credentialsModal.hidden) {
+    const viewedInstance = browserInstanceById(viewedRemoteBrowserInstanceId);
+    if (!remoteBrowserEnabled() || !viewedInstance || viewedInstance.status !== "running") {
+      closeRemoteBrowserCredentialsModal();
+    }
   }
   if (!browserEnabled() && !$("#browserRecordModal").hidden) {
     closeBrowserRecordModal();
@@ -1031,7 +1490,7 @@ function render() {
     if (typingLabel) {
       const node = nodeById(appState.browserRecordNodeId);
       const instances = browserInstancesForNode(appState.browserRecordNodeId);
-      const runningCount = instances.filter((i) => ["running", "starting"].includes(i.status)).length;
+      const runningCount = instances.filter((i) => ["running", "starting", "stopping"].includes(i.status)).length;
       $("#browserRecordTitle").textContent = `${node?.name || "节点"} 浏览器记录`;
       $("#browserRecordMeta").textContent = `${instances.length} 个记录 · ${runningCount} 个运行中`;
     } else {
@@ -1046,18 +1505,21 @@ function renderCores() {
   const singBox = appState.cores["sing-box"];
   const xray = appState.cores.xray;
   const fpKernel = appState.fingerprint_chromium;
-  const kernelBusyClass = kernelDownloadPromise ? " is-busy" : "";
-  const kernelBusyAttributes = kernelDownloadPromise ? ' disabled aria-busy="true"' : "";
+  const installBusy = Boolean(kernelDownloadPromise || coreUploadPromise);
+  const kernelBusyClass = installBusy ? " is-busy" : "";
+  const kernelBusyAttributes = installBusy ? ' disabled aria-busy="true"' : "";
+  const uploadBusyLabel = coreUploadPromise ? "正在导入" : "本地导入";
   // 指纹内核状态:已安装显示 ready,缺失显示可点击的「下载指纹内核」按钮。
   const fpPill = !browserEnabled()
     ? ""
     : fpKernel
-      ? `<button class="pill core-pill ok${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}"${kernelBusyAttributes}>指纹内核 ready</button>`
-      : `<button class="pill core-pill warn${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium"${kernelBusyAttributes}>下载指纹内核</button>`;
+      ? `<button class="pill core-pill ok${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="指纹内核已就绪，点击可重新下载" title="指纹内核已就绪：${escapeHtml(fpKernel)}"${kernelBusyAttributes}><span>指纹内核 ready</span></button>`
+      : `<button class="pill core-pill warn${kernelBusyClass}" type="button" data-action="download-kernel" aria-label="下载指纹内核 fingerprint-chromium" title="点击自动下载安装指纹内核 fingerprint-chromium"${kernelBusyAttributes}><span>下载指纹内核</span></button>`;
   coreStrip.innerHTML = `
-    <button class="pill core-pill ${singBox ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="sing-box" aria-label="查看 sing-box 运行日志" title="查看 sing-box 运行日志">sing-box ${singBox ? "ready" : "missing"}</button>
-    <button class="pill core-pill ${xray ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="xray" aria-label="查看 xray 运行日志" title="查看 xray 运行日志">xray ${xray ? "ready" : "missing"}</button>
+    <button class="pill core-pill ${singBox ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="sing-box" aria-label="查看 sing-box 运行日志" title="查看 sing-box 运行日志"><span>sing-box ${singBox ? "ready" : "missing"}</span></button>
+    <button class="pill core-pill ${xray ? "ok" : "warn"}" type="button" data-action="show-core-log" data-core="xray" aria-label="查看 xray 运行日志" title="查看 xray 运行日志"><span>xray ${xray ? "ready" : "missing"}</span></button>
     ${fpPill}
+    <button class="pill core-pill${coreUploadPromise ? " is-busy" : ""}" type="button" data-action="show-core-upload" aria-label="从本地文件导入代理或指纹内核" title="上传官方 Release 安装包，绕过 GitHub 在线下载"${installBusy ? ' disabled aria-busy="true"' : ""}><span>${uploadBusyLabel}</span></button>
   `;
 }
 
@@ -1065,6 +1527,11 @@ function renderSubscriptions() {
   const list = $("#subscriptionList");
   const count = $("#subsCount");
   if (count) count.textContent = `${appState.subscriptions.length} 个订阅`;
+  const allowNonPublic = $("#allowNonPublicSubscriptions");
+  if (allowNonPublic) {
+    allowNonPublic.checked = Boolean(appState.subscriptionSettings?.allow_non_public_urls);
+  }
+  renderSubscriptionRefreshTask();
   if (!appState.subscriptions.length) {
     list.innerHTML = '<div class="subscription-empty">暂无订阅，粘贴订阅 URL 或原始链接后即可导入。</div>';
     return;
@@ -1075,13 +1542,30 @@ function renderSubscriptions() {
         <article class="subscription-item">
           <div class="subscription-head">
             <span class="sub-avatar">${escapeHtml(initials(item.name))}</span>
-            <div>
-              <strong class="subscription-name">${escapeHtml(item.name)}</strong>
-              <div class="subscription-meta">${item.node_count || 0} 个节点 · ${formatTime(item.last_update)}</div>
+            <div class="subscription-copy">
+              <div class="subscription-title-row">
+                <strong class="subscription-name">${escapeHtml(item.name)}</strong>
+                <span class="sub-status ${item.last_error ? "is-error" : ""}">${item.last_error ? "需检查" : "正常"}</span>
+              </div>
+              <div class="subscription-meta">${item.node_count || 0} 个节点 · 更新于 ${formatTime(item.last_update)}</div>
+              ${item.url ? `<div class="subscription-url" title="${escapeHtml(item.url)}">${escapeHtml(item.url)}</div>` : '<div class="subscription-url">手动导入</div>'}
+              ${item.last_error ? `<div class="subscription-error" title="${escapeHtml(item.last_error)}">${escapeHtml(item.last_error)}</div>` : ""}
             </div>
-            <span class="sub-status">已启用</span>
           </div>
           <div class="item-actions">
+            <label class="field-inline">
+              <span>自动刷新</span>
+              <select class="subscription-schedule" data-action="schedule-sub" data-id="${escapeHtml(item.id)}">
+                ${[
+                  [0, "关闭"],
+                  [15, "每 15 分钟"],
+                  [30, "每 30 分钟"],
+                  [60, "每小时"],
+                  [360, "每 6 小时"],
+                  [1440, "每天"],
+                ].map(([value, label]) => `<option value="${value}" ${Number(item.refresh_interval_minutes || 0) === value ? "selected" : ""}>${label}</option>`).join("")}
+              </select>
+            </label>
             ${
               item.url
                 ? `<button class="row-button" data-action="refresh-sub" data-id="${escapeHtml(item.id)}">${icon("refresh")}<span>刷新</span></button>`
@@ -1089,10 +1573,98 @@ function renderSubscriptions() {
             }
             <button class="row-button danger" data-action="delete-sub" data-id="${escapeHtml(item.id)}">${icon("trash")}<span>删除</span></button>
           </div>
+          ${renderSubscriptionHistory(item)}
         </article>
       `
     )
     .join("");
+}
+
+function renderSubscriptionHistory(item) {
+  const history = Array.isArray(item.refresh_history) ? item.refresh_history.slice(-3).reverse() : [];
+  if (!history.length) return "";
+  const labels = { updated: "已更新", not_modified: "无变化", failed: "失败", cancelled: "已取消" };
+  return `<details class="subscription-history"><summary>最近刷新记录 · ${history.length}</summary><div>${history.map((entry) => {
+    const changes = entry.changes || {};
+    const detail = entry.status === "updated"
+      ? `+${Number(changes.added || 0)} / -${Number(changes.removed || 0)} / ~${Number(changes.changed || 0)}`
+      : entry.error ? escapeHtml(entry.error) : `${Number(entry.duration_ms || 0)} ms`;
+    return `<span class="history-${escapeHtml(entry.status)}">${escapeHtml(labels[entry.status] || entry.status)} · ${formatTime(entry.at)} · ${detail}</span>`;
+  }).join("")}</div></details>`;
+}
+
+function activeSubscriptionRefreshTask() {
+  const tasks = Array.isArray(appState.subscriptionRefresh?.tasks) ? appState.subscriptionRefresh.tasks : [];
+  return [...tasks].reverse().find((task) => ["queued", "running", "cancelling"].includes(task.status)) || null;
+}
+
+function subscriptionRefreshItemDetail(item) {
+  if (!item) return "等待执行";
+  if (item.status === "updated") {
+    const changes = item.changes || {};
+    return `+${Number(changes.added || 0)} / -${Number(changes.removed || 0)} / ~${Number(changes.changed || 0)}`;
+  }
+  if (item.error) return item.error;
+  return `${Number(item.duration_ms || 0)} ms`;
+}
+
+function renderSubscriptionRefreshTask() {
+  const container = $("#subscriptionRefreshTask");
+  const button = $("#refreshAllSubscriptions");
+  if (!container || !button) return;
+  const tasks = Array.isArray(appState.subscriptionRefresh?.tasks) ? appState.subscriptionRefresh.tasks : [];
+  const activeTask = activeSubscriptionRefreshTask();
+  const task = activeTask || tasks[tasks.length - 1] || null;
+  if (!task) {
+    container.hidden = true;
+    button.disabled = false;
+    button.querySelector("span").textContent = "刷新全部";
+    return;
+  }
+  container.hidden = false;
+  const completed = Number(task.completed || 0);
+  const total = Number(task.total || 0);
+  const taskLabels = {
+    queued: "等待开始",
+    running: "进行中",
+    cancelling: "正在取消",
+    completed: "已完成",
+    cancelled: "已取消",
+  };
+  const itemLabels = {
+    updated: "已更新",
+    not_modified: "无变化",
+    failed: "失败",
+    cancelled: "已取消",
+    running: "刷新中",
+    queued: "等待",
+  };
+  const subscriptionNames = new Map(appState.subscriptions.map((item) => [item.id, item.name]));
+  const subscriptionIds = Array.isArray(task.subscription_ids) ? task.subscription_ids : [];
+  const items = Array.isArray(task.items) ? task.items : [];
+  const itemRows = subscriptionIds.map((subscriptionId, index) => {
+    const item = items[index];
+    const pendingStatus = task.active_index === index ? "running" : "queued";
+    const status = item?.status || pendingStatus;
+    const statusClass = Object.prototype.hasOwnProperty.call(itemLabels, status) ? status : "queued";
+    const name = subscriptionNames.get(subscriptionId) || `订阅 ${index + 1}`;
+    return `
+      <div class="subscription-task-item is-${statusClass}">
+        <strong>${escapeHtml(name)}</strong>
+        <span class="subscription-task-result">${escapeHtml(itemLabels[status] || status)} · ${escapeHtml(subscriptionRefreshItemDetail(item))}</span>
+      </div>`;
+  }).join("");
+  const cancelButton = activeTask
+    ? `<button type="button" class="row-button" data-action="cancel-refresh-all" data-id="${escapeHtml(task.id)}"${task.status === "cancelling" ? " disabled" : ""}>${task.status === "cancelling" ? "正在取消" : "取消后续刷新"}</button>`
+    : "";
+  container.innerHTML = `
+    <div class="subscription-task-head">
+      <span>批量刷新 ${completed}/${total} · ${escapeHtml(taskLabels[task.status] || task.status)}</span>
+      ${cancelButton}
+    </div>
+    <div class="subscription-task-items">${itemRows}</div>`;
+  button.disabled = Boolean(activeTask);
+  button.querySelector("span").textContent = activeTask ? `刷新中 ${completed}/${total}` : "再次刷新全部";
 }
 
 function setSelectOptions(select, values, current, allLabel) {
@@ -1109,6 +1681,8 @@ function renderFilters() {
   const regions = [...new Set(appState.nodes.map((node) => node.region))];
   appState.filters.protocol = setSelectOptions($("#protocolFilter"), protocols, appState.filters.protocol, "全部协议");
   appState.filters.region = setSelectOptions($("#regionFilter"), regions, appState.filters.region, "全部地区");
+  const sortSelect = $("#nodeSort");
+  if (sortSelect) sortSelect.value = appState.filters.sort || "name";
 
   const subSelect = $("#subscriptionFilter");
   if (subSelect) {
@@ -1138,6 +1712,9 @@ function bridgeForNode(nodeId) {
 function renderLogFilters() {
   const select = $("#logNodeFilter");
   const nodeOptions = new Map();
+  for (const node of appState.nodes || []) {
+    if (node.id) nodeOptions.set(node.id, node.name || node.id);
+  }
   for (const entry of appState.requestLogs || []) {
     const id = entry.node_id || entry.node_name || "";
     if (!id) continue;
@@ -1159,28 +1736,7 @@ function renderLogFilters() {
 }
 
 function filteredRequestLogs() {
-  const search = appState.logFilters.search.trim().toLowerCase();
-  return (appState.requestLogs || []).filter((entry) => {
-    if (appState.logFilters.node !== "all") {
-      const id = entry.node_id || entry.node_name || "";
-      if (id !== appState.logFilters.node) return false;
-    }
-    if (appState.logFilters.status !== "all" && entry.status !== appState.logFilters.status) return false;
-    if (!search) return true;
-    const target = entry.target || `${entry.target_host || ""}:${entry.target_port || ""}`;
-    return [
-      target,
-      entry.target_host,
-      entry.target_port,
-      entry.node_name,
-      entry.client,
-      entry.status,
-      statusLabel(entry.status),
-      entry.message,
-      entry.command,
-      entry.proxy_protocol,
-    ].some((value) => String(value || "").toLowerCase().includes(search));
-  });
+  return appState.requestLogs || [];
 }
 
 function testSummary(nodeId) {
@@ -1195,10 +1751,13 @@ function testSummary(nodeId) {
   }
   const ok = Boolean(result.ok);
   const latency = result.latency_ms == null ? "-" : `${result.latency_ms} ms`;
+  const age = result.age_seconds == null ? "未知" : `${formatDuration(result.age_seconds)}前`;
+  const successRate = `${Math.round(Number(result.success_rate || 0) * 100)}%`;
   return `
-    <div class="test-result">
+    <div class="test-result ${result.stale ? "is-stale" : ""}">
       <span class="test-line ${ok ? "ok" : "bad"}">${ok ? latency : "失败"}</span>
       <span class="test-message">${escapeHtml(result.message || "")}</span>
+      <span class="test-result-meta">${result.stale ? "已过期 · " : ""}${escapeHtml(age)} · 成功率 ${successRate} (${Number(result.success_count || 0)}/${Number(result.attempt_count || 0)})</span>
       <button class="row-button" data-action="test" data-node="${escapeHtml(nodeId)}"><span>重测</span></button>
     </div>
   `;
@@ -1208,7 +1767,7 @@ function filteredNodes() {
   const search = appState.filters.search.trim().toLowerCase();
   const subFilter = appState.filters.subscription || "all";
   const byNode = subscriptionIndexByNodeId();
-  return appState.nodes.filter((node) => {
+  const nodes = appState.nodes.filter((node) => {
     if (appState.filters.protocol !== "all" && node.protocol !== appState.filters.protocol) return false;
     if (appState.filters.region !== "all" && node.region !== appState.filters.region) return false;
     if (subFilter !== "all") {
@@ -1224,6 +1783,19 @@ function filteredNodes() {
     return [node.name, node.server, node.source, node.protocol, node.region, subName].some((value) =>
       String(value || "").toLowerCase().includes(search)
     );
+  });
+  const testFor = (node) => appState.tests[node.id] || {};
+  return nodes.sort((left, right) => {
+    if (appState.filters.sort === "latency") {
+      return Number(testFor(left).latency_ms ?? Number.MAX_SAFE_INTEGER) - Number(testFor(right).latency_ms ?? Number.MAX_SAFE_INTEGER);
+    }
+    if (appState.filters.sort === "success_rate") {
+      return Number(testFor(right).success_rate ?? -1) - Number(testFor(left).success_rate ?? -1);
+    }
+    if (appState.filters.sort === "tested_at") {
+      return Number(testFor(right).tested_at || 0) - Number(testFor(left).tested_at || 0);
+    }
+    return String(left.name || "").localeCompare(String(right.name || ""), "zh-CN");
   });
 }
 
@@ -1279,10 +1851,6 @@ function groupNodesBySubscription(nodes) {
     group.nodes.push(node);
   }
 
-  for (const group of groups.values()) {
-    group.nodes.sort((a, b) => String(a.name || "").localeCompare(String(b.name || ""), "zh-CN"));
-  }
-
   const ordered = [];
   for (const sub of appState.subscriptions || []) {
     const group = groups.get(`sub:${sub.id}`);
@@ -1305,13 +1873,34 @@ function renderNodeRow(node) {
   const security = node.security || "";
   const server = `${node.server}:${node.port}`;
   const recordLabel = browserInstances.length ? `浏览器记录 ${browserInstances.length}` : "浏览器记录";
+  const coreOptions = Array.isArray(node.core_options) && node.core_options.length
+    ? node.core_options
+    : [node.preferred_core || "sing-box"];
+  const coreControl = coreOptions.length > 1
+    ? `<div class="node-core-control">
+        <select data-core-select="${escapeHtml(node.id)}" aria-label="${escapeHtml(node.name)} 首选核心" ${bridge ? "disabled" : ""}>
+          ${coreOptions.map((core) => `<option value="${escapeHtml(core)}" ${core === node.preferred_core ? "selected" : ""}>${escapeHtml(core)}</option>`).join("")}
+        </select>
+        <label title="首选核心启动失败时尝试备用核心">
+          <input type="checkbox" data-core-fallback="${escapeHtml(node.id)}" ${node.fallback_enabled ? "checked" : ""} ${bridge ? "disabled" : ""}>
+          <span>失败回退</span>
+        </label>
+      </div>`
+    : `<span class="tag core-tag" title="当前节点仅兼容此核心">${escapeHtml(coreOptions[0])}</span>`;
+  const browserActionLabel = remoteBrowserEnabled() ? "远程浏览器" : "浏览器";
+  const browserActionTitle = remoteBrowserEnabled()
+    ? "新开远程浏览器：独立 Docker Worker + 独立 Profile + 绑定该节点代理"
+    : "新开不同指纹浏览器：独立 Profile + 绑定该节点代理";
+  const browserStopTitle = remoteBrowserEnabled()
+    ? "停止该节点的远程浏览器 Worker，保留本地代理"
+    : "结束该节点的指纹浏览器进程，保留本地代理";
   const browserActions = browserEnabled()
     ? `
-          <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开不同指纹浏览器 ${escapeHtml(node.name)}" title="新开不同指纹浏览器：独立 Profile + 绑定该节点代理">${icon("browser")}<span>浏览器</span></button>
+          <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开${escapeHtml(browserActionLabel)} ${escapeHtml(node.name)}" title="${escapeHtml(browserActionTitle)}">${icon("browser")}<span>${escapeHtml(browserActionLabel)}</span></button>
           <button class="row-button" data-action="browser-records" data-node="${escapeHtml(node.id)}" aria-label="查看 ${escapeHtml(node.name)} 的浏览器记录" title="浏览器记录">${icon("list")}<span>${escapeHtml(recordLabel)}</span></button>
           ${
             browserActive
-              ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="结束该节点的指纹浏览器进程，保留本地代理">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
+              ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="${escapeHtml(browserStopTitle)}">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
               : ""
           }
         `
@@ -1327,7 +1916,7 @@ function renderNodeRow(node) {
       <td><span class="tag protocol-tag">${escapeHtml(node.protocol)}</span></td>
       <td><span class="transport-tag"><strong>${escapeHtml(transport)}</strong><em>${escapeHtml(security)}</em></span></td>
       <td><span class="mono server-cell" title="${escapeHtml(server)}">${escapeHtml(server)}</span></td>
-      <td><span class="tag core-tag">${escapeHtml(node.preferred_core || "sing-box")}</span></td>
+      <td>${coreControl}</td>
       <td>${testSummary(node.id)}</td>
       <td>
         <div class="row-actions">
@@ -1374,7 +1963,6 @@ function renderNodeGroupHeader(group, { forceExpand = false } = {}) {
               ${group.nodes.length} 个节点${runningCount ? ` · ${runningCount} 运行中` : ""}${meta ? ` · ${escapeHtml(meta)}` : ""}
             </span>
           </span>
-        </button>
       </td>
     </tr>
   `;
@@ -1385,6 +1973,7 @@ function renderNodes() {
   const empty = $("#emptyNodes");
   const nodes = filteredNodes();
   const groups = groupNodesBySubscription(nodes);
+  renderSpeedTestTaskControls();
   const groupCount = groups.length;
   $("#nodeCount").textContent =
     groupCount > 1
@@ -1416,6 +2005,25 @@ function renderNodes() {
     .join("");
 }
 
+function activeSpeedTestTask() {
+  const tasks = Array.isArray(appState.speedTest?.tasks) ? appState.speedTest.tasks : [];
+  return [...tasks].reverse().find((task) => ["queued", "running", "cancelling"].includes(task.status)) || null;
+}
+
+function renderSpeedTestTaskControls() {
+  const task = activeSpeedTestTask();
+  const startButton = $("#testVisible");
+  const cancelButton = $("#cancelVisibleTest");
+  if (!startButton || !cancelButton) return;
+  startButton.disabled = Boolean(task);
+  startButton.querySelector("span").textContent = task
+    ? `测速中 ${Number(task.completed || 0)}/${Number(task.total || 0)}`
+    : "测试可见节点";
+  cancelButton.hidden = !task;
+  cancelButton.disabled = task?.status === "cancelling";
+  cancelButton.dataset.taskId = task?.id || "";
+}
+
 function renderPool() {
   const pool = appState.pool || {};
   const links = pool.links || {};
@@ -1429,20 +2037,18 @@ function renderPool() {
   const getBtn = $("#poolCopyGet");
   if (listBtn) listBtn.dataset.text = links.list_json || "";
   if (txtBtn) txtBtn.dataset.text = links.proxies_txt || "";
-  if (getBtn) getBtn.dataset.text = links.get_random || "";
+  if (getBtn) getBtn.dataset.text = links.get_health || links.get_random || "";
 
   const rows = $("#poolLinkRows");
   if (!rows) return;
   const items = [
     ["JSON 列表", links.list_json],
     ["文本列表", links.proxies_txt],
-    ["随机获取", links.get_random],
+    ["健康优先", links.get_health || links.get_random],
   ].filter(([, url]) => url);
   if (!items.length) {
     rows.innerHTML = `<div class="pool-link-empty">启动本地代理后，这里会显示可复制的代理池链接。</div>`;
-    return;
-  }
-  rows.innerHTML = items
+  } else rows.innerHTML = items
     .map(
       ([label, url]) => `
       <div class="pool-link-row">
@@ -1451,6 +2057,70 @@ function renderPool() {
       </div>`
     )
     .join("");
+
+  const memberList = $("#poolMemberList");
+  if (!memberList) return;
+  const members = Array.isArray(pool.members) ? pool.members : [];
+  if (!members.length) {
+    memberList.innerHTML = `<div class="pool-link-empty">暂无代理池成员</div>`;
+  } else {
+    memberList.innerHTML = members.map((member) => {
+      const state = member.circuit_state || "closed";
+      const label = state === "excluded" ? "已排除" : state === "open" ? "熔断" : state === "half_open" ? "恢复探测" : "健康";
+      const latency = member.latency_ms == null ? "未测速" : `${Number(member.latency_ms)} ms`;
+      const action = state === "excluded"
+        ? `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="0">恢复</button>`
+        : `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="1800">排除 30 分钟</button>`;
+      return `
+        <div class="pool-member-row is-${escapeHtml(state)}">
+          <div>
+            <strong>${escapeHtml(member.node_name || "未命名节点")}</strong>
+            <span>${escapeHtml(label)} · 健康 ${Number(member.health_score || 0)} · ${escapeHtml(latency)}</span>
+          </div>
+          ${action}
+        </div>`;
+    }).join("");
+  }
+  renderSmartGateway();
+}
+
+function renderSmartGateway() {
+  const gateway = appState.smartGateway || {};
+  const card = $("#smartGatewayCard");
+  const status = $("#smartGatewayStatus");
+  const strategy = $("#smartGatewayStrategy");
+  const port = $("#smartGatewayPort");
+  const region = $("#smartGatewayRegion");
+  const query = $("#smartGatewayQuery");
+  const save = $("#smartGatewaySave");
+  const stop = $("#smartGatewayStop");
+  if (!status || !strategy || !port || !region || !query || !save || !stop) return;
+  strategy.value = gateway.strategy || "health";
+  if (document.activeElement !== port) port.value = Number(gateway.port || 21000);
+  if (document.activeElement !== region) region.value = gateway.region || "";
+  if (document.activeElement !== query) query.value = gateway.query || "";
+  const links = $("#smartGatewayLinks");
+  const unavailable = dockerRuntime();
+  card?.classList.toggle("is-unavailable", unavailable);
+  card?.setAttribute("aria-disabled", unavailable ? "true" : "false");
+  [strategy, port, region, query].forEach((control) => { control.disabled = unavailable; });
+  if (unavailable) {
+    status.textContent = "Docker 模式不可用";
+    save.textContent = "Docker 不可用";
+    save.disabled = true;
+    stop.disabled = true;
+    if (links) links.innerHTML = '<div class="pool-link-empty">Docker 未发布智能网关固定端口，请在宿主机模式使用。</div>';
+    return;
+  }
+  status.textContent = gateway.running ? `运行中 · ${Number(gateway.available_members || 0)} 个节点` : (gateway.last_error || "未运行");
+  save.textContent = gateway.running ? "保存设置" : "保存并启动";
+  save.disabled = false;
+  stop.disabled = !gateway.running;
+  if (links) {
+    links.innerHTML = gateway.running
+      ? `<div class="pool-link-row"><span class="pool-link-label">SOCKS5</span><code class="pool-link-url">${escapeHtml(gateway.socks_url || "")}</code></div><div class="pool-link-row"><span class="pool-link-label">HTTP</span><code class="pool-link-url">${escapeHtml(gateway.http_url || "")}</code></div>`
+      : `<div class="pool-link-empty">保存设置后启动固定入口。</div>`;
+  }
 }
 
 function renderBridges() {
@@ -1458,7 +2128,7 @@ function renderBridges() {
   const bridges = runningBridges();
   const count = $("#bridgesCount");
   if (count) count.textContent = `${bridges.length} 个运行中`;
-  $("#stopAll").disabled = bridges.length === 0;
+  $("#stopAll").disabled = bridges.length === 0 && !appState.smartGateway?.running;
 
   if (!bridges.length) {
     list.innerHTML = `
@@ -1548,7 +2218,13 @@ function renderRequestLogs() {
   const empty = $("#emptyLogs");
   const allLogs = appState.requestLogs || [];
   const logs = filteredRequestLogs();
-  $("#logCount").textContent = allLogs.length === logs.length ? `${logs.length} 条` : `${logs.length} / ${allLogs.length} 条`;
+  const page = appState.requestLogPage;
+  $("#logCount").textContent = page.loaded && page.filtered_total !== page.total
+    ? `${page.filtered_total} / ${page.total} 条`
+    : `${page.loaded ? page.total : allLogs.length} 条`;
+  $("#requestLogPage").textContent = `第 ${page.page} / ${page.page_count} 页`;
+  $("#requestLogPrev").disabled = page.page <= 1;
+  $("#requestLogNext").disabled = page.page >= page.page_count;
   if (!logs.length) {
     rows.innerHTML = "";
     empty.textContent = allLogs.length ? "没有匹配的连接日志" : "暂无连接日志";
@@ -1600,14 +2276,7 @@ function systemLevelLabel(level) {
 
 // 按当前筛选(级别 + 关键词)过滤系统日志。
 function filteredSystemLogs() {
-  const search = appState.systemLogFilters.search.trim().toLowerCase();
-  const level = appState.systemLogFilters.level;
-  return (appState.systemLogs || []).filter((entry) => {
-    if (level !== "all" && entry.level !== level) return false;
-    if (!search) return true;
-    return [entry.message, entry.category, entry.level, systemLevelLabel(entry.level)]
-      .some((value) => String(value || "").toLowerCase().includes(search));
-  });
+  return appState.systemLogs || [];
 }
 
 // 渲染系统日志表格,并同步筛选控件的当前值与计数。
@@ -1623,7 +2292,13 @@ function renderSystemLogs() {
 
   const all = appState.systemLogs || [];
   const logs = filteredSystemLogs();
-  $("#systemCount").textContent = all.length === logs.length ? `${logs.length} 条` : `${logs.length} / ${all.length} 条`;
+  const page = appState.systemLogPage;
+  $("#systemCount").textContent = page.loaded && page.filtered_total !== page.total
+    ? `${page.filtered_total} / ${page.total} 条`
+    : `${page.loaded ? page.total : all.length} 条`;
+  $("#systemLogPage").textContent = `第 ${page.page} / ${page.page_count} 页`;
+  $("#systemLogPrev").disabled = page.page <= 1;
+  $("#systemLogNext").disabled = page.page >= page.page_count;
   if (!logs.length) {
     rows.innerHTML = "";
     empty.textContent = all.length ? "没有匹配的系统日志" : "暂无系统日志";
@@ -1657,7 +2332,13 @@ function openModal(modal) {
 
 function closeModal(modal) {
   modal.hidden = true;
-  if ($("#coreLogModal").hidden && $("#browserRecordModal").hidden) {
+  if (
+    $("#coreLogModal").hidden
+    && $("#coreUploadModal").hidden
+    && $("#browserRecordModal").hidden
+    && $("#remoteBrowserLaunchModal").hidden
+    && $("#remoteBrowserCredentialsModal").hidden
+  ) {
     const shell = $(".app-shell");
     if (shell) {
       shell.inert = false;
@@ -1666,9 +2347,11 @@ function closeModal(modal) {
   }
 }
 
-function findActionTrigger(key) {
+function findActionTrigger(key, action = "") {
   if (!key) return null;
-  return [...document.querySelectorAll("button[data-action]")].find((button) => actionLockKey(button) === key) || null;
+  return [...document.querySelectorAll("button[data-action]")].find((button) => (
+    actionLockKey(button) === key && (!action || button.dataset.action === action)
+  )) || null;
 }
 
 function closeCoreLogModal() {
@@ -1685,6 +2368,162 @@ function closeCoreLogModal() {
   }
   lastCoreLogTrigger = null;
   lastCoreLogTriggerKey = null;
+}
+
+function showCoreUploadError(message = "") {
+  const element = $("#coreUploadError");
+  element.textContent = message;
+  element.hidden = !message;
+}
+
+function coreUploadAccept(kind) {
+  if (kind === "sing-box") return ".tar.gz,.tgz,.zip";
+  if (kind === "xray") return ".zip";
+  return ".zip,.tar.gz,.tgz,.tar.xz,.tar,.dmg";
+}
+
+function coreUploadExample(kind) {
+  const os = appState.platform?.os || "linux";
+  const hostArch = appState.platform?.arch || "x86_64";
+  const arch = kind === "fingerprint-chromium" && remoteBrowserEnabled() ? "x86_64" : hostArch;
+  if (kind === "sing-box") {
+    const osName = os === "darwin" ? "darwin" : os === "windows" ? "windows" : "linux";
+    const archName = arch === "arm64" ? "arm64" : "amd64";
+    const suffix = os === "windows" ? ".zip" : ".tar.gz";
+    return `例如 sing-box-版本-${osName}-${archName}${suffix}`;
+  }
+  if (kind === "xray") {
+    const osName = os === "darwin" ? "macos" : os === "windows" ? "windows" : "linux";
+    const archName = arch === "arm64" ? "arm64-v8a" : "64";
+    return `例如 Xray-${osName}-${archName}.zip`;
+  }
+  const platformName = remoteBrowserEnabled()
+    ? "linux"
+    : appState.platform?.fingerprint_platform || os;
+  const archName = arch === "arm64" ? "arm64" : "x64";
+  return `例如 fingerprint-chromium_${platformName}_${archName}.zip（以实际上游文件名为准）`;
+}
+
+function updateCoreUploadControls({ clearFile = false } = {}) {
+  const kindSelect = $("#coreUploadKind");
+  const fingerprintOption = kindSelect.querySelector('option[value="fingerprint-chromium"]');
+  fingerprintOption.disabled = !browserEnabled();
+  if (fingerprintOption.disabled && kindSelect.value === "fingerprint-chromium") {
+    kindSelect.value = "sing-box";
+  }
+  const kind = kindSelect.value;
+  const fileInput = $("#coreUploadFile");
+  fileInput.accept = coreUploadAccept(kind);
+  if (clearFile) fileInput.value = "";
+  $("#coreUploadPlatformHint").textContent = coreUploadClient.platformHint(
+    kind,
+    appState.platform || {},
+    remoteBrowserEnabled(),
+  );
+  const idleHint = kind === "fingerprint-chromium"
+    ? "替换前请停止所有浏览器实例。"
+    : `替换前请停止正在使用 ${kind} 的本地代理。`;
+  $("#coreUploadFileHint").textContent = `${coreUploadExample(kind)}。${idleHint}`;
+  $("#coreUploadMeta").textContent = "原始文件流式上传 · 单文件最大 2 GiB · 解压后最大 4 GiB";
+}
+
+function setCoreUploadBusy(busy) {
+  const modal = $("#coreUploadModal");
+  modal.querySelectorAll("button, input, select").forEach((control) => {
+    control.disabled = busy;
+  });
+  const submit = $("#coreUploadSubmit");
+  submit.classList.toggle("is-busy", busy);
+  submit.setAttribute("aria-busy", busy ? "true" : "false");
+  submit.querySelector("span").textContent = busy ? "正在上传并安装…" : "上传并安装";
+  if (busy) {
+    const file = $("#coreUploadFile").files?.[0];
+    $("#coreUploadMeta").textContent = file
+      ? `正在处理 ${file.name} · ${formatBytes(file.size)}`
+      : "正在上传并安装";
+  } else {
+    updateCoreUploadControls();
+  }
+}
+
+function showCoreUploadModal(trigger = null) {
+  if (!coreUploadClient) throw new Error("本地导入模块未加载，请刷新页面后重试");
+  const modal = $("#coreUploadModal");
+  $("#coreUploadForm").reset();
+  showCoreUploadError();
+  updateCoreUploadControls();
+  setCoreUploadBusy(false);
+  lastCoreUploadTrigger = trigger;
+  lastCoreUploadTriggerKey = trigger ? actionLockKey(trigger) : null;
+  openModal(modal);
+  window.requestAnimationFrame(() => {
+    if (!modal.hidden) $("#coreUploadKind")?.focus();
+  });
+}
+
+function closeCoreUploadModal({ force = false } = {}) {
+  if (coreUploadPromise && !force) return false;
+  const modal = $("#coreUploadModal");
+  if (!modal || modal.hidden) return false;
+  closeModal(modal);
+  $("#coreUploadForm").reset();
+  showCoreUploadError();
+  const trigger = lastCoreUploadTrigger?.isConnected
+    ? lastCoreUploadTrigger
+    : findActionTrigger(lastCoreUploadTriggerKey, "show-core-upload");
+  trigger?.focus();
+  lastCoreUploadTrigger = null;
+  lastCoreUploadTriggerKey = null;
+  return true;
+}
+
+async function handleCoreUploadSubmit(event) {
+  event.preventDefault();
+  if (coreUploadPromise) return;
+  const kind = $("#coreUploadKind").value;
+  const file = $("#coreUploadFile").files?.[0];
+  const sha256 = $("#coreUploadSha256").value;
+  showCoreUploadError();
+
+  const upload = coreUploadClient.uploadKernel({
+    fetchImpl: window.fetch.bind(window),
+    auth: managementAuth,
+    browser: window,
+    token: managementToken,
+    kind,
+    file,
+    sha256,
+  });
+  coreUploadPromise = upload;
+  setCoreUploadBusy(true);
+  renderCores();
+
+  let result = null;
+  let statusWarning = "";
+  try {
+    result = await upload;
+    try {
+      await loadStatus({ forceFresh: true });
+    } catch (error) {
+      statusWarning = `，但状态刷新失败：${error.message}`;
+    }
+  } catch (error) {
+    if (error?.code === "AUTH_INVALID") managementToken = "";
+    const message = `本地导入失败：${error.message}`;
+    showCoreUploadError(message);
+    showToast(message, "error");
+  } finally {
+    coreUploadPromise = null;
+    setCoreUploadBusy(false);
+    renderCores();
+  }
+
+  if (!result) return;
+  closeCoreUploadModal();
+  const digest = String(result.sha256 || "");
+  const digestLabel = digest ? ` · SHA-256 ${digest.slice(0, 12)}…` : "";
+  const successMessage = `${kind} 本地导入完成${digestLabel}${statusWarning}`;
+  showToast(result.arch_warning || successMessage, result.arch_warning || statusWarning ? "error" : "ok");
 }
 
 function renderCoreLogPayload(payload) {
@@ -1766,6 +2605,418 @@ function closeBrowserRecordModal() {
   lastBrowserRecordTriggerKey = null;
 }
 
+function renderRemoteBrowserBrokerStatus() {
+  const element = $("#remoteBrowserBrokerStatus");
+  if (!element) return;
+  const broker = appState.remoteBrowser || {};
+  const available = broker.configured === true && broker.available === true;
+  element.classList.toggle("is-ready", available);
+  element.classList.toggle("is-error", !available);
+  if (available) {
+    const count = Number(broker.active_sessions || 0);
+    const imagePending = broker.worker_image_ready === false;
+    const image = String(broker.worker_image || "lscr.io/linuxserver/chromium:latest");
+    element.textContent = imagePending
+      ? `浏览器 Broker 已连接 · Worker 镜像尚未缓存，首次启动需拉取 ${image}`
+      : `浏览器 Broker 已连接 · ${count} 个 Worker 运行中`;
+    element.setAttribute("role", "status");
+    return;
+  }
+  const message = String(broker.error || "浏览器 Broker 尚未就绪，请检查 Docker 服务状态").trim();
+  element.textContent = `浏览器 Broker 不可用：${message}`;
+  element.setAttribute("role", "alert");
+}
+
+function showRemoteBrowserLaunchError(message = "") {
+  const element = $("#remoteBrowserLaunchError");
+  if (!element) return;
+  const text = String(message || "").trim();
+  element.textContent = text;
+  element.hidden = !text;
+}
+
+function generateRemoteBrowserPassword() {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  const cryptoApi = window.crypto;
+  if (!cryptoApi?.getRandomValues) return "";
+  const bytes = new Uint8Array(20);
+  cryptoApi.getRandomValues(bytes);
+  return Array.from(bytes, (value) => alphabet[value & 63]).join("");
+}
+
+function fillGeneratedRemoteBrowserPassword({ announce = false } = {}) {
+  const password = generateRemoteBrowserPassword();
+  if (!password) {
+    showRemoteBrowserLaunchError("当前浏览器无法安全生成随机密码，请手动填写强密码");
+    return false;
+  }
+  $("#remoteBrowserPassword").value = password;
+  $("#remoteBrowserPasswordConfirm").value = password;
+  showRemoteBrowserLaunchError();
+  if (announce) showToast("已生成新的远程浏览器密码");
+  return true;
+}
+
+async function copyRemoteBrowserPassword() {
+  const password = String($("#remoteBrowserPassword")?.value || "");
+  if (!password) throw new Error("当前没有可复制的远程浏览器密码");
+  if (!await browserUi.copyText(password, window)) {
+    throw new Error("当前环境无法复制密码，请手动保存");
+  }
+  showToast("已复制远程浏览器密码");
+}
+
+function remoteBrowserSuccessFields() {
+  return {
+    remoteUrl: $("#remoteBrowserSuccessUrl"),
+    username: $("#remoteBrowserSuccessUsername"),
+    password: $("#remoteBrowserSuccessPassword"),
+  };
+}
+
+function remoteBrowserCredentialView() {
+  return {
+    setup: $("#remoteBrowserLaunchSetup"),
+    success: $("#remoteBrowserLaunchSuccess"),
+    dialog: $("#remoteBrowserLaunchModal")?.querySelector('[role="dialog"]'),
+  };
+}
+
+function launchedRemoteBrowserCredentials() {
+  const credentials = browserUi.credentialFields(remoteBrowserSuccessFields());
+  credentials.remoteUrl = safeRemoteBrowserUrl(credentials.remoteUrl);
+  if (!credentials.remoteUrl || !credentials.username || !credentials.password) {
+    throw new Error("当前页面中的远程浏览器凭据已被清除");
+  }
+  return credentials;
+}
+
+function resetRemoteBrowserLaunchContent() {
+  browserUi.clearCredentialFields(remoteBrowserSuccessFields());
+  $("#remoteBrowserUsername").value = "";
+  $("#remoteBrowserPassword").value = "";
+  $("#remoteBrowserPasswordConfirm").value = "";
+  $("#remoteBrowserLaunchTitle").textContent = "启动远程浏览器";
+  $("#remoteBrowserLaunchMeta").textContent = "";
+  browserUi.setCredentialView(remoteBrowserCredentialView(), false);
+}
+
+function showRemoteBrowserLaunchSuccess(result, credentials) {
+  const remoteUrl = safeRemoteBrowserUrl(result?.remote_url);
+  if (!remoteUrl) throw new Error("浏览器 Worker 未返回有效的远程访问地址");
+  browserUi.setCredentialFields(remoteBrowserSuccessFields(), {
+    remoteUrl,
+    username: credentials.username,
+    password: credentials.password,
+  });
+  // 成功态只保留一份凭据，避免隐藏的设置表单继续持有密码副本。
+  $("#remoteBrowserUsername").value = "";
+  $("#remoteBrowserPassword").value = "";
+  $("#remoteBrowserPasswordConfirm").value = "";
+  browserUi.setCredentialView(remoteBrowserCredentialView(), true);
+  $("#remoteBrowserLaunchTitle").textContent = `${result.browser_name || "远程浏览器"} 已启动`;
+  $("#remoteBrowserLaunchMeta").textContent = `${credentials.username} · ${remoteUrl}`;
+}
+
+async function copyLaunchedRemoteBrowserPassword() {
+  const credentials = launchedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(credentials.password, window)) {
+    throw new Error("当前环境无法复制密码，请手动保存");
+  }
+  showToast("已复制远程浏览器密码");
+}
+
+async function copyLaunchedRemoteBrowserUrl() {
+  const credentials = launchedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(credentials.remoteUrl, window)) {
+    throw new Error("当前环境无法复制远程链接，请手动选择链接");
+  }
+  showToast("已复制远程浏览器链接");
+}
+
+async function copyLaunchedRemoteBrowserCredentials() {
+  const credentials = launchedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(browserUi.formatCredentials(credentials), window)) {
+    throw new Error("当前环境无法复制完整凭据，请分别手动保存");
+  }
+  showToast("已复制远程浏览器完整凭据");
+}
+
+function openLaunchedRemoteBrowser() {
+  const credentials = launchedRemoteBrowserCredentials();
+  openRemoteBrowserUrl(credentials.remoteUrl);
+  showToast("正在打开远程浏览器");
+}
+
+function finishRemoteBrowserLaunch() {
+  if (closeRemoteBrowserLaunchModal()) {
+    showToast("远程浏览器凭据已从当前页面清除");
+  }
+}
+
+function setRemoteBrowserLaunchBusy(busy) {
+  const modal = $("#remoteBrowserLaunchModal");
+  const submit = $("#remoteBrowserLaunchSubmit");
+  if (submit) {
+    submit.disabled = busy;
+    submit.classList.toggle("is-busy", busy);
+    submit.setAttribute("aria-busy", busy ? "true" : "false");
+    const label = submit.querySelector("span");
+    if (label) {
+      label.textContent = busy
+        ? appState.remoteBrowser?.worker_image_ready === false
+          ? "正在准备 Worker 镜像…"
+          : "正在创建 Worker…"
+        : "启动并打开";
+    }
+  }
+  modal?.querySelectorAll([
+    '[data-action="close-remote-browser-launch"]',
+    '[data-action="generate-remote-browser-password"]',
+    '[data-action="copy-remote-browser-password"]',
+    '[data-action="copy-launched-remote-browser-password"]',
+    '[data-action="copy-launched-remote-browser-url"]',
+    '[data-action="copy-launched-remote-browser-credentials"]',
+    '[data-action="open-launched-remote-browser"]',
+    '[data-action="finish-remote-browser-launch"]',
+  ].join(",")).forEach((button) => {
+    button.disabled = busy;
+  });
+  ["#remoteBrowserUsername", "#remoteBrowserPassword", "#remoteBrowserPasswordConfirm"].forEach((selector) => {
+    const input = $(selector);
+    if (input) input.disabled = busy;
+  });
+}
+
+function showRemoteBrowserLaunchModal(nodeId, instanceId = "", trigger = null) {
+  if (!remoteBrowserEnabled()) throw new Error("当前运行模式不提供远程浏览器功能");
+  const node = nodeById(nodeId);
+  if (!nodeId || !node) throw new Error("找不到远程浏览器对应的节点");
+  const instance = instanceId ? browserInstanceById(instanceId) : null;
+  if (instanceId && !instance) throw new Error("找不到浏览器记录");
+
+  resetRemoteBrowserLaunchContent();
+  pendingRemoteBrowserLaunch = { nodeId, instanceId };
+  lastRemoteBrowserLaunchTrigger = trigger;
+  lastRemoteBrowserLaunchTriggerKey = trigger ? actionLockKey(trigger) : null;
+  lastRemoteBrowserLaunchTriggerAction = trigger?.dataset?.action || null;
+  $("#remoteBrowserLaunchTitle").textContent = instance
+    ? `启动 ${instance.name || "远程浏览器"}`
+    : "启动远程浏览器";
+  $("#remoteBrowserLaunchMeta").textContent = `${node.name || nodeId} · ${instance ? "复用独立 Profile" : "新建独立 Worker 与 Profile"}`;
+  $("#remoteBrowserUsername").value = String(instance?.remote_username || "proxybridge");
+  $("#remoteBrowserPassword").value = "";
+  $("#remoteBrowserPasswordConfirm").value = "";
+  showRemoteBrowserLaunchError();
+  fillGeneratedRemoteBrowserPassword();
+  renderRemoteBrowserBrokerStatus();
+  setRemoteBrowserLaunchBusy(false);
+
+  const recordsModal = $("#browserRecordModal");
+  const modal = $("#remoteBrowserLaunchModal");
+  modal.dataset.returnToBrowserRecords = recordsModal.hidden ? "false" : "true";
+  if (!recordsModal.hidden) {
+    recordsModal.inert = true;
+    recordsModal.setAttribute("aria-hidden", "true");
+  }
+  openModal(modal);
+  window.requestAnimationFrame(() => {
+    if (!modal.hidden) $("#remoteBrowserUsername")?.focus();
+  });
+}
+
+function closeRemoteBrowserLaunchModal({ force = false } = {}) {
+  if (remoteBrowserLaunchPromise && !force) return false;
+  const modal = $("#remoteBrowserLaunchModal");
+  if (!modal || modal.hidden) return false;
+  closeModal(modal);
+  if (modal.dataset.returnToBrowserRecords === "true") {
+    const recordsModal = $("#browserRecordModal");
+    recordsModal.inert = false;
+    recordsModal.removeAttribute("aria-hidden");
+  }
+  delete modal.dataset.returnToBrowserRecords;
+  pendingRemoteBrowserLaunch = null;
+  showRemoteBrowserLaunchError();
+  resetRemoteBrowserLaunchContent();
+
+  const trigger = lastRemoteBrowserLaunchTrigger?.isConnected
+    ? lastRemoteBrowserLaunchTrigger
+    : findActionTrigger(lastRemoteBrowserLaunchTriggerKey, lastRemoteBrowserLaunchTriggerAction);
+  trigger?.focus();
+  lastRemoteBrowserLaunchTrigger = null;
+  lastRemoteBrowserLaunchTriggerKey = null;
+  lastRemoteBrowserLaunchTriggerAction = null;
+  return true;
+}
+
+function viewedRemoteBrowserCredentialFields() {
+  return {
+    remoteUrl: $("#remoteBrowserCredentialsUrl"),
+    username: $("#remoteBrowserCredentialsUsername"),
+    password: $("#remoteBrowserCredentialsPassword"),
+  };
+}
+
+function viewedRemoteBrowserCredentials() {
+  const credentials = browserUi.credentialFields(viewedRemoteBrowserCredentialFields());
+  credentials.remoteUrl = safeRemoteBrowserUrl(credentials.remoteUrl);
+  if (!credentials.remoteUrl || !credentials.username || !credentials.password) {
+    throw new Error("远程浏览器凭证已被清除，请重新查看");
+  }
+  return credentials;
+}
+
+function resetRemoteBrowserCredentialsContent() {
+  browserUi.clearCredentialFields(viewedRemoteBrowserCredentialFields());
+  $("#remoteBrowserCredentialsTitle").textContent = "查看远程浏览器凭证";
+  $("#remoteBrowserCredentialsMeta").textContent = "";
+  viewedRemoteBrowserInstanceId = null;
+}
+
+function closeRemoteBrowserCredentialsModal() {
+  const modal = $("#remoteBrowserCredentialsModal");
+  if (!modal || modal.hidden) return false;
+  remoteBrowserCredentialsRequestGeneration += 1;
+  closeModal(modal);
+  modal.querySelector('[role="dialog"]')?.setAttribute("aria-busy", "false");
+  if (modal.dataset.returnToBrowserRecords === "true") {
+    const recordsModal = $("#browserRecordModal");
+    recordsModal.inert = false;
+    recordsModal.removeAttribute("aria-hidden");
+  }
+  delete modal.dataset.returnToBrowserRecords;
+  resetRemoteBrowserCredentialsContent();
+
+  const trigger = lastRemoteBrowserCredentialsTrigger?.isConnected
+    ? lastRemoteBrowserCredentialsTrigger
+    : findActionTrigger(
+        lastRemoteBrowserCredentialsTriggerKey,
+        lastRemoteBrowserCredentialsTriggerAction,
+      );
+  if (trigger && !trigger.disabled) {
+    trigger.focus();
+  } else {
+    pendingModalFocusKey = lastRemoteBrowserCredentialsTriggerKey;
+  }
+  lastRemoteBrowserCredentialsTrigger = null;
+  lastRemoteBrowserCredentialsTriggerKey = null;
+  lastRemoteBrowserCredentialsTriggerAction = null;
+  return true;
+}
+
+async function showRemoteBrowserCredentials(instanceId, trigger = null) {
+  if (!remoteBrowserEnabled()) throw new Error("当前运行模式不提供远程浏览器凭证查询");
+  const instance = browserInstanceById(instanceId);
+  if (!instance) throw new Error("找不到远程浏览器记录");
+  if (instance.status !== "running") throw new Error("仅运行中的远程浏览器可以查看访问凭证");
+
+  const modal = $("#remoteBrowserCredentialsModal");
+  const recordsModal = $("#browserRecordModal");
+  resetRemoteBrowserCredentialsContent();
+  viewedRemoteBrowserInstanceId = instanceId;
+  const requestGeneration = ++remoteBrowserCredentialsRequestGeneration;
+  lastRemoteBrowserCredentialsTrigger = trigger;
+  lastRemoteBrowserCredentialsTriggerKey = trigger ? actionLockKey(trigger) : null;
+  lastRemoteBrowserCredentialsTriggerAction = trigger?.dataset?.action || null;
+  $("#remoteBrowserCredentialsTitle").textContent = `${instance.name || "远程浏览器"} 访问凭证`;
+  $("#remoteBrowserCredentialsMeta").textContent = "正在从 Browser Broker 安全读取…";
+  modal.dataset.returnToBrowserRecords = recordsModal.hidden ? "false" : "true";
+  if (!recordsModal.hidden) {
+    recordsModal.inert = true;
+    recordsModal.setAttribute("aria-hidden", "true");
+  }
+  openModal(modal);
+  modal.querySelector('[role="dialog"]')?.setAttribute("aria-busy", "true");
+  modal.querySelector('[data-action="close-remote-browser-credentials"]')?.focus();
+
+  try {
+    const result = await api("/api/browser/credentials", { instance_id: instanceId });
+    if (
+      requestGeneration !== remoteBrowserCredentialsRequestGeneration
+      || modal.hidden
+      || viewedRemoteBrowserInstanceId !== instanceId
+    ) return;
+    const remoteUrl = safeRemoteBrowserUrl(result.remote_url);
+    const username = String(result.username || "");
+    const password = String(result.password || "");
+    if (
+      !remoteUrl
+      || !/^[A-Za-z0-9._-]{1,32}$/.test(username)
+      || Array.from(password).length < 10
+      || Array.from(password).length > 128
+      || /[\x00-\x1f\x7f]/.test(password)
+    ) {
+      throw new Error("服务器返回的远程浏览器凭证格式无效");
+    }
+    browserUi.setCredentialFields(viewedRemoteBrowserCredentialFields(), {
+      remoteUrl,
+      username,
+      password,
+    });
+    $("#remoteBrowserCredentialsMeta").textContent = `${username} · ${remoteUrl}`;
+    modal.querySelector('[role="dialog"]')?.setAttribute("aria-busy", "false");
+    $("#remoteBrowserCredentialsOpen")?.focus();
+  } catch (error) {
+    if (
+      requestGeneration !== remoteBrowserCredentialsRequestGeneration
+      || modal.hidden
+      || viewedRemoteBrowserInstanceId !== instanceId
+    ) return;
+    closeRemoteBrowserCredentialsModal();
+    throw error;
+  }
+}
+
+async function copyViewedRemoteBrowserPassword() {
+  const credentials = viewedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(credentials.password, window)) {
+    throw new Error("当前环境无法复制密码，请手动选择");
+  }
+  showToast("已复制远程浏览器密码");
+}
+
+async function copyViewedRemoteBrowserUrl() {
+  const credentials = viewedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(credentials.remoteUrl, window)) {
+    throw new Error("当前环境无法复制远程链接，请手动选择");
+  }
+  showToast("已复制远程浏览器链接");
+}
+
+async function copyViewedRemoteBrowserCredentials() {
+  const credentials = viewedRemoteBrowserCredentials();
+  if (!await browserUi.copyText(browserUi.formatCredentials(credentials), window)) {
+    throw new Error("当前环境无法复制完整凭证，请分别手动选择");
+  }
+  showToast("已复制远程浏览器完整凭证");
+}
+
+function openViewedRemoteBrowser() {
+  const credentials = viewedRemoteBrowserCredentials();
+  openRemoteBrowserUrl(credentials.remoteUrl);
+  showToast("正在打开远程浏览器");
+}
+
+function openRemoteBrowserUrl(value) {
+  const remoteUrl = safeRemoteBrowserUrl(value);
+  if (!remoteUrl) throw new Error("远程浏览器访问地址无效，请刷新状态后重试");
+  const link = document.createElement("a");
+  link.href = remoteUrl;
+  link.target = "_blank";
+  link.rel = "noopener noreferrer";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+function openRemoteBrowserInstance(instanceId) {
+  const instance = browserInstanceById(instanceId);
+  if (!instance) throw new Error("找不到远程浏览器记录");
+  openRemoteBrowserUrl(instance.remote_url);
+  showToast(`正在打开 ${instance.name || "远程浏览器"}`);
+}
+
 function compactPath(value) {
   const parts = String(value || "").split("/").filter(Boolean);
   return parts.length > 3 ? `.../${parts.slice(-3).join("/")}` : value || "-";
@@ -1774,12 +3025,19 @@ function compactPath(value) {
 function renderBrowserRecords(nodeId) {
   const node = nodeById(nodeId);
   const instances = browserInstancesForNode(nodeId);
-  const runningCount = instances.filter((instance) => ["running", "starting"].includes(instance.status)).length;
+  const runningCount = instances.filter((instance) => ["running", "starting", "stopping"].includes(instance.status)).length;
   $("#browserRecordTitle").textContent = `${node?.name || "节点"} 浏览器记录`;
   $("#browserRecordMeta").textContent = `${instances.length} 个记录 · ${runningCount} 个运行中`;
   const body = $("#browserRecordBody");
+  const brokerError = remoteBrowserEnabled() && appState.remoteBrowser?.available !== true;
+  const brokerAlert = brokerError
+    ? `<div class="browser-record-broker-alert" role="alert">
+        <strong>浏览器 Broker 不可用</strong>
+        <span>${escapeHtml(appState.remoteBrowser?.error || "请检查 Docker Broker 与 Worker 服务状态后重试")}</span>
+      </div>`
+    : "";
   if (!instances.length) {
-    body.innerHTML = `
+    body.innerHTML = `${brokerAlert}
       <div class="core-log-empty">
         <strong>暂无浏览器记录</strong>
         <span>${escapeHtml(node?.name || nodeId || "-")}</span>
@@ -1806,13 +3064,20 @@ function renderBrowserRecords(nodeId) {
     selEnd = active.selectionEnd;
   }
 
-  body.innerHTML = instances
+  body.innerHTML = brokerAlert + instances
     .map((instance) => {
-      const running = ["running", "starting"].includes(instance.status);
+      const running = ["running", "starting", "stopping"].includes(instance.status);
+      const remoteWorker = instance.remote_worker === true || remoteBrowserEnabled();
+      const remoteUrl = safeRemoteBrowserUrl(instance.remote_url);
+      const remoteUrlDisplay = String(instance.remote_url || "").trim() || "-";
+      const workerId = String(instance.remote_container_id || "").slice(0, 12);
+      const workerStatus = browserStatusLabel(instance.status);
+      const instanceError = String(instance.error || "").trim();
       const profilePath = instance.profile_path || "";
       const action = running ? "stop-browser-instance" : "launch-browser-instance";
       const actionLabel = running ? "停止" : "启动";
       const actionIcon = running ? "stop" : "browser";
+      const lastUsedAt = browserUi.browserInstanceLastUsedAt(instance);
       const savedLabel = instance.label || "";
       // Prefer in-progress draft over server value while user is editing / mid-type.
       const label =
@@ -1825,7 +3090,7 @@ function renderBrowserRecords(nodeId) {
           <header>
             <div>
               <strong>${escapeHtml(instance.name || "浏览器")}</strong>
-              <span>${instance.legacy ? "默认浏览器" : "独立指纹"} · ${escapeHtml(formatTime(instance.created_at))}</span>
+              <span>${remoteWorker ? "远程 Worker" : instance.legacy ? "默认浏览器" : "独立指纹"} · 创建 ${escapeHtml(formatTime(instance.created_at))}</span>
               ${pillLabel ? `<span class="browser-record-label-pill" title="${escapeHtml(pillLabel)}">${escapeHtml(pillLabel)}</span>` : ""}
             </div>
             <span class="status ${escapeHtml(instance.status || "stopped")}">${escapeHtml(browserStatusLabel(instance.status))}</span>
@@ -1833,9 +3098,18 @@ function renderBrowserRecords(nodeId) {
           <div class="browser-record-grid">
             <span>指纹</span><code>${escapeHtml(instance.fingerprint_seed || "-")}</code>
             <span>Profile</span><code title="${escapeHtml(profilePath)}">${escapeHtml(compactPath(profilePath))}</code>
+            <span>最近使用</span><code>${escapeHtml(formatTime(lastUsedAt))}</code>
             <span>上次启动</span><code>${escapeHtml(formatTime(instance.last_started_at))}</code>
-            <span>PID</span><code>${escapeHtml(instance.pid || "-")}</code>
+            ${remoteWorker
+              ? `<span>Worker 状态</span><code>${escapeHtml(workerStatus)}${workerId ? ` · ${escapeHtml(workerId)}` : ""}</code>
+                 <span>远程端口</span><code>${escapeHtml(instance.remote_host_port || "-")}</code>
+                 <span>远程地址</span><code title="${escapeHtml(remoteUrlDisplay)}">${escapeHtml(remoteUrlDisplay)}</code>
+                 <span>访问用户</span><code>${escapeHtml(instance.remote_username || "-")}</code>`
+              : `<span>PID</span><code>${escapeHtml(instance.pid || "-")}</code>`}
           </div>
+          ${instanceError
+            ? `<div class="browser-record-error" role="alert"><strong>${remoteWorker ? "Worker 错误" : "启动错误"}</strong><span>${escapeHtml(instanceError)}</span></div>`
+            : ""}
           <div class="browser-record-label-row">
             <label>
               <span>标签</span>
@@ -1857,8 +3131,30 @@ function renderBrowserRecords(nodeId) {
             ><span>保存标签</span></button>
           </div>
           <div class="browser-record-actions">
+            ${remoteWorker
+              ? `<button
+                  class="row-button"
+                  type="button"
+                  data-action="view-remote-browser-credentials"
+                  data-instance="${escapeHtml(instance.id)}"
+                  aria-label="查看 ${escapeHtml(instance.name || "浏览器")} 的访问凭证"
+                  title="${instance.status === "running" ? "从 Browser Broker 按需读取当前访问账号和密码" : "停止后访问密码已销毁；重新启动时会设置新密码"}"
+                  ${instance.status === "running" ? "" : "disabled"}
+                ><span>${instance.status === "running" ? "查看凭证" : "凭证已销毁"}</span></button>`
+              : ""}
+            ${remoteUrl
+              ? `<button class="row-button" type="button" data-action="copy" data-text="${escapeHtml(remoteUrl)}" aria-label="复制 ${escapeHtml(instance.name || "浏览器")} 的远程链接">
+                  ${icon("copy")}<span>复制链接</span>
+                </button>
+                <button class="row-button primary-row" type="button" data-action="open-remote-browser" data-instance="${escapeHtml(instance.id)}" aria-label="远程打开 ${escapeHtml(instance.name || "浏览器")}">
+                  ${icon("link")}<span>远程打开</span>
+                </button>`
+              : ""}
             <button class="row-button ${running ? "danger" : ""}" type="button" data-action="${action}" data-node="${escapeHtml(nodeId)}" data-instance="${escapeHtml(instance.id)}" aria-label="${actionLabel} ${escapeHtml(instance.name || "浏览器")}">
               ${icon(actionIcon)}<span>${actionLabel}</span>
+            </button>
+            <button class="row-button danger" type="button" data-action="delete-browser-instance" data-instance="${escapeHtml(instance.id)}" aria-label="永久删除 ${escapeHtml(instance.name || "浏览器")} 及其 Profile">
+              ${icon("trash")}<span>删除</span>
             </button>
           </div>
         </article>
@@ -1867,7 +3163,9 @@ function renderBrowserRecords(nodeId) {
     .join("");
 
   if (activeId) {
-    const input = body.querySelector(`.browser-label-input[data-instance="${activeId}"]`);
+    const input = body.querySelector(
+      `.browser-label-input[data-instance="${browserUi.cssEscape(activeId, window.CSS)}"]`
+    );
     if (input) {
       input.focus();
       try {
@@ -1884,7 +3182,9 @@ function renderBrowserRecords(nodeId) {
 async function saveBrowserLabel(instanceId) {
   if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   if (!instanceId) return;
-  const input = document.querySelector(`.browser-label-input[data-instance="${instanceId}"]`);
+  const input = document.querySelector(
+    `.browser-label-input[data-instance="${browserUi.cssEscape(instanceId, window.CSS)}"]`
+  );
   const label = String(input?.value || "").trim();
   await api("/api/browser/update", { instance_id: instanceId, label });
   await loadStatus({ forceFresh: true });
@@ -1892,6 +3192,24 @@ async function saveBrowserLabel(instanceId) {
     renderBrowserRecords(appState.browserRecordNodeId);
   }
   showToast(label ? `标签已保存：${label}` : "标签已清空");
+}
+
+async function deleteBrowserInstance(instanceId) {
+  if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
+  const instance = browserInstanceById(instanceId);
+  if (!instance) throw new Error("找不到浏览器记录");
+  const syncEnabled = Boolean(appState.sync?.enabled && appState.sync?.url);
+  const syncNotice = syncEnabled
+    ? " WebDAV 已启用，远端记录和对应 Profile 包也会自动同步删除。"
+    : "";
+  if (!window.confirm(
+    `删除「${instance.name || "浏览器"}」会先停止对应浏览器/Worker，并永久删除该记录的 Profile、Cookie 和本地存储；此操作无法恢复。${syncNotice}确定继续吗？`
+  )) return null;
+  const result = await api("/api/browser/delete", { instance_id: instanceId });
+  await loadStatus({ forceFresh: true });
+  if (appState.browserRecordNodeId) renderBrowserRecords(appState.browserRecordNodeId);
+  showToast(syncEnabled ? "浏览器记录与本地数据已删除，正在同步清理 WebDAV" : "浏览器记录与本地数据已永久删除");
+  return result;
 }
 
 function showBrowserRecords(nodeId, trigger = null) {
@@ -1914,10 +3232,14 @@ async function openBrowserRecordsWithSync(nodeId, trigger = null) {
   if (sync.enabled && sync.url) {
     try {
       showToast("正在从远端同步浏览器数据…");
-      const result = await withSyncOperation(() => api("/api/sync/pull", {}));
+      const result = await withSyncOperation(() =>
+        api("/api/sync/pull", { preserve_local_changes: true })
+      );
       if (result.settings) appState.sync = result.settings;
       await loadStatus({ forceFresh: true });
-      if (result.skipped && result.reason === "already_latest") {
+      if (result.skipped && result.reason === "local_changes_pending") {
+        showToast("检测到本地未上传变更，已保留本地记录；请等待自动上传，或先上传到远端");
+      } else if (result.skipped && result.reason === "already_latest") {
         showToast("已是最新");
       } else if (result.ok === false) {
         showToast((result.errors || []).join("; ") || "同步有错误，显示本地记录", "error");
@@ -1944,14 +3266,10 @@ async function copyText(text) {
   } catch {}
 
   if (!copied) {
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error();
-      await navigator.clipboard.writeText(text);
-      copied = true;
-    } catch {
-      throw new Error("当前环境无法复制到剪贴板");
-    }
+    copied = await browserUi.copyText(text, window);
   }
+
+  if (!copied) throw new Error("当前环境无法复制到剪贴板");
 
   showToast(`已复制 ${text}`);
 }
@@ -1973,13 +3291,155 @@ async function testNode(nodeId) {
   return result;
 }
 
-async function launchBrowser(nodeId, instanceId = "") {
+async function saveNodeCoreSettings(nodeId) {
+  const select = document.querySelector(`select[data-core-select="${CSS.escape(nodeId)}"]`);
+  const fallback = document.querySelector(`input[data-core-fallback="${CSS.escape(nodeId)}"]`);
+  if (!select || !fallback) return;
+  select.disabled = true;
+  fallback.disabled = true;
+  try {
+    const result = await api("/api/nodes/core", {
+      node_id: nodeId,
+      preferred_core: select.value,
+      fallback_enabled: fallback.checked,
+    });
+    const index = appState.nodes.findIndex((node) => node.id === nodeId);
+    if (index >= 0) appState.nodes[index] = result.node;
+    renderNodes();
+    showToast(fallback.checked ? "核心偏好已保存，启动失败将尝试备用核心" : "核心偏好已保存");
+  } catch (error) {
+    await loadStatus({ forceFresh: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function requestBrowserLaunch(nodeId, instanceId = "", credentials = null) {
   if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
   const payload = instanceId ? { node_id: nodeId, instance_id: instanceId } : { node_id: nodeId };
-  const result = await api("/api/browser/launch", payload);
+  if (credentials) {
+    payload.username = credentials.username;
+    payload.password = credentials.password;
+  }
+  return api("/api/browser/launch", payload);
+}
+
+async function launchBrowser(nodeId, instanceId = "", trigger = null) {
+  if (remoteBrowserEnabled()) {
+    showRemoteBrowserLaunchModal(nodeId, instanceId, trigger);
+    return null;
+  }
+  const result = await requestBrowserLaunch(nodeId, instanceId);
   await loadStatus({ forceFresh: true });
   showToast(`已启动${result.browser_name ? ` ${result.browser_name}` : "指纹浏览器"}：${result.proxy}`);
   return result;
+}
+
+function openRemoteBrowserLoadingWindow() {
+  const remoteWindow = window.open("about:blank", "_blank");
+  if (!remoteWindow) return null;
+  try {
+    remoteWindow.opener = null;
+    remoteWindow.document.documentElement.lang = "zh-CN";
+    remoteWindow.document.title = "正在启动远程浏览器";
+    remoteWindow.document.body.style.cssText = "margin:0;min-height:100vh;display:grid;place-items:center;background:#f5f5f7;color:#3a3a3c;font:14px -apple-system,BlinkMacSystemFont,sans-serif";
+    remoteWindow.document.body.textContent = appState.remoteBrowser?.worker_image_ready === false
+      ? "首次启动正在拉取远程浏览器 Worker 镜像；镜像较大，请稍候…"
+      : "正在创建远程浏览器 Worker，请稍候…";
+  } catch (_) {
+    // about:blank 通常同源；若浏览器限制写入，仍可在启动成功后导航。
+  }
+  return remoteWindow;
+}
+
+async function handleRemoteBrowserLaunchSubmit(event) {
+  event.preventDefault();
+  if (remoteBrowserLaunchPromise || !pendingRemoteBrowserLaunch) return;
+
+  const username = String($("#remoteBrowserUsername").value || "").trim();
+  const password = String($("#remoteBrowserPassword").value || "");
+  const passwordConfirm = String($("#remoteBrowserPasswordConfirm").value || "");
+  const passwordLength = Array.from(password).length;
+  if (!/^[A-Za-z0-9._-]{1,32}$/.test(username)) {
+    showRemoteBrowserLaunchError("用户名必须为 1–32 位字母、数字、点、下划线或短横线");
+    $("#remoteBrowserUsername").focus();
+    return;
+  }
+  if (passwordLength < 10 || passwordLength > 128 || /[\x00-\x1f\x7f]/.test(password)) {
+    showRemoteBrowserLaunchError("密码必须为 10–128 个字符，且不能包含控制字符");
+    $("#remoteBrowserPassword").focus();
+    return;
+  }
+  if (password !== passwordConfirm) {
+    showRemoteBrowserLaunchError("两次输入的密码不一致");
+    $("#remoteBrowserPasswordConfirm").focus();
+    return;
+  }
+  if (appState.remoteBrowser?.available !== true) {
+    const brokerMessage = appState.remoteBrowser?.error || "浏览器 Broker 尚未就绪，请检查 Docker 服务状态";
+    showRemoteBrowserLaunchError(`无法启动远程浏览器：${brokerMessage}`);
+    showToast(`浏览器 Broker 不可用：${brokerMessage}`, "error");
+    return;
+  }
+
+  const pending = { ...pendingRemoteBrowserLaunch };
+  const remoteWindow = openRemoteBrowserLoadingWindow();
+  showRemoteBrowserLaunchError();
+  setRemoteBrowserLaunchBusy(true);
+  let result = null;
+  let openedAutomatically = false;
+  remoteBrowserLaunchPromise = requestBrowserLaunch(
+    pending.nodeId,
+    pending.instanceId,
+    { username, password }
+  );
+  try {
+    result = await remoteBrowserLaunchPromise;
+    const remoteUrl = safeRemoteBrowserUrl(result.remote_url);
+    if (!remoteUrl) throw new Error("浏览器 Worker 未返回有效的远程访问地址");
+    showRemoteBrowserLaunchSuccess(result, { username, password });
+    pendingRemoteBrowserLaunch = null;
+    if (remoteWindow && !remoteWindow.closed) {
+      try {
+        remoteWindow.location.replace(remoteUrl);
+        openedAutomatically = true;
+      } catch (_) {
+        // Worker 已成功启动；保留凭据成功页，让用户通过真实点击重新打开。
+        try { remoteWindow.close(); } catch (_) {}
+      }
+    }
+    try {
+      await loadStatus({ forceFresh: true });
+    } catch (statusError) {
+      showToast(`远程浏览器已启动，但状态刷新失败：${statusError.message}`, "error");
+    }
+  } catch (error) {
+    result = null;
+    try { remoteWindow?.close(); } catch (_) {}
+    try {
+      await loadStatus({ forceFresh: true });
+    } catch (_) {
+      // 启动接口错误本身更具体，保留为主要提示。
+    }
+    const message = `远程浏览器启动失败：${error.message}`;
+    showRemoteBrowserLaunchError(message);
+    showToast(message, "error");
+  } finally {
+    remoteBrowserLaunchPromise = null;
+    setRemoteBrowserLaunchBusy(false);
+  }
+
+  if (result) {
+    const browserName = result.browser_name || "远程浏览器";
+    const popupHint = openedAutomatically
+      ? "已在新标签页打开；凭据会保留到你明确完成"
+      : "请保存凭据并点击“打开远程浏览器”";
+    showToast(`${browserName} 已启动，${popupHint}`);
+    window.requestAnimationFrame(() => {
+      if (!$("#remoteBrowserLaunchSuccess").hidden) {
+        $("#remoteBrowserSuccessOpen")?.focus();
+      }
+    });
+  }
 }
 
 // 停止某节点的指纹浏览器进程,保留其本地代理。
@@ -1988,7 +3448,7 @@ async function stopBrowser(nodeId, instanceId = "") {
   const payload = instanceId ? { instance_id: instanceId } : { node_id: nodeId };
   const result = await api("/api/browser/stop", payload);
   await loadStatus({ forceFresh: true });
-  showToast("已停止浏览器，SOCKS5 端口保持运行");
+  showToast(remoteBrowserEnabled() ? "已停止远程浏览器 Worker，代理端口保持运行" : "已停止浏览器，SOCKS5 端口保持运行");
   return result;
 }
 
@@ -2029,12 +3489,21 @@ function actionLockKey(button) {
     case "refresh-sub":
     case "delete-sub":
       return `subscription:${button.dataset.id || ""}`;
+    case "refresh-all-subs":
+    case "cancel-refresh-all":
+      return "subscription-batch";
+    case "save-smart-gateway":
+    case "stop-smart-gateway":
+      return "smart-gateway";
     case "launch-browser":
     case "stop-browser":
       return `browser-node:${button.dataset.node || ""}`;
     case "launch-browser-instance":
     case "stop-browser-instance":
     case "save-browser-label":
+    case "open-remote-browser":
+    case "view-remote-browser-credentials":
+    case "delete-browser-instance":
       return `browser-instance:${button.dataset.instance || ""}`;
     case "test":
       return `node-test:${button.dataset.node || ""}`;
@@ -2054,7 +3523,23 @@ function actionLockKey(button) {
 function actionUsesSpinner(action) {
   return ![
     "close-core-log",
+    "show-core-upload",
+    "close-core-upload",
     "close-browser-records",
+    "close-remote-browser-launch",
+    "generate-remote-browser-password",
+    "copy-remote-browser-password",
+    "copy-launched-remote-browser-password",
+    "copy-launched-remote-browser-url",
+    "copy-launched-remote-browser-credentials",
+    "open-launched-remote-browser",
+    "finish-remote-browser-launch",
+    "open-remote-browser",
+    "close-remote-browser-credentials",
+    "copy-viewed-remote-browser-password",
+    "copy-viewed-remote-browser-url",
+    "copy-viewed-remote-browser-credentials",
+    "open-viewed-remote-browser",
     "copy",
     "browser-records",
     "toggle-node-group",
@@ -2106,9 +3591,9 @@ async function handleAction(event) {
     } else if (action === "test") {
       await testNode(button.dataset.node);
     } else if (action === "launch-browser") {
-      await launchBrowser(button.dataset.node);
+      await launchBrowser(button.dataset.node, "", button);
     } else if (action === "launch-browser-instance") {
-      await launchBrowser(button.dataset.node, button.dataset.instance);
+      await launchBrowser(button.dataset.node, button.dataset.instance, button);
     } else if (action === "stop-browser") {
       await stopBrowser(button.dataset.node);
     } else if (action === "stop-browser-instance") {
@@ -2117,8 +3602,16 @@ async function handleAction(event) {
       await openBrowserRecordsWithSync(button.dataset.node, button);
     } else if (action === "save-browser-label") {
       await saveBrowserLabel(button.dataset.instance);
+    } else if (action === "open-remote-browser") {
+      openRemoteBrowserInstance(button.dataset.instance);
+    } else if (action === "view-remote-browser-credentials") {
+      await showRemoteBrowserCredentials(button.dataset.instance, button);
+    } else if (action === "delete-browser-instance") {
+      await deleteBrowserInstance(button.dataset.instance);
     } else if (action === "download-kernel") {
       await downloadKernel();
+    } else if (action === "show-core-upload") {
+      showCoreUploadModal(button);
     } else if (action === "copy") {
       await copyText(button.dataset.text);
     } else if (action === "rotate-pool-token") {
@@ -2126,6 +3619,15 @@ async function handleAction(event) {
       await api("/api/pool/token/rotate", {});
       await loadStatus({ forceFresh: true });
       showToast("代理池密钥已轮换，旧链接立即失效");
+    } else if (action === "exclude-pool-member") {
+      const duration = Number(button.dataset.duration || 0);
+      await api("/api/pool/exclude", { id: button.dataset.id, duration_seconds: duration });
+      await loadStatus({ forceFresh: true });
+      showToast(duration ? "节点已暂时排除 30 分钟" : "节点已恢复到代理池");
+    } else if (action === "kick-client") {
+      await api("/api/network/clients/kick", { id: button.dataset.id });
+      await loadStatus({ forceFresh: true });
+      showToast("客户端连接已断开");
     } else if (action === "stop") {
       const result = await api("/api/bridges/stop", { id: button.dataset.id });
       await loadStatus({ forceFresh: true });
@@ -2133,16 +3635,47 @@ async function handleAction(event) {
     } else if (action === "stop-all") {
       const result = await api("/api/bridges/stop-all", {});
       await loadStatus({ forceFresh: true });
-      showToast(result.killed_browsers ? "已停止全部端口，关联浏览器已关闭" : "已停止全部端口");
+      showToast(result.killed_browsers ? "已停止全部代理，关联浏览器已关闭" : "已停止全部代理");
     } else if (action === "restart") {
       const stopped = await api("/api/bridges/stop", { id: button.dataset.id });
       await api("/api/bridges/start", { node_id: button.dataset.node, core: "auto" });
       await loadStatus({ forceFresh: true });
       showToast(stopped.killed_browsers ? "已重启服务，关联浏览器已关闭" : "已重启服务");
     } else if (action === "refresh-sub") {
-      await api("/api/subscriptions/refresh", { id: button.dataset.id });
+      const result = await api("/api/subscriptions/refresh", { id: button.dataset.id });
       await loadStatus({ forceFresh: true });
-      showToast("订阅已刷新");
+      const changes = result.changes || {};
+      showToast(result.not_modified
+        ? "订阅远端未变化"
+        : `订阅已刷新：新增 ${Number(changes.added || 0)}、删除 ${Number(changes.removed || 0)}、变更 ${Number(changes.changed || 0)}`);
+    } else if (action === "refresh-all-subs") {
+      const ids = appState.subscriptions.filter((item) => item.url).map((item) => item.id);
+      if (!ids.length) {
+        showToast("没有可刷新的 URL 订阅", "error");
+      } else {
+        const task = await api("/api/subscriptions/refresh-batch/start", { subscription_ids: ids });
+        appState.subscriptionRefresh.tasks = [...(appState.subscriptionRefresh.tasks || []), task];
+        renderActiveView({ force: true });
+        showToast(`已开始刷新 ${ids.length} 个订阅`);
+      }
+    } else if (action === "cancel-refresh-all") {
+      await api("/api/subscriptions/refresh-batch/cancel", { id: button.dataset.id });
+      await loadStatus({ forceFresh: true });
+      showToast("正在取消批量刷新");
+    } else if (action === "save-smart-gateway") {
+      await api("/api/smart-gateway/settings", {
+        enabled: true,
+        strategy: $("#smartGatewayStrategy").value,
+        port: Number($("#smartGatewayPort").value),
+        region: $("#smartGatewayRegion").value,
+        query: $("#smartGatewayQuery").value,
+      });
+      await loadStatus({ forceFresh: true });
+      showToast("智能网关设置已保存");
+    } else if (action === "stop-smart-gateway") {
+      await api("/api/smart-gateway/stop", {});
+      await loadStatus({ forceFresh: true });
+      showToast("智能网关已停止");
     } else if (action === "delete-sub") {
       const subscription = appState.subscriptions.find((item) => item.id === button.dataset.id);
       const name = subscription?.name || "该订阅";
@@ -2154,17 +3687,25 @@ async function handleAction(event) {
     } else if (action === "clear-logs") {
       await api("/api/logs/clear", {});
       await loadStatus({ forceFresh: true });
+      appState.requestLogPage.page = 1;
+      await loadLogPage("request");
       showToast("连接日志已清空");
     } else if (action === "clear-system-logs") {
       await api("/api/system/logs/clear", {});
       await loadStatus({ forceFresh: true });
+      appState.systemLogPage.page = 1;
+      await loadLogPage("system");
       showToast("系统日志已清空");
+    } else if (action === "export-logs") {
+      await downloadLogExport(button.dataset.kind || "request", button.dataset.format || "json");
+      showToast("日志导出已开始下载");
     } else if (action === "reset-log-filters") {
       appState.logFilters.search = "";
       appState.logFilters.node = "all";
       appState.logFilters.status = "all";
       renderLogFilters();
-      renderRequestLogs();
+      appState.requestLogPage.page = 1;
+      await loadLogPage("request");
       showToast("日志筛选已重置");
     } else if (action === "show-core-log") {
       lastCoreLogTrigger = button;
@@ -2172,8 +3713,36 @@ async function handleAction(event) {
       await showCoreLog(button.dataset.core);
     } else if (action === "close-core-log") {
       closeCoreLogModal();
+    } else if (action === "close-core-upload") {
+      closeCoreUploadModal();
     } else if (action === "close-browser-records") {
       closeBrowserRecordModal();
+    } else if (action === "close-remote-browser-launch") {
+      closeRemoteBrowserLaunchModal();
+    } else if (action === "generate-remote-browser-password") {
+      fillGeneratedRemoteBrowserPassword({ announce: true });
+    } else if (action === "copy-remote-browser-password") {
+      await copyRemoteBrowserPassword();
+    } else if (action === "copy-launched-remote-browser-password") {
+      await copyLaunchedRemoteBrowserPassword();
+    } else if (action === "copy-launched-remote-browser-url") {
+      await copyLaunchedRemoteBrowserUrl();
+    } else if (action === "copy-launched-remote-browser-credentials") {
+      await copyLaunchedRemoteBrowserCredentials();
+    } else if (action === "open-launched-remote-browser") {
+      openLaunchedRemoteBrowser();
+    } else if (action === "finish-remote-browser-launch") {
+      finishRemoteBrowserLaunch();
+    } else if (action === "close-remote-browser-credentials") {
+      closeRemoteBrowserCredentialsModal();
+    } else if (action === "copy-viewed-remote-browser-password") {
+      await copyViewedRemoteBrowserPassword();
+    } else if (action === "copy-viewed-remote-browser-url") {
+      await copyViewedRemoteBrowserUrl();
+    } else if (action === "copy-viewed-remote-browser-credentials") {
+      await copyViewedRemoteBrowserCredentials();
+    } else if (action === "open-viewed-remote-browser") {
+      openViewedRemoteBrowser();
     }
   } catch (error) {
     showToast(error.message, "error");
@@ -2199,6 +3768,7 @@ async function handleImport(event) {
       raw: formData.get("raw"),
     });
     form.reset();
+    form.querySelector(".raw-import-details")?.removeAttribute("open");
     await loadStatus({ forceFresh: true });
     showToast(`导入 ${result.subscription.node_count} 个节点`);
   } catch (error) {
@@ -2208,13 +3778,39 @@ async function handleImport(event) {
   }
 }
 
+async function saveSubscriptionSettings(control) {
+  const previous = Boolean(appState.subscriptionSettings?.allow_non_public_urls);
+  control.disabled = true;
+  try {
+    const result = await api("/api/settings/subscriptions", {
+      allow_non_public_urls: Boolean(control.checked),
+    });
+    appState.subscriptionSettings = result.settings || {
+      allow_non_public_urls: Boolean(control.checked),
+    };
+    renderActiveView({ force: true });
+    showToast(control.checked ? "已允许非公网订阅地址" : "已恢复仅允许公网订阅地址");
+  } catch (error) {
+    control.checked = previous;
+    showToast(error.message, "error");
+  } finally {
+    control.disabled = false;
+  }
+}
+
 function trapModalFocus(event) {
   if (event.key !== "Tab") return false;
-  const modal = !$("#browserRecordModal").hidden
-    ? $("#browserRecordModal")
-    : !$("#coreLogModal").hidden
-      ? $("#coreLogModal")
-      : null;
+  const modal = !$("#remoteBrowserCredentialsModal").hidden
+    ? $("#remoteBrowserCredentialsModal")
+    : !$("#remoteBrowserLaunchModal").hidden
+      ? $("#remoteBrowserLaunchModal")
+      : !$("#coreUploadModal").hidden
+        ? $("#coreUploadModal")
+        : !$("#browserRecordModal").hidden
+          ? $("#browserRecordModal")
+          : !$("#coreLogModal").hidden
+            ? $("#coreLogModal")
+            : null;
   if (!modal) return false;
   const dialog = modal.querySelector('[role="dialog"]');
   const focusable = [...dialog.querySelectorAll(
@@ -2263,10 +3859,17 @@ function bindEvents() {
     item.addEventListener("click", () => setActiveView(item.dataset.view));
   });
   $("#importForm").addEventListener("submit", handleImport);
+  $("#coreUploadForm")?.addEventListener("submit", handleCoreUploadSubmit);
+  $("#coreUploadKind")?.addEventListener("change", () => {
+    showCoreUploadError();
+    updateCoreUploadControls({ clearFile: true });
+  });
+  $("#remoteBrowserLaunchForm")?.addEventListener("submit", handleRemoteBrowserLaunchSubmit);
   const networkForm = $("#networkSettingsForm");
   if (networkForm) {
     networkForm.addEventListener("input", markNetworkFormDirty);
     networkForm.addEventListener("change", markNetworkFormDirty);
+    $("#lanAuthMode")?.addEventListener("change", syncLanAuthFields);
     networkForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       const submit = $("#networkSaveButton");
@@ -2277,6 +3880,89 @@ function bindEvents() {
       }
     });
   }
+  const speedTestForm = $("#speedTestSettingsForm");
+  if (speedTestForm) {
+    speedTestForm.addEventListener("input", () => { speedTestFormDirty = true; });
+    speedTestForm.addEventListener("change", () => { speedTestFormDirty = true; });
+    speedTestForm.addEventListener("submit", async (event) => {
+      const submit = $("#speedTestSaveButton");
+      submit.disabled = true;
+      submit.classList.add("is-busy");
+      try {
+        await saveSpeedTestSettings(event);
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        submit.disabled = false;
+        submit.classList.remove("is-busy");
+      }
+    });
+  }
+  const logSettingsForm = $("#logSettingsForm");
+  if (logSettingsForm) {
+    logSettingsForm.addEventListener("input", () => { logSettingsDirty = true; });
+    logSettingsForm.addEventListener("change", () => { logSettingsDirty = true; });
+    logSettingsForm.addEventListener("submit", async (event) => {
+      const submit = $("#logSettingsSaveButton");
+      submit.disabled = true;
+      submit.classList.add("is-busy");
+      try {
+        await saveLogSettings(event);
+      } catch (error) {
+        showToast(error.message, "error");
+      } finally {
+        submit.disabled = false;
+        submit.classList.remove("is-busy");
+      }
+    });
+  }
+  $("#diagnosticsNetworkEnabled")?.addEventListener("change", renderDiagnosticBridgeOptions);
+  $("#diagnosticsRunButton")?.addEventListener("click", async () => {
+    try {
+      await runDiagnostics();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  $("#diagnosticsWebrtcButton")?.addEventListener("click", async () => {
+    try {
+      await runDiagnostics({ webrtcOnly: true });
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  });
+  document.addEventListener("change", async (event) => {
+    if (event.target.matches("#allowNonPublicSubscriptions")) {
+      await saveSubscriptionSettings(event.target);
+      return;
+    }
+    const coreControl = event.target.closest("[data-core-select], [data-core-fallback]");
+    if (coreControl) {
+      const nodeId = coreControl.dataset.coreSelect || coreControl.dataset.coreFallback;
+      try {
+        await saveNodeCoreSettings(nodeId);
+      } catch (error) {
+        showToast(error.message, "error");
+      }
+      return;
+    }
+    const select = event.target.closest('select[data-action="schedule-sub"]');
+    if (!select) return;
+    select.disabled = true;
+    try {
+      await api("/api/subscriptions/schedule", {
+        id: select.dataset.id,
+        refresh_interval_minutes: Number(select.value),
+      });
+      await loadStatus({ forceFresh: true });
+      showToast(Number(select.value) ? "订阅自动刷新周期已更新" : "订阅自动刷新已关闭");
+    } catch (error) {
+      showToast(error.message, "error");
+      await loadStatus({ forceFresh: true }).catch(() => {});
+    } finally {
+      select.disabled = false;
+    }
+  });
   const syncForm = $("#syncForm");
   if (syncForm) {
     // 任意输入/勾选都标记脏数据，避免 3.5s 状态轮询把未保存内容冲掉。
@@ -2343,18 +4029,35 @@ function bindEvents() {
       showToast("没有可测试的节点", "error");
       return;
     }
+    if (nodes.length > 500) {
+      showToast(`当前筛选有 ${nodes.length} 个节点，批量测速上限为 500，请缩小筛选范围`, "error");
+      return;
+    }
     button.disabled = true;
     try {
-      for (const [index, node] of nodes.entries()) {
-        button.querySelector("span").textContent = `测试中 ${index + 1}/${nodes.length}`;
-        await testNode(node.id);
-      }
-      showToast("可见节点测试完成");
+      const task = await api("/api/nodes/test-batch/start", { node_ids: nodes.map((node) => node.id) });
+      appState.speedTest.tasks = [...(appState.speedTest.tasks || []), task];
+      renderSpeedTestTaskControls();
+      showToast(`已启动 ${nodes.length} 个节点的批量测速`);
     } catch (error) {
       showToast(error.message, "error");
     } finally {
-      button.querySelector("span").textContent = "测试可见节点";
-      button.disabled = false;
+      renderSpeedTestTaskControls();
+    }
+  });
+  $("#cancelVisibleTest").addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const taskId = button.dataset.taskId;
+    if (!taskId) return;
+    button.disabled = true;
+    try {
+      await api("/api/nodes/test-batch/cancel", { id: taskId });
+      await loadStatus({ forceFresh: true });
+      showToast("正在取消批量测速");
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      renderSpeedTestTaskControls();
     }
   });
   $("#protocolFilter").addEventListener("change", (event) => {
@@ -2363,6 +4066,10 @@ function bindEvents() {
   });
   $("#regionFilter").addEventListener("change", (event) => {
     appState.filters.region = event.target.value;
+    renderNodes();
+  });
+  $("#nodeSort").addEventListener("change", (event) => {
+    appState.filters.sort = event.target.value;
     renderNodes();
   });
   const subscriptionFilter = $("#subscriptionFilter");
@@ -2378,27 +4085,51 @@ function bindEvents() {
   });
   $("#logSearchInput").addEventListener("input", (event) => {
     appState.logFilters.search = event.target.value;
-    renderRequestLogs();
+    scheduleLogPageLoad("request");
   });
   $("#logNodeFilter").addEventListener("change", (event) => {
     appState.logFilters.node = event.target.value;
-    renderRequestLogs();
+    appState.requestLogPage.page = 1;
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
   });
   $("#logStatusFilter").addEventListener("change", (event) => {
     appState.logFilters.status = event.target.value;
-    renderRequestLogs();
+    appState.requestLogPage.page = 1;
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
   });
   $("#systemSearchInput").addEventListener("input", (event) => {
     appState.systemLogFilters.search = event.target.value;
-    renderSystemLogs();
+    scheduleLogPageLoad("system");
   });
   $("#systemLevelFilter").addEventListener("change", (event) => {
     appState.systemLogFilters.level = event.target.value;
-    renderSystemLogs();
+    appState.systemLogPage.page = 1;
+    loadLogPage("system").catch((error) => showToast(error.message, "error"));
+  });
+  $("#requestLogPrev").addEventListener("click", () => {
+    appState.requestLogPage.page = Math.max(1, appState.requestLogPage.page - 1);
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
+  });
+  $("#requestLogNext").addEventListener("click", () => {
+    appState.requestLogPage.page = Math.min(appState.requestLogPage.page_count, appState.requestLogPage.page + 1);
+    loadLogPage("request").catch((error) => showToast(error.message, "error"));
+  });
+  $("#systemLogPrev").addEventListener("click", () => {
+    appState.systemLogPage.page = Math.max(1, appState.systemLogPage.page - 1);
+    loadLogPage("system").catch((error) => showToast(error.message, "error"));
+  });
+  $("#systemLogNext").addEventListener("click", () => {
+    appState.systemLogPage.page = Math.min(appState.systemLogPage.page_count, appState.systemLogPage.page + 1);
+    loadLogPage("system").catch((error) => showToast(error.message, "error"));
   });
   $("#coreLogModal").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) {
       closeCoreLogModal();
+    }
+  });
+  $("#coreUploadModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeCoreUploadModal();
     }
   });
   $("#browserRecordModal").addEventListener("click", (event) => {
@@ -2406,9 +4137,25 @@ function bindEvents() {
       closeBrowserRecordModal();
     }
   });
+  $("#remoteBrowserLaunchModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeRemoteBrowserLaunchModal();
+    }
+  });
+  $("#remoteBrowserCredentialsModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeRemoteBrowserCredentialsModal();
+    }
+  });
   document.addEventListener("keydown", (event) => {
     if (trapModalFocus(event)) return;
-    if (event.key === "Escape" && !$("#coreLogModal").hidden) {
+    if (event.key === "Escape" && !$("#remoteBrowserCredentialsModal").hidden) {
+      closeRemoteBrowserCredentialsModal();
+    } else if (event.key === "Escape" && !$("#remoteBrowserLaunchModal").hidden) {
+      closeRemoteBrowserLaunchModal();
+    } else if (event.key === "Escape" && !$("#coreUploadModal").hidden) {
+      closeCoreUploadModal();
+    } else if (event.key === "Escape" && !$("#coreLogModal").hidden) {
       closeCoreLogModal();
     } else if (event.key === "Escape" && !$("#browserRecordModal").hidden) {
       closeBrowserRecordModal();
@@ -2419,6 +4166,7 @@ function bindEvents() {
   });
   window.addEventListener("beforeunload", () => {
     window.clearTimeout(statusPollTimer);
+    window.clearTimeout(logFilterTimer);
     statusAbortController?.abort();
   });
 }

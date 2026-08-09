@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import plistlib
 import re
 import subprocess
 import sys
@@ -35,7 +36,14 @@ def resolve_python_executable() -> str:
 def current_launch_command() -> list[str]:
     if is_frozen():
         return [str(Path(sys.executable).resolve()), *AUTOSTART_ARGS]
-    return [resolve_python_executable(), "-m", "desktop.tray_host", *AUTOSTART_ARGS]
+    tray_script = Path(__file__).resolve().with_name("tray_host.py")
+    return [str(Path(resolve_python_executable()).resolve()), str(tray_script), *AUTOSTART_ARGS]
+
+
+def current_launch_working_directory() -> Path:
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
 
 
 def windows_startup_shortcut_path() -> Path:
@@ -61,20 +69,19 @@ def darwin_launch_agent_path() -> Path:
 
 
 def quote_windows_cmd(parts: list[str]) -> str:
-    def quote(part: str) -> str:
-        if not part or re.search(r'[\s"]', part):
-            escaped = part.replace('"', '\\"')
-            return f'"{escaped}"'
-        return part
-
-    return " ".join(quote(part) for part in parts)
+    return subprocess.list2cmdline(parts)
 
 
-def write_windows_shortcut(path: Path, command: list[str]) -> None:
+def write_windows_shortcut(
+    path: Path,
+    command: list[str],
+    *,
+    working_directory: Path | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     target = command[0]
     arguments = quote_windows_cmd(command[1:]) if len(command) > 1 else ""
-    workdir = str(Path(target).resolve().parent)
+    workdir = str((working_directory or Path(target).resolve().parent).resolve())
 
     # Escape for PowerShell double-quoted strings.
     def ps_escape(value: str) -> str:
@@ -129,19 +136,48 @@ def is_autostart_enabled() -> bool:
             text_value = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return False
-        return "Hidden=true" not in text_value
+        return not any(line.strip().lower() == "hidden=true" for line in text_value.splitlines())
     if os_token == "darwin":
         return darwin_launch_agent_path().is_file()
     return False
 
 
-def set_autostart_enabled(enabled: bool, command: list[str] | None = None) -> dict[str, Any]:
+def _quote_desktop_exec_arg(value: str) -> str:
+    if not value or "\x00" in value or "\n" in value or "\r" in value:
+        if value:
+            raise ValueError("autostart command contains an invalid character")
+        return '""'
+    if re.fullmatch(r"[A-Za-z0-9_@+=:,./-]+", value):
+        return value
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("`", "\\`")
+        .replace("$", "\\$")
+        .replace("%", "%%")
+    )
+    return f'"{escaped}"'
+
+
+def _escape_desktop_value(value: str) -> str:
+    if "\x00" in value or "\n" in value or "\r" in value:
+        raise ValueError("autostart path contains an invalid character")
+    return value.replace("\\", "\\\\")
+
+
+def set_autostart_enabled(
+    enabled: bool,
+    command: list[str] | None = None,
+    *,
+    working_directory: Path | None = None,
+) -> dict[str, Any]:
     os_token = host_os_token()
     launch_command = list(command or current_launch_command())
+    workdir = (working_directory or current_launch_working_directory()).expanduser().resolve()
     if os_token == "windows":
         shortcut = windows_startup_shortcut_path()
         if enabled:
-            write_windows_shortcut(shortcut, launch_command)
+            write_windows_shortcut(shortcut, launch_command, working_directory=workdir)
         elif shortcut.exists():
             shortcut.unlink()
         return {"ok": True, "enabled": enabled, "path": str(shortcut), "os": os_token}
@@ -150,13 +186,14 @@ def set_autostart_enabled(enabled: bool, command: list[str] | None = None) -> di
         desktop = linux_autostart_desktop_path()
         if enabled:
             desktop.parent.mkdir(parents=True, exist_ok=True)
-            exec_line = " ".join(part if " " not in part else f'"{part}"' for part in launch_command)
+            exec_line = " ".join(_quote_desktop_exec_arg(part) for part in launch_command)
             content = "\n".join(
                 [
                     "[Desktop Entry]",
                     "Type=Application",
                     f"Name={AUTOSTART_APP_NAME}",
                     f"Exec={exec_line}",
+                    f"Path={_escape_desktop_value(str(workdir))}",
                     "X-GNOME-Autostart-enabled=true",
                     "Hidden=false",
                     "NoDisplay=false",
@@ -178,25 +215,14 @@ def set_autostart_enabled(enabled: bool, command: list[str] | None = None) -> di
         plist = darwin_launch_agent_path()
         if enabled:
             plist.parent.mkdir(parents=True, exist_ok=True)
-            args_xml = "\n".join(f"    <string>{part}</string>" for part in launch_command)
-            content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.proxybridge.tray</string>
-  <key>ProgramArguments</key>
-  <array>
-{args_xml}
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <false/>
-</dict>
-</plist>
-"""
-            plist.write_text(content, encoding="utf-8")
+            payload = {
+                "Label": "com.proxybridge.tray",
+                "ProgramArguments": launch_command,
+                "WorkingDirectory": str(workdir),
+                "RunAtLoad": True,
+                "KeepAlive": False,
+            }
+            plist.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False))
         elif plist.exists():
             plist.unlink()
         return {"ok": True, "enabled": enabled, "path": str(plist), "os": os_token}

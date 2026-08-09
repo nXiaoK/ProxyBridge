@@ -28,6 +28,8 @@ class DockerModeTests(unittest.TestCase):
             "PROXY_BRIDGE_DOCKER": "1",
             "PROXY_BRIDGE_PROXY_PORT_START": "21080",
             "PROXY_BRIDGE_PROXY_PORT_END": "21179",
+            "PROXY_BRIDGE_BROWSER_BROKER_URL": "",
+            "PROXY_BRIDGE_DISABLE_BROWSER": "",
             **extra,
         }
         return mock.patch.dict(os.environ, values, clear=False)
@@ -45,6 +47,7 @@ class DockerModeTests(unittest.TestCase):
     def test_docker_mode_disables_browser_and_skips_browser_directories(self) -> None:
         with self.docker_env():
             self.assertTrue(app.docker_mode())
+            self.assertFalse(app.remote_browser_feature_enabled())
             self.assertFalse(app.browser_feature_enabled())
             with self.assertRaisesRegex(RuntimeError, "不提供浏览器功能"):
                 app.launch_browser({"node_id": "n1"})
@@ -54,6 +57,22 @@ class DockerModeTests(unittest.TestCase):
         self.assertTrue(app.proxy_core_bin_dir().exists())
         self.assertFalse(app.browser_profiles_root().exists())
         self.assertFalse(app.browser_extensions_root().exists())
+
+    def test_docker_mode_enables_browser_only_when_broker_is_configured(self) -> None:
+        with self.docker_env(PROXY_BRIDGE_BROWSER_BROKER_URL="http://browser-broker:8765"):
+            self.assertTrue(app.remote_browser_feature_enabled())
+            self.assertTrue(app.browser_feature_enabled())
+            app.ensure_dirs()
+
+        self.assertTrue(app.browser_profiles_root().is_dir())
+        self.assertTrue(app.browser_extensions_root().is_dir())
+
+        with self.docker_env(
+            PROXY_BRIDGE_BROWSER_BROKER_URL="http://browser-broker:8765",
+            PROXY_BRIDGE_DISABLE_BROWSER="1",
+        ):
+            self.assertFalse(app.remote_browser_feature_enabled())
+            self.assertFalse(app.browser_feature_enabled())
 
     def test_docker_mode_uses_published_proxy_range(self) -> None:
         with self.docker_env(

@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
@@ -37,6 +38,9 @@ READINESS_POLL_INTERVAL = 0.2
 TERMINATE_TIMEOUT = 8.0
 STATUS_REFRESH_INTERVAL = 5.0
 BACKEND_ONLY_FLAG = "--backend-only"
+TRAY_LOG_MAX_BYTES = 4 * 1024 * 1024
+TRAY_LOG_BACKUP_COUNT = 3
+TRAY_LOG_LOCK = threading.RLock()
 
 
 def is_frozen() -> bool:
@@ -195,12 +199,120 @@ def console_url(port: int, host: str = "127.0.0.1") -> str:
     return f"http://{host}:{port}"
 
 
+def console_access_url(base_url: str, token: str) -> str:
+    return f"{base_url.rstrip('/')}/#{urllib.parse.urlencode({'token': token})}"
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """认证后的本机后端控制请求不得携带实例凭证跳转到其他地址。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        raise urllib.error.HTTPError(newurl, code, "后端控制请求拒绝重定向", headers, fp)
+
+
 def ensure_dirs(work_root: Path) -> None:
     work_root.mkdir(parents=True, exist_ok=True)
     try:
         work_root.chmod(0o700)
     except OSError:
         pass
+
+
+def log_backup_path(path: Path, index: int) -> Path:
+    return path.with_name(f"{path.name}.{index}")
+
+
+def rotate_log_for_append(
+    path: Path,
+    incoming_bytes: int,
+    *,
+    max_bytes: int = TRAY_LOG_MAX_BYTES,
+    backup_count: int = TRAY_LOG_BACKUP_COUNT,
+) -> bool:
+    if max_bytes <= 0 or backup_count <= 0:
+        return False
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return False
+    if size + max(0, incoming_bytes) <= max_bytes:
+        return False
+    log_backup_path(path, backup_count).unlink(missing_ok=True)
+    for index in range(backup_count - 1, 0, -1):
+        source = log_backup_path(path, index)
+        if source.exists():
+            source.replace(log_backup_path(path, index + 1))
+    backup = log_backup_path(path, 1)
+    path.replace(backup)
+    if size > max_bytes:
+        with backup.open("rb") as handle:
+            handle.seek(size - max_bytes, os.SEEK_SET)
+            tail = handle.read(max_bytes)
+        temp_path = backup.with_suffix(backup.suffix + ".tmp")
+        with temp_path.open("wb") as handle:
+            handle.write(tail)
+        temp_path.replace(backup)
+    try:
+        backup.chmod(0o600)
+    except OSError:
+        pass
+    return True
+
+
+def append_bounded_log(
+    path: Path,
+    data: bytes,
+    *,
+    max_bytes: int = TRAY_LOG_MAX_BYTES,
+    backup_count: int = TRAY_LOG_BACKUP_COUNT,
+) -> None:
+    if len(data) > max_bytes:
+        data = data[-max_bytes:]
+    with TRAY_LOG_LOCK:
+        rotate_log_for_append(
+            path,
+            len(data),
+            max_bytes=max_bytes,
+            backup_count=backup_count,
+        )
+        with path.open("ab") as handle:
+            if hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(handle.fileno(), 0o600)
+                except OSError:
+                    pass
+            handle.write(data)
+            handle.flush()
+
+
+def pump_bounded_log(
+    stream: Any,
+    path: Path,
+    *,
+    max_bytes: int = TRAY_LOG_MAX_BYTES,
+    backup_count: int = TRAY_LOG_BACKUP_COUNT,
+) -> None:
+    chunk_size = max(1, min(65536, max_bytes))
+    try:
+        while True:
+            chunk = stream.read(chunk_size)
+            if not chunk:
+                break
+            if isinstance(chunk, str):
+                chunk = chunk.encode("utf-8", errors="replace")
+            append_bounded_log(
+                path,
+                chunk,
+                max_bytes=max_bytes,
+                backup_count=backup_count,
+            )
+    except Exception as error:
+        _write_tray_host_log(f"backend log pump failed: {error}")
+    finally:
+        try:
+            stream.close()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -219,8 +331,15 @@ class BackendProcess:
         self.process: subprocess.Popen[Any] | None = None
         self.instance_token = secrets.token_urlsafe(18)
         self.log_path = config.work_root / "tray-backend.log"
-        self._log_handle: Any | None = None
+        self._log_stream: Any | None = None
+        self._log_thread: threading.Thread | None = None
         self._lock = threading.RLock()
+        # 控制请求携带后端实例凭证，只允许直连且拒绝重定向，避免环境代理或
+        # 30x 目标收到 X-ProxyBridge-Instance。
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirectHandler(),
+        )
 
     @property
     def is_running(self) -> bool:
@@ -230,6 +349,10 @@ class BackendProcess:
     @property
     def base_url(self) -> str:
         return console_url(self.config.port, self.config.host)
+
+    @property
+    def access_url(self) -> str:
+        return console_access_url(self.base_url, self.instance_token)
 
     def start(self) -> None:
         with self._lock:
@@ -246,7 +369,6 @@ class BackendProcess:
             # Avoid inheriting a broken PYTHONPATH from the tray launcher.
             env.pop("PYTHONPATH", None)
 
-            self._log_handle = self.log_path.open("ab")
             popen_kwargs: dict[str, Any] = {}
             if os.name == "nt":
                 creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -261,10 +383,24 @@ class BackendProcess:
                 command,
                 cwd=cwd,
                 env=env,
-                stdout=self._log_handle,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                bufsize=0,
                 **popen_kwargs,
             )
+            self._log_stream = getattr(self.process, "stdout", None)
+            if self._log_stream is not None:
+                self._log_thread = threading.Thread(
+                    target=pump_bounded_log,
+                    args=(self._log_stream, self.log_path),
+                    name="tray-backend-log",
+                    daemon=True,
+                )
+                try:
+                    self._log_thread.start()
+                except BaseException:
+                    self.stop()
+                    raise
 
     def wait_until_ready(self, timeout: float = READINESS_TIMEOUT) -> dict[str, Any]:
         deadline = time.monotonic() + timeout
@@ -288,14 +424,13 @@ class BackendProcess:
                 BACKEND_INSTANCE_HEADER: self.instance_token,
             },
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with self._opener.open(request, timeout=timeout) as response:
+            echoed = str(getattr(response, "headers", {}).get(BACKEND_INSTANCE_HEADER) or "")
+            if echoed != self.instance_token:
+                raise RuntimeError("backend instance token mismatch")
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
         if not isinstance(payload, dict):
             raise RuntimeError("invalid status payload")
-        # Prefer matching token when backend echoes it.
-        echoed = str(payload.get("instance_token") or "")
-        if echoed and echoed != self.instance_token:
-            raise RuntimeError("backend instance token mismatch")
         return payload
 
     def stop_all_bridges(self, timeout: float = 5.0) -> dict[str, Any]:
@@ -311,7 +446,10 @@ class BackendProcess:
                 BACKEND_INSTANCE_HEADER: self.instance_token,
             },
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with self._opener.open(request, timeout=timeout) as response:
+            echoed = str(getattr(response, "headers", {}).get(BACKEND_INSTANCE_HEADER) or "")
+            if echoed != self.instance_token:
+                raise RuntimeError("backend instance token mismatch")
             payload = json.loads(response.read().decode("utf-8", errors="replace"))
         return payload if isinstance(payload, dict) else {"ok": True}
 
@@ -362,11 +500,22 @@ class BackendProcess:
         return self.wait_until_ready()
 
     def _close_log(self) -> None:
-        handle = self._log_handle
-        self._log_handle = None
-        if handle is not None:
+        thread = self._log_thread
+        stream = self._log_stream
+        self._log_thread = None
+        self._log_stream = None
+        if thread is not None:
+            if thread.is_alive():
+                thread.join(timeout=3)
+        if thread is not None and thread.is_alive() and stream is not None:
             try:
-                handle.close()
+                stream.close()
+            except Exception:
+                pass
+            thread.join(timeout=1)
+        elif stream is not None:
+            try:
+                stream.close()
             except Exception:
                 pass
 
@@ -478,7 +627,7 @@ class TrayApp:
             icon.title = self._title()
 
     def open_console(self) -> None:
-        webbrowser.open(self.backend.base_url)
+        webbrowser.open(self.backend.access_url)
 
     def restart_backend(self) -> None:
         self._error = None
@@ -626,8 +775,8 @@ def _write_tray_host_log(message: str) -> None:
         work = Path(os.environ.get("PROXY_BRIDGE_WORKDIR") or default_work_root())
         ensure_dirs(work)
         log_path = work / "tray-host.log"
-        with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n".encode("utf-8", errors="replace")
+        append_bounded_log(log_path, line)
     except Exception:
         pass
 
