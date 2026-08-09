@@ -221,16 +221,24 @@ print(dst)
 }
 
 Write-Host "Building ProxyBridge.exe (onefile, windowed)..."
+# --specpath 位于 outputs/windows；源文件必须使用绝对路径，否则 PyInstaller 会错误地从 spec 目录查找。
+$AppSource = Join-Path $RootDir "app.py"
+$WebDavSource = Join-Path $RootDir "webdav_sync.py"
+$RemoteBrowserSource = Join-Path $RootDir "remote_browser.py"
+$VersionModuleSource = Join-Path $RootDir "proxybridge_version.py"
+$StaticSource = Join-Path $RootDir "static"
+$DesktopSource = Join-Path $RootDir "desktop"
+$TrayEntry = Join-Path $RootDir "desktop\tray_host.py"
 $addData = @(
-  "app.py;.",
-  "webdav_sync.py;.",
+  "$AppSource;.",
+  "$WebDavSource;.",
   # 主模块会导入远程浏览器 Broker 客户端；Windows 包需收集该同级模块。
-  "remote_browser.py;.",
+  "$RemoteBrowserSource;.",
   # 版本解析模块和构建生成的 VERSION 必须同时进入 onefile 临时目录。
-  "proxybridge_version.py;.",
+  "$VersionModuleSource;.",
   "$BundledVersionPath;.",
-  "static;static",
-  "desktop;desktop"
+  "$StaticSource;static",
+  "$DesktopSource;desktop"
 )
 $pyiArgs = @(
   "-m", "PyInstaller",
@@ -264,7 +272,7 @@ $pyiArgs += @(
   "--hidden-import", "PIL",
   "--hidden-import", "PIL.Image",
   "--hidden-import", "PIL.ImageDraw",
-  "desktop\tray_host.py"
+  $TrayEntry
 )
 
 Invoke-Python @pyiArgs
