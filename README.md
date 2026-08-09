@@ -61,6 +61,18 @@
 | Linux 服务器 / 无 GUI | `python3 app.py` 无壳控制台 |
 | Docker / NAS / 长期服务 | `docker compose up -d --build` |
 
+## 下载自动打包版本
+
+可直接从 [GitHub Releases](https://github.com/nXiaoK/ProxyBridge/releases/latest) 下载：
+
+- `ProxyBridge-macOS-arm64-<版本>.zip`：Apple Silicon、macOS 13+ 菜单栏 App。
+- `ProxyBridge-Windows-x64-<版本>.exe`：Windows 10/11 x64 便携单文件。
+- `SHA256SUMS.txt`：上述产物的 SHA-256 校验值。
+
+仓库根目录 `VERSION` 是人工维护的基础版本，当前为 `0.3.0`。`main` 每次 push 都会触发发布门禁与双平台打包；成功后使用 `0.3.0-build.<Actions 运行序号>` 创建唯一 Release。修改基础版本时只改 `VERSION`，并同步 macOS 源 plist 中的可读默认值。
+
+自动构建的 macOS App 仅使用 ad-hoc 签名、未做 Apple 公证；Windows EXE 也未购买代码签名证书。首次启动可能遇到 Gatekeeper 或 SmartScreen 提示，处理方式见下方平台说明。
+
 ## 构建机准备
 
 默认构建轻量 App，不会把 `sing-box` / `xray` 打进 App 包里：
@@ -77,6 +89,8 @@ scripts/build_menubar_app.sh
 ```
 
 如需指定用于安装 vendored 依赖的构建机 Python，可设置 `PYTHON_FOR_VENDOR=/path/to/python3`。依赖安装启用哈希校验，wheelhouse 中的文件必须与锁文件一致。
+
+本地复现发布版本时可设置 `PROXY_BRIDGE_VERSION=0.3.0-build.12` 与 `PROXY_BRIDGE_BUILD_NUMBER=12`。前者写入应用界面和包内 `VERSION`，后者写入 macOS `CFBundleVersion` 或 Windows 四段文件版本；构建号必须是非负纯数字。
 
 如果希望构建离线版/内置核心版，携带 `--bundle-cores` 参数；此时会从构建机复制 `sing-box` / `xray` 到 App 内部，因此构建机需要先安装：
 

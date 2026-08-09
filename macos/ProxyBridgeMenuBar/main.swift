@@ -1785,7 +1785,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = lastError == nil ? title : "PB !"
         statusItem.button?.toolTip = tooltipTitle(runningCount: running.count)
 
-        let header = NSMenuItem(title: "Proxy Bridge", action: nil, keyEquivalent: "")
+        let bundleVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+        let backendVersion = latestStatus?.version ?? ""
+        let displayVersion = backendVersion.isEmpty ? bundleVersion : backendVersion
+        let headerTitle = displayVersion.isEmpty ? "Proxy Bridge" : "Proxy Bridge · v\(displayVersion)"
+        let header = NSMenuItem(title: headerTitle, action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 

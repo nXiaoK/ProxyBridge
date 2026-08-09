@@ -51,7 +51,7 @@ ProxyBridge 在 Windows / Linux 上提供两种形态：
 
 1. 获取 `ProxyBridge.exe`  
    - 自己构建：见 [2.3](#23-方式-c在-windows-上构建-proxybridgeexe)  
-   - 或使用已构建好的发布文件
+   - 或从 [GitHub Releases](https://github.com/nXiaoK/ProxyBridge/releases/latest) 下载名称为 `ProxyBridge-Windows-x64-<版本>.exe` 的自动发布文件
 2. 把 `ProxyBridge.exe` 放到任意目录，例如：
    ```text
    D:\Apps\ProxyBridge\ProxyBridge.exe

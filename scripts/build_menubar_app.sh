@@ -4,11 +4,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="$ROOT_DIR/outputs"
 FINAL_APP_DIR="$OUTPUT_DIR/ProxyBridgeMenuBar.app"
+# VERSION 保存人工维护的 SemVer 基础版本；下面两个环境变量只用于发布构建注入完整版本与构建号。
+VERSION_FILE="$ROOT_DIR/VERSION"
+BASE_VERSION=""
+APP_VERSION=""
+BUILD_NUMBER="${PROXY_BRIDGE_BUILD_NUMBER:-1}"
 STAGING_ROOT=""
 APP_DIR=""
 BUILD_LOCK_DIR="$OUTPUT_DIR/.ProxyBridgeMenuBar.build.lock"
 BUILD_LOCK_HELD=0
-TARGET_ARCH="arm64"
+# TARGET_ARCH 默认只构建项目支持的 Apple Silicon 版本；需要交叉编译时可显式覆盖。
+TARGET_ARCH="${TARGET_ARCH:-arm64}"
 SWIFT_TARGET="${TARGET_ARCH}-apple-macos13.0"
 REQUIREMENTS_LOCK="$ROOT_DIR/scripts/requirements.lock"
 VENDOR_PYTHON="${PYTHON_FOR_VENDOR:-}"
@@ -52,6 +58,9 @@ Options:
 Environment:
   PYTHON_FOR_VENDOR=/path/python3          用于构建 bridge/vendor 的 Python。
   PROXY_BRIDGE_VENDOR_WHEELHOUSE=/path     从离线 wheelhouse 安装锁定依赖。
+  PROXY_BRIDGE_VERSION=0.3.0-build.12      写入 App 和内嵌后端的完整版本。
+  PROXY_BRIDGE_BUILD_NUMBER=12             写入 CFBundleVersion 的纯数字构建号。
+  TARGET_ARCH=arm64                        目标 CPU 架构；当前发布仅支持 Apple Silicon。
 EOF
       exit 0
       ;;
@@ -61,6 +70,31 @@ EOF
       ;;
   esac
 done
+
+resolve_build_version() {
+  if [[ ! -f "$VERSION_FILE" ]]; then
+    echo "缺少版本文件：$VERSION_FILE" >&2
+    exit 1
+  fi
+  IFS= read -r BASE_VERSION < "$VERSION_FILE" || true
+  BASE_VERSION="${BASE_VERSION//$'\r'/}"
+  APP_VERSION="${PROXY_BRIDGE_VERSION:-$BASE_VERSION}"
+
+  if [[ ! "$BASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "VERSION 必须是三段数字 SemVer：$BASE_VERSION" >&2
+    exit 1
+  fi
+  if [[ ! "$APP_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+    echo "PROXY_BRIDGE_VERSION 格式无效：$APP_VERSION" >&2
+    exit 1
+  fi
+  if [[ ! "$BUILD_NUMBER" =~ ^[0-9]+$ ]]; then
+    echo "PROXY_BRIDGE_BUILD_NUMBER 必须是纯数字：$BUILD_NUMBER" >&2
+    exit 1
+  fi
+}
+
+resolve_build_version
 
 acquire_build_lock() {
   local owner_pid=""
@@ -239,9 +273,9 @@ EOS
   echo "Bundled xray: $("$CORE_DIR/xray" version | sed -n '1p')"
 }
 
+# 这两个工具只在构建机上执行，必须编译为 runner 本机架构；最终 App 仍按 SWIFT_TARGET 交叉编译。
 swiftc \
   -O \
-  -target "$SWIFT_TARGET" \
   -module-cache-path "$ROOT_DIR/work/swift-module-cache" \
   -framework CoreGraphics \
   -framework Foundation \
@@ -253,7 +287,6 @@ swiftc \
 
 swiftc \
   -O \
-  -target "$SWIFT_TARGET" \
   -module-cache-path "$ROOT_DIR/work/swift-module-cache" \
   "$ROOT_DIR/scripts/atomic_replace_app.swift" \
   -o "$ATOMIC_REPLACE_TOOL"
@@ -269,12 +302,17 @@ swiftc \
   -o "$MACOS_DIR/ProxyBridgeMenuBar"
 
 cp "$ROOT_DIR/macos/ProxyBridgeMenuBar/Info.plist" "$CONTENTS_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $BASE_VERSION" "$CONTENTS_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$CONTENTS_DIR/Info.plist"
 cp "$ICON_PATH" "$RESOURCES_DIR/AppIcon.icns"
 # Backend Python modules (app.py plus any sibling packages it imports at startup).
 cp "$ROOT_DIR/app.py" "$BRIDGE_DIR/app.py"
 cp "$ROOT_DIR/webdav_sync.py" "$BRIDGE_DIR/webdav_sync.py"
 # 主模块会导入远程浏览器 Broker 客户端；菜单栏包需保留该同级模块。
 cp "$ROOT_DIR/remote_browser.py" "$BRIDGE_DIR/remote_browser.py"
+# 完整构建版本写入包内，运行时 API 与 macOS/Windows 文件元数据使用同一来源。
+cp "$ROOT_DIR/proxybridge_version.py" "$BRIDGE_DIR/proxybridge_version.py"
+printf '%s\n' "$APP_VERSION" > "$BRIDGE_DIR/VERSION"
 ditto "$ROOT_DIR/static" "$BRIDGE_DIR/static"
 vendor_python_dependencies
 if [[ "$BUNDLE_CORES" == "1" ]]; then
@@ -288,4 +326,5 @@ codesign --force --deep --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
 
 "$ATOMIC_REPLACE_TOOL" "$APP_DIR" "$FINAL_APP_DIR"
+echo "ProxyBridge version: $APP_VERSION (build $BUILD_NUMBER)"
 echo "$FINAL_APP_DIR"

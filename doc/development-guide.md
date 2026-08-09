@@ -934,7 +934,9 @@ Broker 启动前还会校验该网络必须是 `internal=true`、作用域为 `l
 | `XRAY_BIN` | macOS 内置构建时指定 xray |
 | `PYTHON_FOR_VENDOR` | 安装锁定 vendored 依赖使用的 Python |
 | `PROXY_BRIDGE_VENDOR_WHEELHOUSE` | 离线 wheelhouse |
-| `TARGET_ARCH` | macOS 构建目标架构 |
+| `PROXY_BRIDGE_VERSION` | 写入界面、状态 API 和包内 `VERSION` 的完整 SemVer；发布构建形如 `0.3.0-build.12`，不设置时读取仓库根目录 `VERSION` |
+| `PROXY_BRIDGE_BUILD_NUMBER` | 写入 macOS `CFBundleVersion` 和 Windows 四段文件版本末段的非负整数；GitHub Actions 使用 workflow run number |
+| `TARGET_ARCH` | macOS 构建目标架构，默认 `arm64`；当前正式发布只支持 Apple Silicon |
 
 ## 20. 本地开发
 
@@ -1077,6 +1079,8 @@ scripts/build_menubar_app.sh --bundle-cores
 
 默认目标为 Apple Silicon 和 macOS 13。完整构建可能受签名、网络和 Xcode 工具链影响，至少应完成 Swift parse/typecheck 和 plist 校验。
 
+仓库根目录 `VERSION` 是基础版本唯一来源。macOS 构建脚本会把 `PROXY_BRIDGE_VERSION` 写入 App 内嵌后端的 `VERSION`，并把基础版本与纯数字构建号分别写入 `CFBundleShortVersionString` / `CFBundleVersion`。
+
 ### 22.2 Windows 单文件
 
 ```powershell
@@ -1085,6 +1089,7 @@ scripts/build_menubar_app.sh --bundle-cores
 
 脚本使用 PyInstaller 打包托盘壳、后端、Web 前端和资源。发布前注意：
 
+- 脚本会生成 Windows `FileVersion` / `ProductVersion` 资源，并把同一完整版本写入 onefile 包内。
 - 产物默认未签名。
 - 在 Windows 本机验证 SmartScreen 提示和托盘功能。
 - 验证首次核心下载、工作目录和自动启动。
@@ -1121,7 +1126,19 @@ docker compose logs --tail=100 proxybridge
 - worker HTTPS 端口默认绑定 `127.0.0.1:23000-23099`；LAN 部署必须显式配置私有 IPv4 并收紧防火墙。
 - Broker 启动时清理异常退出遗留 worker；主服务和 Broker 的停止宽限期均为 3 分钟。
 
-### 22.5 发布前清单
+### 22.5 GitHub Actions 自动发布
+
+`.github/workflows/release.yml` 在 `main` 每次 push 后运行，流程为：
+
+1. 从 `VERSION` 读取基础版本，并追加 `build.<workflow run number>` 形成唯一版本与标签。
+2. 在 Ubuntu 执行 Python、Node、Shell、Compose 和差异检查，失败时不发布。
+3. 在 macOS runner 构建、校验并压缩 Apple Silicon App。
+4. 在 Windows runner 构建带版本资源的 x64 便携 EXE。
+5. 两个平台都成功后生成 SHA-256 清单，并用当前任务的短期 `GITHUB_TOKEN` 创建或更新 GitHub Release。
+
+工作流也支持手动选择分支、标签或提交重新打包。自动产物没有正式 Apple/Windows 开发者证书；如将来配置签名，凭据必须放在 GitHub Actions Secrets，不能提交到仓库。
+
+### 22.6 发布前清单
 
 1. 工作树只包含预期文件。
 2. Python 全量测试通过。

@@ -1,0 +1,269 @@
+name: Release desktop builds
+
+on:
+  # 仅 main 的 push 自动发布，避免功能分支产生可下载的正式产物。
+  push:
+    branches:
+      - main
+  # 手动入口可重打 main、标签或指定提交；不会修改仓库中的基础版本。
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 要打包的分支、标签或提交
+        required: false
+        default: main
+        type: string
+
+# 创建标签与 Release 必须写仓库内容；各构建任务不使用额外长期密钥。
+permissions:
+  contents: write
+
+jobs:
+  metadata:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      base_version: ${{ steps.version.outputs.base_version }}
+      build_number: ${{ steps.version.outputs.build_number }}
+      release_version: ${{ steps.version.outputs.release_version }}
+      source_sha: ${{ steps.version.outputs.source_sha }}
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      # push 使用事件提交；手动运行时使用输入的 ref，默认 main。
+      SOURCE_REF: ${{ github.event_name == 'push' && github.sha || inputs.ref }}
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          fetch-depth: 2
+
+      - name: Build version metadata
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_version="$(tr -d '\r\n' < VERSION)"
+          if [[ ! "$base_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "VERSION 必须是三段数字 SemVer，当前值：$base_version" >&2
+            exit 1
+          fi
+
+          # run number 保证同一基础版本下每次 push 都有唯一、递增的 Release 标签。
+          build_number="$GITHUB_RUN_NUMBER"
+          release_version="${base_version}-build.${build_number}"
+          source_sha="$(git rev-parse HEAD)"
+          tag="v${release_version}"
+
+          {
+            echo "base_version=$base_version"
+            echo "build_number=$build_number"
+            echo "release_version=$release_version"
+            echo "source_sha=$source_sha"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+
+  verify:
+    name: Release gate
+    needs: metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # 缓存仅保存公开依赖，不包含订阅、令牌或运行数据。
+          cache: pip
+          cache-dependency-path: |
+            docker/requirements.txt
+            desktop/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install test dependencies
+        run: python -m pip install -r docker/requirements.txt -r desktop/requirements.txt
+      - name: Run Python tests
+        run: python -m unittest discover -s tests
+      - name: Check and test frontend
+        shell: bash
+        run: |
+          node --check static/auth.js
+          node --check static/diagnostics.js
+          node --check static/browser-ui.js
+          node --check static/core-upload.js
+          node --check static/app.js
+          node --test tests/test_frontend_*.js
+      - name: Validate scripts and Compose
+        shell: bash
+        run: |
+          bash -n scripts/*.sh
+          docker compose config --quiet
+          git diff --check HEAD^ HEAD
+
+  build-macos:
+    name: Build macOS arm64 app
+    needs: [metadata, verify]
+    runs-on: macos-14
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build ad-hoc signed app
+        env:
+          # 完整版本进入包内 API；纯数字构建号进入 CFBundleVersion。
+          PROXY_BRIDGE_VERSION: ${{ needs.metadata.outputs.release_version }}
+          PROXY_BRIDGE_BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
+          TARGET_ARCH: arm64
+        run: scripts/build_menubar_app.sh
+
+      - name: Verify embedded macOS version and architecture
+        env:
+          EXPECTED_BASE_VERSION: ${{ needs.metadata.outputs.base_version }}
+          EXPECTED_BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
+          EXPECTED_RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="outputs/ProxyBridgeMenuBar.app"
+          plist="$app/Contents/Info.plist"
+          bundled_version="$app/Contents/Resources/bridge/VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$EXPECTED_BASE_VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$EXPECTED_BUILD_NUMBER"
+          test "$(tr -d '\r\n' < "$bundled_version")" = "$EXPECTED_RELEASE_VERSION"
+          file "$app/Contents/MacOS/ProxyBridgeMenuBar" | grep -q arm64
+          codesign --verify --deep --strict "$app"
+
+      - name: Package macOS asset
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          ditto -c -k --sequesterRsrc --keepParent \
+            outputs/ProxyBridgeMenuBar.app \
+            "release-assets/ProxyBridge-macOS-arm64-${RELEASE_VERSION}.zip"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ needs.metadata.outputs.tag }}
+          path: release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Build Windows x64 exe
+    needs: [metadata, verify]
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          architecture: x64
+
+      - name: Install Windows packaging dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check -r desktop/requirements.txt
+          python -m pip install --disable-pip-version-check "pyinstaller>=6.0"
+
+      - name: Build versioned portable exe
+        shell: pwsh
+        env:
+          # 脚本会同时写入 Windows 版本资源和 onefile 包内 VERSION。
+          PROXY_BRIDGE_VERSION: ${{ needs.metadata.outputs.release_version }}
+          PROXY_BRIDGE_BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
+        run: .\scripts\build_windows_exe.ps1 -Python (Get-Command python).Source -SkipInstall
+
+      - name: Package Windows asset
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item -LiteralPath outputs\windows\release\ProxyBridge.exe `
+            -Destination "release-assets\ProxyBridge-Windows-x64-$env:RELEASE_VERSION.exe"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ needs.metadata.outputs.tag }}
+          path: release-assets/*.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [metadata, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # GITHUB_TOKEN 是 GitHub 为本次任务签发的短期令牌，只用于当前仓库 Release。
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.metadata.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
+      SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums and release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "release-assets/ProxyBridge-macOS-arm64-${RELEASE_VERSION}.zip"
+          test -f "release-assets/ProxyBridge-Windows-x64-${RELEASE_VERSION}.exe"
+          (
+            cd release-assets
+            sha256sum ProxyBridge-* > SHA256SUMS.txt
+          )
+          printf '%s\n' \
+            "此版本由 main 分支 push 后自动构建。" \
+            "" \
+            "- 版本：${RELEASE_VERSION}" \
+            "- 提交：${SOURCE_SHA}" \
+            "- macOS：Apple Silicon，最低 macOS 13，使用 ad-hoc 签名但未公证。" \
+            "- Windows：x64 便携单文件，未购买代码签名证书。" \
+            "" \
+            "首次打开时，macOS Gatekeeper 或 Windows SmartScreen 可能显示安全提示。" \
+            > release-notes.md
+
+      - name: Create or update Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
+          test "${#assets[@]}" -eq 3
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" \
+              --title "ProxyBridge ${RELEASE_VERSION}" \
+              --notes-file release-notes.md \
+              --latest
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --target "$SOURCE_SHA" \
+              --title "ProxyBridge ${RELEASE_VERSION}" \
+              --notes-file release-notes.md \
+              --latest
+          fi
+          gh release view "$TAG" --json url --jq .url

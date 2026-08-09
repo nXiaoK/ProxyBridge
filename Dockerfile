@@ -23,6 +23,8 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
 
 # remote_browser.py 仅包含主服务访问内部 Browser Broker 所需的受限客户端。
 COPY --chown=proxybridge:proxybridge app.py webdav_sync.py remote_browser.py ./
+# VERSION 是基础版本唯一来源；解析模块允许发布构建通过环境变量覆盖完整版本。
+COPY --chown=proxybridge:proxybridge VERSION proxybridge_version.py ./
 COPY --chown=proxybridge:proxybridge static ./static
 
 RUN mkdir -p /data && chown proxybridge:proxybridge /data

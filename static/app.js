@@ -1,4 +1,5 @@
 const appState = {
+  version: "",
   cores: {},
   features: { browser: true, browser_profile_sync: true, remote_browser: false, docker: false },
   runtime: { mode: "headless", docker: false },
@@ -1368,6 +1369,7 @@ async function loadStatus({ forceFresh = false } = {}) {
   const request = (async () => {
     try {
       const status = await api("/api/status", null, { signal: controller.signal });
+      appState.version = status.version || "";
       appState.features = status.features || {
         browser: true,
         browser_profile_sync: true,
@@ -1458,7 +1460,9 @@ function render() {
   );
   const brandSubtitle = $("#brandSubtitle");
   if (brandSubtitle) {
-    brandSubtitle.textContent = dockerRuntime() ? "Docker 控制台 · 订阅节点" : "订阅节点 · 本地代理";
+    const runtimeLabel = dockerRuntime() ? "Docker 控制台 · 订阅节点" : "订阅节点 · 本地代理";
+    const versionLabel = String(appState.version || "").trim();
+    brandSubtitle.textContent = versionLabel ? `v${versionLabel} · ${runtimeLabel}` : runtimeLabel;
   }
   const remoteLaunchModal = $("#remoteBrowserLaunchModal");
   const remoteLaunchHasCredentials = !$("#remoteBrowserLaunchSuccess").hidden;

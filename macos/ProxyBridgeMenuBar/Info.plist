@@ -16,8 +16,10 @@
   <string>Proxy Bridge</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <!-- 基础版本与仓库根目录 VERSION 保持一致；发布构建会在产物中再次校验并注入。 -->
   <key>CFBundleShortVersionString</key>
-  <string>0.2.0</string>
+  <string>0.3.0</string>
+  <!-- 构建序号默认是 1，GitHub Actions 发布时使用当前 workflow run number。 -->
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>

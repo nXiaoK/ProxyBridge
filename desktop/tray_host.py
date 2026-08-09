@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from proxybridge_version import VERSION as APP_VERSION
+
 try:
     from desktop import autostart
 except ImportError:  # pragma: no cover - frozen layout fallback
@@ -588,6 +590,7 @@ class TrayApp:
             icon=load_tray_icon(),
             menu=Menu(
                 MenuItem(lambda item: self._title(), None, enabled=False),
+                MenuItem(f"ProxyBridge · v{APP_VERSION}", None, enabled=False),
                 Menu.SEPARATOR,
                 MenuItem("打开控制台", lambda icon, item: self.open_console()),
                 MenuItem("重启后端", lambda icon, item: self.restart_backend()),

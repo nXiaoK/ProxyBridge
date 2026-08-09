@@ -1,11 +1,58 @@
+# Version 是写入产物的完整 SemVer；BuildNumber 是 Windows 四段文件版本的末段，均可由对应环境变量注入。
 param(
   [string]$Python = "",
-  [switch]$SkipInstall
+  [switch]$SkipInstall,
+  [string]$Version = "",
+  [string]$BuildNumber = ""
 )
 
 $ErrorActionPreference = "Stop"
 $RootDir = Split-Path -Parent $PSScriptRoot
 Set-Location $RootDir
+
+# 仓库 VERSION 是人工维护的基础版本；GitHub Actions 会追加 build 序号后传入完整版本。
+$RepositoryVersionPath = Join-Path $RootDir "VERSION"
+if (-not (Test-Path -LiteralPath $RepositoryVersionPath -PathType Leaf)) {
+  throw "VERSION file not found: $RepositoryVersionPath"
+}
+$BaseVersion = (Get-Content -LiteralPath $RepositoryVersionPath -Raw).Trim()
+if ($BaseVersion -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+  throw "VERSION must contain a three-part numeric SemVer: $BaseVersion"
+}
+if (-not $Version) {
+  $Version = $env:PROXY_BRIDGE_VERSION
+}
+if (-not $Version) {
+  $Version = $BaseVersion
+}
+if (-not $BuildNumber) {
+  $BuildNumber = $env:PROXY_BRIDGE_BUILD_NUMBER
+}
+if (-not $BuildNumber) {
+  $BuildNumber = "1"
+}
+
+$VersionMatch = [regex]::Match(
+  $Version,
+  '^(?<major>0|[1-9]\d*)\.(?<minor>0|[1-9]\d*)\.(?<patch>0|[1-9]\d*)(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$'
+)
+if (-not $VersionMatch.Success) {
+  throw "Version must be SemVer, for example 0.3.0 or 0.3.0-build.12: $Version"
+}
+
+$MajorVersion = [int]$VersionMatch.Groups["major"].Value
+$MinorVersion = [int]$VersionMatch.Groups["minor"].Value
+$PatchVersion = [int]$VersionMatch.Groups["patch"].Value
+[int]$BuildNumberValue = 0
+if ((-not [int]::TryParse($BuildNumber, [ref]$BuildNumberValue)) -or $BuildNumberValue -lt 0 -or $BuildNumberValue -gt 65535) {
+  throw "BuildNumber must be an integer in 0..65535: $BuildNumber"
+}
+foreach ($part in @($MajorVersion, $MinorVersion, $PatchVersion)) {
+  if ($part -gt 65535) {
+    throw "Each numeric version part must be in 0..65535: $Version"
+  }
+}
+Write-Host "Building ProxyBridge version $Version (build $BuildNumberValue)"
 
 function Test-PythonCommand {
   param(
@@ -113,7 +160,45 @@ if (-not $SkipInstall) {
 $OutDir = Join-Path $RootDir "outputs\windows"
 $WorkDir = Join-Path $OutDir "build"
 $DistDir = Join-Path $OutDir "dist"
-New-Item -ItemType Directory -Force -Path $OutDir, $WorkDir, $DistDir | Out-Null
+$MetadataDir = Join-Path $OutDir "metadata"
+New-Item -ItemType Directory -Force -Path $OutDir, $WorkDir, $DistDir, $MetadataDir | Out-Null
+
+# PyInstaller 使用独立文件写入 Windows 资源；包内 VERSION 供后端和控制台在运行时显示同一完整版本。
+$BundledVersionPath = Join-Path $MetadataDir "VERSION"
+Set-Content -LiteralPath $BundledVersionPath -Value $Version -Encoding ASCII
+$VersionResourcePath = Join-Path $MetadataDir "ProxyBridge.version.txt"
+$VersionResource = @"
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=($MajorVersion, $MinorVersion, $PatchVersion, $BuildNumberValue),
+    prodvers=($MajorVersion, $MinorVersion, $PatchVersion, $BuildNumberValue),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        u'040904B0',
+        [
+          StringStruct(u'CompanyName', u'ProxyBridge'),
+          StringStruct(u'FileDescription', u'ProxyBridge desktop client'),
+          StringStruct(u'FileVersion', u'$Version'),
+          StringStruct(u'InternalName', u'ProxyBridge'),
+          StringStruct(u'OriginalFilename', u'ProxyBridge.exe'),
+          StringStruct(u'ProductName', u'ProxyBridge'),
+          StringStruct(u'ProductVersion', u'$Version')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+  ]
+)
+"@
+Set-Content -LiteralPath $VersionResourcePath -Value $VersionResource -Encoding UTF8
 
 $IconPng = Join-Path $RootDir "static\assets\app-icon.png"
 $IconIco = Join-Path $OutDir "ProxyBridge.ico"
@@ -141,6 +226,9 @@ $addData = @(
   "webdav_sync.py;.",
   # 主模块会导入远程浏览器 Broker 客户端；Windows 包需收集该同级模块。
   "remote_browser.py;.",
+  # 版本解析模块和构建生成的 VERSION 必须同时进入 onefile 临时目录。
+  "proxybridge_version.py;.",
+  "$BundledVersionPath;.",
   "static;static",
   "desktop;desktop"
 )
@@ -151,6 +239,7 @@ $pyiArgs = @(
   "--onefile",
   "--windowed",
   "--name", "ProxyBridge",
+  "--version-file", $VersionResourcePath,
   "--distpath", $DistDir,
   "--workpath", $WorkDir,
   "--specpath", $OutDir
@@ -166,6 +255,7 @@ $pyiArgs += @(
   "--hidden-import", "webdav_sync",
   # 明确声明隐藏导入，避免动态加载 app 时遗漏 Broker 客户端模块。
   "--hidden-import", "remote_browser",
+  "--hidden-import", "proxybridge_version",
   "--hidden-import", "desktop",
   "--hidden-import", "desktop.tray_host",
   "--hidden-import", "desktop.autostart",
@@ -183,6 +273,10 @@ $exePath = Join-Path $DistDir "ProxyBridge.exe"
 if (-not (Test-Path $exePath)) {
   throw "Build finished but ProxyBridge.exe was not found at $exePath"
 }
+$EmbeddedProductVersion = (Get-Item -LiteralPath $exePath).VersionInfo.ProductVersion
+if ($EmbeddedProductVersion -ne $Version) {
+  throw "Built exe ProductVersion mismatch: expected $Version, got $EmbeddedProductVersion"
+}
 
 # Convenience copy for double-click distribution.
 $releaseDir = Join-Path $OutDir "release"
@@ -193,6 +287,8 @@ Copy-Item -Force $exePath (Join-Path $releaseDir "ProxyBridge.exe")
 $readme = @"
 ProxyBridge Windows portable build
 =================================
+
+Version: $Version
 
 1. Double-click ProxyBridge.exe
 2. A tray icon appears; the web console opens in your browser

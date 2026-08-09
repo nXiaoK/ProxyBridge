@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 import webdav_sync
+from proxybridge_version import VERSION as APP_VERSION
 from remote_browser import RemoteBrowserBrokerClient, RemoteBrowserError
 
 
@@ -3811,7 +3812,7 @@ def _status_payload(
             "sync_openssl": webdav_sync.openssl_available(),
             "network": network,
             "smart_gateway": smart_gateway_status_payload(state, lan_addresses=lan_addresses),
-            "version": "0.1.0",
+            "version": APP_VERSION,
         }
 
 
@@ -11165,7 +11166,7 @@ def error_response(handler: BaseHTTPRequestHandler, exc: Exception, status: int 
 
 
 class AppHandler(BaseHTTPRequestHandler):
-    server_version = "ProxyBridge/0.1"
+    server_version = f"ProxyBridge/{APP_VERSION}"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         safe_args = tuple(

@@ -9,7 +9,7 @@ python3 -m pip install "pyinstaller>=6.0" >/dev/null
 OUT_DIR="$ROOT_DIR/outputs/linux"
 mkdir -p "$OUT_DIR"
 
-# 主模块会导入远程浏览器 Broker 客户端；二进制包需同时收集源码与隐藏导入。
+# 主模块会导入远程浏览器 Broker 客户端；VERSION 与解析模块也必须进入单文件产物。
 python3 -m PyInstaller \
   --noconfirm \
   --clean \
@@ -21,11 +21,14 @@ python3 -m PyInstaller \
   --add-data "app.py:." \
   --add-data "webdav_sync.py:." \
   --add-data "remote_browser.py:." \
+  --add-data "VERSION:." \
+  --add-data "proxybridge_version.py:." \
   --add-data "static:static" \
   --add-data "desktop:desktop" \
   --hidden-import app \
   --hidden-import webdav_sync \
   --hidden-import remote_browser \
+  --hidden-import proxybridge_version \
   --hidden-import desktop \
   --hidden-import desktop.tray_host \
   --hidden-import desktop.autostart \
