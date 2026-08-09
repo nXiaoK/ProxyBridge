@@ -202,6 +202,9 @@ utun6: flags=8051<UP,POINTOPOINT,RUNNING> mtu 4000
             (app.socket.AF_INET, app.socket.SOCK_STREAM, 6, "", ("198.18.0.1", 0)),
         ]
         with (
+            # 该用例验证 macOS 物理网卡优先级；显式模拟平台，避免 Linux CI 跳过 ifconfig 分支。
+            mock.patch.object(app.sys, "platform", "darwin"),
+            mock.patch.object(app.Path, "exists", return_value=True),
             mock.patch.object(app.subprocess, "run", return_value=mock.Mock(stdout=ifconfig_output)),
             mock.patch.object(app.socket, "socket", side_effect=OSError("no route probe")),
             mock.patch.object(app.socket, "getaddrinfo", return_value=hostname_infos),

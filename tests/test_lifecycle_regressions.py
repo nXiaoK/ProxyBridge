@@ -1321,6 +1321,10 @@ class LifecycleRegressionTests(unittest.TestCase):
                     errors.append(error)
 
         with (
+            # 测试数据是 macOS dmg；固定目标平台，避免 runner 主机改变资产选择结果。
+            mock.patch.object(app, "host_os_token", return_value="darwin"),
+            mock.patch.object(app, "host_arch_token", return_value="arm64"),
+            mock.patch.object(app, "remote_browser_feature_enabled", return_value=False),
             mock.patch.object(app, "_open_https_url", side_effect=fake_open_https),
             mock.patch.object(app, "fingerprint_chromium_path", side_effect=fake_fingerprint_path),
             mock.patch.object(app, "_install_from_dmg", side_effect=fake_install),

@@ -269,7 +269,8 @@ class AutostartTests(unittest.TestCase):
         ):
             command = autostart.current_launch_command()
 
-        self.assertEqual(command[0], "/usr/bin/python3")
+        # current_launch_command 会解析符号链接；Ubuntu runner 的 python3 常指向 python3.x。
+        self.assertEqual(Path(command[0]), Path("/usr/bin/python3").resolve())
         self.assertEqual(Path(command[1]), Path(autostart.__file__).resolve().with_name("tray_host.py"))
         self.assertTrue(Path(command[1]).is_absolute())
         self.assertEqual(command[2:], ["--no-open"])
