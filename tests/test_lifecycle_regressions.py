@@ -312,6 +312,8 @@ class LifecycleRegressionTests(unittest.TestCase):
             mock.patch.object(app, "terminate_process", side_effect=controlled_terminate),
             mock.patch.object(app, "sync_process_status", side_effect=observed_sync),
             mock.patch.object(app, "wait_for_port", return_value=True),
+            # 本测试只验证关闭互斥，避免 CI 宿主机 DNS 探测阻塞状态查询。
+            mock.patch.object(app, "lan_ipv4_addresses", return_value=[]),
         ):
             shutdown_thread = threading.Thread(target=shutdown_worker)
             shutdown_thread.start()
@@ -769,6 +771,12 @@ class LifecycleRegressionTests(unittest.TestCase):
             def poll(self) -> None:
                 return None
 
+            def terminate(self) -> None:
+                events.append("terminate")
+
+            def kill(self) -> None:
+                events.append("kill")
+
             def wait(self, *, timeout: int) -> int:
                 self.wait_calls += 1
                 events.append(("wait", timeout))
@@ -781,12 +789,13 @@ class LifecycleRegressionTests(unittest.TestCase):
         def kill_process_group(_pid: int, sig: int) -> None:
             events.append(sig)
 
-        with mock.patch.object(app.os, "killpg", side_effect=kill_process_group):
+        with mock.patch.object(app.os, "killpg", side_effect=kill_process_group, create=True):
             app.terminate_process(process)
 
+        signals = ("terminate", "kill") if app.os.name == "nt" else (app.signal.SIGTERM, app.signal.SIGKILL)
         self.assertEqual(
             events,
-            [app.signal.SIGTERM, ("wait", 3), app.signal.SIGKILL, ("wait", 3)],
+            [signals[0], ("wait", 3), signals[1], ("wait", 3)],
         )
 
     def test_runtime_log_pump_reports_failure_and_unregisters_itself(self) -> None:
@@ -904,6 +913,12 @@ class LifecycleRegressionTests(unittest.TestCase):
             def poll(self) -> None:
                 return None
 
+            def terminate(self) -> None:
+                pass
+
+            def kill(self) -> None:
+                pass
+
             def wait(self, *, timeout: int) -> int:
                 self.wait_timeouts.append(timeout)
                 raise app.subprocess.TimeoutExpired(str(self.pid), timeout)
@@ -912,7 +927,7 @@ class LifecycleRegressionTests(unittest.TestCase):
         app.BROWSER_PROCESS_TABLE[instance_id] = process
         app.BROWSER_TABLE[node_id] = [process]
 
-        with mock.patch.object(app.os, "killpg"):
+        with mock.patch.object(app.os, "killpg", create=True):
             with self.assertRaises(app.subprocess.TimeoutExpired):
                 app.stop_browser_instance_process(instance_id)
 

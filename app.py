@@ -2974,7 +2974,8 @@ def _stage_install_copy(source: Path, dest: Path, mode: int) -> Path:
     try:
         shutil.copy2(source, temp_path)
         temp_path.chmod(mode)
-        with temp_path.open("rb") as handle:
+        # Windows 的 fsync 需要可写句柄；只读句柄会报 Bad file descriptor。
+        with temp_path.open("rb+") as handle:
             os.fsync(handle.fileno())
         return temp_path
     except BaseException:

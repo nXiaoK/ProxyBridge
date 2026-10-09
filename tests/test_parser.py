@@ -1309,7 +1309,9 @@ class ParserTests(unittest.TestCase):
             self.assertEqual(log_path.read_bytes(), b"")
             self.assertEqual(app.runtime_log_backup_path(log_path, 1).read_bytes(), b"xTAIL")
             self.assertEqual(app.runtime_log_backup_path(log_path, 2).read_bytes(), b"older")
-            self.assertEqual(app.runtime_log_backup_path(log_path, 1).stat().st_mode & 0o777, 0o600)
+            # Windows chmod 只支持只读标记，没有 POSIX 的用户/组权限语义。
+            if app.os.name != "nt":
+                self.assertEqual(app.runtime_log_backup_path(log_path, 1).stat().st_mode & 0o777, 0o600)
 
     def test_runtime_log_pump_rotates_while_stream_is_writing(self):
         with tempfile.TemporaryDirectory() as temp_dir:

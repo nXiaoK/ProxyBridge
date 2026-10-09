@@ -169,7 +169,7 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertIn("inst1", push["uploaded_profiles"])
 
         # Mutate local state and wipe profile, then pull back.
-        # Local edits invalidate applied sha so pull is not treated as already-latest.
+        # 本地变更版本使旧快照失效，手动拉取不能被判定为已最新。
         with self.lock:
             state = self._load()
             state["subscriptions"] = []
@@ -254,12 +254,16 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.store.files[profile_url] = webdav_sync.pack_profile_dir(profile)
         cookie.write_bytes(b"cookie-data")
         self.engine.mark_local_change()
+        before = self._load()["settings"]["webdav"]
 
         result = self.engine.pull(force=True)
         self.assertFalse(result["ok"])
         self.assertTrue(any("哈希不匹配" in error for error in result["errors"]))
         self.assertEqual(cookie.read_bytes(), b"cookie-data")
-        self.assertEqual(self._load()["settings"]["webdav"]["last_applied_state_sha256"], "")
+        after = self._load()["settings"]["webdav"]
+        self.assertEqual(after["last_applied_state_sha256"], before["last_applied_state_sha256"])
+        self.assertEqual(after["last_applied_local_change_version"], before["last_applied_local_change_version"])
+        self.assertFalse(webdav_sync.remote_is_already_latest(after, manifest))
 
     def test_failed_pull_does_not_mark_snapshot_applied(self):
         self.engine.push()
@@ -267,10 +271,14 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         profile_url = self._remote_profile_url(client, manifest, "inst1")
         self.store.files.pop(profile_url)
         self.engine.mark_local_change()
+        before = self._load()["settings"]["webdav"]
 
         failed = self.engine.pull(force=True)
         self.assertFalse(failed["ok"])
-        self.assertEqual(self._load()["settings"]["webdav"]["last_applied_state_sha256"], "")
+        after = self._load()["settings"]["webdav"]
+        self.assertEqual(after["last_applied_state_sha256"], before["last_applied_state_sha256"])
+        self.assertEqual(after["last_applied_local_change_version"], before["last_applied_local_change_version"])
+        self.assertFalse(webdav_sync.remote_is_already_latest(after, manifest))
         retried = self.engine.pull()
         self.assertFalse(retried["ok"])
         self.assertFalse(retried.get("skipped", False))
@@ -316,11 +324,15 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         remote_state["subscriptions"][0]["name"] = "tampered"
         self.store.files[state_url] = json.dumps(remote_state, ensure_ascii=False, indent=2).encode("utf-8")
         self.engine.mark_local_change()
+        before = self._load()["settings"]["webdav"]
 
         with self.assertRaisesRegex(RuntimeError, "哈希与 manifest 不一致"):
             self.engine.pull(force=True)
         self.assertEqual(self._load()["subscriptions"][0]["name"], "机场A")
-        self.assertEqual(self._load()["settings"]["webdav"]["last_applied_state_sha256"], "")
+        after = self._load()["settings"]["webdav"]
+        self.assertEqual(after["last_applied_state_sha256"], before["last_applied_state_sha256"])
+        self.assertEqual(after["last_applied_local_change_version"], before["last_applied_local_change_version"])
+        self.assertFalse(webdav_sync.remote_is_already_latest(after, manifest))
 
     def test_pull_rejects_unsupported_schema(self):
         self.engine.push()
@@ -800,6 +812,13 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertFalse(
             webdav_sync.remote_is_already_latest(cfg, {"state_sha256": "def", "updated_at": 50, "device_id": "other"})
         )
+        # 本地版本领先于已应用版本时，哈希相同和旧时间戳都不能触发跳过。
+        cfg.update(local_change_version=2, last_applied_local_change_version=1)
+        for manifest in ({"state_sha256": "abc", "updated_at": 90}, {"updated_at": 90}):
+            with self.subTest(manifest=manifest):
+                self.assertFalse(webdav_sync.remote_is_already_latest(cfg, manifest))
+        cfg["last_applied_local_change_version"] = 2
+        self.assertTrue(webdav_sync.remote_is_already_latest(cfg, {"state_sha256": "abc"}))
         # No sha: timestamp fallback
         cfg2 = {"device_id": "dev-a", "last_pull_at": 100, "last_remote_updated_at": 200, "last_applied_state_sha256": ""}
         self.assertTrue(webdav_sync.remote_is_already_latest(cfg2, {"updated_at": 90, "device_id": "other"}))

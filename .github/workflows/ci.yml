@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # 1 启用 Python UTF-8 模式，避免 Windows 重定向日志使用 cp1252 导致中文输出异常。
+  PYTHONUTF8: "1"
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -98,7 +102,8 @@ jobs:
             -H "X-ProxyBridge-Instance: $token" \
             "$base_url/api/status" \
             -o /tmp/proxybridge-status.json
-          python3 -c "import json; assert json.load(open('/tmp/proxybridge-status.json', encoding='utf-8'))['ok'] is True"
+          # 状态接口直接返回状态对象；校验 Docker 模式及代理列表，不依赖不存在的 ok 字段。
+          python3 -c "import json; data = json.load(open('/tmp/proxybridge-status.json', encoding='utf-8')); assert data['runtime']['docker'] is True; assert isinstance(data['bridges'], list)"
           tr -d '\r' < /tmp/proxybridge-headers | grep -Fx "X-ProxyBridge-Instance: $token"
       - name: Show container logs
         if: always()

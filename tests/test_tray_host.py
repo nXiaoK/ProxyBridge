@@ -145,7 +145,7 @@ class TrayHostHelperTests(unittest.TestCase):
                     self.assertEqual(tray_host.default_work_root(), Path("/var/data/ProxyBridge"))
             with mock.patch.object(tray_host, "host_os_token", return_value="darwin"):
                 root = tray_host.default_work_root()
-                self.assertTrue(str(root).endswith("Library/Application Support/ProxyBridge"))
+                self.assertEqual(root.parts[-3:], ("Library", "Application Support", "ProxyBridge"))
         finally:
             if old is None:
                 os.environ.pop("PROXY_BRIDGE_WORKDIR", None)
@@ -249,7 +249,7 @@ class TrayHostHelperTests(unittest.TestCase):
     def test_backend_command_uses_python_script_when_not_frozen(self) -> None:
         with mock.patch.object(tray_host, "is_frozen", return_value=False):
             command = tray_host.backend_command("/usr/bin/python3", Path("/repo/app.py"))
-        self.assertEqual(command, ["/usr/bin/python3", "/repo/app.py"])
+        self.assertEqual(command, ["/usr/bin/python3", str(Path("/repo/app.py"))])
 
     def test_resource_root_prefers_meipass_when_frozen(self) -> None:
         with mock.patch.object(tray_host, "is_frozen", return_value=True):
@@ -295,7 +295,8 @@ class AutostartTests(unittest.TestCase):
                         self.assertTrue(desktop.is_file())
                         content = desktop.read_text(encoding="utf-8")
                         self.assertIn("Exec=/usr/bin/proxybridge --no-open", content)
-                        self.assertIn(f"Path={Path(temp_dir).resolve() / 'source root'}", content)
+                        expected_path = str(Path(temp_dir).resolve() / "source root").replace("\\", "\\\\")
+                        self.assertIn(f"Path={expected_path}", content)
                         self.assertTrue(autostart.is_autostart_enabled())
                         disabled = autostart.set_autostart_enabled(False)
                         self.assertFalse(disabled["enabled"])
@@ -317,7 +318,8 @@ class AutostartTests(unittest.TestCase):
 
             content = Path(result["path"]).read_text(encoding="utf-8")
             self.assertIn('Exec="/tmp/Proxy & Bridge/python" "/tmp/100%%/tray\\"host.py" "\\$HOME"', content)
-            self.assertIn(f"Path={Path(temp_dir).resolve() / 'repo & source'}", content)
+            expected_path = str(Path(temp_dir).resolve() / "repo & source").replace("\\", "\\\\")
+            self.assertIn(f"Path={expected_path}", content)
 
     def test_darwin_autostart_serializes_special_paths_with_plistlib(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

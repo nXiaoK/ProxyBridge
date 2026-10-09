@@ -287,6 +287,9 @@ def remote_is_already_latest(cfg: dict[str, Any], manifest: dict[str, Any]) -> b
     """
     if not isinstance(manifest, dict):
         return False
+    # 本地存在未同步变更时，即使远端哈希相同，也必须允许手动拉取覆盖本地状态。
+    if int(cfg.get("local_change_version") or 0) > int(cfg.get("last_applied_local_change_version") or 0):
+        return False
     remote_sha = str(manifest.get("state_sha256") or "").strip().lower()
     local_sha = str(cfg.get("last_applied_state_sha256") or "").strip().lower()
     if remote_sha and local_sha and remote_sha == local_sha:
@@ -1760,11 +1763,12 @@ class SyncEngine:
         # stop upload is still queued/failed/disabled. Explicit sync-page pulls keep
         # the existing remote-authoritative behavior (preserve_local_changes=False),
         # and force=True always remains an intentional override.
+        # Issue #1 修复: 使用版本号检测本地变更而不是清除 last_applied_state_sha256
         if (
             preserve_local_changes
             and not force
             and local_last_change
-            and not str(cfg.get("last_applied_state_sha256") or "")
+            and int(cfg.get("local_change_version") or 0) > int(cfg.get("last_applied_local_change_version") or 0)
         ):
             status = "检测到本地未上传变更，已跳过浏览器记录自动拉取"
             self.log(status, level="warn", category="同步")
@@ -1824,6 +1828,7 @@ class SyncEngine:
                     cfg["last_remote_updated_at"] = remote_updated_preview
                 if manifest.get("state_sha256"):
                     cfg["last_applied_state_sha256"] = str(manifest.get("state_sha256") or "")
+                # 注意：不更新 last_applied_local_change_version，因为这是 skip，未真正应用状态
                 state["settings"]["webdav"] = cfg
                 self.save_state(state)
             self.log(status, category="同步")
@@ -2049,7 +2054,8 @@ class SyncEngine:
             cfg["last_applied_state_sha256"] = _validate_sha256(
                 manifest.get("state_sha256"), "manifest.state_sha256"
             )
-            # 记录此次pull应用的本地变更版本，用于竞态条件检测（Issue #1）
+            # 只在成功应用状态时才更新版本号，用于竞态条件检测（Issue #1）
+            # 失败或跳过时不更新，这样可以在下次同步时重试
             cfg["last_applied_local_change_version"] = int(cfg.get("local_change_version") or 0)
             cfg["last_error"] = ""
             removed_subs = len(applied.get("removed_subscription_ids") or [])
@@ -2177,8 +2183,8 @@ class SyncEngine:
         with self._auto_queue_lock:
             if full_push:
                 self._auto_full_push_pending = True
-                # Issue #3 修复: 不清空instance_ids，确保单个浏览器上传不会丢失
-                # 改为: full_push之后还会继续处理instance_ids
+                # 完整上传已经包含所有可上传的 Profile，合并已有单实例任务。
+                self._auto_instance_ids.clear()
             elif instance_id and not self._auto_full_push_pending:
                 self._auto_instance_ids.add(instance_id)
             if reason and reason not in self._auto_reasons:
@@ -2190,19 +2196,14 @@ class SyncEngine:
             threading.Thread(target=self._drain_auto_sync_queue, name="webdav-auto-sync", daemon=True).start()
 
     def _take_auto_sync_job(self) -> tuple[bool, list[str], list[str]] | None:
-        """取出下一个待处理的同步任务。
-
-        优先级顺序（Issue #3 修复）:
-        1. 先处理 instance_ids（单个浏览器 Profile 上传）
-        2. 再处理 full_push（完整状态同步）
-        这确保了单个 Profile 上传不会因为 full_push 而被丢弃。
-        """
+        """取出下一个任务；完整上传覆盖已排队的单实例上传。"""
         with self._auto_queue_lock:
             # 优先处理单个 instance
             if self._auto_instance_ids:
                 instance_ids = sorted(self._auto_instance_ids)
                 reasons = list(self._auto_reasons)
                 self._auto_instance_ids.clear()
+                self._auto_reasons.clear()
                 return False, instance_ids, reasons
 
             # 再处理 full_push
