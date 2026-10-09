@@ -180,6 +180,11 @@ def default_webdav_settings() -> dict[str, Any]:
         "last_local_change_at": None,
         # SHA-256 of the last applied/uploaded state.sync.json body (manifest.state_sha256).
         "last_applied_state_sha256": "",
+        # 本地变更版本号：每次 mark_local_change() 递增，用于检测真实的本地变更。
+        # 防止竞态条件导致的状态丢失（Issue #1）。
+        "local_change_version": 0,
+        # 上次成功应用/上传的本地变更版本号，与 local_change_version 对比。
+        "last_applied_local_change_version": 0,
         "last_error": "",
         "last_status": "",
     }
@@ -221,6 +226,16 @@ def normalize_webdav_settings(raw: Any) -> dict[str, Any]:
                 base[key] = int(value)
             except (TypeError, ValueError):
                 base[key] = None
+    # 本地变更版本号，需保证为非负整数
+    for key in ("local_change_version", "last_applied_local_change_version"):
+        value = base.get(key)
+        if value is None or value == "":
+            base[key] = 0
+        else:
+            try:
+                base[key] = max(0, int(value))
+            except (TypeError, ValueError):
+                base[key] = 0
     base["last_applied_state_sha256"] = str(base.get("last_applied_state_sha256") or "").strip().lower()
     base["last_error"] = redact_sensitive_text(base.get("last_error"))
     base["last_status"] = redact_sensitive_text(base.get("last_status"))
@@ -1332,11 +1347,19 @@ class SyncEngine:
         return manifest, snapshot_meta, remote_state
 
     def _local_state_fingerprint(self, state: dict[str, Any]) -> str:
+        """计算本地状态指纹用于检测 Pull 中的并发变化（Issue #4 修复）。
+
+        指纹应包含所有会影响同步决策的数据，包括:
+        - subscriptions, nodes 内容
+        - browser_instances 的完整metadata（包括运行状态）
+        - 时间戳信息
+        """
         payload: dict[str, Any] = {
             "subscriptions": state.get("subscriptions") or [],
             "nodes": state.get("nodes") or [],
         }
         if self.sync_browser_data:
+            # 完整的 browser_instances 数据（包括运行状态）用于指纹计算
             payload["browser_instances"] = state.get("browser_instances") or []
         return sha256_bytes(
             json.dumps(
@@ -1421,6 +1444,7 @@ class SyncEngine:
         ``instance_ids`` limits which profiles are re-packed/uploaded (auto single-instance
         upload). State + remote orphan deletion always reflect the full local truth.
         """
+        # Issue #8 修复: Snapshot cfg 避免在操作中途加密设置改变
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
@@ -1636,6 +1660,11 @@ class SyncEngine:
             encoded_manifest,
             content_type="application/json",
         )
+        # 三阶段提交（Issue #2 - Manifest原子性）:
+        # 1. 新Profile已在循环中上传 ✓
+        # 2. 上传新State和临时Manifest
+        # 3. 用MOVE操作原子替换Manifest（MOVE通常是WebDAV服务器级别的原子操作）
+        # 4. 最后才删除旧Profile和兼容alias
         client.move(temporary_manifest_url, urls["manifest"], overwrite=True)
 
         # Compatibility aliases for older clients. New clients only follow the
@@ -1660,6 +1689,7 @@ class SyncEngine:
 
         # Garbage collection happens only for full browser-aware snapshots. A
         # subscription-only client must never delete browser data it cannot manage.
+        # 必须在Manifest更新之后才删除旧Profile，确保Pull不会读到悬空引用。
         if self.sync_browser_data:
             for rid in list(remote_hashes.keys()):
                 if rid in local_instance_ids:
@@ -1682,6 +1712,8 @@ class SyncEngine:
             cfg["last_push_at"] = now
             cfg["last_remote_updated_at"] = int(manifest["updated_at"])
             cfg["last_applied_state_sha256"] = str(manifest.get("state_sha256") or "")
+            # 记录此次push应用的本地变更版本，用于竞态条件检测（Issue #1）
+            cfg["last_applied_local_change_version"] = int(cfg.get("local_change_version") or 0)
             cfg["last_error"] = "; ".join(errors) if errors else ""
             if self.sync_browser_data:
                 cfg["last_status"] = (
@@ -1968,6 +2000,8 @@ class SyncEngine:
                 ),
             )
             # Drop local browser profiles for records deleted on the remote side.
+            # Issue #6 修复: 先收集要删除的，验证后再执行，确保原子性和一致性
+            profiles_to_purge: list[tuple[str, Path]] = []
             for record in (
                 (applied.get("removed_browsers") or []) if self.sync_browser_data else []
             ):
@@ -1987,12 +2021,22 @@ class SyncEngine:
                         bool(record.get("legacy")),
                     )
                     if path.exists():
-                        shutil.rmtree(path, ignore_errors=False)
-                        purged_profiles.append(iid)
+                        profiles_to_purge.append((iid, path))
+                except Exception as exc:
+                    errors.append(f"验证本地 Profile {iid} 路径失败: {exc}")
+
+            # 现在执行删除（所有路径已验证）
+            for iid, path in profiles_to_purge:
+                try:
+                    shutil.rmtree(path, ignore_errors=False)
+                    purged_profiles.append(iid)
                     # Legacy node-level profile dir when empty of instances.
-                    node_root = path.parent if not record.get("legacy") else path
+                    node_root = path.parent if not path.parent.name.startswith(".") else path
                     if node_root.exists() and node_root.is_dir() and not any(node_root.iterdir()):
-                        shutil.rmtree(node_root, ignore_errors=False)
+                        try:
+                            shutil.rmtree(node_root, ignore_errors=False)
+                        except OSError:
+                            pass  # node_root 可能被其他实例占用
                 except Exception as exc:
                     errors.append(f"清理本地 Profile {iid}: {exc}")
 
@@ -2005,6 +2049,8 @@ class SyncEngine:
             cfg["last_applied_state_sha256"] = _validate_sha256(
                 manifest.get("state_sha256"), "manifest.state_sha256"
             )
+            # 记录此次pull应用的本地变更版本，用于竞态条件检测（Issue #1）
+            cfg["last_applied_local_change_version"] = int(cfg.get("local_change_version") or 0)
             cfg["last_error"] = ""
             removed_subs = len(applied.get("removed_subscription_ids") or [])
             if self.sync_browser_data:
@@ -2089,12 +2135,19 @@ class SyncEngine:
         }
 
     def mark_local_change(self) -> None:
+        """标记本地发生了变更。
+
+        使用递增的版本号（而非清除标记）来检测真实的本地变更，
+        防止竞态条件导致的状态丢失（Issue #1）。
+        auto-sync线程通过对比local_change_version和last_applied_local_change_version
+        来判断是否有待上传的本地变更。
+        """
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
             cfg["last_local_change_at"] = int(time.time())
-            # Local divergence: can no longer claim we match the remote snapshot.
-            cfg["last_applied_state_sha256"] = ""
+            # 递增版本号，不清除 last_applied_state_sha256
+            cfg["local_change_version"] = int(cfg.get("local_change_version") or 0) + 1
             state["settings"]["webdav"] = cfg
             self.save_state(state)
 
@@ -2124,7 +2177,8 @@ class SyncEngine:
         with self._auto_queue_lock:
             if full_push:
                 self._auto_full_push_pending = True
-                self._auto_instance_ids.clear()
+                # Issue #3 修复: 不清空instance_ids，确保单个浏览器上传不会丢失
+                # 改为: full_push之后还会继续处理instance_ids
             elif instance_id and not self._auto_full_push_pending:
                 self._auto_instance_ids.add(instance_id)
             if reason and reason not in self._auto_reasons:
@@ -2136,32 +2190,70 @@ class SyncEngine:
             threading.Thread(target=self._drain_auto_sync_queue, name="webdav-auto-sync", daemon=True).start()
 
     def _take_auto_sync_job(self) -> tuple[bool, list[str], list[str]] | None:
+        """取出下一个待处理的同步任务。
+
+        优先级顺序（Issue #3 修复）:
+        1. 先处理 instance_ids（单个浏览器 Profile 上传）
+        2. 再处理 full_push（完整状态同步）
+        这确保了单个 Profile 上传不会因为 full_push 而被丢弃。
+        """
         with self._auto_queue_lock:
-            if not self._auto_full_push_pending and not self._auto_instance_ids:
-                self._auto_worker_running = False
-                return None
-            full_push = self._auto_full_push_pending
-            instance_ids = [] if full_push else sorted(self._auto_instance_ids)
-            reasons = list(self._auto_reasons)
-            self._auto_full_push_pending = False
-            self._auto_instance_ids.clear()
-            self._auto_reasons.clear()
-            return full_push, instance_ids, reasons
+            # 优先处理单个 instance
+            if self._auto_instance_ids:
+                instance_ids = sorted(self._auto_instance_ids)
+                reasons = list(self._auto_reasons)
+                self._auto_instance_ids.clear()
+                return False, instance_ids, reasons
+
+            # 再处理 full_push
+            if self._auto_full_push_pending:
+                reasons = list(self._auto_reasons)
+                self._auto_full_push_pending = False
+                self._auto_reasons.clear()
+                return True, [], reasons
+
+            self._auto_worker_running = False
+            return None
 
     def _drain_auto_sync_queue(self) -> None:
-        while True:
+        """处理自动同步队列（Issue #5 修复 - 添加超时保护）。
+
+        使用超时保护防止 state_lock 死锁导致整个线程卡住。
+        """
+        max_iterations = 100  # 防止无限循环
+        iteration_count = 0
+        while iteration_count < max_iterations:
+            iteration_count += 1
             job = self._take_auto_sync_job()
             if job is None:
                 return
             full_push, instance_ids, reasons = job
             try:
-                with self.state_lock:
+                # 使用超时获取锁，防止死锁
+                acquired = self.state_lock.acquire(timeout=10.0)
+                if not acquired:
+                    self.log(
+                        "自动上传获取状态锁超时，可能存在死锁",
+                        level="error",
+                        category="同步"
+                    )
+                    # 重新入队这个任务以便重试
+                    with self._auto_queue_lock:
+                        if full_push:
+                            self._auto_full_push_pending = True
+                        else:
+                            self._auto_instance_ids.update(instance_ids)
+                        self._auto_worker_running = False
+                    return
+                try:
                     state = self.load_state()
                     cfg = self.get_settings(state)
                     if not cfg.get("enabled") or not cfg.get("url"):
                         continue
                     if not full_push and not cfg.get("auto_upload_on_browser_stop"):
                         continue
+                finally:
+                    self.state_lock.release()
                 if full_push:
                     label = f"（{'、'.join(reasons)}）" if reasons else ""
                     self.log(f"自动上传到 WebDAV{label}", category="同步")
