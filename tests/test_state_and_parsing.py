@@ -163,7 +163,10 @@ class StateAndParsingTests(unittest.TestCase):
         )
         app.import_subscription({"name": "two", "url": "https://two.test/sub", "raw": shared_link})
 
-        app.delete_subscription(first["subscription"]["id"])
+        # 此处验证删除语义和同步触发；队列执行由 WebDAV 测试覆盖，避免后台线程越过临时目录生命周期。
+        with mock.patch.object(app.webdav_sync.SyncEngine, "maybe_auto_push") as auto_push:
+            app.delete_subscription(first["subscription"]["id"])
+        auto_push.assert_called_once_with(reason="删除订阅")
 
         state = app.load_state()
         self.assertEqual(len(state["subscriptions"]), 1)
@@ -216,9 +219,11 @@ class StateAndParsingTests(unittest.TestCase):
         self.assertEqual([node["name"] for node in payload["nodes"]], ["A"])
         recovered = json.loads(app.STATE_PATH.read_text(encoding="utf-8"))
         self.assertEqual([node["name"] for node in recovered["nodes"]], ["A"])
-        self.assertEqual(app.STATE_PATH.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(app.WORK_ROOT.stat().st_mode & 0o777, 0o700)
+        # Windows chmod 不支持 POSIX 权限位；恢复数据的断言仍在所有平台执行。
+        if os.name != "nt":
+            self.assertEqual(app.STATE_PATH.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(app.WORK_ROOT.stat().st_mode & 0o777, 0o700)
 
     def test_fetch_subscription_rejects_non_http_and_oversized_response(self):
         with self.assertRaisesRegex(ValueError, "http\(s\)"):

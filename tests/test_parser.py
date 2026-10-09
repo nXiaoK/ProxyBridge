@@ -523,9 +523,11 @@ class ParserTests(unittest.TestCase):
                     "v-test",
                 )
 
-                self.assertEqual(installed, str(app.proxy_core_bin_dir() / "xray"))
-                self.assertTrue((app.proxy_core_bin_dir() / "xray").is_file())
-                self.assertTrue((app.proxy_core_bin_dir() / "xray-core").is_file())
+                binary_name = "xray.exe" if os.name == "nt" else "xray"
+                self.assertEqual(installed, str(app.proxy_core_bin_dir() / binary_name))
+                self.assertTrue((app.proxy_core_bin_dir() / binary_name).is_file())
+                # Windows 直接启动 exe，只有 POSIX 平台需要 xray-core 和 shell 包装器。
+                self.assertEqual((app.proxy_core_bin_dir() / "xray-core").is_file(), os.name != "nt")
                 self.assertFalse((app.proxy_core_bin_dir() / "xray-assets").exists())
         finally:
             app.WORK_ROOT = old_work_root
