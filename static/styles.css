@@ -1221,7 +1221,7 @@ tr.node-group-header[data-group-id^="source:"] .node-group-avatar {
   color: var(--text-tertiary);
 }
 tbody tr.node-row td:first-child {
-  padding-left: 42px; /* 与分组标题缩进对齐 */
+  padding-left: 8px; /* 为复选框让出空间 */
 }
 
 .actions-col { width: 1%; white-space: nowrap; }
@@ -2929,4 +2929,178 @@ tbody .row-actions .row-button {
   .diagnostic-latency {
     margin-left: 0;
   }
+}
+
+/* ============================================================
+   批量选择和批量操作功能样式
+   ============================================================ */
+
+/* 复选框容器样式 */
+.checkbox-wrapper {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  position: relative;
+  user-select: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  margin: 0;
+}
+
+.checkbox-wrapper input[type="checkbox"] {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+/* 自定义复选框外观 */
+.checkbox-custom {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--bg-input);
+  transition: all var(--transition);
+  position: relative;
+}
+
+/* 复选框激活态 */
+.checkbox-wrapper input[type="checkbox"]:checked ~ .checkbox-custom {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* 复选框 hover 态 */
+.checkbox-wrapper:hover .checkbox-custom {
+  border-color: var(--accent);
+}
+
+/* 复选框焦点态 */
+.checkbox-wrapper input[type="checkbox"]:focus-visible ~ .checkbox-custom {
+  outline: 2px solid color-mix(in oklab, var(--accent) 55%, transparent);
+  outline-offset: 2px;
+}
+
+/* 复选框勾选图标 */
+.checkbox-wrapper input[type="checkbox"]:checked ~ .checkbox-custom::after {
+  content: '✓';
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: white;
+  font-size: 12px;
+  font-weight: bold;
+  animation: scaleIn var(--transition) ease-out;
+}
+
+@keyframes scaleIn {
+  from {
+    transform: scale(0.5);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* 不确定态（indeterminate） */
+.checkbox-wrapper input[type="checkbox"]:indeterminate ~ .checkbox-custom {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.checkbox-wrapper input[type="checkbox"]:indeterminate ~ .checkbox-custom::after {
+  content: '−';
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: bold;
+}
+
+/* 表头复选框列 */
+th.checkbox-col {
+  width: 40px;
+  text-align: center;
+  padding: 9px 8px !important;
+}
+
+/* 表行复选框列 */
+td.checkbox-col {
+  width: 40px;
+  text-align: center;
+  padding: 9px 8px !important;
+}
+
+/* 被选中的行样式 */
+tbody tr.is-selected td {
+  background: color-mix(in oklab, var(--accent) 8%, transparent);
+}
+
+tbody tr.is-selected:hover td {
+  background: color-mix(in oklab, var(--accent) 12%, transparent);
+}
+
+/* 批量操作条 */
+.batch-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  background: color-mix(in oklab, var(--accent) 6%, var(--bg-panel));
+  border-top: 0.5px solid var(--border-subtle);
+  margin-top: 8px;
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+  animation: slideUp 200ms ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.batch-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+#batchSelectedCount {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.batch-buttons {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+#clearSelectionsBtn,
+#batchStartBtn {
+  white-space: nowrap;
+  flex-shrink: 0;
 }

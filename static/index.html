@@ -143,6 +143,12 @@
               <table>
                 <thead>
                   <tr>
+                    <th class="checkbox-col">
+                      <label class="checkbox-wrapper" title="全选所有可见节点">
+                        <input id="nodeSelectAll" type="checkbox" aria-label="全选所有可见节点">
+                        <span class="checkbox-custom" aria-hidden="true"></span>
+                      </label>
+                    </th>
                     <th>名称</th>
                     <th>地区</th>
                     <th>协议</th>
@@ -156,6 +162,15 @@
                 <tbody id="nodeRows"></tbody>
               </table>
               <div class="empty-state" id="emptyNodes">暂无节点</div>
+            </div>
+            <div class="batch-actions" id="batchActionsBar" hidden>
+              <div class="batch-info">
+                <span id="batchSelectedCount">已选择 0 个节点</span>
+              </div>
+              <div class="batch-buttons">
+                <button class="row-button" type="button" data-action="clear-selections" id="clearSelectionsBtn">取消选择</button>
+                <button class="row-button primary-row" type="button" data-action="batch-start-nodes" id="batchStartBtn">批量启动</button>
+              </div>
             </div>
           </div>
         </section>

@@ -47,6 +47,8 @@ const appState = {
   sync: null,
   syncOpenssl: null,
   diagnostics: { result: null, webrtc: null, running: false },
+  // 批量选择功能：存储选中的节点 ID
+  selectedNodeIds: new Set(),
 };
 
 const managementAuth = window.ProxyBridgeAuth;
@@ -1909,8 +1911,16 @@ function renderNodeRow(node) {
           }
         `
     : "";
+  // 检查该节点是否被选中
+  const isSelected = appState.selectedNodeIds.has(node.id);
   return `
-    <tr class="node-row ${bridge ? "is-running" : ""}" data-node-id="${escapeHtml(node.id)}">
+    <tr class="node-row ${bridge ? "is-running" : ""} ${isSelected ? "is-selected" : ""}" data-node-id="${escapeHtml(node.id)}">
+      <td class="checkbox-col">
+        <label class="checkbox-wrapper" title="${isSelected ? "取消选择" : "选择"} ${escapeHtml(node.name)}">
+          <input type="checkbox" class="node-checkbox" data-node-id="${escapeHtml(node.id)}" ${isSelected ? "checked" : ""} aria-label="选择 ${escapeHtml(node.name)}">
+          <span class="checkbox-custom" aria-hidden="true"></span>
+        </label>
+      </td>
       <td>
         <div class="name-cell">
           <span class="node-name">${escapeHtml(node.name)}</span>
@@ -1947,7 +1957,7 @@ function renderNodeGroupHeader(group, { forceExpand = false } = {}) {
   const meta = metaBits.join(" · ");
   return `
     <tr class="node-group-header ${collapsed ? "is-collapsed" : ""}" data-group-id="${escapeHtml(group.id)}">
-      <td colspan="8">
+      <td colspan="9">
         <button
           type="button"
           class="node-group-toggle"
@@ -1992,6 +2002,7 @@ function renderNodes() {
     } else {
       empty.textContent = "暂无节点";
     }
+    updateBatchActionsBar();
     return;
   }
   empty.classList.remove("visible");
@@ -2007,6 +2018,158 @@ function renderNodes() {
       return header + group.nodes.map((node) => renderNodeRow(node)).join("");
     })
     .join("");
+
+  // 更新批量操作条的可见性
+  updateBatchActionsBar();
+  // 绑定复选框事件
+  bindNodeCheckboxes();
+}
+
+// 绑定节点行的复选框事件
+function bindNodeCheckboxes() {
+  // 处理单个节点复选框
+  document.querySelectorAll(".node-checkbox").forEach((checkbox) => {
+    checkbox.addEventListener("change", (e) => {
+      const nodeId = e.target.dataset.nodeId;
+      if (e.target.checked) {
+        appState.selectedNodeIds.add(nodeId);
+      } else {
+        appState.selectedNodeIds.delete(nodeId);
+      }
+      updateBatchActionsBar();
+      // 更新行样式
+      const row = document.querySelector(`[data-node-id="${nodeId}"]`);
+      if (row) {
+        row.classList.toggle("is-selected", e.target.checked);
+      }
+    });
+  });
+
+  // 处理全选复选框
+  const selectAllCheckbox = $("#nodeSelectAll");
+  if (selectAllCheckbox) {
+    selectAllCheckbox.addEventListener("change", (e) => {
+      const visibleNodes = filteredNodes();
+      if (e.target.checked) {
+        // 全选所有可见节点
+        visibleNodes.forEach((node) => {
+          appState.selectedNodeIds.add(node.id);
+        });
+      } else {
+        // 取消全选
+        visibleNodes.forEach((node) => {
+          appState.selectedNodeIds.delete(node.id);
+        });
+      }
+      // 更新所有行的复选框和样式
+      document.querySelectorAll(".node-checkbox").forEach((checkbox) => {
+        const nodeId = checkbox.dataset.nodeId;
+        const isSelected = appState.selectedNodeIds.has(nodeId);
+        checkbox.checked = isSelected;
+        const row = document.querySelector(`[data-node-id="${nodeId}"]`);
+        if (row) {
+          row.classList.toggle("is-selected", isSelected);
+        }
+      });
+      updateBatchActionsBar();
+    });
+  }
+}
+
+// 更新批量操作条的显示状态
+function updateBatchActionsBar() {
+  const batchBar = $("#batchActionsBar");
+  if (!batchBar) return;
+
+  const selectedCount = appState.selectedNodeIds.size;
+  const selectAllCheckbox = $("#nodeSelectAll");
+  const visibleNodes = filteredNodes();
+
+  // 更新全选复选框的状态
+  if (selectAllCheckbox) {
+    if (visibleNodes.length === 0) {
+      selectAllCheckbox.checked = false;
+      selectAllCheckbox.indeterminate = false;
+    } else if (selectedCount === 0) {
+      selectAllCheckbox.checked = false;
+      selectAllCheckbox.indeterminate = false;
+    } else if (selectedCount === visibleNodes.length) {
+      selectAllCheckbox.checked = true;
+      selectAllCheckbox.indeterminate = false;
+    } else {
+      selectAllCheckbox.indeterminate = true;
+    }
+  }
+
+  // 显示/隐藏批量操作条
+  if (selectedCount > 0) {
+    batchBar.hidden = false;
+    const countEl = $("#batchSelectedCount");
+    if (countEl) {
+      countEl.textContent = `已选择 ${selectedCount} 个节点`;
+    }
+  } else {
+    batchBar.hidden = true;
+  }
+}
+
+// 清除所有选择
+function clearNodeSelections() {
+  appState.selectedNodeIds.clear();
+  const selectAllCheckbox = $("#nodeSelectAll");
+  if (selectAllCheckbox) {
+    selectAllCheckbox.checked = false;
+    selectAllCheckbox.indeterminate = false;
+  }
+  document.querySelectorAll(".node-checkbox").forEach((checkbox) => {
+    checkbox.checked = false;
+  });
+  document.querySelectorAll(".node-row.is-selected").forEach((row) => {
+    row.classList.remove("is-selected");
+  });
+  updateBatchActionsBar();
+}
+
+// 批量启动选中的节点
+async function batchStartNodes() {
+  if (appState.selectedNodeIds.size === 0) {
+    showToast("请先选择要启动的节点", "error");
+    return;
+  }
+
+  const selectedNodeIds = Array.from(appState.selectedNodeIds);
+  const successCount = { count: 0 };
+  const failureCount = { count: 0 };
+
+  // 依次启动每个选中的节点
+  for (const nodeId of selectedNodeIds) {
+    try {
+      await api("/api/node/start", { node_id: nodeId });
+      successCount.count++;
+    } catch (error) {
+      console.error(`启动节点 ${nodeId} 失败:`, error);
+      failureCount.count++;
+    }
+    // 添加小延迟避免过快请求
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+
+  // 刷新状态
+  await loadStatus({ forceFresh: true }).catch((error) => {
+    console.error("刷新状态失败:", error);
+  });
+
+  // 显示结果提示
+  if (failureCount.count === 0) {
+    showToast(`成功启动 ${successCount.count} 个节点`);
+  } else if (successCount.count === 0) {
+    showToast(`启动 ${selectedNodeIds.length} 个节点失败`, "error");
+  } else {
+    showToast(`成功启动 ${successCount.count} 个，失败 ${failureCount.count} 个`);
+  }
+
+  // 清除选择
+  clearNodeSelections();
 }
 
 function activeSpeedTestTask() {
@@ -3747,6 +3910,12 @@ async function handleAction(event) {
       await copyViewedRemoteBrowserCredentials();
     } else if (action === "open-viewed-remote-browser") {
       openViewedRemoteBrowser();
+    } else if (action === "clear-selections") {
+      // 清除所有选择
+      clearNodeSelections();
+    } else if (action === "batch-start-nodes") {
+      // 批量启动选中的节点
+      await batchStartNodes();
     }
   } catch (error) {
     showToast(error.message, "error");
