@@ -1831,6 +1831,15 @@ function renderCores() {
 
 function renderSubscriptions() {
   const list = $("#subscriptionList");
+  const subscriptionIds = new Set(appState.subscriptions.map((item) => item.id));
+  // 已删除的订阅不能因菜单或规则编辑仍打开而被 keyed diff 延后移除。
+  for (const card of list.querySelectorAll("[data-subscription-id]")) {
+    if (subscriptionIds.has(card.dataset.subscriptionId)) continue;
+    if (card.contains(document.activeElement)) {
+      $('.view[data-view="subscriptions"] [data-action="open-subscription-drawer"]')?.focus();
+    }
+    card.remove();
+  }
   const count = $("#subsCount");
   if (count) count.textContent = `${appState.subscriptions.length} 个订阅`;
   const allowNonPublic = $("#allowNonPublicSubscriptions");
@@ -4396,11 +4405,29 @@ async function handleAction(event) {
       await loadStatus({ forceFresh: true });
       showToast("智能网关已停止");
     } else if (action === "delete-sub") {
-      const subscription = appState.subscriptions.find((item) => item.id === button.dataset.id);
-      const name = subscription?.name || "该订阅";
-      const nodeCount = Number(subscription?.node_count || (subscription?.node_ids || []).length || 0);
+      const subscriptionId = button.dataset.id;
+      const subscription = appState.subscriptions.find((item) => item.id === subscriptionId);
+      button.closest(".row-more")?.removeAttribute("open");
+      if (!subscription) {
+        await loadStatus({ forceFresh: true });
+        showToast("订阅列表已更新，请重新操作");
+        return;
+      }
+      const name = subscription.name || "该订阅";
+      const nodeCount = Number(subscription.node_count || (subscription.node_ids || []).length || 0);
       if (!await confirmAction(`删除「${name}」将清理最多 ${nodeCount} 个未被其他订阅引用的节点及浏览器 Profile。此操作可能删除 Cookie 和登录态。`, { title: "删除订阅", confirmLabel: "删除订阅" })) return;
-      await api("/api/subscriptions/delete", { id: button.dataset.id });
+      try {
+        await api("/api/subscriptions/delete", { id: subscriptionId });
+      } catch (error) {
+        try {
+          await loadStatus({ forceFresh: true });
+        } catch (_) {
+          throw error;
+        }
+        if (appState.subscriptions.some((item) => item.id === subscriptionId)) throw error;
+        showToast("订阅已不存在，列表已更新");
+        return;
+      }
       await loadStatus({ forceFresh: true });
       showToast("订阅已删除");
     } else if (action === "clear-logs") {

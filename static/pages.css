@@ -20,6 +20,10 @@ select {
   color: var(--text-primary);
   font-size: var(--font-size-sm);
 }
+/* 页面层通用输入规则优先级相同，工具栏搜索框在后续规则中为图标留出位置。 */
+.view-toolbar .search-field input[type="search"] {
+  padding-left: calc(var(--space-6) + var(--space-1));
+}
 textarea {
   padding: 8px 10px;
   border: 1px solid var(--border-strong);

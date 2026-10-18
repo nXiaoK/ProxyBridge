@@ -340,6 +340,9 @@ input, select, textarea {
 
 /* Unified toolbar (per view) */
 .view-toolbar {
+  /* 工具栏菜单需整体高于后续可滚动内容中的 sticky 表头。 */
+  position: relative;
+  z-index: 20;
   flex-shrink: 0;
   min-height: var(--toolbar-height);
   display: flex;
@@ -2696,6 +2699,7 @@ tbody .row-actions .row-button {
   -webkit-app-region: drag;
 }
 [data-shell="native"] .view-toolbar button,
+[data-shell="native"] .view-toolbar summary,
 [data-shell="native"] .view-toolbar input,
 [data-shell="native"] .view-toolbar select,
 [data-shell="native"] .view-toolbar label {
