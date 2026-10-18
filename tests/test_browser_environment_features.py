@@ -227,12 +227,31 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
         self.assertEqual(manifest["host_permissions"], ["http://127.0.0.1/*"])
         self.assertNotIn("content_scripts", manifest)
         self.assertNotIn("web_accessible_resources", manifest)
-        script = (helper / "background.js").read_text(encoding="utf-8")
-        self.assertIn('"http://127.0.0.1:8899/api/browser/window-closed"', script)
+        # 脚本保持静态（Chromium 会缓存 Service Worker 脚本），令牌与回调地址写在每次启动刷新的 config.json。
+        self.assertEqual((helper / "background.js").read_text(encoding="utf-8"), app.BROWSER_WINDOW_HELPER_SCRIPT)
+        config = json.loads((helper / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["endpoint"], "http://127.0.0.1:8899/api/browser/window-closed")
         tokens = {owner: token for token, (owner, _process) in app.BROWSER_WINDOW_TOKENS.items()}
-        self.assertIn(json.dumps(tokens[record["id"]]), script)
+        self.assertEqual(config["token"], tokens[record["id"]])
+        # 目录名包含脚本哈希：脚本变化即得到新扩展 ID，旧 Profile 不会继续运行缓存的旧脚本。
+        self.assertEqual(helper.name, app.BROWSER_WINDOW_HELPER_REVISION)
         # 助手扩展位于工作目录而非 Profile，不随 WebDAV 同步。
         self.assertFalse(str(helper).startswith(str(app.browser_profiles_root())))
+
+    def test_window_helper_refreshes_token_and_removes_legacy_layout(self) -> None:
+        instance_root = app.browser_extensions_root() / "window_helper" / app.stable_id("window-helper", "inst")
+        stale = instance_root / "0123456789ab"
+        stale.mkdir(parents=True)
+        (stale / "background.js").write_text("old", encoding="utf-8")
+        (instance_root / "background.js").write_text("legacy", encoding="utf-8")
+        first = app.prepare_browser_window_helper("inst", "token-1", "http://127.0.0.1:8787/api/browser/window-closed")
+        second = app.prepare_browser_window_helper("inst", "token-2", "http://127.0.0.1:8787/api/browser/window-closed")
+        self.assertEqual(first, second)
+        self.assertEqual(sorted(path.name for path in instance_root.iterdir()), [app.BROWSER_WINDOW_HELPER_REVISION])
+        self.assertEqual(json.loads((second / "config.json").read_text(encoding="utf-8"))["token"], "token-2")
+        # 最后一个窗口关闭后 Profile 会被立即销毁，脚本必须在 onRemoved 中同步发出请求，不能再延时确认。
+        self.assertNotIn("setTimeout", app.BROWSER_WINDOW_HELPER_SCRIPT)
+        self.assertIn("keepalive: true", app.BROWSER_WINDOW_HELPER_SCRIPT)
 
     def test_window_helper_is_skipped_off_macos_when_disabled_or_lan_bound(self) -> None:
         for platform, env in (

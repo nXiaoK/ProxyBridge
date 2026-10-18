@@ -1584,50 +1584,101 @@ def browser_window_closed_endpoint() -> str | None:
     return None
 
 
-BROWSER_WINDOW_HELPER_SCRIPT = """// 由 ProxyBridge 在每次启动时生成，请勿修改。
+# 窗口助手脚本保持静态，令牌与回调地址每次启动写入同目录的 config.json：
+# Chromium 会在 Profile 中缓存命令行加载扩展的 Service Worker 脚本，即使改了版本号也不重新读取，
+# 若把令牌写进脚本，第二次启动起就会带着过期令牌回调。脚本内容变化时目录名随之变化（见下方哈希），
+# 从而得到新的扩展 ID，确保旧 Profile 也能加载新脚本。
+BROWSER_WINDOW_HELPER_SCRIPT = """// 由 ProxyBridge 生成，请勿修改。
 // macOS 上关闭最后一个窗口后 Chromium 仍会驻留在 Dock；窗口全部关闭时通知 ProxyBridge 停止此浏览器。
-const ENDPOINT = __ENDPOINT__;
-const TOKEN = __TOKEN__;
-const WINDOW_TYPES = ["normal", "popup", "panel", "app", "devtools"];
-let pending = null;
+// Chromium 会在最后一个窗口关闭后立即销毁 Profile 与本 Service Worker，因此必须在 onRemoved 回调中
+// 同步发出请求，不能先 await 或延时再确认。
+const FILTER = { windowTypes: ["normal", "popup", "panel", "app", "devtools"] };
+const openWindows = new Set();
+let config = null;
+let ready = false;
+let notified = false;
 
-async function notifyIfNoWindows() {
-  pending = null;
-  const windows = await chrome.windows.getAll({ windowTypes: WINDOW_TYPES });
-  if (windows.length) return;
-  try {
-    await fetch(ENDPOINT, { method: "POST", headers: { "Content-Type": "text/plain" }, body: TOKEN, cache: "no-store", credentials: "omit" });
-  } catch (_) {
-    // 控制台未运行时忽略；浏览器保持原样。
-  }
+const configLoaded = fetch(chrome.runtime.getURL("config.json"), { cache: "no-store" })
+  .then((response) => response.json())
+  .then((value) => { config = value; }, () => {});
+
+function send() {
+  if (!config || !config.endpoint || !config.token) return;
+  fetch(config.endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain" },
+    body: config.token,
+    cache: "no-store",
+    credentials: "omit",
+    keepalive: true,
+  }).catch(() => {
+    // 控制台未运行时忽略；浏览器保持原样，之后仍可再次通知。
+    notified = false;
+  });
 }
 
-chrome.windows.onRemoved.addListener(() => {
-  if (pending) clearTimeout(pending);
-  // 稍等片刻再确认，避免拖出标签页等瞬时无窗口状态被误判。
-  pending = setTimeout(notifyIfNoWindows, 1500);
-});
+function notify() {
+  if (notified) return;
+  notified = true;
+  if (config) send();
+  else configLoaded.then(send);
+}
+
+chrome.windows.onCreated.addListener((win) => {
+  openWindows.add(win.id);
+  notified = false;
+}, FILTER);
+
+chrome.windows.onRemoved.addListener((windowId) => {
+  openWindows.delete(windowId);
+  if (ready) {
+    if (!openWindows.size) notify();
+    return;
+  }
+  // Service Worker 刚被唤醒、窗口列表尚未就绪时再查询一次（尽力而为）。
+  chrome.windows.getAll(FILTER).then((windows) => { if (!windows.length) notify(); }, () => {});
+}, FILTER);
+
+chrome.windows.getAll(FILTER).then((windows) => {
+  windows.forEach((win) => openWindows.add(win.id));
+  ready = true;
+}, () => {});
+
+// 定期调用扩展 API，避免 Service Worker 空闲 30 秒后被回收而丢失窗口列表。
+setInterval(() => chrome.runtime.getPlatformInfo(() => {}), 20000);
 """
+BROWSER_WINDOW_HELPER_REVISION = hashlib.sha256(BROWSER_WINDOW_HELPER_SCRIPT.encode("utf-8")).hexdigest()[:12]
 
 
 def prepare_browser_window_helper(instance_id: str, token: str, endpoint: str) -> Path:
     """写入该记录专用的窗口助手扩展（位于工作目录，不进入 Profile，也不参与同步）。"""
-    root = browser_extensions_root() / "window_helper" / stable_id("window-helper", instance_id)
+    instance_root = browser_extensions_root() / "window_helper" / stable_id("window-helper", instance_id)
+    root = instance_root / BROWSER_WINDOW_HELPER_REVISION
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # 清理旧版本助手（包括早期直接写在记录目录下的 manifest.json / background.js）。
+    for child in instance_root.iterdir():
+        if child == root:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child, ignore_errors=True)
+        else:
+            child.unlink(missing_ok=True)
     hostname = str(urllib.parse.urlsplit(endpoint).hostname or "127.0.0.1")
     manifest = {
         "manifest_version": 3,
         "name": "ProxyBridge Window Helper",
         "description": "关闭最后一个窗口后通知 ProxyBridge 停止此浏览器。",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "background": {"service_worker": "background.js"},
-        # 只需访问本机控制台；不声明内容脚本与网页可访问资源，网页无法探测到该扩展。
+        # 只需访问本机控制台；不声明内容脚本与网页可访问资源，网页无法探测到该扩展或读取 config.json。
         "host_permissions": [f"http://{'[::1]' if hostname == '::1' else hostname}/*"],
     }
-    script = BROWSER_WINDOW_HELPER_SCRIPT.replace("__ENDPOINT__", json.dumps(endpoint)).replace(
-        "__TOKEN__", json.dumps(token)
+    files = (
+        ("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)),
+        ("background.js", BROWSER_WINDOW_HELPER_SCRIPT),
+        ("config.json", json.dumps({"endpoint": endpoint, "token": token})),
     )
-    for name, content in (("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)), ("background.js", script)):
+    for name, content in files:
         target = root / name
         temporary = target.with_suffix(target.suffix + ".tmp")
         temporary.write_text(content, encoding="utf-8")
