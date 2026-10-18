@@ -1030,15 +1030,15 @@ sequenceDiagram
 
 ## References
 
-- 代码：`/Users/xiaok/github/ProxyBridge/app.py`  
+- 代码：`app.py`  
   - `ACTIVE_BRIDGE_STATUSES`, `start_bridge` / `_start_bridge`, `stop_bridge`, `restore_enabled_bridges`  
   - `status_payload` / `_status_payload`  
   - `AppHandler.is_trusted_request`, `do_GET`, `do_HEAD`, `do_POST`, `log_message`  
   - `Socks5LogProxy`, `bridge_runtime_is_active`, `synchronize_process_state`, `now_ts`
-- 前端：`/Users/xiaok/github/ProxyBridge/static/index.html`, `static/app.js`（`runningBridges`, `renderBridges`, `handleAction`, `refreshStatus`）
-- 安全测试：`/Users/xiaok/github/ProxyBridge/tests/test_security.py`
-- 生命周期设计：`/Users/xiaok/github/ProxyBridge/docs/superpowers/specs/2026-07-10-lifecycle-resource-ownership-design.md`
-- 产品说明：`/Users/xiaok/github/ProxyBridge/README.md`
+- 前端：`static/index.html`, `static/app.js`（`runningBridges`, `renderBridges`, `handleAction`, `refreshStatus`）
+- 安全测试：`tests/test_security.py`
+- 生命周期设计：`docs/superpowers/specs/2026-07-10-lifecycle-resource-ownership-design.md`
+- 产品说明：`README.md`
 
 ---
 
