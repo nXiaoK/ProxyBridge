@@ -71,6 +71,10 @@ def pick_assets(host_os: str, host_arch: str) -> dict[str, tuple[dict, str]]:
 
 
 def main() -> int:
+    # Windows Runner 的控制台默认 cp1252，无法输出中文进度；统一改为 UTF-8，无法编码的字符替换而不中断下载。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="下载完整版需要内置的官方安装包")
     parser.add_argument("--os", dest="host_os", required=True, choices=("darwin", "windows", "linux"))
     parser.add_argument("--arch", dest="host_arch", required=True, choices=("arm64", "x86_64"))

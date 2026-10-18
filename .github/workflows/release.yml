@@ -18,6 +18,10 @@ on:
 permissions:
   contents: write
 
+env:
+  # 1 启用 Python UTF-8 模式，避免 Windows Runner 以 cp1252 输出中文日志时报 UnicodeEncodeError。
+  PYTHONUTF8: "1"
+
 jobs:
   metadata:
     name: Resolve release metadata
