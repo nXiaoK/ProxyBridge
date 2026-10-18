@@ -763,6 +763,7 @@ http://127.0.0.1:8787/#token=...
 | 诊断 | `/api/diagnostics/run` |
 | 浏览器 | `/api/browser/launch`、`stop`、`delete`、`credentials`、`update`（单条 `instance_id` 或批量 `instance_ids`）、`create`、`rebind`、`regenerate-fingerprint`、`open-url`、`cookies/export`、`cookies/import`、`extensions/delete`、`download-kernel`（可选 `tag` / `latest`） |
 | 浏览器扩展 | `/api/browser/extensions/upload`（`application/octet-stream`，文件名放在 `X-ProxyBridge-Upload-Name`，上限 64 MiB） |
+| 窗口助手回调 | `/api/browser/window-closed`（仅 macOS 本机浏览器内的窗口助手扩展调用；正文为启动时下发的一次性令牌，不检查来源、不需要管理令牌，始终返回 204） |
 | 指纹内核版本 | `/api/browser/kernels/releases`、`default`、`delete` |
 | 日志 | `/api/logs/clear`、`/api/system/logs/clear` |
 | 代理池 | `/api/pool/token/rotate`、`feedback`、`exclude` |

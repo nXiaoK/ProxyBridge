@@ -646,7 +646,8 @@ class ParserTests(unittest.TestCase):
                 self.assertEqual(provider["search_url"], "https://www.google.com/search?q={searchTerms}")
                 load_extension_args = [arg for arg in command if arg.startswith("--load-extension=")]
                 self.assertEqual(len(load_extension_args), 1)
-                extension_path = Path(load_extension_args[0].split("=", 1)[1])
+                # macOS 上还会追加窗口助手扩展，第一个始终是默认搜索扩展。
+                extension_path = Path(load_extension_args[0].split("=", 1)[1].split(",")[0])
                 manifest = json.loads((extension_path / "manifest.json").read_text(encoding="utf-8"))
                 search_provider = manifest["chrome_settings_overrides"]["search_provider"]
                 self.assertEqual(search_provider["name"], "Google")

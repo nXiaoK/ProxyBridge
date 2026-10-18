@@ -243,6 +243,9 @@ BROWSER_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
 # 本机浏览器最近一次启动命令（仅内存）：未开启 CDP 时「打开网址」复用完整参数交给
 # Chromium 单实例转发，即使原进程恰好退出，新进程也仍带代理与指纹参数。
 BROWSER_LAUNCH_COMMANDS: dict[str, list[str]] = {}
+# macOS 上关闭 Chromium 最后一个窗口后进程仍驻留在 Dock。启动本机浏览器时生成一次性令牌，
+# 由窗口助手扩展在窗口全部关闭后携带令牌通知控制台停止该浏览器：令牌 -> (实例 ID, 进程)。
+BROWSER_WINDOW_TOKENS: dict[str, tuple[str, subprocess.Popen]] = {}
 LOG_PROXY_TABLE: dict[str, "Socks5LogProxy"] = {}
 TRAFFIC_TABLE: dict[str, dict[str, int]] = {}
 REQUEST_LOG_PENDING_UPDATES: dict[str, dict[str, Any]] = {}
@@ -312,6 +315,8 @@ BROWSER_EXTENSION_LOCK = threading.RLock()
 # 扩展包上传上限 64 MiB；解压后的文件数与体积仍受通用归档限制约束。
 BROWSER_EXTENSION_UPLOAD_LIMIT = 64 * 1024 * 1024
 BROWSER_EXTENSION_UPLOAD_PATH = "/api/browser/extensions/upload"
+# 窗口助手扩展回调地址；只接受启动时下发的一次性令牌，不需要管理令牌，也不检查来源。
+BROWSER_WINDOW_CLOSED_PATH = "/api/browser/window-closed"
 # 一键检测可打开的指纹检测站点；前端只显示这些固定目标。
 FINGERPRINT_CHECK_SITES = {
     "browserscan": "https://www.browserscan.net/",
@@ -1552,6 +1557,131 @@ def sync_profile_extensions(profile_path: Path, extension_ids: list[str]) -> lis
             else:
                 log_event(f"扩展 {extension_id} 已不在扩展库中，启动时跳过", level="warn", category="浏览器")
     return usable
+
+
+def browser_stop_on_last_window_enabled() -> bool:
+    """macOS 默认开启「关闭最后一个窗口即停止浏览器」。
+
+    环境变量 PROXY_BRIDGE_BROWSER_STOP_ON_LAST_WINDOW 设为 0 / false / off 时关闭；
+    Windows 与 Linux 上 Chromium 关闭最后一个窗口本身就会退出，因此不加载窗口助手。
+    """
+    if host_os_token() != "darwin":
+        return False
+    value = str(os.environ.get("PROXY_BRIDGE_BROWSER_STOP_ON_LAST_WINDOW", "1")).strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def browser_window_closed_endpoint() -> str | None:
+    """返回浏览器可直连的控制台回调地址；控制台只监听局域网地址时浏览器流量会走代理，此时不启用。"""
+    host = str(os.environ.get("PROXY_BRIDGE_HOST") or "127.0.0.1").strip().lower()
+    port = safe_int(os.environ.get("PROXY_BRIDGE_PORT"), DEFAULT_SERVER_PORT)
+    if not 1 <= port <= 65535:
+        return None
+    if host in {"127.0.0.1", "localhost", "0.0.0.0", ""}:
+        return f"http://127.0.0.1:{port}{BROWSER_WINDOW_CLOSED_PATH}"
+    if host in {"::1", "::"}:
+        return f"http://[::1]:{port}{BROWSER_WINDOW_CLOSED_PATH}"
+    return None
+
+
+BROWSER_WINDOW_HELPER_SCRIPT = """// 由 ProxyBridge 在每次启动时生成，请勿修改。
+// macOS 上关闭最后一个窗口后 Chromium 仍会驻留在 Dock；窗口全部关闭时通知 ProxyBridge 停止此浏览器。
+const ENDPOINT = __ENDPOINT__;
+const TOKEN = __TOKEN__;
+const WINDOW_TYPES = ["normal", "popup", "panel", "app", "devtools"];
+let pending = null;
+
+async function notifyIfNoWindows() {
+  pending = null;
+  const windows = await chrome.windows.getAll({ windowTypes: WINDOW_TYPES });
+  if (windows.length) return;
+  try {
+    await fetch(ENDPOINT, { method: "POST", headers: { "Content-Type": "text/plain" }, body: TOKEN, cache: "no-store", credentials: "omit" });
+  } catch (_) {
+    // 控制台未运行时忽略；浏览器保持原样。
+  }
+}
+
+chrome.windows.onRemoved.addListener(() => {
+  if (pending) clearTimeout(pending);
+  // 稍等片刻再确认，避免拖出标签页等瞬时无窗口状态被误判。
+  pending = setTimeout(notifyIfNoWindows, 1500);
+});
+"""
+
+
+def prepare_browser_window_helper(instance_id: str, token: str, endpoint: str) -> Path:
+    """写入该记录专用的窗口助手扩展（位于工作目录，不进入 Profile，也不参与同步）。"""
+    root = browser_extensions_root() / "window_helper" / stable_id("window-helper", instance_id)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    hostname = str(urllib.parse.urlsplit(endpoint).hostname or "127.0.0.1")
+    manifest = {
+        "manifest_version": 3,
+        "name": "ProxyBridge Window Helper",
+        "description": "关闭最后一个窗口后通知 ProxyBridge 停止此浏览器。",
+        "version": "1.0.0",
+        "background": {"service_worker": "background.js"},
+        # 只需访问本机控制台；不声明内容脚本与网页可访问资源，网页无法探测到该扩展。
+        "host_permissions": [f"http://{'[::1]' if hostname == '::1' else hostname}/*"],
+    }
+    script = BROWSER_WINDOW_HELPER_SCRIPT.replace("__ENDPOINT__", json.dumps(endpoint)).replace(
+        "__TOKEN__", json.dumps(token)
+    )
+    for name, content in (("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2)), ("background.js", script)):
+        target = root / name
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_text(content, encoding="utf-8")
+        temporary.replace(target)
+    return root
+
+
+def register_browser_window_token(token: str, instance_id: str, process: subprocess.Popen) -> None:
+    """登记一次性令牌；调用方需持有 PROCESS_LOCK。同一记录的旧令牌与已退出进程的令牌一并清理。"""
+    for existing, (owner, owner_process) in list(BROWSER_WINDOW_TOKENS.items()):
+        if owner == instance_id or owner_process.poll() is not None:
+            BROWSER_WINDOW_TOKENS.pop(existing, None)
+    BROWSER_WINDOW_TOKENS[token] = (instance_id, process)
+
+
+def handle_browser_last_window_closed(token: str) -> bool:
+    """窗口助手回调：令牌有效且对应进程仍在运行时，在后台停止该浏览器。"""
+    token = str(token or "").strip()
+    if not token or len(token) > 128:
+        return False
+    with PROCESS_LOCK:
+        match: tuple[str, str, subprocess.Popen] | None = None
+        for candidate, (instance_id, process) in BROWSER_WINDOW_TOKENS.items():
+            if hmac.compare_digest(candidate.encode("utf-8"), token.encode("utf-8")):
+                match = (candidate, instance_id, process)
+        if match is None:
+            return False
+        candidate, instance_id, process = match
+        BROWSER_WINDOW_TOKENS.pop(candidate, None)
+        if BROWSER_PROCESS_TABLE.get(instance_id) is not process or process.poll() is not None:
+            return False
+    threading.Thread(
+        target=_stop_browser_after_last_window,
+        args=(instance_id, process),
+        name="browser-last-window",
+        daemon=True,
+    ).start()
+    return True
+
+
+def _stop_browser_after_last_window(instance_id: str, process: subprocess.Popen) -> None:
+    if SHUTTING_DOWN.is_set():
+        return
+    with PROCESS_LOCK:
+        if BROWSER_PROCESS_TABLE.get(instance_id) is not process or process.poll() is not None:
+            return
+    try:
+        with STATE_LOCK:
+            name = str(find_browser_instance(load_state(), instance_id).get("name") or "浏览器")
+        # 与界面上的「停止」一致：结束浏览器进程组、保留本地代理，并按设置自动上传 Profile。
+        stop_browser({"instance_id": instance_id})
+        log_event(f"「{name}」的窗口已全部关闭，已自动停止浏览器", category="浏览器")
+    except Exception as exc:
+        log_event(f"窗口关闭后自动停止浏览器失败：{exc}", level="warn", category="浏览器")
 
 
 def browser_node_profile_root(node_id: str) -> Path:
@@ -8210,6 +8340,11 @@ def _run_browser_launch(
     extension_paths = [str(search_extension_path)] + [
         str(profile_path / PROFILE_EXTENSIONS_DIR / extension_id) for extension_id in extension_ids
     ]
+    window_token = ""
+    window_endpoint = browser_window_closed_endpoint() if browser_stop_on_last_window_enabled() else None
+    if window_endpoint:
+        window_token = secrets.token_urlsafe(32)
+        extension_paths.append(str(prepare_browser_window_helper(instance_id, window_token, window_endpoint)))
     proxy = f"socks5://127.0.0.1:{local_port}"
 
     # 每条记录有固定指纹种子；时区/语言按配置取出口 IP、节点地区或手动值，使指纹与代理出口一致。
@@ -8261,6 +8396,8 @@ def _run_browser_launch(
             BROWSER_TABLE[node_id] = procs
             BROWSER_PROCESS_TABLE[instance_id] = process
             BROWSER_LAUNCH_COMMANDS[instance_id] = [arg for arg in command if arg not in start_urls]
+            if window_token:
+                register_browser_window_token(window_token, instance_id, process)
         with STATE_LOCK:
             state = load_state()
             try:
@@ -13077,6 +13214,20 @@ class AppHandler(BaseHTTPRequestHandler):
         data = self.rfile.read(length)
         return json.loads(data.decode("utf-8"))
 
+    def handle_browser_window_closed(self) -> None:
+        raw_length = str(self.headers.get("Content-Length") or "0")
+        length = int(raw_length) if re.fullmatch(r"[0-9]{1,4}", raw_length) else -1
+        if 0 < length <= 256:
+            try:
+                token = self.rfile.read(length).decode("ascii", errors="ignore")
+                handle_browser_last_window_closed(token)
+            except Exception as exc:
+                log_event(f"处理浏览器窗口关闭通知失败：{exc}", level="warn", category="浏览器")
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def handle_browser_extension_upload(self) -> None:
         require_browser_feature()
         content_type = _single_upload_header(self.headers, "Content-Type")
@@ -13459,6 +13610,11 @@ class AppHandler(BaseHTTPRequestHandler):
         self.serve_static(head_only=True)
 
     def do_POST(self) -> None:
+        if urllib.parse.urlsplit(self.path).path == BROWSER_WINDOW_CLOSED_PATH:
+            # 来自浏览器内窗口助手扩展：来源是 chrome-extension://，无法携带管理令牌，
+            # 仅凭启动时下发的一次性令牌鉴权；无论结果如何都返回 204，不泄露状态。
+            self.handle_browser_window_closed()
+            return
         if not self.is_trusted_request():
             self._send_request_error(403, "不可信请求来源")
             return

@@ -109,6 +109,7 @@ outputs/ProxyBridgeMenuBar.app
 - 「Cookie 与检测」中可一键打开 BrowserScan、Pixelscan、CreepJS 检测页；开启 CDP 并运行后，可导入 / 导出 JSON（Cookie-Editor、EditThisCookie、CDP 格式）或 Netscape `cookies.txt`。导出内容含登录凭据，请妥善保管。
 - 「换绑节点」把已停止的记录移到另一个节点，Profile 目录随之移动，指纹种子与 Cookie 不变；早期的「默认浏览器」记录不支持换绑。
 - 订阅刷新导致节点 ID 变化（例如机场修改了参数）时，绑定的浏览器记录与 Profile 会保留，原节点在节点列表中显示为「已从订阅移除 · 仅为浏览器记录保留」，换绑或删除最后一条记录后自动清理。手动删除订阅时默认同样保留，只有在确认框中勾选后才会连同 Profile 永久删除。
+- macOS 上点击窗口左上角红色按钮关闭浏览器的最后一个窗口后，Chromium 默认仍驻留在 Dock；ProxyBridge 会为本机浏览器加载「ProxyBridge Window Helper」扩展，窗口全部关闭约 1.5 秒后通知控制台，按「停止」同样的流程结束浏览器（保留本地代理，并按设置自动上传 Profile）。该扩展位于工作目录的 `browser_extensions/window_helper/`，不进入 Profile，没有内容脚本，网页无法探测；每次启动使用新的一次性令牌。只开一个窗口中的部分标签或关闭多窗口中的一个不会触发。设置环境变量 `PROXY_BRIDGE_BROWSER_STOP_ON_LAST_WINDOW=0` 可关闭此行为；控制台只监听局域网地址（`--host` 为具体 IP）时也不会启用。Windows 与 Linux 上关闭最后一个窗口本身就会退出浏览器，不加载该扩展。
 - 实际指纹还会受内核版本和运行环境影响，不保证匿名性或无法被网站关联。
 - 使用代理时强制 `--webrtc-ip-handling-policy=disable_non_proxied_udp`，阻止非代理 UDP 候选。
 
@@ -201,6 +202,7 @@ Proxy Bridge console: http://127.0.0.1:8787/#token=...
 | `--no-core-auto-install` | 启动时不自动下载 `sing-box` / `xray` |
 | `PROXY_BRIDGE_SING_BOX` / `PROXY_BRIDGE_XRAY` | 手动指定核心可执行文件 |
 | `PROXY_BRIDGE_FP_CHROMIUM` | 手动指定指纹 Chromium 可执行文件；设置后始终作为默认内核，浏览器配置中固定的其他版本仍按各自版本启动 |
+| `PROXY_BRIDGE_BROWSER_STOP_ON_LAST_WINDOW` | 仅 macOS：默认开启，关闭浏览器最后一个窗口后自动停止该浏览器；设为 `0` / `false` / `off` 时保持 Chromium 的 Dock 驻留行为 |
 
 说明：
 

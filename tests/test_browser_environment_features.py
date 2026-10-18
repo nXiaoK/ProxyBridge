@@ -80,6 +80,7 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
             app.BROWSER_PROCESS_TABLE.update(self.old_browser_process_table)
             app.BROWSER_LAUNCH_COMMANDS.clear()
             app.BROWSER_LAUNCH_COMMANDS.update(self.old_launch_commands)
+            app.BROWSER_WINDOW_TOKENS.clear()
         with app.EXIT_LOCALE_CACHE_LOCK:
             app.EXIT_LOCALE_CACHE.clear()
         self.sync_patch.stop()
@@ -183,6 +184,106 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "999.0.0.1"):
             self.launch(missing["id"], lambda _port: {"ip": "1.1.1.1", "region_code": "HK"})
         self.assertEqual(len(app.load_state()["browser_instances"]), 2)
+
+    # ---------- macOS 关闭最后一个窗口后自动停止 ----------
+    def launch_with_platform(self, platform: str, env: dict[str, str] | None = None) -> tuple[dict[str, object], list[str]]:
+        self.install_stub_kernel()
+        state = app.empty_state()
+        state["nodes"] = [{"id": "node-mac", "name": "Mac", "region": "香港", "protocol": "vless"}]
+        record = app.create_browser_instance_record(state, "node-mac")
+        state["browser_instances"] = [record]
+        app.save_state(state)
+        with mock.patch.object(app, "host_os_token", return_value=platform), mock.patch.dict(os.environ, env or {}):
+            command = self.launch(record["id"], lambda _port: {"ip": "1.1.1.1", "region_code": "HK"})
+        return record, command
+
+    def test_macos_launch_loads_window_helper_with_one_time_token(self) -> None:
+        record, command = self.launch_with_platform("darwin", {"PROXY_BRIDGE_PORT": "8899", "PROXY_BRIDGE_HOST": "127.0.0.1"})
+        paths = next(arg for arg in command if arg.startswith("--load-extension=")).split("=", 1)[1].split(",")
+        self.assertEqual(len(paths), 2)
+        helper = Path(paths[1])
+        manifest = json.loads((helper / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["host_permissions"], ["http://127.0.0.1/*"])
+        self.assertNotIn("content_scripts", manifest)
+        self.assertNotIn("web_accessible_resources", manifest)
+        script = (helper / "background.js").read_text(encoding="utf-8")
+        self.assertIn('"http://127.0.0.1:8899/api/browser/window-closed"', script)
+        tokens = {owner: token for token, (owner, _process) in app.BROWSER_WINDOW_TOKENS.items()}
+        self.assertIn(json.dumps(tokens[record["id"]]), script)
+        # 助手扩展位于工作目录而非 Profile，不随 WebDAV 同步。
+        self.assertFalse(str(helper).startswith(str(app.browser_profiles_root())))
+
+    def test_window_helper_is_skipped_off_macos_when_disabled_or_lan_bound(self) -> None:
+        for platform, env in (
+            ("linux", {}),
+            ("darwin", {"PROXY_BRIDGE_BROWSER_STOP_ON_LAST_WINDOW": "0"}),
+            ("darwin", {"PROXY_BRIDGE_HOST": "192.168.1.5"}),
+        ):
+            with self.subTest(platform=platform, env=env):
+                app.BROWSER_WINDOW_TOKENS.clear()
+                _record, command = self.launch_with_platform(platform, env)
+                paths = next(arg for arg in command if arg.startswith("--load-extension=")).split("=", 1)[1].split(",")
+                self.assertEqual(len(paths), 1)
+                self.assertEqual(app.BROWSER_WINDOW_TOKENS, {})
+
+    def test_last_window_callback_stops_matching_running_browser_once(self) -> None:
+        live = FakePopen(["chrome"])
+        with app.PROCESS_LOCK:
+            app.BROWSER_PROCESS_TABLE["inst"] = live
+            app.register_browser_window_token("good-token", "inst", live)
+
+        class InlineThread:
+            def __init__(self, *, target, args, **_kwargs):
+                self.target, self.args = target, args
+
+            def start(self) -> None:
+                self.target(*self.args)
+
+        state = app.empty_state()
+        state["nodes"] = [{"id": "n", "name": "N"}]
+        state["browser_instances"] = [{"id": "inst", "node_id": "n", "name": "店铺", "status": "running"}]
+        app.save_state(state)
+        with (
+            mock.patch.object(app.threading, "Thread", InlineThread),
+            mock.patch.object(app, "stop_browser", return_value={"ok": True}) as stop,
+        ):
+            self.assertFalse(app.handle_browser_last_window_closed("wrong-token"))
+            self.assertTrue(app.handle_browser_last_window_closed("good-token"))
+            self.assertFalse(app.handle_browser_last_window_closed("good-token"))
+        stop.assert_called_once_with({"instance_id": "inst"})
+
+        class ExitedPopen(FakePopen):
+            def poll(self) -> int:
+                return 0
+
+        exited = ExitedPopen(["chrome"])
+        with app.PROCESS_LOCK:
+            app.BROWSER_PROCESS_TABLE["inst"] = exited
+            app.register_browser_window_token("late-token", "inst", live)
+        self.assertFalse(app.handle_browser_last_window_closed("late-token"))
+
+    def test_window_closed_endpoint_accepts_extension_origin_without_management_token(self) -> None:
+        from email.message import Message
+        import io
+
+        handler = object.__new__(app.AppHandler)
+        handler.command = "POST"
+        handler.path = app.BROWSER_WINDOW_CLOSED_PATH
+        handler.requestline = f"POST {handler.path} HTTP/1.1"
+        handler.request_version = "HTTP/1.1"
+        handler.headers = Message()
+        handler.headers["Host"] = "127.0.0.1:8787"
+        handler.headers["Origin"] = "chrome-extension://abcdefghijklmnop"
+        handler.headers["Content-Type"] = "text/plain"
+        handler.headers["Content-Length"] = "11"
+        handler.rfile = io.BytesIO(b"token-value")
+        handler.wfile = io.BytesIO()
+        with mock.patch.object(app, "handle_browser_last_window_closed", return_value=False) as callback:
+            handler.do_POST()
+        callback.assert_called_once_with("token-value")
+        self.assertIn(b" 204 ", handler.wfile.getvalue().split(b"\r\n", 1)[0])
+        with mock.patch.dict(os.environ, {"PROXY_BRIDGE_HOST": "0.0.0.0", "PROXY_BRIDGE_PORT": "8787"}):
+            self.assertEqual(app.browser_window_closed_endpoint(), "http://127.0.0.1:8787/api/browser/window-closed")
 
     # ---------- 记录编辑 ----------
     def test_create_batch_update_and_regenerate(self) -> None:
