@@ -178,7 +178,7 @@ worker 网络也属于强制部署契约：必须是 `internal=true`、作用域
 
 默认启动后会从 GitHub Releases 自动下载当前 Linux 架构对应的 `sing-box` 和 `xray`，并保存到 `/data/proxy-cores/`。因此首次启动需要容器能访问 GitHub。
 
-如果 fnOS、NAS 或服务器访问 GitHub 很慢，不需要进入容器或直接修改命名卷。可在另一台电脑下载官方 Release 文件，使用最新启动日志中的完整认证 URL 打开控制台，点击侧边栏底部「本地导入」上传：
+如果 fnOS、NAS 或服务器访问 GitHub 很慢，不需要进入容器或直接修改命名卷。可在另一台电脑下载官方 Release 文件，使用最新启动日志中的完整认证 URL 打开控制台，进入「设置 → 内核管理」，点击「本地导入」上传：
 
 - Linux amd64 sing-box：例如 `sing-box-1.13.15-linux-amd64-glibc.tar.gz`。
 - Linux amd64 Xray：例如 `Xray-linux-64.zip`。

@@ -1,6 +1,7 @@
 const appState = {
   version: "",
   cores: {},
+  coreCatalog: [],
   features: { browser: true, browser_profile_sync: true, remote_browser: false, docker: false },
   runtime: { mode: "headless", docker: false },
   remoteBrowser: { configured: false, available: false, active_sessions: 0, error: "" },
@@ -10,8 +11,11 @@ const appState = {
   browser_instances: [],
   subscriptions: [],
   nodes: [],
+  regions: [],
   bridges: [],
   tests: {},
+  nodeHistories: {},
+  healthSettings: { auto_switch: false },
   speedTest: { settings: null, tasks: [] },
   subscriptionSettings: { allow_non_public_urls: false },
   subscriptionRefresh: { tasks: [] },
@@ -24,13 +28,14 @@ const appState = {
   pool: null,
   network: null,
   networkStatus: "loading",
-  activeView: "nodes",
+  activeView: "overview",
   filters: {
     protocol: "all",
     region: "all",
     subscription: "all",
     sort: "name",
     search: "",
+    status: "all",
   },
   // groupId -> true 表示折叠；缺省为展开。
   collapsedNodeGroups: loadCollapsedNodeGroups(),
@@ -54,6 +59,8 @@ const appState = {
 const managementAuth = window.ProxyBridgeAuth;
 const browserUi = window.ProxyBridgeBrowserUi;
 const coreUploadClient = window.ProxyBridgeCoreUpload;
+const uiCore = window.ProxyBridgeUiCore;
+const i18n = window.ProxyBridgeI18n;
 let managementToken = managementAuth.loadManagementToken(window);
 
 const $ = (selector) => document.querySelector(selector);
@@ -70,6 +77,7 @@ let lastRemoteBrowserLaunchTriggerAction = null;
 let lastRemoteBrowserCredentialsTriggerKey = null;
 let lastRemoteBrowserCredentialsTriggerAction = null;
 let pendingRemoteBrowserLaunch = null;
+let pendingRemoteBrowserBatchNodeIds = [];
 let remoteBrowserLaunchPromise = null;
 let viewedRemoteBrowserInstanceId = null;
 let remoteBrowserCredentialsRequestGeneration = 0;
@@ -81,6 +89,7 @@ let coreUploadPromise = null;
 let statusRequestPromise = null;
 let statusAbortController = null;
 let statusPollTimer = null;
+let statusPollDeadline = 0;
 let syncOperationPromise = null;
 let networkSettingsSavePromise = null;
 let logPageRequestGeneration = 0;
@@ -89,13 +98,33 @@ let logSettingsHydrated = false;
 let logSettingsDirty = false;
 const actionInFlight = new Set();
 const renderSignatures = new Map();
+let confirmResolver = null;
+let currentNodeDetailId = null;
+let currentNodeDetailTab = "overview";
+let statusEventController = null;
+let statusEventConnected = false;
+let nodeVirtualFrame = 0;
+const revealedSecrets = new Set();
+let browserPageFilter = { node: "all", status: "all", search: "" };
+
+const renderOverview = window.ProxyBridgePages.createOverviewRenderer({ $, appState, runningBridges, escapeHtml, formatLogTime, icon });
+const renderKernelPage = window.ProxyBridgePages.createKernelRenderer({ $, appState, browserEnabled, escapeHtml });
+const renderBrowserPage = window.ProxyBridgePages.createBrowserRenderer({ $, appState, browserPageFilter, browserUi, browserEnabled, remoteBrowserEnabled, escapeHtml, nodeById, safeRemoteBrowserUrl, formatRelativeTime, browserStatusLabel, uiCore });
+const renderNodes = window.ProxyBridgePages.createNodeRenderer({ $, appState, bridgeForNode, mostRecentBridgeForNode, browserEnabled, browserInstancesForNode, runningBrowserInstancesForNode, escapeHtml, icon, latencyCell, isNodeGroupCollapsed, groupAverageLatency, initials, filteredNodes, groupNodesBySubscription, renderSpeedTestTaskControls, updateBatchActionsBar, bindNodeCheckboxes, uiCore });
+let currentPoolLinkFormat = "list_json";
+let poolLinksExpanded = null;
+let subscriptionPreviewSignature = "";
+let subscriptionPreviewResult = null;
 
 const STATUS_REQUEST_TIMEOUT_MS = 12_000;
 const STATUS_POLL_VISIBLE_MS = 3_500;
 const STATUS_POLL_HIDDEN_MS = 30_000;
+// 延迟显示阈值：300ms 起提示偏慢，800ms 起提示慢，仅影响界面着色。
+const LATENCY_WARNING_MS = 300;
+const LATENCY_SLOW_MS = 800;
 
 // 侧边栏可切换的视图列表,顺序与 HTML 中 .nav-item / .view 一致。
-const VIEW_IDS = ["nodes", "subscriptions", "bridges", "logs", "system", "settings", "sync", "diagnostics"];
+const VIEW_IDS = ["overview", "nodes", "subscriptions", "bridges", "pool", "browsers", "logs", "system", "settings", "cores", "sync", "diagnostics"];
 
 function browserEnabled() {
   return appState.features?.browser !== false;
@@ -115,17 +144,26 @@ function setActiveView(view) {
   appState.activeView = view;
   try { localStorage.setItem("pb-view", view); } catch (e) {}
   document.querySelectorAll(".nav-item").forEach((item) => {
-    item.setAttribute("aria-current", item.dataset.view === view ? "true" : "false");
+    const selected = item.dataset.view === view || (item.dataset.view === "logs" && view === "system");
+    item.setAttribute("aria-current", selected ? "true" : "false");
   });
   document.querySelectorAll(".view").forEach((section) => {
     section.hidden = section.dataset.view !== view;
   });
+  document.querySelectorAll("[data-log-tab]").forEach((tab) => {
+    const active = tab.dataset.logTab === view;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
+  });
   renderActiveView({ force: true });
+  i18n.apply(document);
   applyActionInFlightState();
   if (view === "logs") {
     loadLogPage("request").catch((error) => showToast(error.message, "error"));
   } else if (view === "system") {
     loadLogPage("system").catch((error) => showToast(error.message, "error"));
+  } else if (view === "cores") {
+    loadCoreCatalog().catch((error) => showToast(error.message, "error"));
   }
 }
 
@@ -142,8 +180,137 @@ function renderNav() {
   setNavCount("navCountNodes", appState.nodes.length);
   setNavCount("navCountSubs", appState.subscriptions.length);
   setNavCount("navCountBridges", runningBridges().length);
-  setNavCount("navCountLogs", Number(appState.logCenter?.request_total ?? appState.requestLogs.length));
-  setNavCount("navCountSystem", Number(appState.logCenter?.system_total ?? appState.systemLogs.length));
+  const errorCount = Number(appState.logCenter?.system_error_total ?? (appState.systemLogs || []).filter((entry) => /error|critical|错误|致命/i.test(String(entry.level || entry.severity || ""))).length);
+  setNavCount("navCountLogs", errorCount);
+  const errorBadge = document.getElementById("systemErrorCount");
+  for (const badge of [errorBadge, document.getElementById("systemErrorCountSystem")]) {
+    if (badge) {
+      badge.hidden = errorCount === 0;
+      badge.textContent = String(errorCount);
+    }
+  }
+}
+
+function confirmAction(message, { title = "确认操作", confirmLabel = "继续", details = "" } = {}) {
+  const dialog = $("#confirmDialog");
+  if (!dialog) return Promise.reject(new Error("无法打开操作确认对话框，请刷新页面后重试"));
+  $("#confirmTitle").textContent = title;
+  $("#confirmMessage").textContent = message;
+  const detailEl = $("#confirmDetails");
+  detailEl.textContent = details;
+  detailEl.hidden = !details;
+  $("#confirmAccept").textContent = confirmLabel;
+  dialog.hidden = false;
+  dialog.querySelector("[role=alertdialog]").focus();
+  return new Promise((resolve) => { confirmResolver = resolve; });
+}
+
+function finishConfirmation(accepted) {
+  const dialog = $("#confirmDialog");
+  if (!dialog || dialog.hidden) return;
+  dialog.hidden = true;
+  if (confirmResolver) confirmResolver(Boolean(accepted));
+  confirmResolver = null;
+}
+
+function openDrawer(drawer, focusSelector = null) {
+  if (!drawer) return;
+  drawer.hidden = false;
+  document.body.classList.add("has-open-drawer");
+  requestAnimationFrame(() => (focusSelector ? drawer.querySelector(focusSelector) : drawer.querySelector("[role=dialog]") || drawer).focus());
+}
+
+function closeDrawer(drawer) {
+  if (!drawer) return;
+  drawer.hidden = true;
+  if (!document.querySelector(".drawer-backdrop:not([hidden])")) document.body.classList.remove("has-open-drawer");
+}
+
+function setNodeDensity(value) {
+  const density = value === "standard" ? "standard" : "compact";
+  document.documentElement.dataset.nodeDensity = density;
+  try { localStorage.setItem("pb-node-density", density); } catch (_) {}
+  for (const selector of ["#nodeDensity", "#settingsNodeDensity"]) {
+    const control = $(selector);
+    if (control && document.activeElement !== control) control.value = density;
+  }
+  if (appState.activeView === "nodes") renderNodes();
+}
+
+const COMMAND_PAGES = [
+  ["overview", "概览"], ["nodes", "节点"], ["bridges", "运行中代理"], ["pool", "代理池与网关"],
+  ["browsers", "指纹浏览器"], ["subscriptions", "订阅"], ["logs", "连接日志"],
+  ["settings", "通用设置"], ["cores", "内核管理"], ["sync", "WebDAV 同步"], ["diagnostics", "诊断中心"],
+];
+
+function renderCommandResults() {
+  const query = String($("#commandSearch")?.value || "").trim().toLowerCase();
+  const pages = COMMAND_PAGES.filter(([, label]) => label.toLowerCase().includes(query));
+  const nodes = appState.nodes.filter((node) => [node.name, node.server, node.region, node.region_code, node.remark].some((value) => String(value || "").toLowerCase().includes(query))).slice(0, 8);
+  $("#commandResults").innerHTML = `<section class="command-group"><span>页面</span>${pages.map(([view, label]) => `<button type="button" data-action="command-run" data-command="page" data-view="${view}"><span>${escapeHtml(label)}</span><kbd>↵</kbd></button>`).join("")}</section>${nodes.length ? `<section class="command-group"><span>节点</span>${nodes.map((node) => `<button type="button" data-action="command-run" data-command="node" data-node="${escapeHtml(node.id)}"><span><strong>${escapeHtml(node.name)}</strong><small>${escapeHtml(node.region || node.region_code || node.server || "")}</small></span><kbd>启动 / 复制</kbd></button>`).join("")}</section>` : ""}`;
+}
+
+function openCommandPalette() {
+  const palette = $("#commandPalette");
+  palette.hidden = false;
+  $("#commandSearch").value = "";
+  renderCommandResults();
+  requestAnimationFrame(() => $("#commandSearch").focus());
+}
+
+function closeCommandPalette() {
+  $("#commandPalette").hidden = true;
+}
+
+function groupAverageLatency(nodes) {
+  const values = nodes.map((node) => appState.tests[node.id]).filter((item) => item?.ok && Number.isFinite(Number(item.latency_ms))).map((item) => Number(item.latency_ms));
+  return values.length ? `${Math.round(values.reduce((sum, item) => sum + item, 0) / values.length)} ms` : "—";
+}
+
+
+async function loadCoreCatalog() {
+  const result = await api("/api/cores");
+  appState.coreCatalog = Array.isArray(result.cores) ? result.cores : [];
+  renderKernelPage();
+}
+
+
+function renderNodeDetailDrawer() {
+  const node = nodeById(currentNodeDetailId);
+  if (!node) return closeDrawer($("#nodeDetailDrawer"));
+  const bridge = bridgeForNode(node.id);
+  $("#nodeDetailTitle").textContent = node.name || "节点详情";
+  $("#nodeDetailStatus").textContent = bridge ? `运行中 · :${bridge.port}` : "已停止";
+  const content = $("#nodeDrawerContent");
+  const tests = appState.tests[node.id];
+  const coreOptions = Array.isArray(node.core_options) && node.core_options.length ? node.core_options : [node.preferred_core || "sing-box"];
+  // 地区选项以服务端目录为准，避免界面提供后端不接受的代码；空值表示自动识别。
+  const regionOptions = [...appState.regions, { code: "ZZ", name: "未分类" }];
+  const history = Array.isArray(appState.nodeHistories[node.id]) ? appState.nodeHistories[node.id] : (Array.isArray(tests?.history) ? tests.history.slice().reverse() : (tests ? [tests] : []));
+  if (currentNodeDetailTab === "overview") content.innerHTML = `<div class="detail-stat-grid"><div><span>地区</span><strong>${escapeHtml(node.region_code || node.region || "未分类")}</strong></div><div><span>协议</span><strong>${escapeHtml([node.protocol, node.transport, node.security].filter(Boolean).join(" · ") || "—")}</strong></div><div><span>延迟</span><strong>${escapeHtml(tests?.ok ? `${tests.latency_ms} ms` : tests ? "测速失败" : "未测试")}</strong></div></div><section class="drawer-section"><h3>服务器</h3><code>${escapeHtml(`${node.server}:${node.port}`)}</code></section><section class="drawer-section"><h3>备注</h3><p>${escapeHtml(node.remark || "暂无备注")}</p></section><section class="drawer-section"><h3>运行状态</h3><p>${bridge ? `本地端口 :${escapeHtml(bridge.port)} · SOCKS5 与 HTTP 可用` : "当前未运行"}</p><button class="row-button" data-action="${bridge ? "copy" : "start"}" ${bridge ? `data-text="${escapeHtml(bridge.socks_url)}"` : `data-node="${escapeHtml(node.id)}"`}>${bridge ? "复制 SOCKS5 地址" : "启动节点"}</button></section>`;
+  else if (currentNodeDetailTab === "browsers") content.innerHTML = `<div class="drawer-browser-list">${browserInstancesForNode(node.id).length ? browserInstancesForNode(node.id).map((instance) => `<div class="drawer-browser-row"><div><strong>${escapeHtml(instance.label || instance.name || "浏览器")}</strong><span>${escapeHtml(browserStatusLabel(instance.status))} · ${escapeHtml(formatTime(browserUi.browserInstanceLastUsedAt(instance)))}</span></div><button class="row-button" data-action="${["running", "starting", "stopping"].includes(instance.status) ? "stop-browser-instance" : "launch-browser-instance"}" data-instance="${escapeHtml(instance.id)}" data-node="${escapeHtml(node.id)}">${["running", "starting", "stopping"].includes(instance.status) ? "停止" : "启动"}</button><button class="icon-button danger" data-action="delete-browser-instance" data-instance="${escapeHtml(instance.id)}" aria-label="删除浏览器记录">×</button></div>`).join("") : `<div class="compact-empty">此节点还没有浏览器记录。</div>`}</div>`;
+  else if (currentNodeDetailTab === "history") content.innerHTML = history.length ? `<div class="test-history-list">${history.map((item) => `<div><span class="state-dot ${item.ok ? "is-ok" : "is-error"}"></span><strong>${item.ok ? `${escapeHtml(item.latency_ms)} ms` : "失败"}</strong><span>${escapeHtml(item.message || "测速完成")}</span><time>${escapeHtml(formatTime(item.tested_at || item.ts || item.at))}</time></div>`).join("")}</div><button class="toolbar-button" data-action="test" data-node="${escapeHtml(node.id)}">重新测速</button>` : `<div class="compact-empty">暂无测速历史。<button class="toolbar-button" data-action="test" data-node="${escapeHtml(node.id)}">立即测速</button></div>`;
+  else content.innerHTML = `<form class="node-config-form" id="nodeDetailForm"><label><span>地区覆盖</span><select id="nodeDetailRegion"><option value="">自动识别</option>${regionOptions.map(({ code, name }) => `<option value="${escapeHtml(code)}" ${node.region_override === code ? "selected" : ""}>${escapeHtml(code)} · ${escapeHtml(name)}</option>`).join("")}</select></label><label><span>备注名</span><input id="nodeDetailRemark" maxlength="500" value="${escapeHtml(node.remark || "")}" placeholder="用于识别节点的自定义备注"></label><label><span>首选核心</span><select data-core-select="${escapeHtml(node.id)}" ${bridge ? "disabled" : ""}>${coreOptions.map((core) => `<option value="${escapeHtml(core)}" ${core === node.preferred_core ? "selected" : ""}>${escapeHtml(core)}</option>`).join("")}</select></label><label class="sync-checkbox"><input type="checkbox" data-core-fallback="${escapeHtml(node.id)}" ${node.fallback_enabled ? "checked" : ""} ${bridge ? "disabled" : ""}><span>首选核心失败后尝试备用核心</span></label><label class="sync-checkbox"><input id="nodeDetailFavorite" type="checkbox" ${node.favorite ? "checked" : ""}><span>收藏节点并置顶</span></label><button class="primary-button" type="button" data-action="save-node-details" data-node="${escapeHtml(node.id)}">保存详情</button></form><details class="technical-details"><summary>技术信息</summary><dl><dt>节点 ID</dt><dd><code>${escapeHtml(node.id)}</code></dd><dt>服务器</dt><dd><code>${escapeHtml(`${node.server}:${node.port}`)}</code></dd><dt>核心回退</dt><dd>${node.fallback_enabled ? "已启用" : "关闭"}</dd></dl></details>`;
+  document.querySelectorAll("[data-node-tab]").forEach((tab) => {
+    tab.classList.toggle("is-active", tab.dataset.nodeTab === currentNodeDetailTab);
+    tab.setAttribute("aria-selected", tab.dataset.nodeTab === currentNodeDetailTab ? "true" : "false");
+  });
+}
+
+function openNodeDetail(nodeId, tab = "overview") {
+  if (!nodeById(nodeId)) return;
+  currentNodeDetailId = nodeId;
+  currentNodeDetailTab = tab;
+  renderNodeDetailDrawer();
+  openDrawer($("#nodeDetailDrawer"));
+  if (tab === "history") loadNodeHistory(nodeId).catch((error) => showToast(error.message, "error"));
+}
+
+async function loadNodeHistory(nodeId) {
+  const result = await api(`/api/nodes/history?node_id=${encodeURIComponent(nodeId)}`);
+  appState.nodeHistories[nodeId] = Array.isArray(result.history) ? result.history : [];
+  if (currentNodeDetailId === nodeId && currentNodeDetailTab === "history") renderNodeDetailDrawer();
+  return appState.nodeHistories[nodeId];
 }
 
 function escapeHtml(value) {
@@ -317,13 +484,22 @@ async function downloadLogExport(kind, format) {
   URL.revokeObjectURL(url);
 }
 
-function showToast(message, kind = "ok") {
+function showToast(message, kind = "ok", { duration } = {}) {
   const toast = $("#toast");
-  toast.textContent = message;
+  toast.replaceChildren(document.createTextNode(message));
   toast.classList.toggle("error", kind === "error");
+  if (kind === "error") {
+    const logLink = document.createElement("button");
+    logLink.type = "button";
+    logLink.className = "toast-log-link";
+    logLink.textContent = "查看日志";
+    logLink.addEventListener("click", () => setActiveView("system"), { once: true });
+    toast.append(logLink);
+  }
   toast.classList.add("visible");
   window.clearTimeout(showToast.timer);
-  showToast.timer = window.setTimeout(() => toast.classList.remove("visible"), 3600);
+  const timeout = duration ?? (kind === "error" ? 0 : 3000);
+  if (timeout > 0) showToast.timer = window.setTimeout(() => toast.classList.remove("visible"), timeout);
 }
 
 function formatTime(seconds) {
@@ -334,6 +510,18 @@ function formatTime(seconds) {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function formatRelativeTime(value) {
+  if (!value) return "—";
+  const timestamp = typeof value === "number" ? value : Date.parse(value) / 1000;
+  if (!Number.isFinite(timestamp)) return "—";
+  const delta = Math.max(0, Math.floor(Date.now() / 1000 - timestamp));
+  if (delta < 60) return "刚刚";
+  if (delta < 3600) return `${Math.floor(delta / 60)} 分钟前`;
+  if (delta < 86400) return `${Math.floor(delta / 3600)} 小时前`;
+  if (delta < 86400 * 30) return `${Math.floor(delta / 86400)} 天前`;
+  return formatTime(timestamp);
 }
 
 function formatDuration(seconds) {
@@ -486,6 +674,16 @@ let speedTestFormDirty = false;
 
 function markNetworkFormDirty() {
   networkFormDirty = true;
+  updateSettingsSaveBar();
+}
+
+function anyGeneralSettingsDirty() {
+  return networkFormDirty || speedTestFormDirty || logSettingsDirty;
+}
+
+function updateSettingsSaveBar() {
+  const bar = $("#settingsSaveBar");
+  if (bar) bar.hidden = !anyGeneralSettingsDirty();
 }
 
 function applyNetworkSettingsToForm(network, { force = false } = {}) {
@@ -495,6 +693,7 @@ function applyNetworkSettingsToForm(network, { force = false } = {}) {
   allowLan.checked = Boolean(network?.allow_lan);
   const security = network?.security || {};
   $("#lanAuthMode").value = security.auth_mode || "none";
+  $("#lanAuthMode").dataset.previousAuthMode = security.auth_mode || "none";
   $("#lanUsername").value = security.username || "";
   $("#lanPassword").value = "";
   $("#lanToken").value = "";
@@ -784,6 +983,26 @@ function renderNetworkSettings() {
   const isStale = networkStatus === "error" && hasSnapshot;
   const enabled = Boolean(network?.allow_lan);
   const dockerManaged = network?.docker_managed === true;
+  const lanChecked = Boolean($("#allowLan")?.checked);
+  const securityFields = $(".network-security-grid");
+  const warning = $("#networkShareWarning");
+  if (securityFields) securityFields.hidden = !lanChecked;
+  if (warning) warning.hidden = !lanChecked;
+  const authMode = $("#lanAuthMode")?.value || "none";
+  $("#lanUsernameField").hidden = !lanChecked || authMode !== "basic";
+  $("#lanPasswordField").hidden = !lanChecked || authMode !== "basic";
+  $("#lanTokenField").hidden = !lanChecked || authMode !== "token";
+  const density = localStorage.getItem("pb-node-density") === "standard" ? "standard" : "compact";
+  const densityControl = $("#settingsNodeDensity");
+  if (densityControl && document.activeElement !== densityControl) densityControl.value = density;
+  const version = $("#aboutVersion");
+  if (version) version.textContent = appState.version ? `v${appState.version}` : "—";
+  const themeSelect = $("#themeSelect");
+  if (themeSelect && document.activeElement !== themeSelect) themeSelect.value = localStorage.getItem("pb-theme") || "system";
+  const languageSelect = $("#languageSelect");
+  if (languageSelect && document.activeElement !== languageSelect) languageSelect.value = i18n.getLocale();
+  const healthToggle = $("#healthAutoSwitch");
+  if (healthToggle && document.activeElement !== healthToggle) healthToggle.checked = appState.healthSettings?.auto_switch === true;
 
   const settingsHint = $("#networkSettingsHint");
   if (settingsHint) {
@@ -865,6 +1084,7 @@ function renderNetworkSettings() {
       ? `${formatBytes(storage.used_bytes)} / ${formatBytes(storage.quota_bytes)} · ${Number(storage.file_count || 0)} 个文件`
       : "—";
   }
+  updateSettingsSaveBar();
 }
 
 async function saveSpeedTestSettings(event) {
@@ -880,6 +1100,7 @@ async function saveSpeedTestSettings(event) {
   const result = await api("/api/settings/speed-test", payload);
   appState.speedTest.settings = result.settings;
   speedTestFormDirty = false;
+  updateSettingsSaveBar();
   renderNetworkSettings();
   showToast("测速设置已保存");
 }
@@ -899,6 +1120,7 @@ async function saveLogSettings(event) {
   };
   if (saved.storage) appState.logCenter.storage = saved.storage;
   logSettingsDirty = false;
+  updateSettingsSaveBar();
   renderNetworkSettings();
   showToast(`日志设置已保存，清理 ${Number(saved.cleanup?.deleted_files || 0)} 个文件`);
 }
@@ -957,10 +1179,15 @@ async function saveNetworkSettings(event) {
   }
 
   const reboundCount = Number(result.rebound_count || 0);
+  if (result.generated_token) {
+    $("#lanAuthMode").value = "token";
+    $("#lanTokenField").hidden = false;
+    $("#lanToken").value = result.generated_token;
+  }
   showToast(
-    reboundCount > 0
-      ? `网络设置已保存，已重新绑定 ${reboundCount} 个运行中代理，原有连接可能已中断`
-      : "网络设置已保存"
+    `${reboundCount > 0 ? `网络设置已保存，已重新绑定 ${reboundCount} 个运行中代理，原有连接可能已中断。` : "网络设置已保存。"}${result.generated_token ? "新 Token 仅显示本次，请复制并妥善保存。" : ""}`,
+    "ok",
+    { duration: result.generated_token ? 9000 : undefined },
   );
   return result;
 }
@@ -1040,6 +1267,22 @@ function renderSync() {
   if (autoUploadOption) autoUploadOption.hidden = !browserSyncEnabled;
   const autoUpload = $("#syncAutoUpload");
   if (autoUpload) autoUpload.disabled = !browserSyncEnabled;
+  const encryptPassword = $("#syncEncryptPasswordField");
+  if (encryptPassword) encryptPassword.hidden = !$("#syncEncrypt")?.checked;
+  const configured = Boolean(String(settings.url || "").trim());
+  const enabled = Boolean(configured && settings.enabled);
+  for (const [id, available] of [["syncTestBtn", configured], ["syncCheckBtn", configured], ["syncPushBtn", enabled], ["syncPullBtn", enabled]]) {
+    const button = $(`#${id}`);
+    if (button) {
+      button.disabled = !available || Boolean(syncOperationPromise);
+      button.title = available ? "" : configured ? "请先启用同步" : "请先配置 WebDAV URL";
+    }
+  }
+  const card = $("#syncStatusCard");
+  if (card) {
+    const ready = enabled;
+    card.innerHTML = `<div class="sync-status-main"><span class="state-dot ${ready ? "is-ok" : "is-idle"}"></span><div><strong>${ready ? "同步已启用" : configured ? "已配置 · 尚未启用" : "WebDAV 未配置"}</strong><span>${escapeHtml(settings.last_status || (ready ? "等待同步" : "填写服务器信息以开始同步"))}</span></div></div><div class="sync-status-meta"><span>上次上传 <strong>${escapeHtml(formatRelativeTime(settings.last_push_at))}</strong></span><span>上次拉取 <strong>${escapeHtml(formatRelativeTime(settings.last_pull_at))}</strong></span><span>远端更新 <strong>${escapeHtml(formatRelativeTime(settings.last_remote_updated_at))}</strong></span></div>${settings.last_error ? `<p class="sync-status-error">${escapeHtml(settings.last_error)}</p>` : ""}`;
+  }
   renderSyncMeta(settings);
 }
 
@@ -1081,7 +1324,37 @@ async function runSyncAction(kind) {
   };
   const path = paths[kind];
   if (!path) return;
-  const result = await api(path, {});
+  let payload = {};
+  if (kind === "pull") {
+    const preview = await api("/api/sync/preview", {});
+    if (!preview?.ok) throw new Error(preview?.error || "无法预览远端数据，请检查同步设置");
+    if (preview.already_latest || preview.remote_newer === false) {
+      showToast("远端没有比本地更新的数据，无需拉取");
+      return preview;
+    }
+    const remote = preview.remote || {};
+    const summary = preview.summary || {};
+    const summaryLines = [];
+    const describe = (label, item) => {
+      if (!item || typeof item !== "object") return;
+      const added = Number(item.added ?? item.added_count ?? 0);
+      const removed = Number(item.removed ?? item.removed_count ?? 0);
+      const updated = Number(item.updated ?? item.updated_count ?? 0);
+      summaryLines.push(`${label}：新增 ${added} · 删除 ${removed} · 更新 ${updated}`);
+    };
+    describe("订阅", summary.subscriptions);
+    describe("节点", summary.nodes);
+    describe("Profile", summary.profiles || summary.browser_profiles);
+    if (!summaryLines.length) summaryLines.push(`远端数据：${Number(summary.remote_profile_count || 0)} 个 Profile`);
+    const remoteLabel = [remote.device_name || remote.device_id || "未知设备", formatRelativeTime(remote.updated_at || remote.timestamp)].filter(Boolean).join(" · ");
+    if (!await confirmAction("拉取会覆盖本机同步范围内的订阅、节点和浏览器 Profile。请确认已关闭冲突的浏览器。", {
+      title: "确认从远端拉取",
+      confirmLabel: "拉取并覆盖",
+      details: `远端：${remoteLabel}\n${summaryLines.join("\n")}\n\n将只应用本次预览的状态版本；若远端在此期间变化，需要重新预览。`,
+    })) return;
+    payload.expected_state_sha256 = preview.state_sha256;
+  }
+  const result = await api(path, payload);
   if (result.settings) appState.sync = result.settings;
   // 操作结果只刷新状态文案，不覆盖用户正在编辑的表单。
   if (kind === "pull") await loadStatus({ forceFresh: true });
@@ -1153,11 +1426,12 @@ async function withSyncOperation(task, trigger = null) {
 
 function formatLogTime(seconds) {
   if (!seconds) return "-";
-  return new Date(seconds * 1000).toLocaleTimeString("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+  const date = new Date(Number(seconds) * 1000);
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) {
+    return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  return `${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })}`;
 }
 
 function formatBytes(value) {
@@ -1253,6 +1527,18 @@ function renderWhenChanged(key, value, renderer, force = false) {
 
 function renderActiveView({ force = false } = {}) {
   switch (appState.activeView) {
+    case "overview":
+      renderWhenChanged("overview", {
+        nodes: appState.nodes,
+        subscriptions: appState.subscriptions,
+        bridges: appState.bridges,
+        tests: appState.tests,
+        systemLogs: appState.systemLogs,
+        logCenter: appState.logCenter,
+        cores: appState.cores,
+        sync: appState.sync,
+      }, renderOverview, force);
+      break;
     case "nodes":
       renderWhenChanged(
         "nodes",
@@ -1305,6 +1591,17 @@ function renderActiveView({ force = false } = {}) {
         force
       );
       break;
+    case "pool":
+      renderWhenChanged("pool", { pool: appState.pool, gateway: appState.smartGateway, docker: dockerRuntime() }, () => {
+        renderPool();
+      }, force);
+      break;
+    case "browsers":
+      renderWhenChanged("browsers", { instances: appState.browser_instances, nodes: appState.nodes, filter: browserPageFilter }, renderBrowserPage, force);
+      break;
+    case "cores":
+      renderKernelPage();
+      break;
     case "logs":
       renderWhenChanged(
         "logs",
@@ -1353,6 +1650,56 @@ function renderActiveView({ force = false } = {}) {
   }
 }
 
+function applyStatusSnapshot(status) {
+  appState.version = status.version || "";
+  appState.features = status.features || {
+    browser: true,
+    browser_profile_sync: true,
+    remote_browser: false,
+    docker: false,
+  };
+  appState.runtime = status.runtime || { mode: status.platform?.shell_mode || "headless", docker: false };
+  appState.remoteBrowser = status.remote_browser || {
+    configured: false,
+    available: false,
+    active_sessions: 0,
+    error: "",
+  };
+  appState.platform = status.platform || null;
+  appState.cores = status.cores || {};
+  appState.fingerprint_chromium = status.fingerprint_chromium || null;
+  appState.active_browsers = status.active_browsers || [];
+  appState.browser_instances = status.browser_instances || [];
+  const subscriptionUrls = new Map((status.subscriptions || []).map((item) => [item.id, item.url]));
+  for (const item of appState.subscriptions) {
+    if (subscriptionUrls.get(item.id) !== item.url) revealedSecrets.delete(`subscription:${item.id}`);
+  }
+  appState.subscriptions = status.subscriptions || [];
+  appState.nodes = status.nodes || [];
+  appState.regions = Array.isArray(status.regions) ? status.regions : appState.regions;
+  appState.bridges = status.bridges || [];
+  appState.tests = status.tests || {};
+  appState.speedTest = status.speed_test || { settings: null, tasks: [] };
+  appState.subscriptionSettings = status.subscription_settings || { allow_non_public_urls: false };
+  appState.subscriptionRefresh = status.subscription_refresh || { tasks: [] };
+  appState.smartGateway = status.smart_gateway || null;
+  appState.logCenter = status.logs || appState.logCenter;
+  if (appState.activeView !== "logs" || !appState.requestLogPage.loaded) appState.requestLogs = status.request_logs || [];
+  if (appState.activeView !== "system" || !appState.systemLogPage.loaded) appState.systemLogs = status.system_logs || [];
+  if (appState.pool?.base_url !== status.pool?.base_url) {
+    for (const key of revealedSecrets) if (key.startsWith("pool:")) revealedSecrets.delete(key);
+  }
+  appState.pool = status.pool || null;
+  if (status.network && typeof status.network === "object") {
+    appState.network = status.network;
+    appState.networkStatus = "ready";
+  } else appState.networkStatus = "error";
+  appState.sync = status.sync || appState.sync || null;
+  appState.healthSettings = status.health_settings || appState.healthSettings || { auto_switch: false };
+  if ("sync_openssl" in status) appState.syncOpenssl = Boolean(status.sync_openssl);
+  render();
+}
+
 async function loadStatus({ forceFresh = false } = {}) {
   if (statusRequestPromise) {
     const current = statusRequestPromise;
@@ -1371,50 +1718,7 @@ async function loadStatus({ forceFresh = false } = {}) {
   const request = (async () => {
     try {
       const status = await api("/api/status", null, { signal: controller.signal });
-      appState.version = status.version || "";
-      appState.features = status.features || {
-        browser: true,
-        browser_profile_sync: true,
-        remote_browser: false,
-        docker: false,
-      };
-      appState.runtime = status.runtime || { mode: status.platform?.shell_mode || "headless", docker: false };
-      appState.remoteBrowser = status.remote_browser || {
-        configured: false,
-        available: false,
-        active_sessions: 0,
-        error: "",
-      };
-      appState.platform = status.platform || null;
-      appState.cores = status.cores || {};
-      appState.fingerprint_chromium = status.fingerprint_chromium || null;
-      appState.active_browsers = status.active_browsers || [];
-      appState.browser_instances = status.browser_instances || [];
-      appState.subscriptions = status.subscriptions || [];
-      appState.nodes = status.nodes || [];
-      appState.bridges = status.bridges || [];
-      appState.tests = status.tests || {};
-      appState.speedTest = status.speed_test || { settings: null, tasks: [] };
-      appState.subscriptionSettings = status.subscription_settings || { allow_non_public_urls: false };
-      appState.subscriptionRefresh = status.subscription_refresh || { tasks: [] };
-      appState.smartGateway = status.smart_gateway || null;
-      appState.logCenter = status.logs || appState.logCenter;
-      if (appState.activeView !== "logs" || !appState.requestLogPage.loaded) {
-        appState.requestLogs = status.request_logs || [];
-      }
-      if (appState.activeView !== "system" || !appState.systemLogPage.loaded) {
-        appState.systemLogs = status.system_logs || [];
-      }
-      appState.pool = status.pool || null;
-      if (status.network && typeof status.network === "object") {
-        appState.network = status.network;
-        appState.networkStatus = "ready";
-      } else {
-        appState.networkStatus = "error";
-      }
-      appState.sync = status.sync || appState.sync || null;
-      if ("sync_openssl" in status) appState.syncOpenssl = Boolean(status.sync_openssl);
-      render();
+      applyStatusSnapshot(status);
       return true;
     } catch (error) {
       let statusError = error;
@@ -1444,8 +1748,7 @@ function render() {
       nodes: appState.nodes.length,
       subscriptions: appState.subscriptions.length,
       bridges: runningBridges().length,
-      logs: Number(appState.logCenter?.request_total ?? appState.requestLogs.length),
-      system: Number(appState.logCenter?.system_total ?? appState.systemLogs.length),
+      logs: Number(appState.logCenter?.system_error_total ?? appState.systemLogs.filter((entry) => /error|critical|错误|致命/i.test(String(entry.level || entry.severity || ""))).length),
     },
     renderNav
   );
@@ -1460,12 +1763,8 @@ function render() {
     },
     renderCores
   );
-  const brandSubtitle = $("#brandSubtitle");
-  if (brandSubtitle) {
-    const runtimeLabel = dockerRuntime() ? "Docker 控制台 · 订阅节点" : "订阅节点 · 本地代理";
-    const versionLabel = String(appState.version || "").trim();
-    brandSubtitle.textContent = versionLabel ? `v${versionLabel} · ${runtimeLabel}` : runtimeLabel;
-  }
+  const footerStatus = $("#footerStatus");
+  if (footerStatus) footerStatus.textContent = `${appState.cores["sing-box"] || appState.cores.xray ? "核心正常" : "核心待安装"} · 局域网${appState.network?.allow_lan ? "已开启" : "关闭"} · ${appState.sync?.last_push_at ? `同步 ${formatRelativeTime(appState.sync.last_push_at)}` : "同步未运行"}`;
   const remoteLaunchModal = $("#remoteBrowserLaunchModal");
   const remoteLaunchHasCredentials = !$("#remoteBrowserLaunchSuccess").hidden;
   if (
@@ -1504,6 +1803,7 @@ function render() {
     }
   }
   applyActionInFlightState();
+  i18n.apply(document);
 }
 
 function renderCores() {
@@ -1538,14 +1838,16 @@ function renderSubscriptions() {
     allowNonPublic.checked = Boolean(appState.subscriptionSettings?.allow_non_public_urls);
   }
   renderSubscriptionRefreshTask();
+  const securityBadge = $("#nonPublicSubscriptionBadge");
+  if (securityBadge) securityBadge.hidden = !appState.subscriptionSettings?.allow_non_public_urls;
   if (!appState.subscriptions.length) {
-    list.innerHTML = '<div class="subscription-empty">暂无订阅，粘贴订阅 URL 或原始链接后即可导入。</div>';
+    uiCore.patchKeyedHtml(list, '<div class="subscription-empty" data-ui-key="subscriptions:empty">暂无订阅，粘贴订阅 URL 或原始链接后即可导入。</div>', { keyAttribute: "data-ui-key" });
     return;
   }
-  list.innerHTML = appState.subscriptions
+  uiCore.patchKeyedHtml(list, appState.subscriptions
     .map(
       (item) => `
-        <article class="subscription-item">
+        <article class="subscription-item" data-ui-key="subscription:${escapeHtml(item.id)}" data-subscription-id="${escapeHtml(item.id)}">
           <div class="subscription-head">
             <span class="sub-avatar">${escapeHtml(initials(item.name))}</span>
             <div class="subscription-copy">
@@ -1553,8 +1855,9 @@ function renderSubscriptions() {
                 <strong class="subscription-name">${escapeHtml(item.name)}</strong>
                 <span class="sub-status ${item.last_error ? "is-error" : ""}">${item.last_error ? "需检查" : "正常"}</span>
               </div>
-              <div class="subscription-meta">${item.node_count || 0} 个节点 · 更新于 ${formatTime(item.last_update)}</div>
-              ${item.url ? `<div class="subscription-url" title="${escapeHtml(item.url)}">${escapeHtml(item.url)}</div>` : '<div class="subscription-url">手动导入</div>'}
+              <div class="subscription-meta">${item.node_count || 0} 个节点 · 更新于 ${escapeHtml(formatRelativeTime(item.last_update))}</div>
+              ${item.url ? `<div class="subscription-sensitive-url"><code class="subscription-url" title="${revealedSecrets.has(`subscription:${item.id}`) ? "完整地址已显示" : "地址已脱敏"}">${escapeHtml(revealedSecrets.has(`subscription:${item.id}`) ? item.url : uiCore.maskSensitiveUrl(item.url))}</code><button class="icon-button" type="button" data-action="reveal-subscription-url" data-id="${escapeHtml(item.id)}" aria-label="显示或隐藏订阅 URL">◎</button></div>` : '<div class="subscription-url">手动导入</div>'}
+              ${renderSubscriptionUsage(item)}
               ${item.last_error ? `<div class="subscription-error" title="${escapeHtml(item.last_error)}">${escapeHtml(item.last_error)}</div>` : ""}
             </div>
           </div>
@@ -1577,13 +1880,33 @@ function renderSubscriptions() {
                 ? `<button class="row-button" data-action="refresh-sub" data-id="${escapeHtml(item.id)}">${icon("refresh")}<span>刷新</span></button>`
                 : ""
             }
-            <button class="row-button danger" data-action="delete-sub" data-id="${escapeHtml(item.id)}">${icon("trash")}<span>删除</span></button>
+            <details class="row-more"><summary class="icon-button" aria-label="更多订阅操作">⋯</summary><div><button type="button" data-action="copy-subscription-url" data-id="${escapeHtml(item.id)}">复制 URL</button><button type="button" data-action="delete-sub" data-id="${escapeHtml(item.id)}">删除订阅</button></div></details>
           </div>
+          <details class="subscription-rules"><summary>节点过滤规则${item.filter_include || item.filter_exclude ? " · 已启用" : ""}</summary><div class="form-grid"><label><span>包含关键词（每行一个）</span><textarea data-sub-filter="include" data-id="${escapeHtml(item.id)}" rows="2">${escapeHtml(item.filter_include || "")}</textarea></label><label><span>排除关键词（每行一个）</span><textarea data-sub-filter="exclude" data-id="${escapeHtml(item.id)}" rows="2">${escapeHtml(item.filter_exclude || "")}</textarea></label><label class="sync-checkbox sync-span-2"><input type="checkbox" data-sub-filter="regex" data-id="${escapeHtml(item.id)}" ${item.filter_regex ? "checked" : ""}><span>将规则作为正则表达式处理</span></label></div><button class="toolbar-button" type="button" data-action="save-subscription-filters" data-id="${escapeHtml(item.id)}">保存过滤规则</button></details>
           ${renderSubscriptionHistory(item)}
         </article>
       `
     )
-    .join("");
+    .join(""), { keyAttribute: "data-ui-key" });
+}
+
+function renderSubscriptionUsage(item) {
+  const usage = item.usage;
+  if (!usage) return "";
+  const hasUsedBytes = usage.upload != null && usage.download != null;
+  const hasTotal = usage.total != null;
+  const used = hasUsedBytes ? Number(usage.upload) + Number(usage.download) : null;
+  const total = hasTotal ? Math.max(0, Number(usage.total)) : null;
+  const percent = total > 0 && used != null ? Math.max(0, Math.min(100, used / total * 100)) : null;
+  const days = usage.expire != null && Number(usage.expire) > 0 ? Math.ceil((Number(usage.expire) - Date.now() / 1000) / 86400) : null;
+  if (used == null && total == null && days == null) return "";
+  const usedLabel = used == null ? "已用量未知" : `${escapeHtml(formatBytes(used))} 已用`;
+  const totalLabel = total == null ? "总量未知" : escapeHtml(formatBytes(total));
+  const usageMarkup = used != null || total != null
+    ? `<div><span>流量</span><strong>${usedLabel} / ${totalLabel}</strong>${percent != null ? `<span>${percent.toFixed(0)}%</span>` : ""}</div>${percent != null ? `<div class="usage-track"><span style="width:${percent}%"></span></div>` : ""}`
+    : `<div><span>流量</span><strong>流量信息不完整</strong></div>`;
+  const expiryMarkup = days != null ? `<small class="${days <= 7 ? "text-warning" : ""}">${days < 0 ? "已到期" : `剩余 ${days} 天`}</small>` : "";
+  return `<div class="subscription-usage">${usageMarkup}${expiryMarkup}</div>`;
 }
 
 function renderSubscriptionHistory(item) {
@@ -1673,13 +1996,38 @@ function renderSubscriptionRefreshTask() {
   button.querySelector("span").textContent = activeTask ? `刷新中 ${completed}/${total}` : "再次刷新全部";
 }
 
+function updateOptionsMarkup(select, signature, markup, validValues, desiredValue) {
+  if (!select) return "all";
+  const current = select.value;
+  if (select.dataset.optionsSignature !== signature) {
+    if (document.activeElement === select) {
+      if (select.dataset.refreshOptionsOnBlur !== "true") {
+        select.dataset.refreshOptionsOnBlur = "true";
+        select.addEventListener("blur", () => requestAnimationFrame(() => {
+          delete select.dataset.refreshOptionsOnBlur;
+          if (appState.activeView === "nodes") {
+            renderFilters();
+            renderNodes();
+          } else if (appState.activeView === "browsers") renderBrowserPage();
+          else if (appState.activeView === "logs" || appState.activeView === "system") renderActiveView({ force: true });
+        }), { once: true });
+      }
+      return validValues.includes(current) ? current : "all";
+    }
+    select.innerHTML = markup;
+    select.dataset.optionsSignature = signature;
+  }
+  if (document.activeElement !== select) select.value = validValues.includes(desiredValue) ? desiredValue : "all";
+  return validValues.includes(select.value) ? select.value : "all";
+}
+
 function setSelectOptions(select, values, current, allLabel) {
   const normalized = ["all", ...values.filter(Boolean).sort((a, b) => a.localeCompare(b, "zh-CN"))];
-  select.innerHTML = normalized
+  const signature = JSON.stringify(normalized);
+  const markup = normalized
     .map((value) => `<option value="${escapeHtml(value)}">${value === "all" ? allLabel : escapeHtml(value)}</option>`)
     .join("");
-  select.value = normalized.includes(current) ? current : "all";
-  return select.value;
+  return updateOptionsMarkup(select, signature, markup, normalized, current);
 }
 
 function renderFilters() {
@@ -1688,7 +2036,7 @@ function renderFilters() {
   appState.filters.protocol = setSelectOptions($("#protocolFilter"), protocols, appState.filters.protocol, "全部协议");
   appState.filters.region = setSelectOptions($("#regionFilter"), regions, appState.filters.region, "全部地区");
   const sortSelect = $("#nodeSort");
-  if (sortSelect) sortSelect.value = appState.filters.sort || "name";
+  if (sortSelect && document.activeElement !== sortSelect) sortSelect.value = appState.filters.sort || "name";
 
   const subSelect = $("#subscriptionFilter");
   if (subSelect) {
@@ -1700,19 +2048,40 @@ function renderFilters() {
       ),
       '<option value="__other__">其他 / 未归组</option>',
     ];
-    subSelect.innerHTML = options.join("");
     const allowed = new Set(["all", "__other__", ...(appState.subscriptions || []).map((s) => s.id)]);
     if (!allowed.has(appState.filters.subscription)) {
       appState.filters.subscription = "all";
     }
-    subSelect.value = appState.filters.subscription;
+    const signature = JSON.stringify((appState.subscriptions || []).map((sub) => [sub.id, sub.name, sub.node_count, sub.node_ids?.length]));
+    appState.filters.subscription = updateOptionsMarkup(
+      subSelect,
+      signature,
+      options.join(""),
+      [...allowed],
+      appState.filters.subscription,
+    );
   }
 
-  $("#searchInput").value = appState.filters.search;
+  const search = $("#searchInput");
+  if (document.activeElement !== search) search.value = appState.filters.search;
 }
 
 function bridgeForNode(nodeId) {
   return appState.bridges.find((bridge) => bridge.node_id === nodeId && ["running", "starting"].includes(bridge.status));
+}
+
+function mostRecentBridgeForNode(nodeId) {
+  let latest = null;
+  let latestAt = -Infinity;
+  for (const bridge of appState.bridges || []) {
+    if (bridge.node_id !== nodeId) continue;
+    const timestamp = Number(bridge.started_at || bridge.created_at || 0);
+    if (timestamp >= latestAt) {
+      latest = bridge;
+      latestAt = timestamp;
+    }
+  }
+  return latest;
 }
 
 function renderLogFilters() {
@@ -1727,53 +2096,54 @@ function renderLogFilters() {
     nodeOptions.set(id, entry.node_name || id);
   }
   const options = [...nodeOptions.entries()].sort((a, b) => a[1].localeCompare(b[1], "zh-CN"));
-  select.innerHTML = [
+  const logFilterOptions = [
     '<option value="all">全部节点</option>',
     ...options.map(([id, name]) => `<option value="${escapeHtml(id)}">${escapeHtml(name)}</option>`),
   ].join("");
-  if (![...nodeOptions.keys(), "all"].includes(appState.logFilters.node)) {
-    appState.logFilters.node = "all";
-  }
-  select.value = appState.logFilters.node;
-  $("#logStatusFilter").value = ["all", "connecting", "connected", "closed", "failed"].includes(appState.logFilters.status)
-    ? appState.logFilters.status
-    : "all";
-  $("#logSearchInput").value = appState.logFilters.search;
+  const logFilterValues = ["all", ...nodeOptions.keys()];
+  if (!logFilterValues.includes(appState.logFilters.node)) appState.logFilters.node = "all";
+  appState.logFilters.node = updateOptionsMarkup(select, JSON.stringify([...nodeOptions]), logFilterOptions, logFilterValues, appState.logFilters.node);
+  const statusFilter = $("#logStatusFilter");
+  if (document.activeElement !== statusFilter) statusFilter.value = ["all", "connecting", "connected", "closed", "failed"].includes(appState.logFilters.status) ? appState.logFilters.status : "all";
+  const search = $("#logSearchInput");
+  if (document.activeElement !== search) search.value = appState.logFilters.search;
 }
 
 function filteredRequestLogs() {
   return appState.requestLogs || [];
 }
 
-function testSummary(nodeId) {
+function latencyCell(nodeId) {
   const result = appState.tests[nodeId];
-  if (!result) {
-    return `
-      <div class="test-result">
-        <span class="test-line">未测试</span>
-        <button class="row-button" data-action="test" data-node="${escapeHtml(nodeId)}"><span>测试</span></button>
-      </div>
-    `;
-  }
-  const ok = Boolean(result.ok);
-  const latency = result.latency_ms == null ? "-" : `${result.latency_ms} ms`;
+  if (!result) return `<button class="latency-badge is-idle" data-action="test" data-node="${escapeHtml(nodeId)}" title="点击测速">未测试</button>`;
+  if (!result.ok) return `<button class="latency-badge is-error" data-action="test" data-node="${escapeHtml(nodeId)}" title="${escapeHtml(result.message || "测速失败")}">失败 · 重测</button>`;
+  if (!Number.isFinite(result.latency_ms) || result.latency_ms < 0) return `<button class="latency-badge is-idle" data-action="test" data-node="${escapeHtml(nodeId)}" title="点击重测" data-i18n>无延迟数据</button>`;
+  const ms = Number(result.latency_ms);
+  const speed = ms < LATENCY_WARNING_MS ? "is-ok" : ms < LATENCY_SLOW_MS ? "is-warn" : "is-slow";
+  const rate = Math.round(Number(result.success_rate || 0) * 100);
   const age = result.age_seconds == null ? "未知" : `${formatDuration(result.age_seconds)}前`;
-  const successRate = `${Math.round(Number(result.success_rate || 0) * 100)}%`;
-  return `
-    <div class="test-result ${result.stale ? "is-stale" : ""}">
-      <span class="test-line ${ok ? "ok" : "bad"}">${ok ? latency : "失败"}</span>
-      <span class="test-message">${escapeHtml(result.message || "")}</span>
-      <span class="test-result-meta">${result.stale ? "已过期 · " : ""}${escapeHtml(age)} · 成功率 ${successRate} (${Number(result.success_count || 0)}/${Number(result.attempt_count || 0)})</span>
-      <button class="row-button" data-action="test" data-node="${escapeHtml(nodeId)}"><span>重测</span></button>
-    </div>
-  `;
+  return `<button class="latency-badge ${speed} ${result.stale ? "is-stale" : ""}" data-action="test" data-node="${escapeHtml(nodeId)}" title="成功率 ${rate}% · ${escapeHtml(age)}${result.message ? ` · ${escapeHtml(result.message)}` : ""}">${ms} ms${result.stale ? " · 过期" : ""}</button>`;
 }
 
 function filteredNodes() {
   const search = appState.filters.search.trim().toLowerCase();
   const subFilter = appState.filters.subscription || "all";
   const byNode = subscriptionIndexByNodeId();
+  const latestBridges = new Map();
+  for (const bridge of appState.bridges || []) {
+    const previous = latestBridges.get(bridge.node_id);
+    const timestamp = Number(bridge.started_at || bridge.created_at || 0);
+    if (!previous || timestamp >= Number(previous.started_at || previous.created_at || 0)) latestBridges.set(bridge.node_id, bridge);
+  }
   const nodes = appState.nodes.filter((node) => {
+    const bridge = bridgeForNode(node.id);
+    const result = appState.tests[node.id];
+    const latestBridge = latestBridges.get(node.id);
+    const healthError = bridge?.health?.status === "error" || (!bridge && latestBridge?.health?.status === "error");
+    if (appState.filters.status === "running" && !bridge) return false;
+    if (appState.filters.status === "available" && (!result || !result.ok || result.stale || healthError)) return false;
+    if (appState.filters.status === "failed" && (!healthError && (!result || result.ok))) return false;
+    if (appState.filters.status === "untested" && result) return false;
     if (appState.filters.protocol !== "all" && node.protocol !== appState.filters.protocol) return false;
     if (appState.filters.region !== "all" && node.region !== appState.filters.region) return false;
     if (subFilter !== "all") {
@@ -1792,6 +2162,7 @@ function filteredNodes() {
   });
   const testFor = (node) => appState.tests[node.id] || {};
   return nodes.sort((left, right) => {
+    if (Boolean(left.favorite) !== Boolean(right.favorite)) return left.favorite ? -1 : 1;
     if (appState.filters.sort === "latency") {
       return Number(testFor(left).latency_ms ?? Number.MAX_SAFE_INTEGER) - Number(testFor(right).latency_ms ?? Number.MAX_SAFE_INTEGER);
     }
@@ -1869,166 +2240,13 @@ function groupNodesBySubscription(nodes) {
   return ordered;
 }
 
-function renderNodeRow(node) {
-  const bridge = bridgeForNode(node.id);
-  const browserInstances = browserEnabled() ? browserInstancesForNode(node.id) : [];
-  const runningBrowserCount = browserEnabled() ? runningBrowserInstancesForNode(node.id).length : 0;
-  const browserActive = browserEnabled()
-    && (runningBrowserCount > 0 || appState.active_browsers.includes(node.id));
-  const transport = node.transport || "-";
-  const security = node.security || "";
-  const server = `${node.server}:${node.port}`;
-  const recordLabel = browserInstances.length ? `浏览器记录 ${browserInstances.length}` : "浏览器记录";
-  const coreOptions = Array.isArray(node.core_options) && node.core_options.length
-    ? node.core_options
-    : [node.preferred_core || "sing-box"];
-  const coreControl = coreOptions.length > 1
-    ? `<div class="node-core-control">
-        <select data-core-select="${escapeHtml(node.id)}" aria-label="${escapeHtml(node.name)} 首选核心" ${bridge ? "disabled" : ""}>
-          ${coreOptions.map((core) => `<option value="${escapeHtml(core)}" ${core === node.preferred_core ? "selected" : ""}>${escapeHtml(core)}</option>`).join("")}
-        </select>
-        <label title="首选核心启动失败时尝试备用核心">
-          <input type="checkbox" data-core-fallback="${escapeHtml(node.id)}" ${node.fallback_enabled ? "checked" : ""} ${bridge ? "disabled" : ""}>
-          <span>失败回退</span>
-        </label>
-      </div>`
-    : `<span class="tag core-tag" title="当前节点仅兼容此核心">${escapeHtml(coreOptions[0])}</span>`;
-  const browserActionLabel = remoteBrowserEnabled() ? "远程浏览器" : "浏览器";
-  const browserActionTitle = remoteBrowserEnabled()
-    ? "新开远程浏览器：独立 Docker Worker + 独立 Profile + 绑定该节点代理"
-    : "新开不同指纹浏览器：独立 Profile + 绑定该节点代理";
-  const browserStopTitle = remoteBrowserEnabled()
-    ? "停止该节点的远程浏览器 Worker，保留本地代理"
-    : "结束该节点的指纹浏览器进程，保留本地代理";
-  const browserActions = browserEnabled()
-    ? `
-          <button class="row-button" data-action="launch-browser" data-node="${escapeHtml(node.id)}" aria-label="新开${escapeHtml(browserActionLabel)} ${escapeHtml(node.name)}" title="${escapeHtml(browserActionTitle)}">${icon("browser")}<span>${escapeHtml(browserActionLabel)}</span></button>
-          <button class="row-button" data-action="browser-records" data-node="${escapeHtml(node.id)}" aria-label="查看 ${escapeHtml(node.name)} 的浏览器记录" title="浏览器记录">${icon("list")}<span>${escapeHtml(recordLabel)}</span></button>
-          ${
-            browserActive
-              ? `<button class="row-button danger" data-action="stop-browser" data-node="${escapeHtml(node.id)}" aria-label="停止 ${escapeHtml(node.name)} 的浏览器" title="${escapeHtml(browserStopTitle)}">${icon("stop")}<span>停止浏览器${runningBrowserCount > 1 ? ` ${runningBrowserCount}` : ""}</span></button>`
-              : ""
-          }
-        `
-    : "";
-  // 检查该节点是否被选中
-  const isSelected = appState.selectedNodeIds.has(node.id);
-  return `
-    <tr class="node-row ${bridge ? "is-running" : ""} ${isSelected ? "is-selected" : ""}" data-node-id="${escapeHtml(node.id)}">
-      <td class="checkbox-col">
-        <label class="checkbox-wrapper" title="${isSelected ? "取消选择" : "选择"} ${escapeHtml(node.name)}">
-          <input type="checkbox" class="node-checkbox" data-node-id="${escapeHtml(node.id)}" ${isSelected ? "checked" : ""} aria-label="选择 ${escapeHtml(node.name)}">
-          <span class="checkbox-custom" aria-hidden="true"></span>
-        </label>
-      </td>
-      <td>
-        <div class="name-cell">
-          <span class="node-name">${escapeHtml(node.name)}</span>
-        </div>
-      </td>
-      <td><span class="region-cell">${escapeHtml(node.region || "未分类")}</span></td>
-      <td><span class="tag protocol-tag">${escapeHtml(node.protocol)}</span></td>
-      <td><span class="transport-tag"><strong>${escapeHtml(transport)}</strong><em>${escapeHtml(security)}</em></span></td>
-      <td><span class="mono server-cell" title="${escapeHtml(server)}">${escapeHtml(server)}</span></td>
-      <td>${coreControl}</td>
-      <td>${testSummary(node.id)}</td>
-      <td>
-        <div class="row-actions">
-          ${
-            bridge
-              ? `<button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.socks_url)}">${icon("copy")}<span>SOCKS</span></button>
-                <button class="row-button" data-action="copy" data-text="${escapeHtml(bridge.http_url || bridge.socks_url)}">${icon("copy")}<span>HTTP</span></button>`
-              : `<button class="row-button primary-row" data-action="start" data-node="${escapeHtml(node.id)}">${icon("play")}<span>启动并复制</span></button>`
-          }
-          ${browserActions}
-        </div>
-      </td>
-    </tr>
-  `;
-}
-
-function renderNodeGroupHeader(group, { forceExpand = false } = {}) {
-  const collapsed = !forceExpand && isNodeGroupCollapsed(group.id);
-  const runningCount = group.nodes.filter((node) => bridgeForNode(node.id)).length;
-  const kindLabel = group.kind === "subscription" ? "订阅" : "来源";
-  const metaBits = [];
-  if (group.subscription?.url) metaBits.push("URL 订阅");
-  else if (group.kind === "source") metaBits.push("手动/未挂接");
-  const meta = metaBits.join(" · ");
-  return `
-    <tr class="node-group-header ${collapsed ? "is-collapsed" : ""}" data-group-id="${escapeHtml(group.id)}">
-      <td colspan="9">
-        <button
-          type="button"
-          class="node-group-toggle"
-          data-action="toggle-node-group"
-          data-group="${escapeHtml(group.id)}"
-          aria-expanded="${collapsed ? "false" : "true"}"
-          title="${collapsed ? "展开分组" : "折叠分组"}"
-        >
-          <span class="node-group-chevron" aria-hidden="true">${icon("chevron")}</span>
-          <span class="node-group-avatar" aria-hidden="true">${escapeHtml(initials(group.name))}</span>
-          <span class="node-group-text">
-            <span class="node-group-title-row">
-              <strong class="node-group-name">${escapeHtml(group.name)}</strong>
-              <span class="tag node-group-kind">${escapeHtml(kindLabel)}</span>
-            </span>
-            <span class="node-group-meta">
-              ${group.nodes.length} 个节点${runningCount ? ` · ${runningCount} 运行中` : ""}${meta ? ` · ${escapeHtml(meta)}` : ""}
-            </span>
-          </span>
-      </td>
-    </tr>
-  `;
-}
-
-function renderNodes() {
-  const rows = $("#nodeRows");
-  const empty = $("#emptyNodes");
-  const nodes = filteredNodes();
-  const groups = groupNodesBySubscription(nodes);
-  renderSpeedTestTaskControls();
-  const groupCount = groups.length;
-  $("#nodeCount").textContent =
-    groupCount > 1
-      ? `${nodes.length} / ${appState.nodes.length} 个节点 · ${groupCount} 组`
-      : `${nodes.length} / ${appState.nodes.length} 个节点`;
-  empty.classList.toggle("visible", appState.nodes.length === 0);
-  if (!nodes.length) {
-    rows.innerHTML = "";
-    if (appState.nodes.length) {
-      empty.textContent = "没有匹配的节点";
-      empty.classList.add("visible");
-    } else {
-      empty.textContent = "暂无节点";
-    }
-    updateBatchActionsBar();
-    return;
-  }
-  empty.classList.remove("visible");
-
-  // 搜索时强制展开全部分组，避免命中节点被藏在折叠里。
-  const forceExpand = Boolean(appState.filters.search.trim());
-  // 仅一组时仍显示分组头，便于识别订阅来源；折叠逻辑照常。
-  rows.innerHTML = groups
-    .map((group) => {
-      const collapsed = !forceExpand && isNodeGroupCollapsed(group.id);
-      const header = renderNodeGroupHeader(group, { forceExpand });
-      if (collapsed) return header;
-      return header + group.nodes.map((node) => renderNodeRow(node)).join("");
-    })
-    .join("");
-
-  // 更新批量操作条的可见性
-  updateBatchActionsBar();
-  // 绑定复选框事件
-  bindNodeCheckboxes();
-}
 
 // 绑定节点行的复选框事件
 function bindNodeCheckboxes() {
   // 处理单个节点复选框
   document.querySelectorAll(".node-checkbox").forEach((checkbox) => {
+    if (checkbox.dataset.changeBound) return;
+    checkbox.dataset.changeBound = "true";
     checkbox.addEventListener("change", (e) => {
       const nodeId = e.target.dataset.nodeId;
       if (e.target.checked) {
@@ -2038,7 +2256,7 @@ function bindNodeCheckboxes() {
       }
       updateBatchActionsBar();
       // 更新行样式
-      const row = document.querySelector(`[data-node-id="${nodeId}"]`);
+      const row = e.target.closest("tr.node-row");
       if (row) {
         row.classList.toggle("is-selected", e.target.checked);
       }
@@ -2066,7 +2284,7 @@ function bindNodeCheckboxes() {
         const nodeId = checkbox.dataset.nodeId;
         const isSelected = appState.selectedNodeIds.has(nodeId);
         checkbox.checked = isSelected;
-        const row = document.querySelector(`[data-node-id="${nodeId}"]`);
+        const row = checkbox.closest("tr.node-row");
         if (row) {
           row.classList.toggle("is-selected", isSelected);
         }
@@ -2138,17 +2356,17 @@ async function batchStartNodes() {
   }
 
   const selectedNodeIds = Array.from(appState.selectedNodeIds);
-  const successCount = { count: 0 };
-  const failureCount = { count: 0 };
+  let successCount = 0;
+  const failures = [];
 
-  // 依次启动每个选中的节点
+  // 依次启动选中节点，保留各节点的失败原因供用户处理。
   for (const nodeId of selectedNodeIds) {
     try {
-      await api("/api/node/start", { node_id: nodeId });
-      successCount.count++;
+      await api("/api/bridges/start", { node_id: nodeId, core: "auto" });
+      successCount++;
     } catch (error) {
       console.error(`启动节点 ${nodeId} 失败:`, error);
-      failureCount.count++;
+      failures.push({ nodeId, name: nodeById(nodeId)?.name || nodeId, error: error.message || String(error) });
     }
     // 添加小延迟避免过快请求
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -2160,16 +2378,26 @@ async function batchStartNodes() {
   });
 
   // 显示结果提示
-  if (failureCount.count === 0) {
-    showToast(`成功启动 ${successCount.count} 个节点`);
-  } else if (successCount.count === 0) {
-    showToast(`启动 ${selectedNodeIds.length} 个节点失败`, "error");
-  } else {
-    showToast(`成功启动 ${successCount.count} 个，失败 ${failureCount.count} 个`);
-  }
+  if (failures.length) {
+    showToast(`批量启动完成：成功 ${successCount} 个，失败 ${failures.length} 个`, "error");
+    showBatchStartResults(successCount, failures);
+  } else showToast(`成功启动 ${successCount} 个节点`);
 
   // 清除选择
   clearNodeSelections();
+}
+
+function showBatchStartResults(successCount, failures) {
+  const dialog = $("#batchStartResultDialog");
+  if (!dialog) return;
+  $("#batchStartResultSummary").textContent = `成功启动 ${successCount} 个节点，${failures.length} 个失败。`;
+  $("#batchStartFailureList").innerHTML = failures.map((item) => `<li><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.error)}</span></li>`).join("");
+  dialog.hidden = false;
+  dialog.querySelector('[role="dialog"]')?.focus();
+}
+
+function closeBatchStartResults() {
+  $("#batchStartResultDialog").hidden = true;
 }
 
 function activeSpeedTestTask() {
@@ -2194,47 +2422,59 @@ function renderSpeedTestTaskControls() {
 function renderPool() {
   const pool = appState.pool || {};
   const links = pool.links || {};
+  const members = Array.isArray(pool.members) ? pool.members : [];
+  const memberCount = Number(pool.member_count ?? members.length ?? 0);
   const countEl = $("#poolMemberCount");
-  if (countEl) {
-    const n = Number(pool.member_count || 0);
-    countEl.textContent = `${n} 个成员`;
+  if (countEl) countEl.textContent = `${memberCount} 个成员`;
+  if (poolLinksExpanded == null) poolLinksExpanded = memberCount > 0;
+  const poolShowLinks = $("#poolShowLinks");
+  const poolAccessLinks = $("#poolAccessLinks");
+  const poolEmptyGuide = $("#poolEmptyGuide");
+  const poolAccessUrl = $("#poolAccessUrl");
+  const linkByFormat = {
+    list_json: links.list_json || "",
+    proxies_txt: links.proxies_txt || "",
+    get_health: links.get_health || links.get_random || "",
+  };
+  const visibleUrl = revealedSecrets.has(`pool:${currentPoolLinkFormat}`);
+  const selectedUrl = linkByFormat[currentPoolLinkFormat] || "";
+  if (poolShowLinks) {
+    poolShowLinks.hidden = !Object.values(linkByFormat).some(Boolean);
+    poolShowLinks.textContent = poolLinksExpanded ? "隐藏访问链接" : "显示访问链接";
+    poolShowLinks.setAttribute("aria-expanded", poolLinksExpanded ? "true" : "false");
+    poolShowLinks.title = memberCount ? "显示或隐藏访问链接" : "启动节点后成员会自动加入，也可查看空池链接";
   }
-  const listBtn = $("#poolCopyListJson");
-  const txtBtn = $("#poolCopyProxiesTxt");
-  const getBtn = $("#poolCopyGet");
-  if (listBtn) listBtn.dataset.text = links.list_json || "";
-  if (txtBtn) txtBtn.dataset.text = links.proxies_txt || "";
-  if (getBtn) getBtn.dataset.text = links.get_health || links.get_random || "";
-
-  const rows = $("#poolLinkRows");
-  if (!rows) return;
-  const items = [
-    ["JSON 列表", links.list_json],
-    ["文本列表", links.proxies_txt],
-    ["健康优先", links.get_health || links.get_random],
-  ].filter(([, url]) => url);
-  if (!items.length) {
-    rows.innerHTML = `<div class="pool-link-empty">启动本地代理后，这里会显示可复制的代理池链接。</div>`;
-  } else rows.innerHTML = items
-    .map(
-      ([label, url]) => `
-      <div class="pool-link-row">
-        <span class="pool-link-label">${escapeHtml(label)}</span>
-        <code class="pool-link-url" title="${escapeHtml(url)}">${escapeHtml(url)}</code>
-      </div>`
-    )
-    .join("");
+  if (poolAccessLinks) poolAccessLinks.hidden = !poolLinksExpanded;
+  if (poolEmptyGuide) poolEmptyGuide.textContent = memberCount
+    ? "运行中的代理会自动加入，可按需临时排除成员。"
+    : "启动节点后会自动加入代理池。";
+  if (poolAccessUrl && document.activeElement !== poolAccessUrl) {
+    poolAccessUrl.value = selectedUrl ? (visibleUrl ? selectedUrl : uiCore.maskSensitiveUrl(selectedUrl)) : "";
+    poolAccessUrl.title = visibleUrl ? "敏感访问链接已显示" : "访问链接中的密钥已隐藏";
+  }
+  document.querySelectorAll("[data-pool-format]").forEach((button) => {
+    const active = button.dataset.poolFormat === currentPoolLinkFormat;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  const revealButton = $("#poolRevealLink");
+  if (revealButton) {
+    revealButton.textContent = visibleUrl ? "◉" : "◎";
+    revealButton.setAttribute("aria-label", visibleUrl ? "隐藏访问链接" : "显示访问链接");
+    revealButton.title = visibleUrl ? "隐藏敏感链接" : "显示完整链接";
+  }
 
   const memberList = $("#poolMemberList");
   if (!memberList) return;
-  const members = Array.isArray(pool.members) ? pool.members : [];
   if (!members.length) {
-    memberList.innerHTML = `<div class="pool-link-empty">暂无代理池成员</div>`;
+    memberList.innerHTML = "";
   } else {
     memberList.innerHTML = members.map((member) => {
-      const state = member.circuit_state || "closed";
-      const label = state === "excluded" ? "已排除" : state === "open" ? "熔断" : state === "half_open" ? "恢复探测" : "健康";
+    const state = member.circuit_state || "closed";
+      const excludedRemaining = Math.max(0, Number(member.excluded_until || 0) - Date.now() / 1000);
+      const label = state === "excluded" ? `已排除 · ${Math.ceil(excludedRemaining / 60)} 分钟` : state === "open" ? `熔断 · ${Math.ceil(excludedRemaining)} 秒` : state === "half_open" ? "恢复探测" : "健康";
       const latency = member.latency_ms == null ? "未测速" : `${Number(member.latency_ms)} ms`;
+      const successRate = member.success_rate == null ? "成功率未知" : `成功率 ${Math.round(Number(member.success_rate) * 100)}%`;
       const action = state === "excluded"
         ? `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="0">恢复</button>`
         : `<button class="row-button" type="button" data-action="exclude-pool-member" data-id="${escapeHtml(member.id || "")}" data-duration="1800">排除 30 分钟</button>`;
@@ -2242,7 +2482,8 @@ function renderPool() {
         <div class="pool-member-row is-${escapeHtml(state)}">
           <div>
             <strong>${escapeHtml(member.node_name || "未命名节点")}</strong>
-            <span>${escapeHtml(label)} · 健康 ${Number(member.health_score || 0)} · ${escapeHtml(latency)}</span>
+            <span>${escapeHtml(label)} · 健康 ${Number(member.health_score || 0)} · ${escapeHtml(latency)} · ${escapeHtml(successRate)}</span>
+            ${member.last_error ? `<small class="text-error">${escapeHtml(member.last_error)}</small>` : ""}
           </div>
           ${action}
         </div>`;
@@ -2262,7 +2503,7 @@ function renderSmartGateway() {
   const save = $("#smartGatewaySave");
   const stop = $("#smartGatewayStop");
   if (!status || !strategy || !port || !region || !query || !save || !stop) return;
-  strategy.value = gateway.strategy || "health";
+  if (document.activeElement !== strategy) strategy.value = gateway.strategy || "health";
   if (document.activeElement !== port) port.value = Number(gateway.port || 21000);
   if (document.activeElement !== region) region.value = gateway.region || "";
   if (document.activeElement !== query) query.value = gateway.query || "";
@@ -2279,13 +2520,16 @@ function renderSmartGateway() {
     if (links) links.innerHTML = '<div class="pool-link-empty">Docker 未发布智能网关固定端口，请在宿主机模式使用。</div>';
     return;
   }
-  status.textContent = gateway.running ? `运行中 · ${Number(gateway.available_members || 0)} 个节点` : (gateway.last_error || "未运行");
+  status.textContent = gateway.running ? `运行中 · ${Number(gateway.available_members || 0)} 个节点 · ${Number(gateway.client_count || 0)} 个连接` : (gateway.last_error || "未运行");
   save.textContent = gateway.running ? "保存设置" : "保存并启动";
   save.disabled = false;
   stop.disabled = !gateway.running;
+  stop.hidden = !gateway.running;
   if (links) {
+    const allocations = Array.isArray(gateway.allocations) ? gateway.allocations : [];
+    const switches = Array.isArray(gateway.recent_switches) ? gateway.recent_switches.slice(0, 5) : [];
     links.innerHTML = gateway.running
-      ? `<div class="pool-link-row"><span class="pool-link-label">SOCKS5</span><code class="pool-link-url">${escapeHtml(gateway.socks_url || "")}</code></div><div class="pool-link-row"><span class="pool-link-label">HTTP</span><code class="pool-link-url">${escapeHtml(gateway.http_url || "")}</code></div>`
+      ? `<div class="pool-link-row"><span class="pool-link-label">SOCKS5</span><code class="pool-link-url">${escapeHtml(gateway.socks_url || "")}</code></div><div class="pool-link-row"><span class="pool-link-label">HTTP</span><code class="pool-link-url">${escapeHtml(gateway.http_url || "")}</code></div><div class="gateway-observability"><strong>节点分配</strong>${allocations.length ? allocations.map((item) => `<span>${escapeHtml(item.node_name || item.name || "节点")} · ${Number(item.connections || item.count || 0)} 次 · ${Math.round(Number(item.share || item.ratio || 0) * 100)}%</span>`).join("") : "<span>暂无连接分配记录</span>"}<strong>最近切换</strong>${switches.length ? switches.map((item) => `<span>${escapeHtml(item.from_node || appState.bridges.find((bridge) => bridge.id === item.from)?.node_name || "起始")} → ${escapeHtml(item.to_node || item.node_name || appState.bridges.find((bridge) => bridge.id === item.to)?.node_name || "节点")} · ${escapeHtml(formatLogTime(item.at || item.timestamp))}</span>`).join("") : "<span>暂无切换事件</span>"}</div>`
       : `<div class="pool-link-empty">保存设置后启动固定入口。</div>`;
   }
 }
@@ -2298,31 +2542,33 @@ function renderBridges() {
   $("#stopAll").disabled = bridges.length === 0 && !appState.smartGateway?.running;
 
   if (!bridges.length) {
-    list.innerHTML = `
-      <div class="bridge-empty">
+    uiCore.patchKeyedHtml(list, `
+      <div class="bridge-empty" data-ui-key="bridge:empty">
         <div class="status-orb idle">${icon("minus")}</div>
         <strong>暂无运行中的本地代理</strong>
         <span>在「节点」里启动一个节点后，它会在这里显示为一张独立的端口卡片。同一端口同时支持 SOCKS5、HTTP 代理和 HTTPS CONNECT。</span>
       </div>
-    `;
+    `, { keyAttribute: "data-ui-key" });
     return;
   }
 
-  list.innerHTML = bridges.map((bridge) => {
+  uiCore.patchKeyedHtml(list, bridges.map((bridge) => {
     const endpoint = endpointParts(bridge.socks_url, bridge.port);
     const listenAddress = bridge.listen_host || endpoint.address;
+    const healthError = bridge.health?.status === "error";
     const httpUrl = bridge.http_url || `http://127.0.0.1:${bridge.port}`;
     const uploadBytes = Number(bridge.upload_bytes || 0);
     const downloadBytes = Number(bridge.download_bytes || 0);
     const totalBytes = Number(bridge.total_bytes || uploadBytes + downloadBytes);
     return `
-      <article class="bridge-card" data-bridge-id="${escapeHtml(bridge.id)}">
+      <article class="bridge-card ${healthError ? "is-unhealthy" : ""}" data-ui-key="bridge:${escapeHtml(bridge.id)}" data-bridge-id="${escapeHtml(bridge.id)}">
         <header class="bridge-card-head">
           <div class="status-orb ${bridge.status === "running" ? "" : "idle"}">${icon(bridge.status === "running" ? "check" : "minus")}</div>
           <div class="bridge-card-title">
             <div class="bridge-card-name">
               <strong>${escapeHtml(bridge.node_name)}</strong>
-              <span class="status ${escapeHtml(bridge.status)}">${escapeHtml(bridge.status)}</span>
+              <span class="status-pill ${healthError ? "is-error" : "is-ok"}">${healthError ? "探测异常" : "运行中"}</span>
+              <span class="bridge-runtime">${escapeHtml(formatDuration(bridge.runtime_seconds || Math.floor(Date.now() / 1000 - Number(bridge.started_at || Date.now() / 1000))))}</span>
             </div>
             <div class="bridge-meta">${escapeHtml(bridge.region || "-")} · ${escapeHtml(bridge.protocol || "-")} · ${escapeHtml(bridge.core || "-")}</div>
           </div>
@@ -2349,13 +2595,13 @@ function renderBridges() {
             </div>
             <button class="row-button copy-icon" data-action="copy" data-text="${escapeHtml(endpoint.port)}" aria-label="复制本地端口" title="复制本地端口">${icon("copy")}</button>
           </div>
-          <div class="endpoint-row">
+          ${appState.network?.allow_lan ? `<div class="endpoint-row">
             <div>
               <span class="endpoint-label">监听地址</span>
               <span class="endpoint-value">${escapeHtml(listenAddress)}</span>
             </div>
             <button class="row-button copy-icon" data-action="copy" data-text="${escapeHtml(listenAddress)}" aria-label="复制监听地址" title="复制监听地址">${icon("copy")}</button>
-          </div>
+          </div>` : ""}
           <div class="endpoint-row endpoint-url">
             <div>
               <span class="endpoint-label">SOCKS5 URL</span>
@@ -2374,10 +2620,11 @@ function renderBridges() {
         <div class="bridge-actions">
           <button class="row-button danger" data-action="stop" data-id="${escapeHtml(bridge.id)}">${icon("stop")}<span>停止</span></button>
           <button class="row-button" data-action="restart" data-id="${escapeHtml(bridge.id)}" data-node="${escapeHtml(bridge.node_id)}">${icon("refresh")}<span>重启</span></button>
+          <details class="row-more"><summary class="icon-button" aria-label="更多复制格式">⋯</summary><div><button type="button" data-action="copy-bridge-format" data-node="${escapeHtml(bridge.node_id)}" data-format="env">复制环境变量</button><button type="button" data-action="copy-bridge-format" data-node="${escapeHtml(bridge.node_id)}" data-format="curl">复制 curl 示例</button><button type="button" data-action="copy-bridge-format" data-node="${escapeHtml(bridge.node_id)}" data-format="clash">复制 Clash 片段</button></div></details>
         </div>
       </article>
     `;
-  }).join("");
+  }).join(""), { keyAttribute: "data-ui-key" });
 }
 
 function renderRequestLogs() {
@@ -2452,8 +2699,10 @@ function renderSystemLogs() {
   const empty = $("#emptySystemLogs");
   if (!rows) return;
   // 回填筛选控件的值(轮询刷新时保持用户选择)。
-  $("#systemSearchInput").value = appState.systemLogFilters.search;
-  $("#systemLevelFilter").value = ["all", "info", "warn", "error"].includes(appState.systemLogFilters.level)
+  const systemSearch = $("#systemSearchInput");
+  if (document.activeElement !== systemSearch) systemSearch.value = appState.systemLogFilters.search;
+  const systemLevel = $("#systemLevelFilter");
+  if (document.activeElement !== systemLevel) systemLevel.value = ["all", "info", "warn", "error"].includes(appState.systemLogFilters.level)
     ? appState.systemLogFilters.level
     : "all";
 
@@ -2881,8 +3130,12 @@ function showRemoteBrowserLaunchSuccess(result, credentials) {
   $("#remoteBrowserPassword").value = "";
   $("#remoteBrowserPasswordConfirm").value = "";
   browserUi.setCredentialView(remoteBrowserCredentialView(), true);
-  $("#remoteBrowserLaunchTitle").textContent = `${result.browser_name || "远程浏览器"} 已启动`;
-  $("#remoteBrowserLaunchMeta").textContent = `${credentials.username} · ${remoteUrl}`;
+  $("#remoteBrowserLaunchTitle").textContent = result.batch_count > 1
+    ? `已启动 ${result.batch_count} 个远程浏览器`
+    : `${result.browser_name || "远程浏览器"} 已启动`;
+  $("#remoteBrowserLaunchMeta").textContent = result.batch_count > 1
+    ? `${credentials.username} · 本批次使用同一访问凭据 · 可在指纹浏览器页查看所有 Worker`
+    : `${credentials.username} · ${remoteUrl}`;
 }
 
 async function copyLaunchedRemoteBrowserPassword() {
@@ -2967,10 +3220,14 @@ function showRemoteBrowserLaunchModal(nodeId, instanceId = "", trigger = null) {
   lastRemoteBrowserLaunchTrigger = trigger;
   lastRemoteBrowserLaunchTriggerKey = trigger ? actionLockKey(trigger) : null;
   lastRemoteBrowserLaunchTriggerAction = trigger?.dataset?.action || null;
-  $("#remoteBrowserLaunchTitle").textContent = instance
+  $("#remoteBrowserLaunchTitle").textContent = pendingRemoteBrowserBatchNodeIds.length > 1
+    ? `启动 ${pendingRemoteBrowserBatchNodeIds.length} 个远程浏览器`
+    : instance
     ? `启动 ${instance.name || "远程浏览器"}`
     : "启动远程浏览器";
-  $("#remoteBrowserLaunchMeta").textContent = `${node.name || nodeId} · ${instance ? "复用独立 Profile" : "新建独立 Worker 与 Profile"}`;
+  $("#remoteBrowserLaunchMeta").textContent = pendingRemoteBrowserBatchNodeIds.length > 1
+    ? `为 ${pendingRemoteBrowserBatchNodeIds.length} 个所选节点各建独立 Worker 与 Profile；同一组访问凭据会用于本批次。`
+    : `${node.name || nodeId} · ${instance ? "复用独立 Profile" : "新建独立 Worker 与 Profile"}`;
   $("#remoteBrowserUsername").value = String(instance?.remote_username || "proxybridge");
   $("#remoteBrowserPassword").value = "";
   $("#remoteBrowserPasswordConfirm").value = "";
@@ -3004,6 +3261,7 @@ function closeRemoteBrowserLaunchModal({ force = false } = {}) {
   }
   delete modal.dataset.returnToBrowserRecords;
   pendingRemoteBrowserLaunch = null;
+  pendingRemoteBrowserBatchNodeIds = [];
   showRemoteBrowserLaunchError();
   resetRemoteBrowserLaunchContent();
 
@@ -3369,8 +3627,9 @@ async function deleteBrowserInstance(instanceId) {
   const syncNotice = syncEnabled
     ? " WebDAV 已启用，远端记录和对应 Profile 包也会自动同步删除。"
     : "";
-  if (!window.confirm(
-    `删除「${instance.name || "浏览器"}」会先停止对应浏览器/Worker，并永久删除该记录的 Profile、Cookie 和本地存储；此操作无法恢复。${syncNotice}确定继续吗？`
+  if (!await confirmAction(
+    `删除「${instance.name || "浏览器"}」会先停止对应浏览器/Worker，并永久删除该记录的 Profile、Cookie 和本地存储；此操作无法恢复。${syncNotice}`,
+    { title: "永久删除浏览器 Profile", confirmLabel: "永久删除", details: "该 Profile 中保存的 Cookie、登录态和本地数据无法恢复。" }
   )) return null;
   const result = await api("/api/browser/delete", { instance_id: instanceId });
   await loadStatus({ forceFresh: true });
@@ -3425,7 +3684,7 @@ async function openBrowserRecordsWithSync(nodeId, trigger = null) {
   showBrowserRecords(nodeId, trigger);
 }
 
-async function copyText(text) {
+async function copyText(text, { sensitive = false } = {}) {
   let copied = false;
   try {
     const result = await api("/api/clipboard", { text });
@@ -3438,7 +3697,138 @@ async function copyText(text) {
 
   if (!copied) throw new Error("当前环境无法复制到剪贴板");
 
-  showToast(`已复制 ${text}`);
+  const isSensitive = sensitive || /\/pool\/[^/]+|[?&](token|key|auth|secret)=/i.test(String(text));
+  showToast(isSensitive ? "敏感链接已复制，请谨慎分享。" : `已复制 ${text}`);
+}
+
+function bridgeCopyValue(nodeId, format) {
+  const bridge = bridgeForNode(nodeId);
+  if (!bridge) throw new Error("该节点当前没有运行中的代理");
+  const socks = bridge.socks_url || `socks5h://127.0.0.1:${bridge.port}`;
+  const http = bridge.http_url || `http://127.0.0.1:${bridge.port}`;
+  const endpoint = endpointParts(socks, bridge.port);
+  if (format === "env") return `export ALL_PROXY='${socks}'\nexport HTTP_PROXY='${http}'\nexport HTTPS_PROXY='${http}'`;
+  if (format === "curl") return `curl --proxy '${http}' https://example.com/`;
+  const name = String(bridge.node_name || "Proxy").replaceAll("'", "''");
+  return `proxies:\n  - name: '${name}'\n    type: socks5\n    server: 127.0.0.1\n    port: ${Number(endpoint.port)}`;
+}
+
+async function copyBridgeFormat(nodeId, format) {
+  await copyText(bridgeCopyValue(nodeId, format));
+}
+
+async function batchTestNodes() {
+  const ids = [...appState.selectedNodeIds];
+  if (!ids.length) return showToast("请先选择节点", "error");
+  if (ids.length > 500) return showToast("一次最多测速 500 个节点，请缩小选择范围", "error");
+  const task = await api("/api/nodes/test-batch/start", { node_ids: ids });
+  appState.speedTest.tasks = [...(appState.speedTest.tasks || []), task];
+  renderActiveView({ force: true });
+  showToast(`已开始测试 ${ids.length} 个节点`);
+}
+
+function nodeHasFreshLatency(node) {
+  const result = appState.tests[node.id];
+  return Boolean(result?.ok && !result.stale && Number.isFinite(result.latency_ms) && result.latency_ms >= 0);
+}
+
+async function startFastestNodes(nodes, count) {
+  const requestedCount = Number(count);
+  if (!Number.isInteger(requestedCount) || requestedCount < 1) throw new Error("启动数量必须是正整数");
+  const candidates = nodes
+    .filter((node) => !bridgeForNode(node.id) && nodeHasFreshLatency(node))
+    .sort((left, right) => Number(appState.tests[left.id].latency_ms) - Number(appState.tests[right.id].latency_ms))
+    .slice(0, requestedCount);
+  if (!candidates.length) {
+    showToast("没有未运行且测速成功、结果未过期的节点。", "error");
+    return;
+  }
+  let started = 0;
+  const errors = [];
+  for (const node of candidates) {
+    try {
+      await api("/api/bridges/start", { node_id: node.id, core: "auto" });
+      started += 1;
+    } catch (error) {
+      errors.push(`${node.name}: ${error.message}`);
+    }
+  }
+  await loadStatus({ forceFresh: true });
+  showToast(errors.length ? `已启动 ${started} 个节点，${errors.length} 个失败` : `已启动延迟最低的 ${started} 个节点`);
+  if (errors.length) console.warn("启动最快节点时发生错误", errors);
+}
+
+async function batchStopNodes() {
+  const bridges = [...appState.selectedNodeIds].map(bridgeForNode).filter(Boolean);
+  if (!bridges.length) return showToast("所选节点没有运行中的代理");
+  if (!await confirmAction(`将停止 ${bridges.length} 个代理，相关连接会中断，关联浏览器会关闭；浏览器 Profile、Cookie 和登录态会保留。`, { title: "批量停止代理", confirmLabel: "批量停止" })) return;
+  for (const bridge of bridges) await api("/api/bridges/stop", { id: bridge.id });
+  await loadStatus({ forceFresh: true });
+  clearNodeSelections();
+  showToast(`已停止 ${bridges.length} 个代理`);
+}
+
+async function batchLaunchBrowsers() {
+  const ids = [...appState.selectedNodeIds];
+  if (!browserEnabled()) throw new Error("当前运行模式未启用指纹浏览器");
+  if (!ids.length) return showToast("请先选择节点", "error");
+  if (remoteBrowserEnabled()) {
+    pendingRemoteBrowserBatchNodeIds = ids;
+    showRemoteBrowserLaunchModal(ids[0], "", document.querySelector('[data-action="batch-launch-browsers"]'));
+    return;
+  }
+  let started = 0;
+  const failed = [];
+  for (const nodeId of ids) {
+    try { await requestBrowserLaunch(nodeId); started += 1; }
+    catch (error) { failed.push(`${nodeById(nodeId)?.name || nodeId}: ${error.message}`); }
+  }
+  await loadStatus({ forceFresh: true });
+  clearNodeSelections();
+  showToast(failed.length ? `已启动 ${started} 个浏览器，${failed.length} 个失败` : `已启动 ${started} 个浏览器`);
+  if (failed.length) console.warn("批量启动浏览器失败", failed);
+}
+
+async function batchExcludePoolMembers() {
+  const selected = new Set(appState.selectedNodeIds);
+  const members = (appState.pool?.members || []).filter((member) => selected.has(member.node_id));
+  if (!members.length) return showToast("所选节点中没有代理池成员", "error");
+  for (const member of members) await api("/api/pool/exclude", { id: member.id, duration_seconds: 1800 });
+  await loadStatus({ forceFresh: true });
+  clearNodeSelections();
+  showToast(`已将 ${members.length} 个节点暂时移出代理池`);
+}
+
+async function stopAllVisibleBrowsers() {
+  const records = browserUi.sortBrowserInstancesByRecentUse(appState.browser_instances || []).filter((item) => {
+    if (!["running", "starting", "stopping"].includes(item.status)) return false;
+    if (browserPageFilter.node !== "all" && item.node_id !== browserPageFilter.node) return false;
+    const query = String(browserPageFilter.search || "").trim().toLowerCase();
+    const node = nodeById(item.node_id);
+    if (query && ![item.label, item.name, item.node_name, node?.name].some((value) => String(value || "").toLowerCase().includes(query))) return false;
+    return true;
+  });
+  if (!records.length) return;
+  if (!await confirmAction(`将停止 ${records.length} 个指纹浏览器，Profile 和本地数据会保留。`, { title: "停止指纹浏览器", confirmLabel: "全部停止" })) return;
+  for (const record of records) await api("/api/browser/stop", { instance_id: record.id });
+  await loadStatus({ forceFresh: true });
+  showToast(`已停止 ${records.length} 个浏览器`);
+}
+
+async function saveAllGeneralSettings(trigger) {
+  const submitEvent = { preventDefault() {} };
+  if (networkFormDirty) await withNetworkSettingsSave(() => saveNetworkSettings(submitEvent), trigger);
+  if (speedTestFormDirty) await saveSpeedTestSettings(submitEvent);
+  if (logSettingsDirty) await saveLogSettings(submitEvent);
+  updateSettingsSaveBar();
+}
+
+function discardGeneralSettings() {
+  networkFormDirty = false;
+  speedTestFormDirty = false;
+  logSettingsDirty = false;
+  if (appState.network) applyNetworkSettingsToForm(appState.network, { force: true });
+  renderNetworkSettings();
 }
 
 async function startNode(nodeId) {
@@ -3554,17 +3944,37 @@ async function handleRemoteBrowserLaunchSubmit(event) {
   setRemoteBrowserLaunchBusy(true);
   let result = null;
   let openedAutomatically = false;
-  remoteBrowserLaunchPromise = requestBrowserLaunch(
-    pending.nodeId,
-    pending.instanceId,
-    { username, password }
-  );
+  const isRemoteBatchLaunch = pendingRemoteBrowserBatchNodeIds.length > 0;
+  const batchNodeIds = pendingRemoteBrowserBatchNodeIds.length
+    ? [...pendingRemoteBrowserBatchNodeIds]
+    : [pending.nodeId];
+  remoteBrowserLaunchPromise = (async () => {
+    let lastResult = null;
+    const failures = [];
+    for (const nodeId of batchNodeIds) {
+      try {
+        lastResult = await requestBrowserLaunch(
+          nodeId,
+          batchNodeIds.length === 1 ? pending.instanceId : "",
+          { username, password }
+        );
+      } catch (error) {
+        failures.push(`${nodeById(nodeId)?.name || nodeId}: ${error.message}`);
+      }
+    }
+    if (!lastResult) throw new Error(failures.join("；") || "没有成功启动远程浏览器");
+    lastResult.batch_count = batchNodeIds.length - failures.length;
+    lastResult.batch_failures = failures;
+    return lastResult;
+  })();
   try {
     result = await remoteBrowserLaunchPromise;
     const remoteUrl = safeRemoteBrowserUrl(result.remote_url);
     if (!remoteUrl) throw new Error("浏览器 Worker 未返回有效的远程访问地址");
     showRemoteBrowserLaunchSuccess(result, { username, password });
     pendingRemoteBrowserLaunch = null;
+    pendingRemoteBrowserBatchNodeIds = [];
+    if (isRemoteBatchLaunch) clearNodeSelections();
     if (remoteWindow && !remoteWindow.closed) {
       try {
         remoteWindow.location.replace(remoteUrl);
@@ -3600,7 +4010,10 @@ async function handleRemoteBrowserLaunchSubmit(event) {
     const popupHint = openedAutomatically
       ? "已在新标签页打开；凭据会保留到你明确完成"
       : "请保存凭据并点击“打开远程浏览器”";
-    showToast(`${browserName} 已启动，${popupHint}`);
+    showToast(result.batch_count > 1
+      ? `已启动 ${result.batch_count} 个远程浏览器${result.batch_failures?.length ? `，${result.batch_failures.length} 个失败` : ""}；${popupHint}`
+      : `${browserName} 已启动，${popupHint}`);
+    if (result.batch_failures?.length) console.warn("批量启动远程浏览器失败", result.batch_failures);
     window.requestAnimationFrame(() => {
       if (!$("#remoteBrowserLaunchSuccess").hidden) {
         $("#remoteBrowserSuccessOpen")?.focus();
@@ -3747,7 +4160,131 @@ async function handleAction(event) {
   actionInFlight.add(lockKey);
   applyActionInFlightState();
   try {
-    if (action === "toggle-node-group") {
+    if (action === "close-batch-start-results") {
+      closeBatchStartResults();
+    } else if (action === "command-run") {
+      closeCommandPalette();
+      if (button.dataset.command === "page") setActiveView(button.dataset.view);
+      else {
+        const bridge = bridgeForNode(button.dataset.node);
+        if (bridge) await copyText(bridge.socks_url);
+        else await startNode(button.dataset.node);
+      }
+    } else if (action === "accept-confirm") {
+      finishConfirmation(true);
+    } else if (action === "cancel-confirm") {
+      finishConfirmation(false);
+    } else if (action === "navigate") {
+      setActiveView(button.dataset.view || "overview");
+    } else if (action === "open-subscription-drawer") {
+      setActiveView("subscriptions");
+      openDrawer($("#subscriptionDrawer"), '[name="url"]');
+    } else if (action === "close-subscription-drawer") {
+      closeDrawer($("#subscriptionDrawer"));
+    } else if (action === "preview-subscription-filter") {
+      await previewSubscriptionImport();
+    } else if (action === "open-node-detail") {
+      openNodeDetail(button.dataset.node);
+    } else if (action === "close-node-drawer") {
+      closeDrawer($("#nodeDetailDrawer"));
+    } else if (action === "toggle-node-favorite") {
+      const node = nodeById(button.dataset.node);
+      if (node) {
+        const result = await api("/api/nodes/update", { node_id: node.id, favorite: !node.favorite });
+        Object.assign(node, result.node || { favorite: !node.favorite });
+        renderNodes();
+        showToast(node.favorite ? "已收藏并置顶" : "已取消收藏");
+      }
+    } else if (action === "save-node-details") {
+      const node = nodeById(button.dataset.node);
+      if (!node) throw new Error("找不到节点");
+      const preferredCore = $("[data-core-select]")?.value || node.preferred_core;
+      const fallbackEnabled = Boolean($("[data-core-fallback]")?.checked);
+      const changedCore = preferredCore !== node.preferred_core || fallbackEnabled !== Boolean(node.fallback_enabled);
+      const result = await api("/api/nodes/update", {
+        node_id: node.id,
+        region: $("#nodeDetailRegion").value,
+        favorite: Boolean($("#nodeDetailFavorite").checked),
+        remark: $("#nodeDetailRemark").value.trim(),
+      });
+      Object.assign(node, result.node || {});
+      if (changedCore) {
+        const coreResult = await api("/api/nodes/core", { node_id: node.id, preferred_core: preferredCore, fallback_enabled: fallbackEnabled });
+        Object.assign(node, coreResult.node || {});
+      }
+      renderNodeDetailDrawer();
+      renderNodes();
+      showToast("节点详情已保存");
+    } else if (action === "launch-browser-from-drawer") {
+      await launchBrowser(currentNodeDetailId, "", button);
+    } else if (action === "toggle-pool-links") {
+      poolLinksExpanded = !poolLinksExpanded;
+      renderPool();
+    } else if (action === "select-pool-format") {
+      currentPoolLinkFormat = ["list_json", "proxies_txt", "get_health"].includes(button.dataset.poolFormat)
+        ? button.dataset.poolFormat
+        : "list_json";
+      renderPool();
+    } else if (action === "reveal-pool-link") {
+      const key = `pool:${currentPoolLinkFormat}`;
+      if (revealedSecrets.has(key)) revealedSecrets.delete(key); else revealedSecrets.add(key);
+      renderPool();
+    } else if (action === "copy-pool-link") {
+      const links = appState.pool?.links || {};
+      const url = currentPoolLinkFormat === "get_health"
+        ? links.get_health || links.get_random
+        : links[currentPoolLinkFormat];
+      if (url) await copyText(url, { sensitive: true });
+    } else if (action === "reveal-subscription-url") {
+      const key = `subscription:${button.dataset.id}`;
+      if (revealedSecrets.has(key)) revealedSecrets.delete(key); else revealedSecrets.add(key);
+      renderSubscriptions();
+    } else if (action === "copy-subscription-url") {
+      const item = appState.subscriptions.find((subscription) => subscription.id === button.dataset.id);
+      if (item?.url) await copyText(item.url, { sensitive: true });
+    } else if (action === "save-subscription-filters") {
+      await saveSubscriptionFilters(button.dataset.id, button);
+    } else if (action === "batch-test-nodes") {
+      await batchTestNodes();
+    } else if (action === "batch-start-nodes") {
+      await batchStartNodes();
+    } else if (action === "batch-stop-nodes") {
+      await batchStopNodes();
+    } else if (action === "batch-launch-browsers") {
+      await batchLaunchBrowsers();
+    } else if (action === "batch-exclude-pool") {
+      await batchExcludePoolMembers();
+    } else if (action === "stop-all-browsers") {
+      await stopAllVisibleBrowsers();
+    } else if (action === "save-all-settings") {
+      await saveAllGeneralSettings(button);
+    } else if (action === "discard-settings") {
+      discardGeneralSettings();
+    } else if (action === "reveal-lan-token") {
+      const input = $("#lanToken");
+      input.type = input.type === "password" ? "text" : "password";
+    } else if (action === "copy-lan-token") {
+      if ($("#lanToken").value) await copyText($("#lanToken").value, { sensitive: true });
+    } else if (action === "open-system-log-search") {
+      appState.systemLogFilters.search = button.dataset.search || "";
+      appState.systemLogPage.page = 1;
+      setActiveView("system");
+      await loadLogPage("system");
+    } else if (action === "test-node-group") {
+      const group = groupNodesBySubscription(filteredNodes()).find((item) => item.id === button.dataset.group);
+      if (group?.nodes.length) {
+        const task = await api("/api/nodes/test-batch/start", { node_ids: group.nodes.map((node) => node.id) });
+        appState.speedTest.tasks = [...(appState.speedTest.tasks || []), task];
+        showToast(`已启动 ${group.nodes.length} 个节点的测速`);
+      }
+    } else if (action === "start-fastest-group") {
+      const group = groupNodesBySubscription(filteredNodes()).find((item) => item.id === button.dataset.group);
+      await startFastestNodes(group?.nodes || [], 1);
+    } else if (action === "start-fastest-visible") {
+      await startFastestNodes(filteredNodes(), Number($("#fastestNodeCount").value || 1));
+    } else if (action === "copy-bridge-format") {
+      await copyBridgeFormat(button.dataset.node, button.dataset.format);
+    } else if (action === "toggle-node-group") {
       const groupId = button.dataset.group;
       if (groupId) {
         setNodeGroupCollapsed(groupId, !isNodeGroupCollapsed(groupId));
@@ -3762,8 +4299,10 @@ async function handleAction(event) {
     } else if (action === "launch-browser-instance") {
       await launchBrowser(button.dataset.node, button.dataset.instance, button);
     } else if (action === "stop-browser") {
+      if (!await confirmAction("将关闭此节点关联的指纹浏览器进程，现有标签页会结束；Profile、Cookie 和登录态会保留。", { title: "停止节点浏览器", confirmLabel: "停止浏览器" })) return;
       await stopBrowser(button.dataset.node);
     } else if (action === "stop-browser-instance") {
+      if (!await confirmAction("将关闭此浏览器进程，现有标签页会结束；Profile、Cookie 和登录态会保留。", { title: "停止浏览器", confirmLabel: "停止浏览器" })) return;
       await stopBrowser(button.dataset.node, button.dataset.instance);
     } else if (action === "browser-records") {
       await openBrowserRecordsWithSync(button.dataset.node, button);
@@ -3777,12 +4316,17 @@ async function handleAction(event) {
       await deleteBrowserInstance(button.dataset.instance);
     } else if (action === "download-kernel") {
       await downloadKernel();
+    } else if (action === "update-core") {
+      const result = await api("/api/cores/update", { core: button.dataset.core });
+      await loadStatus({ forceFresh: true });
+      await loadCoreCatalog();
+      showToast(`${button.dataset.core} 已更新${result.version ? `：${result.version}` : ""}`);
     } else if (action === "show-core-upload") {
       showCoreUploadModal(button);
     } else if (action === "copy") {
       await copyText(button.dataset.text);
     } else if (action === "rotate-pool-token") {
-      if (!window.confirm("轮换代理池密钥后，所有旧链接会立即失效。确定继续吗？")) return;
+      if (!await confirmAction("轮换代理池密钥后，所有旧链接会立即失效。", { title: "轮换代理池密钥", confirmLabel: "轮换密钥" })) return;
       await api("/api/pool/token/rotate", {});
       await loadStatus({ forceFresh: true });
       showToast("代理池密钥已轮换，旧链接立即失效");
@@ -3792,18 +4336,25 @@ async function handleAction(event) {
       await loadStatus({ forceFresh: true });
       showToast(duration ? "节点已暂时排除 30 分钟" : "节点已恢复到代理池");
     } else if (action === "kick-client") {
+      if (!await confirmAction("断开此客户端的代理连接。客户端可以重新连接。", { title: "断开客户端", confirmLabel: "断开" })) return;
       await api("/api/network/clients/kick", { id: button.dataset.id });
       await loadStatus({ forceFresh: true });
       showToast("客户端连接已断开");
     } else if (action === "stop") {
+      const bridge = appState.bridges.find((item) => item.id === button.dataset.id);
+      if (!await confirmAction(`将停止「${bridge?.node_name || "本地代理"}」，现有连接会中断${appState.browser_instances.some((item) => item.node_id === bridge?.node_id && ["running", "starting", "stopping"].includes(item.status)) ? "，关联浏览器也会关闭" : ""}。浏览器 Profile、Cookie 和登录态会保留。`, { title: "停止本地代理", confirmLabel: "停止代理" })) return;
       const result = await api("/api/bridges/stop", { id: button.dataset.id });
       await loadStatus({ forceFresh: true });
       showToast(result.killed_browsers ? "已停止端口，关联浏览器已关闭" : "已停止端口");
     } else if (action === "stop-all") {
+      const runningCount = runningBridges().length;
+      if (!await confirmAction(`将停止全部 ${runningCount} 个本地代理${appState.smartGateway?.running ? "并停止智能网关" : ""}。现有连接会中断；关联浏览器将关闭，但其 Profile、Cookie 和登录态会保留。`, { title: "停止所有代理", confirmLabel: "全部停止" })) return;
       const result = await api("/api/bridges/stop-all", {});
       await loadStatus({ forceFresh: true });
       showToast(result.killed_browsers ? "已停止全部代理，关联浏览器已关闭" : "已停止全部代理");
     } else if (action === "restart") {
+      const bridge = appState.bridges.find((item) => item.id === button.dataset.id);
+      if (!await confirmAction(`重启「${bridge?.node_name || "本地代理"}」会中断现有连接并关闭关联浏览器；Profile、Cookie 和登录态会保留。`, { title: "重启本地代理", confirmLabel: "重启" })) return;
       const stopped = await api("/api/bridges/stop", { id: button.dataset.id });
       await api("/api/bridges/start", { node_id: button.dataset.node, core: "auto" });
       await loadStatus({ forceFresh: true });
@@ -3840,6 +4391,7 @@ async function handleAction(event) {
       await loadStatus({ forceFresh: true });
       showToast("智能网关设置已保存");
     } else if (action === "stop-smart-gateway") {
+      if (!await confirmAction("将停止智能网关入口，正在使用该入口的连接会中断。代理池成员和浏览器 Profile 不会删除。", { title: "停止智能网关", confirmLabel: "停止网关" })) return;
       await api("/api/smart-gateway/stop", {});
       await loadStatus({ forceFresh: true });
       showToast("智能网关已停止");
@@ -3847,17 +4399,19 @@ async function handleAction(event) {
       const subscription = appState.subscriptions.find((item) => item.id === button.dataset.id);
       const name = subscription?.name || "该订阅";
       const nodeCount = Number(subscription?.node_count || (subscription?.node_ids || []).length || 0);
-      if (!window.confirm(`删除「${name}」将清理最多 ${nodeCount} 个未被其他订阅引用的节点及浏览器 Profile。确定继续吗？`)) return;
+      if (!await confirmAction(`删除「${name}」将清理最多 ${nodeCount} 个未被其他订阅引用的节点及浏览器 Profile。此操作可能删除 Cookie 和登录态。`, { title: "删除订阅", confirmLabel: "删除订阅" })) return;
       await api("/api/subscriptions/delete", { id: button.dataset.id });
       await loadStatus({ forceFresh: true });
       showToast("订阅已删除");
     } else if (action === "clear-logs") {
+      if (!await confirmAction("清空后将删除当前保存的全部连接日志。此操作不可恢复。", { title: "清空连接日志", confirmLabel: "清空日志" })) return;
       await api("/api/logs/clear", {});
       await loadStatus({ forceFresh: true });
       appState.requestLogPage.page = 1;
       await loadLogPage("request");
       showToast("连接日志已清空");
     } else if (action === "clear-system-logs") {
+      if (!await confirmAction("清空后将删除当前保存的全部系统日志。此操作不可恢复。", { title: "清空系统日志", confirmLabel: "清空日志" })) return;
       await api("/api/system/logs/clear", {});
       await loadStatus({ forceFresh: true });
       appState.systemLogPage.page = 1;
@@ -3913,15 +4467,13 @@ async function handleAction(event) {
     } else if (action === "clear-selections") {
       // 清除所有选择
       clearNodeSelections();
-    } else if (action === "batch-start-nodes") {
-      // 批量启动选中的节点
-      await batchStartNodes();
     }
   } catch (error) {
     showToast(error.message, "error");
   } finally {
     actionInFlight.delete(lockKey);
     applyActionInFlightState();
+    i18n.apply(document);
     if (action === "stop-all" && appState.activeView === "bridges") {
       renderActiveView({ force: true });
     }
@@ -3933,22 +4485,83 @@ async function handleImport(event) {
   const form = event.currentTarget;
   const submit = form.querySelector('button[type="submit"]');
   const formData = new FormData(form);
+  const filterInclude = String(formData.get("filter_include") || "").trim();
+  const filterExclude = String(formData.get("filter_exclude") || "").trim();
+  const filterRegex = formData.get("filter_regex") === "on";
+  const previewSignature = subscriptionFormPreviewSignature(formData);
+  if ((filterInclude || filterExclude) && (!subscriptionPreviewResult || subscriptionPreviewSignature !== previewSignature)) {
+    showToast("保存过滤规则前，请先预览命中的节点。", "error");
+    return;
+  }
   submit.disabled = true;
   try {
     const result = await api("/api/subscriptions/import", {
       name: formData.get("name"),
       url: formData.get("url"),
       raw: formData.get("raw"),
+      filter_include: filterInclude,
+      filter_exclude: filterExclude,
+      filter_regex: filterRegex,
     });
     form.reset();
     form.querySelector(".raw-import-details")?.removeAttribute("open");
     await loadStatus({ forceFresh: true });
     showToast(`导入 ${result.subscription.node_count} 个节点`);
+    closeDrawer($("#subscriptionDrawer"));
+    subscriptionPreviewResult = null;
+    subscriptionPreviewSignature = "";
   } catch (error) {
     showToast(error.message, "error");
   } finally {
     submit.disabled = false;
   }
+}
+
+function subscriptionFormPreviewSignature(formData = new FormData($("#importForm"))) {
+  return JSON.stringify({
+    url: String(formData.get("url") || "").trim(),
+    raw: String(formData.get("raw") || "").trim(),
+    filter_include: String(formData.get("filter_include") || "").trim(),
+    filter_exclude: String(formData.get("filter_exclude") || "").trim(),
+    filter_regex: formData.get("filter_regex") === "on",
+  });
+}
+
+async function previewSubscriptionImport() {
+  const form = $("#importForm");
+  const data = new FormData(form);
+  const signature = subscriptionFormPreviewSignature(data);
+  const url = String(data.get("url") || "").trim();
+  const raw = String(data.get("raw") || "").trim();
+  if (!url && !raw) throw new Error("请先填写订阅 URL 或原始内容");
+  const result = await api("/api/subscriptions/preview", {
+    url,
+    raw,
+    filter_include: String(data.get("filter_include") || "").trim(),
+    filter_exclude: String(data.get("filter_exclude") || "").trim(),
+    filter_regex: data.get("filter_regex") === "on",
+  });
+  subscriptionPreviewResult = result;
+  subscriptionPreviewSignature = signature;
+  const output = $("#subscriptionFilterPreview");
+  const nodes = Array.isArray(result.nodes) ? result.nodes : [];
+  output.innerHTML = `<strong>命中 ${Number(result.matched || 0)} / ${Number(result.total || 0)} 个</strong>${Number(result.excluded || 0) ? ` · 排除 ${Number(result.excluded)} 个` : ""}${nodes.length ? `<ul>${nodes.slice(0, 8).map((node) => `<li>${escapeHtml(node.name || "未命名节点")}</li>`).join("")}${nodes.length > 8 ? `<li>还有 ${nodes.length - 8} 个</li>` : ""}</ul>` : ""}`;
+  return result;
+}
+
+async function saveSubscriptionFilters(subscriptionId, trigger) {
+  const card = trigger.closest(".subscription-item");
+  const include = card.querySelector('[data-sub-filter="include"]')?.value || "";
+  const exclude = card.querySelector('[data-sub-filter="exclude"]')?.value || "";
+  const regex = Boolean(card.querySelector('[data-sub-filter="regex"]')?.checked);
+  await api("/api/subscriptions/update", {
+    id: subscriptionId,
+    filter_include: include,
+    filter_exclude: exclude,
+    filter_regex: regex,
+  });
+  await loadStatus({ forceFresh: true });
+  showToast("订阅过滤规则已保存，后续刷新将按此规则解析");
 }
 
 async function saveSubscriptionSettings(control) {
@@ -3973,7 +4586,15 @@ async function saveSubscriptionSettings(control) {
 
 function trapModalFocus(event) {
   if (event.key !== "Tab") return false;
-  const modal = !$("#remoteBrowserCredentialsModal").hidden
+  const modal = !$("#confirmDialog").hidden
+    ? $("#confirmDialog")
+    : !$("#batchStartResultDialog").hidden
+      ? $("#batchStartResultDialog")
+      : !$("#nodeDetailDrawer").hidden
+      ? $("#nodeDetailDrawer")
+      : !$("#subscriptionDrawer").hidden
+        ? $("#subscriptionDrawer")
+        : !$("#remoteBrowserCredentialsModal").hidden
     ? $("#remoteBrowserCredentialsModal")
     : !$("#remoteBrowserLaunchModal").hidden
       ? $("#remoteBrowserLaunchModal")
@@ -3985,7 +4606,7 @@ function trapModalFocus(event) {
             ? $("#coreLogModal")
             : null;
   if (!modal) return false;
-  const dialog = modal.querySelector('[role="dialog"]');
+  const dialog = modal.querySelector('[role="dialog"], [role="alertdialog"]') || modal;
   const focusable = [...dialog.querySelectorAll(
     'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
   )].filter((element) => !element.hidden && element.getClientRects().length > 0);
@@ -4009,14 +4630,19 @@ function trapModalFocus(event) {
   return false;
 }
 
-function scheduleStatusPoll(delay = document.hidden ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_VISIBLE_MS) {
+function scheduleStatusPoll(delay = document.hidden ? STATUS_POLL_HIDDEN_MS : statusEventConnected ? STATUS_POLL_HIDDEN_MS : STATUS_POLL_VISIBLE_MS) {
+  const nextDelay = Math.max(0, Number(delay) || 0);
+  const deadline = Date.now() + nextDelay;
+  if (statusPollTimer && statusPollDeadline <= deadline) return;
   window.clearTimeout(statusPollTimer);
-  statusPollTimer = window.setTimeout(runStatusPoll, delay);
+  statusPollDeadline = deadline;
+  statusPollTimer = window.setTimeout(runStatusPoll, nextDelay);
 }
 
 async function runStatusPoll({ reportError = false } = {}) {
   window.clearTimeout(statusPollTimer);
   statusPollTimer = null;
+  statusPollDeadline = 0;
   try {
     await loadStatus();
   } catch (error) {
@@ -4024,6 +4650,57 @@ async function runStatusPoll({ reportError = false } = {}) {
   } finally {
     scheduleStatusPoll();
   }
+}
+
+async function startStatusEvents() {
+  if (statusEventController) statusEventController.abort();
+  const controller = new AbortController();
+  statusEventController = controller;
+  while (!controller.signal.aborted) {
+    try {
+      const headers = { Accept: "text/event-stream" };
+      if (managementToken) headers[managementAuth.headerName] = managementToken;
+      const response = await fetch("/api/events", { method: "GET", headers, cache: "no-store", signal: controller.signal });
+      if (!response.ok || !response.body) throw new Error(`事件流不可用：HTTP ${response.status}`);
+      const responseToken = response.headers.get(managementAuth.headerName);
+      if (!managementAuth.validateResponseToken(window, managementToken, responseToken)) throw new Error("管理令牌已失效");
+      statusEventConnected = true;
+      scheduleStatusPoll(STATUS_POLL_HIDDEN_MS);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (!controller.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true }).replaceAll("\r\n", "\n");
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          let eventName = "message";
+          const data = [];
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) eventName = line.slice(6).trim();
+            else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+          }
+          if (eventName === "status" && data.length) {
+            try { applyStatusSnapshot(JSON.parse(data.join("\n"))); }
+            catch (error) { console.warn("忽略格式错误的状态推送", error); }
+          }
+        }
+      }
+      await reader.cancel().catch(() => {});
+    } catch (error) {
+      if (controller.signal.aborted) break;
+      console.warn("状态事件流已断开，继续轮询", error);
+    } finally {
+      const wasConnected = statusEventConnected;
+      statusEventConnected = false;
+      if (!controller.signal.aborted && (wasConnected || !statusPollTimer)) scheduleStatusPoll(STATUS_POLL_VISIBLE_MS);
+    }
+    if (!controller.signal.aborted) await new Promise((resolve) => window.setTimeout(resolve, 2500));
+  }
+  if (statusEventController === controller) statusEventController = null;
 }
 
 function bindEvents() {
@@ -4043,6 +4720,26 @@ function bindEvents() {
     networkForm.addEventListener("input", markNetworkFormDirty);
     networkForm.addEventListener("change", markNetworkFormDirty);
     $("#lanAuthMode")?.addEventListener("change", syncLanAuthFields);
+    $("#allowLan")?.addEventListener("change", () => {
+      if ($("#allowLan").checked && $("#lanAuthMode").value === "none") {
+        $("#lanAuthMode").value = "token";
+        $("#lanAuthMode").dataset.previousAuthMode = "token";
+        $("#lanToken").value = "";
+      }
+      renderNetworkSettings();
+      markNetworkFormDirty();
+    });
+    $("#lanAuthMode")?.addEventListener("change", async (event) => {
+      const previous = event.target.dataset.previousAuthMode || "token";
+      if (event.target.value === "none" && $("#allowLan").checked) {
+        const allowed = await confirmAction("关闭认证后，任何可访问代理端口的设备都可以使用代理。请确认当前网络可信。", { title: "启用无认证共享", confirmLabel: "关闭认证" });
+        if (!allowed) event.target.value = previous === "none" ? "token" : previous;
+      }
+      event.target.dataset.previousAuthMode = event.target.value;
+      syncLanAuthFields();
+      renderNetworkSettings();
+      markNetworkFormDirty();
+    });
     networkForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       const submit = $("#networkSaveButton");
@@ -4055,8 +4752,8 @@ function bindEvents() {
   }
   const speedTestForm = $("#speedTestSettingsForm");
   if (speedTestForm) {
-    speedTestForm.addEventListener("input", () => { speedTestFormDirty = true; });
-    speedTestForm.addEventListener("change", () => { speedTestFormDirty = true; });
+    speedTestForm.addEventListener("input", () => { speedTestFormDirty = true; updateSettingsSaveBar(); });
+    speedTestForm.addEventListener("change", () => { speedTestFormDirty = true; updateSettingsSaveBar(); });
     speedTestForm.addEventListener("submit", async (event) => {
       const submit = $("#speedTestSaveButton");
       submit.disabled = true;
@@ -4073,8 +4770,8 @@ function bindEvents() {
   }
   const logSettingsForm = $("#logSettingsForm");
   if (logSettingsForm) {
-    logSettingsForm.addEventListener("input", () => { logSettingsDirty = true; });
-    logSettingsForm.addEventListener("change", () => { logSettingsDirty = true; });
+    logSettingsForm.addEventListener("input", () => { logSettingsDirty = true; updateSettingsSaveBar(); });
+    logSettingsForm.addEventListener("change", () => { logSettingsDirty = true; updateSettingsSaveBar(); });
     logSettingsForm.addEventListener("submit", async (event) => {
       const submit = $("#logSettingsSaveButton");
       submit.disabled = true;
@@ -4139,8 +4836,8 @@ function bindEvents() {
   const syncForm = $("#syncForm");
   if (syncForm) {
     // 任意输入/勾选都标记脏数据，避免 3.5s 状态轮询把未保存内容冲掉。
-    syncForm.addEventListener("input", markSyncFormDirty);
-    syncForm.addEventListener("change", markSyncFormDirty);
+    syncForm.addEventListener("input", () => { markSyncFormDirty(); renderSync(); });
+    syncForm.addEventListener("change", () => { markSyncFormDirty(); renderSync(); });
     syncForm.addEventListener("submit", async (event) => {
       event.preventDefault();
       const submit = syncForm.querySelector('button[type="submit"]');
@@ -4167,6 +4864,54 @@ function bindEvents() {
   bindSyncBtn("syncPullBtn", "pull");
   bindSyncBtn("syncCheckBtn", "check");
   document.addEventListener("click", handleAction);
+  $("#commandSearch")?.addEventListener("input", renderCommandResults);
+  document.querySelectorAll("[data-log-tab]").forEach((tab) => tab.addEventListener("click", () => setActiveView(tab.dataset.logTab)));
+  document.querySelectorAll("[data-node-tab]").forEach((tab) => tab.addEventListener("click", () => {
+    currentNodeDetailTab = tab.dataset.nodeTab;
+    renderNodeDetailDrawer();
+    if (currentNodeDetailTab === "history") loadNodeHistory(currentNodeDetailId).catch((error) => showToast(error.message, "error"));
+  }));
+  $("#subscriptionDrawer")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closeDrawer(event.currentTarget); });
+  $("#nodeDetailDrawer")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closeDrawer(event.currentTarget); });
+  $("#confirmDialog")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) finishConfirmation(false); });
+  $("#batchStartResultDialog")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closeBatchStartResults(); });
+  $("#commandPalette")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closeCommandPalette(); });
+  $("#browserNodeFilter")?.addEventListener("change", (event) => { browserPageFilter.node = event.target.value; renderBrowserPage(); });
+  $("#browserStatusFilter")?.addEventListener("change", (event) => { browserPageFilter.status = event.target.value; renderBrowserPage(); });
+  $("#browserSearchInput")?.addEventListener("input", (event) => { browserPageFilter.search = event.target.value; renderBrowserPage(); });
+  $("#languageSelect")?.addEventListener("change", (event) => {
+    i18n.setLocale(event.target.value);
+    renderActiveView({ force: true });
+    i18n.apply(document);
+  });
+  $("#nodeDensity")?.addEventListener("change", (event) => setNodeDensity(event.target.value));
+  $("#settingsNodeDensity")?.addEventListener("change", (event) => setNodeDensity(event.target.value));
+  $("#nodeViewport")?.addEventListener("scroll", () => {
+    if (appState.nodes.length <= 300 || nodeVirtualFrame) return;
+    nodeVirtualFrame = requestAnimationFrame(() => { nodeVirtualFrame = 0; renderNodes(); });
+  }, { passive: true });
+  document.querySelectorAll("[data-node-status]").forEach((button) => button.addEventListener("click", () => {
+    appState.filters.status = button.dataset.nodeStatus || "all";
+    document.querySelectorAll("[data-node-status]").forEach((item) => item.classList.toggle("is-active", item === button));
+    if ($("#nodeViewport")) $("#nodeViewport").scrollTop = 0;
+    renderNodes();
+  }));
+  $("#healthAutoSwitch")?.addEventListener("change", async (event) => {
+    const next = event.target.checked;
+    event.target.disabled = true;
+    try {
+      const result = await api("/api/settings/health", { auto_switch: next });
+      appState.healthSettings = result.settings || { auto_switch: next };
+      showToast(next ? "已启用健康检查自动切换" : "已关闭健康检查自动切换");
+    } catch (error) {
+      event.target.checked = !next;
+      showToast(error.message, "error");
+    } finally { event.target.disabled = false; }
+  });
+  $("#importForm")?.addEventListener("input", () => {
+    const output = $("#subscriptionFilterPreview");
+    if (subscriptionPreviewSignature !== subscriptionFormPreviewSignature()) output.textContent = "规则已更改，请重新预览。";
+  });
   $("#refreshStatus").addEventListener("click", async (event) => {
     const button = event.currentTarget;
     button.classList.add("is-busy");
@@ -4322,6 +5067,37 @@ function bindEvents() {
   });
   document.addEventListener("keydown", (event) => {
     if (trapModalFocus(event)) return;
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      openCommandPalette();
+      return;
+    }
+    if (event.key === "/" && !event.metaKey && !event.ctrlKey && !["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement?.tagName) && !document.activeElement?.isContentEditable) {
+      event.preventDefault();
+      setActiveView("nodes");
+      $("#searchInput").focus();
+      return;
+    }
+    if (event.key === "Escape" && !$("#confirmDialog").hidden) {
+      finishConfirmation(false);
+      return;
+    }
+    if (event.key === "Escape" && !$("#batchStartResultDialog").hidden) {
+      closeBatchStartResults();
+      return;
+    }
+    if (event.key === "Escape" && !$("#commandPalette").hidden) {
+      closeCommandPalette();
+      return;
+    }
+    if (event.key === "Escape" && !$("#nodeDetailDrawer").hidden) {
+      closeDrawer($("#nodeDetailDrawer"));
+      return;
+    }
+    if (event.key === "Escape" && !$("#subscriptionDrawer").hidden) {
+      closeDrawer($("#subscriptionDrawer"));
+      return;
+    }
     if (event.key === "Escape" && !$("#remoteBrowserCredentialsModal").hidden) {
       closeRemoteBrowserCredentialsModal();
     } else if (event.key === "Escape" && !$("#remoteBrowserLaunchModal").hidden) {
@@ -4341,10 +5117,14 @@ function bindEvents() {
     window.clearTimeout(statusPollTimer);
     window.clearTimeout(logFilterTimer);
     statusAbortController?.abort();
+    statusEventController?.abort();
   });
 }
 
 bindEvents();
 // 初始视图:优先使用上次记忆的选择(在 <html> 上的 data-initial-view)。
-setActiveView(document.documentElement.getAttribute("data-initial-view") || "nodes");
+setNodeDensity(localStorage.getItem("pb-node-density") || "compact");
+i18n.setLocale(i18n.getLocale());
+setActiveView(document.documentElement.getAttribute("data-initial-view") || "overview");
 runStatusPoll({ reportError: true });
+startStatusEvents();

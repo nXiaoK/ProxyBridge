@@ -92,12 +92,11 @@ jobs:
         run: python -m unittest discover -s tests
       - name: Check and test frontend
         shell: bash
+        # 发布门禁覆盖原生模块入口和拆分页面，保持无前端构建步骤。
         run: |
-          node --check static/auth.js
-          node --check static/diagnostics.js
-          node --check static/browser-ui.js
-          node --check static/core-upload.js
-          node --check static/app.js
+          for frontend_source in static/*.js static/*.mjs static/pages/*.js; do
+            node --check "$frontend_source"
+          done
           node --test tests/test_frontend_*.js
       - name: Validate scripts and Compose
         shell: bash

@@ -191,6 +191,164 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.assertEqual(state["browser_instances"][0]["status"], "stopped")
         self.assertTrue((self.profiles / "nodehash" / "inst1" / "Default" / "Cookies").exists())
 
+    def test_node_metadata_and_subscription_filters_roundtrip_through_webdav(self):
+        with self.lock:
+            state = self._load()
+            state["subscriptions"][0].update(
+                {
+                    "filter_include": "media,work",
+                    "filter_exclude": "ads",
+                    "filter_regex": True,
+                }
+            )
+            state["nodes"][0].update(
+                {
+                    "region_code": "HK",
+                    "region_override": "HK",
+                    "favorite": True,
+                    "remark": "daily",
+                }
+            )
+            self._save(state)
+
+        pushed = self.engine.push()
+        self.assertTrue(pushed["ok"])
+        client, manifest = self._remote_manifest()
+        remote_state = json.loads(
+            self.store.files[self._remote_state_url(client, manifest)].decode("utf-8")
+        )
+        self.assertEqual(
+            {
+                key: remote_state["nodes"][0][key]
+                for key in ("region", "region_code", "region_override", "favorite", "remark")
+            },
+            {
+                "region": "香港",
+                "region_code": "HK",
+                "region_override": "HK",
+                "favorite": True,
+                "remark": "daily",
+            },
+        )
+        self.assertEqual(
+            {
+                key: remote_state["subscriptions"][0][key]
+                for key in ("filter_include", "filter_exclude", "filter_regex")
+            },
+            {"filter_include": "media,work", "filter_exclude": "ads", "filter_regex": True},
+        )
+
+        with self.lock:
+            state = self._load()
+            state["subscriptions"][0].update(
+                {"filter_include": "", "filter_exclude": "", "filter_regex": False}
+            )
+            state["nodes"][0].update(
+                {
+                    "region": "日本",
+                    "region_code": "JP",
+                    "region_override": "JP",
+                    "favorite": False,
+                    "remark": "local",
+                }
+            )
+            self._save(state)
+
+        pulled = self.engine.pull(force=True)
+        self.assertTrue(pulled["ok"])
+        state = self._load()
+        self.assertEqual(
+            {
+                key: state["nodes"][0][key]
+                for key in ("region", "region_code", "region_override", "favorite", "remark")
+            },
+            {
+                "region": "香港",
+                "region_code": "HK",
+                "region_override": "HK",
+                "favorite": True,
+                "remark": "daily",
+            },
+        )
+        self.assertEqual(
+            {
+                key: state["subscriptions"][0][key]
+                for key in ("filter_include", "filter_exclude", "filter_regex")
+            },
+            {"filter_include": "media,work", "filter_exclude": "ads", "filter_regex": True},
+        )
+
+    def test_preview_pull_returns_hash_and_safe_remote_summary_without_writing(self):
+        with self.lock:
+            state = self._load()
+            state["browser_instances"][0].update(
+                {
+                    "pid": 987,
+                    "bridge_id": "local-bridge",
+                    "proxy": "socks5://127.0.0.1:1080",
+                    "exit_check": {"ip": "192.0.2.1", "region_code": "US"},
+                }
+            )
+            self._save(state)
+        self.assertTrue(self.engine.push()["ok"])
+        client, manifest = self._remote_manifest()
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        state_url = self._remote_state_url(client, manifest)
+        remote_state = json.loads(self.store.files[state_url].decode("utf-8"))
+        remote_state["browser_instances"].append(
+            {"id": "remote-only", "node_id": "n1", "name": "Remote only", "legacy": False}
+        )
+        remote_state["profile_hashes"]["remote-only"] = "f" * 64
+        remote_state["updated_at"] += 1
+        state_bytes = json.dumps(remote_state, ensure_ascii=False, indent=2).encode("utf-8")
+        state_hash = webdav_sync.sha256_bytes(state_bytes)
+        state_file = f"state-{state_hash[:16]}-preview.sync.json"
+        manifest["state_sha256"] = state_hash
+        manifest["state_file"] = state_file
+        manifest["updated_at"] = remote_state["updated_at"]
+        manifest["browser_instance_count"] = len(remote_state["browser_instances"])
+        manifest["profile_hashes"] = dict(remote_state["profile_hashes"])
+        manifest["profile_files"]["remote-only"] = "remote-only.tar.gz"
+        manifest["profile_count"] = len(remote_state["profile_hashes"])
+        self.store.files[client.url_for("ProxyBridge", state_file)] = state_bytes
+        self.store.files[manifest_url] = json.dumps(
+            manifest, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        local_only_profile = self.profiles / "nodehash" / "local-only" / "Default"
+        local_only_profile.mkdir(parents=True)
+        with self.lock:
+            state = self._load()
+            state["browser_instances"].append(
+                {
+                    "id": "local-only",
+                    "node_id": "n1",
+                    "name": "Local only",
+                    "status": "stopped",
+                    "legacy": False,
+                }
+            )
+            self._save(state)
+        before_state_file = self.state_path.read_bytes()
+
+        preview = self.engine.preview_pull()
+
+        self.assertTrue(preview["ok"])
+        self.assertEqual(preview["state_sha256"], manifest["state_sha256"])
+        self.assertEqual(preview["summary"]["subscriptions"]["remote_count"], 1)
+        self.assertEqual(preview["summary"]["nodes"]["remote_count"], 1)
+        self.assertEqual(preview["summary"]["browser_instances"]["remote_count"], 2)
+        self.assertEqual(preview["summary"]["browser_instances"]["updated_count"], 0)
+        self.assertEqual(preview["summary"]["profiles"]["local_count"], 2)
+        self.assertEqual(preview["summary"]["profiles"]["remote_count"], 2)
+        self.assertEqual(preview["summary"]["profiles"]["added_count"], 1)
+        self.assertEqual(preview["summary"]["profiles"]["removed_count"], 1)
+        self.assertEqual(preview["summary"]["profiles"]["updated_count"], 1)
+        self.assertEqual(preview["remote"]["nodes"][0]["region"], "香港")
+        self.assertNotIn("exit_check", preview["remote"]["browser_instances"][0])
+        self.assertNotIn("settings", preview["remote"]["nodes"][0])
+        self.assertNotIn("url", preview["remote"]["subscriptions"][0])
+        self.assertEqual(self.state_path.read_bytes(), before_state_file)
+
     def test_convenience_pull_preserves_unuploaded_local_browser_record(self):
         self.engine.push()
         local_record = {
@@ -318,6 +476,7 @@ class WebDAVSyncUnitTests(unittest.TestCase):
 
     def test_pull_rejects_state_hash_mismatch(self):
         self.engine.push()
+        preview = self.engine.preview_pull()
         client, manifest = self._remote_manifest()
         state_url = self._remote_state_url(client, manifest)
         remote_state = json.loads(self.store.files[state_url].decode("utf-8"))
@@ -325,14 +484,52 @@ class WebDAVSyncUnitTests(unittest.TestCase):
         self.store.files[state_url] = json.dumps(remote_state, ensure_ascii=False, indent=2).encode("utf-8")
         self.engine.mark_local_change()
         before = self._load()["settings"]["webdav"]
+        before_state_file = self.state_path.read_bytes()
+        cookie = self.profiles / "nodehash" / "inst1" / "Default" / "Cookies"
+        before_cookie = cookie.read_bytes()
 
-        with self.assertRaisesRegex(RuntimeError, "哈希与 manifest 不一致"):
-            self.engine.pull(force=True)
+        with mock.patch.object(webdav_sync, "unpack_profile_dir") as unpack:
+            with self.assertRaisesRegex(RuntimeError, "重新预览"):
+                self.engine.pull(expected_state_sha256=preview["state_sha256"])
+        unpack.assert_not_called()
         self.assertEqual(self._load()["subscriptions"][0]["name"], "机场A")
+        self.assertEqual(self.state_path.read_bytes(), before_state_file)
+        self.assertEqual(cookie.read_bytes(), before_cookie)
         after = self._load()["settings"]["webdav"]
         self.assertEqual(after["last_applied_state_sha256"], before["last_applied_state_sha256"])
         self.assertEqual(after["last_applied_local_change_version"], before["last_applied_local_change_version"])
         self.assertFalse(webdav_sync.remote_is_already_latest(after, manifest))
+
+    def test_pull_rejects_snapshot_changed_after_preview_before_writing_profiles(self):
+        self.assertTrue(self.engine.push()["ok"])
+        preview = self.engine.preview_pull()
+        client, manifest = self._remote_manifest()
+        manifest_url = client.url_for("ProxyBridge", "manifest.json")
+        original_state_url = self._remote_state_url(client, manifest)
+        remote_state = json.loads(self.store.files[original_state_url].decode("utf-8"))
+        remote_state["nodes"][0]["remark"] = "changed after preview"
+        remote_state["updated_at"] += 1
+        state_bytes = json.dumps(remote_state, ensure_ascii=False, indent=2).encode("utf-8")
+        changed_hash = webdav_sync.sha256_bytes(state_bytes)
+        changed_state_file = f"state-{changed_hash[:16]}-after-preview.sync.json"
+        manifest["state_sha256"] = changed_hash
+        manifest["state_file"] = changed_state_file
+        manifest["updated_at"] = remote_state["updated_at"]
+        self.store.files[client.url_for("ProxyBridge", changed_state_file)] = state_bytes
+        self.store.files[manifest_url] = json.dumps(
+            manifest, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        before_state_file = self.state_path.read_bytes()
+        cookie = self.profiles / "nodehash" / "inst1" / "Default" / "Cookies"
+        before_cookie = cookie.read_bytes()
+
+        with mock.patch.object(webdav_sync, "unpack_profile_dir") as unpack:
+            with self.assertRaisesRegex(RuntimeError, "重新预览"):
+                self.engine.pull(force=True, expected_state_sha256=preview["state_sha256"])
+
+        unpack.assert_not_called()
+        self.assertEqual(self.state_path.read_bytes(), before_state_file)
+        self.assertEqual(cookie.read_bytes(), before_cookie)
 
     def test_pull_rejects_unsupported_schema(self):
         self.engine.push()

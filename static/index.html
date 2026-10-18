@@ -14,7 +14,10 @@
             document.documentElement.setAttribute("data-theme", saved);
           }
           var view = localStorage.getItem("pb-view");
-          if (view) document.documentElement.setAttribute("data-initial-view", view);
+          if (view && view !== "nodes") document.documentElement.setAttribute("data-initial-view", view);
+          else document.documentElement.setAttribute("data-initial-view", "overview");
+          var density = localStorage.getItem("pb-node-density") === "standard" ? "standard" : "compact";
+          document.documentElement.setAttribute("data-node-density", density);
         } catch (e) {}
         if (/ProxyBridgeShell/.test(navigator.userAgent)) {
           document.documentElement.setAttribute("data-shell", "native");
@@ -34,41 +37,53 @@
           </div>
           <div class="brand-text">
             <strong>Proxy Bridge</strong>
-            <span id="brandSubtitle">订阅节点 · 本地代理</span>
           </div>
         </div>
 
         <nav class="sidebar-nav" aria-label="视图切换">
-          <p class="nav-group-title">通用</p>
-          <button class="nav-item" type="button" data-view="nodes" aria-current="true" aria-label="节点">
+          <p class="nav-group-title">概览</p>
+          <button class="nav-item" type="button" data-view="overview" aria-label="概览">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="8" height="8" rx="2"/><rect x="13" y="3" width="8" height="5" rx="2"/><rect x="13" y="10" width="8" height="11" rx="2"/><rect x="3" y="13" width="8" height="8" rx="2"/></svg>
+            <span class="nav-label">概览</span>
+          </button>
+          <p class="nav-group-title">工作区</p>
+          <button class="nav-item" type="button" data-view="nodes" aria-current="false" aria-label="节点">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2.2"/><circle cx="18" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="18" r="2.2"/><path d="M8 6h8M6 8v8M18 8v8M8 18h8"/></svg>
             <span class="nav-label">节点</span>
             <span class="nav-count" id="navCountNodes">0</span>
+          </button>
+          <button class="nav-item" type="button" data-view="bridges" aria-label="运行中代理">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 11V7a6 6 0 0 1 12 0v4"/><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M12 15v2"/></svg>
+            <span class="nav-label">运行中代理</span>
+            <span class="nav-count" id="navCountBridges">0</span>
+          </button>
+          <button class="nav-item" type="button" data-view="pool" aria-label="代理池与网关">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="6" r="2"/><circle cx="18" cy="6" r="2"/><circle cx="12" cy="18" r="2"/><path d="m8 7 3 8M16 7l-3 8M8 6h8"/></svg>
+            <span class="nav-label">代理池与网关</span>
+          </button>
+          <button class="nav-item" type="button" data-view="browsers" aria-label="指纹浏览器">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 8h18M7 6h.01M10 6h.01"/></svg>
+            <span class="nav-label">指纹浏览器</span>
           </button>
           <button class="nav-item" type="button" data-view="subscriptions" aria-label="订阅">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 9h8M8 13h8M8 17h5"/></svg>
             <span class="nav-label">订阅</span>
             <span class="nav-count" id="navCountSubs">0</span>
           </button>
-          <button class="nav-item" type="button" data-view="bridges" aria-label="本地代理">
-            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 11V7a6 6 0 0 1 12 0v4"/><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M12 15v2"/></svg>
-            <span class="nav-label">本地代理</span>
-            <span class="nav-count" id="navCountBridges">0</span>
-          </button>
-          <button class="nav-item" type="button" data-view="logs" aria-label="连接日志">
+          <p class="nav-group-title">日志</p>
+          <button class="nav-item" type="button" data-view="logs" aria-label="日志">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h10"/></svg>
-            <span class="nav-label">连接日志</span>
+            <span class="nav-label">日志</span>
             <span class="nav-count" id="navCountLogs">0</span>
           </button>
-          <button class="nav-item" type="button" data-view="system" aria-label="系统日志">
-            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="9"/></svg>
-            <span class="nav-label">系统日志</span>
-            <span class="nav-count" id="navCountSystem">0</span>
-          </button>
           <p class="nav-group-title">设置</p>
-          <button class="nav-item" type="button" data-view="settings" aria-label="通用设置">
+          <button class="nav-item" type="button" data-view="settings" aria-label="通用">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
-            <span class="nav-label">通用设置</span>
+            <span class="nav-label">通用</span>
+          </button>
+          <button class="nav-item" type="button" data-view="cores" aria-label="内核管理">
+            <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="5" width="14" height="14" rx="3"/><path d="M9 9h6v6H9zM9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></svg>
+            <span class="nav-label">内核管理</span>
           </button>
           <button class="nav-item" type="button" data-view="sync" aria-label="WebDAV 同步">
             <svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 0 1 13.7-5.6M20 12a8 8 0 0 1-13.7 5.6"/><path d="M18 3v4h-4M6 21v-4h4"/></svg>
@@ -82,8 +97,9 @@
 
         <!-- 侧边栏底部:代理核心 / 指纹内核状态 + 主题切换 -->
         <div class="sidebar-footer">
-          <div class="core-strip" id="coreStrip" aria-live="polite"></div>
-          <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换深色 / 浅色" title="切换深色 / 浅色">
+          <button class="footer-status" id="footerStatus" type="button" data-action="navigate" data-view="settings" aria-label="查看运行状态">核心待安装 · 局域网关闭 · 同步未运行</button>
+          <div class="core-strip" id="coreStrip" aria-live="polite" hidden></div>
+          <button class="theme-toggle" id="themeToggle" type="button" aria-label="切换深色 / 浅色" title="切换深色 / 浅色" hidden>
             <svg id="themeIconSun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="M4.9 4.9l1.4 1.4"/><path d="M17.7 17.7l1.4 1.4"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="M4.9 19.1l1.4-1.4"/><path d="M17.7 6.3l1.4-1.4"/></svg>
             <svg id="themeIconMoon" viewBox="0 0 24 24" aria-hidden="true" style="display:none"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
           </button>
@@ -92,14 +108,24 @@
 
       <!-- ============ 内容区(详情栏) ============ -->
       <main class="content" id="mainContent">
+        <!-- ---------- 概览视图 ---------- -->
+        <section class="view" data-view="overview" aria-labelledby="overviewTitle" hidden>
+          <header class="view-toolbar">
+            <div class="view-heading"><h1 id="overviewTitle">概览</h1><span class="countline" id="overviewStatus">正在读取工作状态</span></div>
+            <div class="toolbar-controls"><button class="toolbar-button" type="button" data-action="open-subscription-drawer">添加订阅</button></div>
+          </header>
+          <div class="view-body overview-body" id="overviewContent"></div>
+        </section>
+
         <!-- ---------- 节点视图 ---------- -->
-        <section class="view" data-view="nodes" aria-labelledby="nodesTitle">
+        <section class="view" data-view="nodes" aria-labelledby="nodesTitle" hidden>
           <header class="view-toolbar">
             <div class="view-heading">
               <h1 id="nodesTitle">节点</h1>
               <span class="countline" id="nodeCount">0 个节点</span>
             </div>
             <div class="toolbar-controls">
+              <details class="filter-menu"><summary class="toolbar-button">筛选</summary><div class="filter-options">
               <label class="field-inline">
                 <span>订阅</span>
                 <select id="subscriptionFilter" aria-label="按订阅筛选"></select>
@@ -121,11 +147,12 @@
                   <option value="tested_at">最近测试</option>
                 </select>
               </label>
+              </div></details>
               <div class="search-field">
                 <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
                 <input id="searchInput" type="search" autocomplete="off" placeholder="搜索名称 / 服务器 / 订阅" aria-label="搜索节点">
               </div>
-              <button class="toolbar-button" id="testVisible" type="button">
+              <button class="primary-button" id="testVisible" type="button">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6L9 17l-5-5"/></svg>
                 <span>测试可见节点</span>
               </button>
@@ -136,10 +163,19 @@
               <button class="toolbar-button icon-only" id="refreshList" type="button" aria-label="刷新列表" title="刷新列表">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4M18 3v4h-4M6 21v-4h4"/></svg>
               </button>
+              <details class="row-more toolbar-more"><summary class="toolbar-button">更多</summary><div><label><span data-i18n>启动数量</span><input id="fastestNodeCount" type="number" min="1" step="1" value="1" inputmode="numeric" aria-label="启动最快节点数量" data-i18n-aria-label></label><button type="button" data-action="start-fastest-visible" data-i18n>启动最快节点</button></div></details>
             </div>
+            <label class="field-inline node-density-control"><span>密度</span><select id="nodeDensity" aria-label="节点行高"><option value="compact">紧凑</option><option value="standard">标准</option></select></label>
           </header>
           <div class="view-body">
-            <div class="table-shell">
+            <div class="node-quick-filters" id="nodeQuickFilters" role="group" aria-label="节点状态筛选">
+              <button type="button" class="filter-chip is-active" data-node-status="all">全部</button>
+              <button type="button" class="filter-chip" data-node-status="running">运行中</button>
+              <button type="button" class="filter-chip" data-node-status="available">可用</button>
+              <button type="button" class="filter-chip" data-node-status="failed">失败</button>
+              <button type="button" class="filter-chip" data-node-status="untested">未测试</button>
+            </div>
+            <div class="table-shell" id="nodeViewport">
               <table>
                 <thead>
                   <tr>
@@ -152,10 +188,8 @@
                     <th>名称</th>
                     <th>地区</th>
                     <th>协议</th>
-                    <th>传输</th>
-                    <th>服务器</th>
                     <th>核心</th>
-                    <th>测试</th>
+                    <th>延迟</th>
                     <th class="actions-col">操作</th>
                   </tr>
                 </thead>
@@ -169,7 +203,11 @@
               </div>
               <div class="batch-buttons">
                 <button class="row-button" type="button" data-action="clear-selections" id="clearSelectionsBtn">取消选择</button>
-                <button class="row-button primary-row" type="button" data-action="batch-start-nodes" id="batchStartBtn">批量启动</button>
+                <button class="row-button" type="button" data-action="batch-test-nodes">测速选中</button>
+                <button class="row-button" type="button" data-action="batch-start-nodes" id="batchStartBtn">批量启动</button>
+                <button class="row-button danger" type="button" data-action="batch-stop-nodes">批量停止</button>
+                <button class="row-button" type="button" data-action="batch-launch-browsers">批量开浏览器</button>
+                <button class="row-button" type="button" data-action="batch-exclude-pool">移出代理池</button>
               </div>
             </div>
           </div>
@@ -183,6 +221,8 @@
               <span class="countline" id="subsCount">0 个订阅</span>
             </div>
             <div class="toolbar-controls">
+              <span class="security-badge" id="nonPublicSubscriptionBadge" hidden>允许非公网地址</span>
+              <button class="primary-button" type="button" data-action="open-subscription-drawer">添加订阅</button>
               <button class="toolbar-button" id="refreshAllSubscriptions" type="button" data-action="refresh-all-subs">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 0 1-13.7 5.6M4 12A8 8 0 0 1 17.7 6.4M18 3v4h-4M6 21v-4h4"/></svg>
                 <span>刷新全部</span>
@@ -193,10 +233,12 @@
             </div>
           </header>
           <div class="view-body subscriptions-body">
+            <aside class="drawer-backdrop" id="subscriptionDrawer" hidden>
+              <section class="detail-drawer" role="dialog" aria-modal="true" aria-labelledby="importTitle" tabindex="-1">
             <form id="importForm" class="import-card">
               <div class="import-card-title">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M20 16.5A4.5 4.5 0 0 1 15.5 21h-7A4.5 4.5 0 0 1 4 16.5"/></svg>
-                <h2>导入订阅</h2>
+                <h2 id="importTitle">添加订阅</h2>
               </div>
               <div class="form-grid">
                 <label>
@@ -215,6 +257,15 @@
                   <textarea name="raw" rows="4" spellcheck="false" placeholder="vless://..."></textarea>
                 </label>
               </details>
+              <details class="advanced-filter-details">
+                <summary>节点过滤规则</summary>
+                <div class="form-grid">
+                  <label><span>仅包含（每行一个关键词）</span><textarea name="filter_include" rows="2"></textarea></label>
+                  <label><span>排除（每行一个关键词）</span><textarea name="filter_exclude" rows="2"></textarea></label>
+                  <label class="sync-checkbox sync-span-2"><input name="filter_regex" type="checkbox"><span>将包含 / 排除规则作为正则表达式处理</span></label>
+                </div>
+                <div class="filter-preview-actions"><button class="toolbar-button" id="previewSubscriptionFilter" type="button" data-action="preview-subscription-filter">预览命中节点</button><span id="subscriptionFilterPreview" role="status"></span></div>
+              </details>
               <div class="import-card-actions">
                 <button class="primary-button" type="submit">
                   <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M20 16.5A4.5 4.5 0 0 1 15.5 21h-7A4.5 4.5 0 0 1 4 16.5"/></svg>
@@ -222,6 +273,9 @@
                 </button>
               </div>
             </form>
+                <button class="icon-button drawer-close" type="button" data-action="close-subscription-drawer" aria-label="关闭添加订阅">×</button>
+              </section>
+            </aside>
 
             <div class="subscription-security" role="group" aria-labelledby="subscriptionSecurityTitle">
               <div class="subscription-security-icon" aria-hidden="true">
@@ -237,7 +291,6 @@
               </label>
             </div>
 
-            <div class="section-divider"><span>已导入</span></div>
             <div class="subscription-task" id="subscriptionRefreshTask" hidden></div>
             <div class="subscription-list" id="subscriptionList"></div>
           </div>
@@ -251,46 +304,57 @@
               <span class="countline" id="bridgesCount">0 个运行中</span>
             </div>
             <div class="toolbar-controls">
-              <button class="toolbar-button danger" id="stopAll" type="button" data-action="stop-all">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7h10v10H7z"/></svg>
-                <span>全部停止</span>
-              </button>
+              <details class="row-more toolbar-more"><summary class="toolbar-button">更多</summary><div><button type="button" id="stopAll" class="danger-text" data-action="stop-all">全部停止</button></div></details>
             </div>
           </header>
           <div class="view-body">
+            <div class="bridge-list" id="bridgeList"></div>
+          </div>
+        </section>
+
+        <!-- ---------- 代理池与网关 ---------- -->
+        <section class="view" data-view="pool" aria-labelledby="poolTitle" hidden>
+          <header class="view-toolbar"><div class="view-heading"><h1 id="poolTitle">代理池与网关</h1><span class="countline" id="poolMemberCount">0 个成员</span></div><div class="toolbar-controls"><details class="row-more toolbar-more"><summary class="toolbar-button">更多</summary><div><button type="button" class="danger-text" data-action="rotate-pool-token" id="poolRotateToken">轮换密钥</button></div></details></div></header>
+          <div class="view-body pool-page-body">
             <section class="pool-card" id="poolCard" aria-label="代理池">
-              <div class="pool-card-head">
-                <strong>代理池</strong>
-                <span class="countline" id="poolMemberCount">0 个成员</span>
-              </div>
-              <p class="view-hint">自动包含运行中的 HTTP / SOCKS5 代理；健康优先会综合测速、成功率和连续失败，熔断节点恢复后自动重试。</p>
-              <div class="pool-link-rows" id="poolLinkRows"></div>
+              <div class="pool-card-head"><strong>访问链接</strong><span class="security-badge">密钥默认隐藏</span></div>
+              <p class="view-hint" id="poolEmptyGuide">启动节点后会自动加入代理池。</p>
+              <button class="toolbar-button pool-links-toggle" type="button" id="poolShowLinks" data-action="toggle-pool-links" aria-expanded="false">显示访问链接</button>
+              <div class="pool-link-rows pool-access-links" id="poolAccessLinks" hidden>
+                <div class="pool-link-formats" role="group" aria-label="代理池链接格式" id="poolLinkFormats">
+                  <button type="button" class="filter-chip is-active" data-action="select-pool-format" data-pool-format="list_json" aria-pressed="true">JSON</button>
+                  <button type="button" class="filter-chip" data-action="select-pool-format" data-pool-format="proxies_txt" aria-pressed="false">文本</button>
+                  <button type="button" class="filter-chip" data-action="select-pool-format" data-pool-format="get_health" aria-pressed="false">健康优先</button>
+                </div>
+                <div class="pool-access-field">
+                  <label for="poolAccessUrl"><span>只读访问链接</span><input id="poolAccessUrl" type="text" readonly spellcheck="false" value="" aria-label="只读代理池访问链接"></label>
+                  <button class="icon-button" type="button" data-action="reveal-pool-link" id="poolRevealLink" aria-label="显示或隐藏访问链接" title="显示或隐藏访问链接">◎</button>
+                  <button class="icon-button" type="button" data-action="copy-pool-link" aria-label="复制访问链接" title="复制访问链接">⧉</button>
+                </div>
+                <p class="view-hint">密钥仅在显式显示或复制时使用。</p>
+              </section>
               <div class="pool-member-list" id="poolMemberList"></div>
-              <div class="pool-card-actions">
-                <button type="button" class="toolbar-button" data-action="copy" id="poolCopyListJson" data-text="">复制 JSON 列表链接</button>
-                <button type="button" class="toolbar-button" data-action="copy" id="poolCopyProxiesTxt" data-text="">复制文本列表链接</button>
-                <button type="button" class="toolbar-button" data-action="copy" id="poolCopyGet" data-text="">复制健康优先链接</button>
-                <button type="button" class="toolbar-button danger" data-action="rotate-pool-token" id="poolRotateToken">轮换密钥</button>
-              </div>
             </section>
             <section class="pool-card smart-gateway-card" id="smartGatewayCard" aria-label="智能网关">
-              <div class="pool-card-head">
-                <strong>智能网关</strong>
-                <span class="countline" id="smartGatewayStatus">未运行</span>
-              </div>
-              <p class="view-hint">一个固定入口按健康策略选择代理池节点；连接建立后保持当前节点。</p>
+              <div class="pool-card-head"><strong>智能网关</strong><span class="countline" id="smartGatewayStatus">未运行</span></div>
+              <p class="view-hint">一个固定入口按策略选择代理池节点，并在连接期间保持节点。</p>
               <div class="smart-gateway-controls">
                 <label class="field-inline"><span>策略</span><select id="smartGatewayStrategy"><option value="health">健康优先</option><option value="latency">延迟优先</option><option value="round_robin">轮询</option><option value="random">随机</option></select></label>
                 <label class="field-inline"><span>端口</span><input id="smartGatewayPort" type="number" min="1" max="65535" inputmode="numeric"></label>
                 <label class="field-inline"><span>地区</span><input id="smartGatewayRegion" type="text" maxlength="128" placeholder="全部"></label>
-                <label class="field-inline"><span>筛选</span><input id="smartGatewayQuery" type="text" maxlength="128" placeholder="名称包含"></label>
-                <button class="toolbar-button" type="button" data-action="save-smart-gateway" id="smartGatewaySave">保存并启动</button>
-                <button class="toolbar-button danger" type="button" data-action="stop-smart-gateway" id="smartGatewayStop">停止</button>
+                <label class="field-inline"><span>名称筛选</span><input id="smartGatewayQuery" type="text" maxlength="128" placeholder="名称包含"></label>
+                <button class="primary-button" type="button" data-action="save-smart-gateway" id="smartGatewaySave">启动网关</button>
+                <button class="toolbar-button danger" type="button" data-action="stop-smart-gateway" id="smartGatewayStop" hidden>停止网关</button>
               </div>
               <div class="pool-link-rows" id="smartGatewayLinks"></div>
             </section>
-            <div class="bridge-list" id="bridgeList"></div>
           </div>
+        </section>
+
+        <!-- ---------- 全局指纹浏览器 ---------- -->
+        <section class="view" data-view="browsers" aria-labelledby="browsersTitle" hidden>
+          <header class="view-toolbar"><div class="view-heading"><h1 id="browsersTitle">指纹浏览器</h1><span class="countline" id="browserCount">0 条记录</span></div><div class="toolbar-controls"><div class="search-field"><svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="browserSearchInput" type="search" placeholder="搜索名称或标签" aria-label="搜索浏览器名称或标签" autocomplete="off"></div><label class="field-inline"><span>节点</span><select id="browserNodeFilter"><option value="all">全部节点</option></select></label><label class="field-inline"><span>状态</span><select id="browserStatusFilter"><option value="all">全部状态</option><option value="running">运行中</option><option value="stopped">已停止</option></select></label><button class="toolbar-button danger" id="stopBrowsers" type="button" data-action="stop-all-browsers" hidden>停止运行中的浏览器</button></div></header>
+          <div class="view-body"><div class="browser-list-table" id="browserList"></div></div>
         </section>
 
         <!-- ---------- 连接日志视图 ---------- -->
@@ -328,6 +392,10 @@
               </button>
             </div>
           </header>
+          <div class="view-body log-tab-strip" role="tablist" aria-label="日志类型">
+            <button type="button" class="log-tab is-active" role="tab" aria-selected="true" data-log-tab="logs">连接日志</button>
+            <button type="button" class="log-tab" role="tab" aria-selected="false" data-log-tab="system">系统日志 <span id="systemErrorCount" class="error-count" hidden>0</span></button>
+          </div>
           <div class="view-body">
             <p class="view-hint">显示通过本地代理的 CONNECT/HTTP 目标、节点、流量和耗时。</p>
             <div class="log-table-shell">
@@ -408,19 +476,18 @@
                   <span>密码（留空保持不变）</span>
                   <input id="lanPassword" type="password" maxlength="255" autocomplete="new-password">
                 </label>
-                <label id="lanTokenField" class="sync-span-2" hidden>
-                  <span>Token（首次启用必填；已配置时留空保持不变）</span>
-                  <input id="lanToken" type="text" maxlength="255" autocomplete="off" spellcheck="false">
-                </label>
+                <div id="lanTokenField" class="sync-span-2 sensitive-field" hidden>
+                  <label><span>Token（新启用时会自动生成）</span><input id="lanToken" type="password" maxlength="255" autocomplete="off" spellcheck="false"></label>
+                  <button class="icon-button" type="button" data-action="reveal-lan-token" aria-label="显示或隐藏 Token">◉</button>
+                  <button class="icon-button" type="button" data-action="copy-lan-token" aria-label="复制 Token">⧉</button>
+                </div>
                 <label class="sync-span-2">
                   <span>允许的 IP / CIDR（每行一项）</span>
                   <textarea id="lanAllowedCidrs" rows="3" spellcheck="false"></textarea>
                 </label>
               </div>
 
-              <div class="import-card-actions">
-                <button class="primary-button" id="networkSaveButton" type="submit" disabled>保存设置</button>
-              </div>
+              <div class="import-card-actions" hidden><button class="toolbar-button" id="networkSaveButton" type="submit" disabled>保存设置</button></div>
             </form>
 
             <form id="speedTestSettingsForm" class="settings-card">
@@ -453,9 +520,7 @@
                   <input id="speedTestRetries" type="number" min="0" max="2" step="1">
                 </label>
               </div>
-              <div class="import-card-actions">
-                <button class="primary-button" id="speedTestSaveButton" type="submit">保存测速设置</button>
-              </div>
+              <div class="import-card-actions" hidden><button class="toolbar-button" id="speedTestSaveButton" type="submit">保存测速设置</button></div>
             </form>
 
             <form id="logSettingsForm" class="settings-card">
@@ -481,10 +546,22 @@
                   <strong id="logStorageUsage">—</strong>
                 </div>
               </div>
-              <div class="import-card-actions">
-                <button class="primary-button" id="logSettingsSaveButton" type="submit">保存日志设置</button>
-              </div>
+              <div class="import-card-actions" hidden><button class="toolbar-button" id="logSettingsSaveButton" type="submit">保存日志设置</button></div>
             </form>
+
+            <section class="settings-card appearance-settings" aria-labelledby="appearanceTitle">
+              <div class="import-card-title"><h2 id="appearanceTitle">外观</h2></div>
+              <div class="form-grid settings-form-grid">
+                <label><span>主题</span><select id="themeSelect"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select></label>
+                <label><span>界面语言</span><select id="languageSelect"><option value="zh-CN">简体中文</option><option value="en">英语</option></select></label>
+                <label><span>节点行高</span><select id="settingsNodeDensity"><option value="compact">紧凑 · 36px</option><option value="standard">标准 · 44px</option></select></label>
+                <div><span class="settings-field-label">版本</span><strong id="aboutVersion">—</strong></div>
+              </div>
+            </section>
+            <section class="settings-card health-settings" aria-labelledby="healthSettingsTitle">
+              <div class="import-card-title"><h2 id="healthSettingsTitle">代理健康检查</h2></div>
+              <label class="settings-toggle-row"><span class="settings-toggle-copy"><strong>无浏览器绑定的节点故障后自动切换</strong><span>默认关闭。切换会中断连接并改变出口；浏览器绑定节点始终保持原出口。</span></span><input id="healthAutoSwitch" type="checkbox" aria-label="允许健康检查自动切换节点"></label>
+            </section>
 
             <section class="settings-info-card" aria-labelledby="networkInfoTitle">
               <div class="settings-info-head">
@@ -520,7 +597,14 @@
                 <div class="settings-empty">暂无活动连接</div>
               </div>
             </section>
+            <div class="settings-save-bar" id="settingsSaveBar" hidden><span>有未保存的更改</span><button type="button" class="toolbar-button" data-action="discard-settings">放弃</button><button type="button" class="primary-button" data-action="save-all-settings">保存设置</button></div>
           </div>
+        </section>
+
+        <!-- ---------- 内核管理 ---------- -->
+        <section class="view" data-view="cores" aria-labelledby="coresTitle" hidden>
+          <header class="view-toolbar"><div class="view-heading"><h1 id="coresTitle">内核管理</h1><span class="countline">版本与安装状态</span></div><div class="toolbar-controls"><button class="primary-button" type="button" data-action="show-core-upload">本地导入</button></div></header>
+          <div class="view-body"><div class="kernel-list" id="kernelList"></div></div>
         </section>
 
         <!-- ---------- WebDAV 同步视图 ---------- -->
@@ -538,6 +622,7 @@
             </div>
           </header>
           <div class="view-body sync-body">
+            <section class="sync-status-card" id="syncStatusCard" aria-live="polite"></section>
             <p class="view-hint" id="syncDescription">
               在多台 Mac 之间同步<strong>订阅 / 节点</strong>与<strong>已停止的指纹浏览器 Profile</strong>（Cookie、LocalStorage 等），实现换机接力。
               删除订阅会清理关联节点的浏览器记录与本地 Profile，并在启用同步时<strong>自动上传</strong>（远端对应数据一并删除）。
@@ -575,7 +660,7 @@
                 </label>
               </div>
 
-              <div class="section-divider"><span>自动化（v1.1）</span></div>
+              <div class="section-divider"><span>自动化</span></div>
               <div class="form-grid">
                 <label class="sync-checkbox">
                   <input id="syncAutoUpload" name="auto_upload_on_browser_stop" type="checkbox">
@@ -587,20 +672,20 @@
                 </label>
               </div>
 
-              <div class="section-divider"><span>加密（v2 可选）</span></div>
+              <div class="section-divider"><span>端到端加密</span></div>
               <div class="form-grid">
                 <label class="sync-checkbox">
                   <input id="syncEncrypt" name="encrypt" type="checkbox">
                   <span>端到端加密（OpenSSL AES-256-CBC）</span>
                 </label>
-                <label>
+                <label id="syncEncryptPasswordField" hidden>
                   <span>加密密码</span>
                   <input id="syncEncryptPassword" name="encrypt_password" type="password" autocomplete="off" placeholder="已设置则留空不改">
                 </label>
               </div>
 
               <div class="import-card-actions">
-                <button class="primary-button" type="submit">保存设置</button>
+                <button class="toolbar-button" type="submit">保存设置</button>
               </div>
             </form>
 
@@ -681,6 +766,10 @@
               </button>
             </div>
           </header>
+          <div class="view-body log-tab-strip" role="tablist" aria-label="日志类型">
+            <button type="button" class="log-tab" role="tab" aria-selected="false" data-log-tab="logs">连接日志</button>
+            <button type="button" class="log-tab is-active" role="tab" aria-selected="true" data-log-tab="system">系统日志 <span id="systemErrorCountSystem" class="error-count" hidden>0</span></button>
+          </div>
           <div class="view-body">
             <p class="view-hint">记录软件运行中的关键事件(启动、订阅、本地代理启停、测试、报错等),用于排查使用问题。</p>
             <div class="log-table-shell">
@@ -705,6 +794,36 @@
           </div>
         </section>
       </main>
+    </div>
+
+    <div class="drawer-backdrop" id="nodeDetailDrawer" hidden>
+      <section class="detail-drawer node-detail-drawer" role="dialog" aria-modal="true" aria-labelledby="nodeDetailTitle" tabindex="-1">
+        <header class="drawer-header"><div><span class="eyebrow">节点详情</span><h2 id="nodeDetailTitle">节点</h2><span id="nodeDetailStatus" class="status-pill"></span></div><button type="button" class="icon-button" data-action="close-node-drawer" aria-label="关闭详情">×</button></header>
+        <div class="drawer-tabs" role="tablist" aria-label="节点详情"><button class="drawer-tab is-active" type="button" data-node-tab="overview">概览</button><button class="drawer-tab" type="button" data-node-tab="browsers">浏览器</button><button class="drawer-tab" type="button" data-node-tab="history">测速历史</button><button class="drawer-tab" type="button" data-node-tab="config">配置</button></div>
+        <div class="drawer-content" id="nodeDrawerContent"></div>
+        <footer class="drawer-footer"><button class="toolbar-button" type="button" data-action="close-node-drawer">关闭</button><button class="primary-button" type="button" data-action="launch-browser-from-drawer">新开浏览器</button></footer>
+      </section>
+    </div>
+
+    <div class="command-backdrop" id="commandPalette" hidden>
+      <section class="command-dialog" role="dialog" aria-modal="true" aria-labelledby="commandTitle">
+        <label class="command-search"><span id="commandTitle" class="sr-only">命令面板</span><input id="commandSearch" type="search" placeholder="搜索节点、启动代理或打开页面…" autocomplete="off"><kbd>ESC</kbd></label>
+        <div id="commandResults" class="command-results"></div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="confirmDialog" hidden>
+      <section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMessage" tabindex="-1">
+        <div class="confirm-mark" aria-hidden="true">!</div><h2 id="confirmTitle">确认操作</h2><p id="confirmMessage"></p><div id="confirmDetails" class="confirm-details" hidden></div>
+        <footer><button class="toolbar-button" type="button" data-action="cancel-confirm">取消</button><button class="danger-button" id="confirmAccept" type="button" data-action="accept-confirm">继续</button></footer>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="batchStartResultDialog" hidden>
+      <section class="confirm-dialog batch-result-dialog" role="dialog" aria-modal="true" aria-labelledby="batchStartResultTitle" tabindex="-1">
+        <h2 id="batchStartResultTitle">批量启动结果</h2><p id="batchStartResultSummary"></p><ul id="batchStartFailureList" class="batch-failure-list"></ul>
+        <footer><button class="primary-button" type="button" data-action="close-batch-start-results">关闭</button></footer>
+      </section>
     </div>
 
     <!-- ============ 核心日志弹窗 ============ -->
@@ -920,6 +1039,7 @@
       (function () {
         var root = document.documentElement;
         var btn = document.getElementById("themeToggle");
+        var select = document.getElementById("themeSelect");
         var sun = document.getElementById("themeIconSun");
         var moon = document.getElementById("themeIconMoon");
         function currentTheme() {
@@ -934,22 +1054,24 @@
           sun.style.display = t === "dark" ? "" : "none";
           moon.style.display = t === "dark" ? "none" : "";
         }
-        btn.addEventListener("click", function () {
-          var next = currentTheme() === "dark" ? "light" : "dark";
-          root.setAttribute("data-theme", next);
-          try { localStorage.setItem("pb-theme", next); } catch (e) {}
+        function setTheme(next) {
+          if (next === "system") {
+            root.removeAttribute("data-theme");
+            try { localStorage.removeItem("pb-theme"); } catch (e) {}
+          } else {
+            root.setAttribute("data-theme", next);
+            try { localStorage.setItem("pb-theme", next); } catch (e) {}
+          }
           syncIcon();
-        });
+        }
+        if (btn) btn.addEventListener("click", function () { setTheme(currentTheme() === "dark" ? "light" : "dark"); });
+        if (select) select.addEventListener("change", function () { setTheme(select.value); });
         if (window.matchMedia) {
-          window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", syncIcon);
+          window.matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", syncIcon);
         }
         syncIcon();
       })();
     </script>
-    <script src="/static/auth.js"></script>
-    <script src="/static/diagnostics.js"></script>
-    <script src="/static/browser-ui.js"></script>
-    <script src="/static/core-upload.js"></script>
-    <script src="/static/app.js"></script>
+    <script type="module" src="/static/main.mjs"></script>
   </body>
 </html>

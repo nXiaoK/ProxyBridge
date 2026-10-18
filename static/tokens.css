@@ -1,0 +1,183 @@
+/* 主题、五档字号、间距与状态色的统一配置；组件和页面仅引用这些 token。 */
+
+@layer tokens {
+:root {
+  color-scheme: light dark;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "PingFang SC", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* 字号仅使用 11 / 12 / 13 / 15 / 20px 五档，后续规则都引用这些 token。 */
+  --font-size-xs: 11px;
+  --font-size-2xs: var(--font-size-xs);
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-lg: 15px;
+  --font-size-display: 20px;
+  /* 间距刻度供组件和页面复用，保持布局留白一致。 */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  /* 大面板与抽屉统一使用 12px 圆角。 */
+  --radius-xl: var(--radius-lg);
+
+  /* 桌面侧栏和工具栏尺寸，窄屏由页面层覆盖。 */
+  --sidebar-width: 232px;
+  --toolbar-height: 56px;
+  /* 控件高度和表格行高供布局与虚拟列表共同读取。 */
+  --control-height: 32px;
+  --node-row-height: 36px;
+  --node-group-row-height: 40px;
+
+  /* 原色和透明色阶集中定义，组件规则只引用语义 token。 */
+  --color-white: #fff;
+  --color-black: #000;
+  --color-transparent: transparent;
+  --color-sky: #64d2ff;
+  --color-purple: #a78bfa;
+  --color-indigo: #6366f1;
+  --color-success-strong: #1f9d40;
+  --color-black-a04: rgba(0, 0, 0, 0.04);
+  --color-black-a15: rgba(0, 0, 0, 0.15);
+  --color-black-a22: rgba(0, 0, 0, 0.22);
+  --color-black-a24: rgba(0, 0, 0, 0.24);
+  --color-black-a28: rgba(0, 0, 0, 0.28);
+  --color-white-a25: rgba(255, 255, 255, 0.25);
+  /* 下拉箭头使用同一套轻量图标色。 */
+  --select-chevron: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='none' stroke='%238e8e93' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M1 1l4 4 4-4'/></svg>");
+
+  --transition: 140ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ---------------- Light theme (default) ---------------- */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+  --bg-app: #ffffff;
+  --bg-sidebar: rgba(246, 246, 248, 0.8);
+  --bg-content: #ffffff;
+  --bg-toolbar: rgba(255, 255, 255, 0.72);
+  --bg-panel: #ffffff;
+  --bg-elevated: #f7f7f9;
+  --bg-input: #ffffff;
+  --bg-hover: rgba(0, 0, 0, 0.05);
+  --bg-active: rgba(0, 0, 0, 0.09);
+  --bg-selection: rgba(10, 132, 255, 0.14);
+  /* 页面抽屉和模式框使用两级遮罩强度。 */
+  --bg-scrim: rgba(17, 24, 39, 0.42);
+  --bg-modal-scrim: rgba(0, 0, 0, 0.34);
+
+  --nav-selected: rgba(10, 132, 255, 0.14);
+  --nav-selected-text: var(--accent);
+
+  --text-primary: #1d1d1f;
+  --text-secondary: rgba(60, 60, 67, 0.72);
+  --text-tertiary: rgba(60, 60, 67, 0.5);
+  --text-inverse: #ffffff;
+
+  --border-subtle: rgba(0, 0, 0, 0.07);
+  --border-strong: rgba(0, 0, 0, 0.13);
+  --separator: rgba(0, 0, 0, 0.08);
+
+  --accent: #0a84ff;
+  --accent-hover: #0071e3;
+  --accent-soft: rgba(10, 132, 255, 0.12);
+  --success: #28a745;
+  --warning: #d98416;
+  --danger: #e0362c;
+
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.04), 0 1px 8px -4px rgba(0, 0, 0, 0.08);
+  --shadow-modal: 0 24px 60px -20px rgba(0, 0, 0, 0.28), 0 2px 6px rgba(0, 0, 0, 0.08);
+  --shadow-inset: inset 0 0 0 0.5px rgba(0, 0, 0, 0.05);
+}
+
+/* ---------------- Dark theme ---------------- */
+[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-app: #1e1e1e;
+  --bg-sidebar: rgba(38, 38, 40, 0.7);
+  --bg-content: #232324;
+  --bg-toolbar: rgba(42, 42, 44, 0.72);
+  --bg-panel: #2c2c2e;
+  --bg-elevated: #323234;
+  --bg-input: #1c1c1e;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(255, 255, 255, 0.1);
+  --bg-selection: rgba(10, 132, 255, 0.24);
+  --bg-scrim: rgba(0, 0, 0, 0.58);
+  --bg-modal-scrim: rgba(0, 0, 0, 0.58);
+
+  --nav-selected: rgba(10, 132, 255, 0.26);
+  --nav-selected-text: #6cb6ff;
+
+  --text-primary: #f5f5f7;
+  --text-secondary: rgba(235, 235, 245, 0.68);
+  --text-tertiary: rgba(235, 235, 245, 0.42);
+  --text-inverse: #1d1d1f;
+
+  --border-subtle: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.15);
+  --separator: rgba(255, 255, 255, 0.09);
+
+  --accent: #0a84ff;
+  --accent-hover: #409cff;
+  --accent-soft: rgba(10, 132, 255, 0.24);
+  --success: #32d74b;
+  --warning: #ff9f0a;
+  --danger: #ff453a;
+
+  --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px -8px rgba(0, 0, 0, 0.5);
+  --shadow-modal: 0 32px 80px -20px rgba(0, 0, 0, 0.7), 0 2px 8px rgba(0, 0, 0, 0.5);
+  --shadow-inset: inset 0 0 0 0.5px rgba(255, 255, 255, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg-app: #1e1e1e;
+    --bg-sidebar: rgba(38, 38, 40, 0.7);
+    --bg-content: #232324;
+    --bg-toolbar: rgba(42, 42, 44, 0.72);
+    --bg-panel: #2c2c2e;
+    --bg-elevated: #323234;
+    --bg-input: #1c1c1e;
+    --bg-hover: rgba(255, 255, 255, 0.06);
+    --bg-active: rgba(255, 255, 255, 0.1);
+    --bg-selection: rgba(10, 132, 255, 0.24);
+    --bg-scrim: rgba(0, 0, 0, 0.58);
+    --bg-modal-scrim: rgba(0, 0, 0, 0.58);
+
+    --nav-selected: rgba(10, 132, 255, 0.26);
+    --nav-selected-text: #6cb6ff;
+
+    --text-primary: #f5f5f7;
+    --text-secondary: rgba(235, 235, 245, 0.68);
+    --text-tertiary: rgba(235, 235, 245, 0.42);
+    --text-inverse: #1d1d1f;
+
+    --border-subtle: rgba(255, 255, 255, 0.08);
+    --border-strong: rgba(255, 255, 255, 0.15);
+    --separator: rgba(255, 255, 255, 0.09);
+
+    --accent-hover: #409cff;
+    --accent-soft: rgba(10, 132, 255, 0.24);
+    --success: #32d74b;
+    --warning: #ff9f0a;
+    --danger: #ff453a;
+
+    --shadow-panel: 0 1px 2px rgba(0, 0, 0, 0.3), 0 4px 16px -8px rgba(0, 0, 0, 0.5);
+    --shadow-modal: 0 32px 80px -20px rgba(0, 0, 0, 0.7), 0 2px 8px rgba(0, 0, 0, 0.5);
+    --shadow-inset: inset 0 0 0 0.5px rgba(255, 255, 255, 0.05);
+  }
+}
+
+}

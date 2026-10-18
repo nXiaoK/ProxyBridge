@@ -674,6 +674,8 @@ def sanitize_browser_instance_for_sync(instance: dict[str, Any]) -> dict[str, An
         label = label[:120].rstrip()
     record["label"] = label
     record.pop("tag", None)
+    # 出口自检结果属于本机网络环境，不应被其他设备上的旧结果覆盖。
+    record.pop("exit_check", None)
     # Drop absolute path; receiver rebuilds from node_id + instance id.
     record.pop("profile_path", None)
     return record
@@ -1349,6 +1351,166 @@ class SyncEngine:
         snapshot_meta = validate_remote_snapshot(manifest, remote_state, raw_state)
         return manifest, snapshot_meta, remote_state
 
+    @_serialized_sync_operation
+    def preview_pull(self) -> dict[str, Any]:
+        """Return a credential-free summary of the remote snapshot without applying it."""
+        with self.state_lock:
+            state = self.load_state()
+            cfg = self.get_settings(state)
+            self._require_cfg(cfg)
+            local_subscriptions = [
+                dict(item) for item in state.get("subscriptions") or [] if isinstance(item, dict)
+            ]
+            local_nodes = [dict(item) for item in state.get("nodes") or [] if isinstance(item, dict)]
+            local_browsers = [
+                dict(item)
+                for item in state.get("browser_instances") or []
+                if isinstance(item, dict)
+            ]
+
+        client = self.client_factory(cfg)
+        urls = self._remote_urls(client, cfg)
+        if not client.exists(urls["manifest"]):
+            raise RuntimeError(
+                "远端还没有同步数据（找不到 manifest.json），请先从源设备上传同步数据。"
+            )
+        manifest, snapshot_meta, remote_state = self._read_remote_snapshot(client, cfg, urls)
+
+        remote_subscriptions = [
+            dict(item)
+            for item in remote_state.get("subscriptions") or []
+            if isinstance(item, dict)
+        ]
+        remote_nodes = [dict(item) for item in remote_state.get("nodes") or [] if isinstance(item, dict)]
+        remote_browsers = [
+            dict(item)
+            for item in remote_state.get("browser_instances") or []
+            if isinstance(item, dict)
+        ]
+
+        def entity_summary(
+            local_items: list[dict[str, Any]], remote_items: list[dict[str, Any]]
+        ) -> dict[str, int]:
+            local_by_id = {str(item.get("id") or ""): item for item in local_items if item.get("id")}
+            remote_by_id = {str(item.get("id") or ""): item for item in remote_items if item.get("id")}
+            shared_ids = local_by_id.keys() & remote_by_id.keys()
+            return {
+                "local_count": len(local_by_id),
+                "remote_count": len(remote_by_id),
+                "added_count": len(remote_by_id.keys() - local_by_id.keys()),
+                "removed_count": len(local_by_id.keys() - remote_by_id.keys()),
+                "updated_count": sum(local_by_id[item_id] != remote_by_id[item_id] for item_id in shared_ids),
+            }
+
+        local_browsers_for_summary = [
+            sanitize_browser_instance_for_sync(item) for item in local_browsers
+        ]
+        remote_browsers_for_summary = [
+            sanitize_browser_instance_for_sync(item) for item in remote_browsers
+        ]
+        browser_summary = entity_summary(
+            local_browsers_for_summary, remote_browsers_for_summary
+        )
+        if not self.sync_browser_data:
+            browser_summary.update(
+                {
+                    "added_count": 0,
+                    "removed_count": 0,
+                    "updated_count": 0,
+                }
+            )
+        local_profile_hashes: dict[str, str] = {}
+        if self.sync_browser_data:
+            for instance in local_browsers:
+                instance_id = str(instance.get("id") or "")
+                if not instance_id:
+                    continue
+                try:
+                    profile_path = self._profile_path_for(instance)
+                    if not profile_path.is_dir():
+                        continue
+                    marker = profile_path / PROFILE_SYNC_MARKER
+                    marker_hash = marker.read_text(encoding="utf-8").strip() if marker.is_file() else ""
+                    local_profile_hashes[instance_id] = marker_hash
+                except (OSError, RuntimeError, ValueError):
+                    continue
+        remote_profile_hashes = snapshot_meta["profile_hashes"]
+        remote_browser_ids = {
+            str(item.get("id") or "") for item in remote_browsers if item.get("id")
+        }
+        profile_summary = {
+            "local_count": len(local_profile_hashes),
+            "remote_count": len(remote_profile_hashes),
+            "added_count": len(remote_profile_hashes.keys() - local_profile_hashes.keys()),
+            "removed_count": len(local_profile_hashes.keys() - remote_browser_ids),
+            "updated_count": sum(
+                instance_id in local_profile_hashes
+                and local_profile_hashes[instance_id] != profile_hash
+                for instance_id, profile_hash in remote_profile_hashes.items()
+            ),
+            "unchanged_count": sum(
+                local_profile_hashes.get(instance_id) == profile_hash
+                for instance_id, profile_hash in remote_profile_hashes.items()
+            ),
+        }
+        if not self.sync_browser_data:
+            profile_summary.update(
+                {"added_count": 0, "removed_count": 0, "updated_count": 0, "unchanged_count": 0}
+            )
+        remote_nodes_preview = [
+            {
+                key: item[key]
+                for key in (
+                    "id",
+                    "name",
+                    "region",
+                    "region_code",
+                    "region_override",
+                    "protocol",
+                    "favorite",
+                    "remark",
+                )
+                if key in item
+            }
+            for item in remote_nodes
+        ]
+        remote_subscriptions_preview = [
+            {
+                key: item[key]
+                for key in ("id", "name", "node_count")
+                if key in item
+            }
+            for item in remote_subscriptions
+        ]
+        remote_browsers_preview = [
+            {
+                key: item[key]
+                for key in ("id", "name", "node_id", "label", "legacy", "profile_layout")
+                if key in item
+            }
+            for item in remote_browsers_for_summary
+        ]
+        return {
+            "ok": True,
+            "state_sha256": snapshot_meta["state_sha256"],
+            "summary": {
+                "sync_scope": "all" if self.sync_browser_data else "subscriptions",
+                "subscriptions": entity_summary(local_subscriptions, remote_subscriptions),
+                "nodes": entity_summary(local_nodes, remote_nodes),
+                "browser_instances": browser_summary,
+                "profiles": profile_summary,
+                "applies_browser_data": self.sync_browser_data,
+            },
+            "remote": {
+                "device_id": str(manifest.get("device_id") or ""),
+                "updated_at": int(manifest.get("updated_at") or 0),
+                "subscriptions": remote_subscriptions_preview,
+                "nodes": remote_nodes_preview,
+                "browser_instances": remote_browsers_preview,
+                "profile_count": len(snapshot_meta["profile_hashes"]),
+            },
+        }
+
     def _local_state_fingerprint(self, state: dict[str, Any]) -> str:
         """计算本地状态指纹用于检测 Pull 中的并发变化（Issue #4 修复）。
 
@@ -1749,7 +1911,14 @@ class SyncEngine:
         *,
         force: bool = False,
         preserve_local_changes: bool = False,
+        expected_state_sha256: str | None = None,
     ) -> dict[str, Any]:
+        expected_state_hash: str | None = None
+        if expected_state_sha256 is not None:
+            expected_state_hash = str(expected_state_sha256 or "").strip().lower()
+            if not SHA256_PATTERN.fullmatch(expected_state_hash):
+                raise ValueError("预览状态哈希无效，请重新预览后再拉取")
+
         with self.state_lock:
             state = self.load_state()
             cfg = self.get_settings(state)
@@ -1810,9 +1979,18 @@ class SyncEngine:
             raise RuntimeError("远端 manifest.json 超过允许大小")
         manifest = json.loads(raw_manifest.decode("utf-8"))
         manifest_meta = validate_manifest(manifest)
+        if (
+            expected_state_hash is not None
+            and manifest_meta["state_sha256"] != expected_state_hash
+        ):
+            raise RuntimeError("远端同步状态已变化，请重新预览后再拉取")
 
         # 「已最新则跳过」：只读 manifest 即可判定，避免再下 state/profiles。
-        if not force and remote_is_already_latest(cfg, manifest):
+        if (
+            expected_state_hash is None
+            and not force
+            and remote_is_already_latest(cfg, manifest)
+        ):
             status = "已是最新，跳过拉取"
             with self.state_lock:
                 state = self.load_state()
@@ -1855,6 +2033,11 @@ class SyncEngine:
         )
         if len(raw_state) > MAX_STATE_BYTES:
             raise RuntimeError("远端 state.sync.json 超过允许大小")
+        if (
+            expected_state_hash is not None
+            and sha256_bytes(raw_state) != expected_state_hash
+        ):
+            raise RuntimeError("远端同步状态已变化，请重新预览后再拉取")
         remote_state = json.loads(raw_state.decode("utf-8"))
         snapshot_meta = validate_remote_snapshot(manifest, remote_state, raw_state)
         profile_hashes = snapshot_meta["profile_hashes"]

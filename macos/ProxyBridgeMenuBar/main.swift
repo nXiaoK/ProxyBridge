@@ -486,8 +486,9 @@ final class ConsoleWindowController: NSWindowController, NSWindowDelegate, WKNav
         self.webView = WKWebView(frame: .zero, configuration: configuration)
 
         let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1360, height: 800)
-        let preferredWidth = min(CGFloat(1520), max(CGFloat(1040), visibleFrame.width - 96))
-        let preferredHeight = min(CGFloat(820), max(CGFloat(640), visibleFrame.height - 96))
+        // 控制台最小尺寸为 960×600，保证桌面工作区可读；网页在更窄窗口使用卡片布局。
+        let preferredWidth = min(CGFloat(1520), max(CGFloat(960), visibleFrame.width - 96))
+        let preferredHeight = min(CGFloat(820), max(CGFloat(600), visibleFrame.height - 96))
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: preferredWidth, height: preferredHeight),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -495,7 +496,7 @@ final class ConsoleWindowController: NSWindowController, NSWindowDelegate, WKNav
             defer: false
         )
         window.title = "Proxy Bridge 控制台"
-        window.minSize = NSSize(width: 1040, height: 640)
+        window.minSize = NSSize(width: 960, height: 600)
         window.center()
         super.init(window: window)
         window.delegate = self

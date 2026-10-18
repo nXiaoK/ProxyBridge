@@ -283,6 +283,15 @@ DIAGNOSTIC_RUN_SEMAPHORE = threading.BoundedSemaphore(DIAGNOSTIC_MAX_CONCURRENT_
 SUBSCRIPTION_SCHEDULER_LOCK = threading.Lock()
 SUBSCRIPTION_SCHEDULER_WAKE = threading.Event()
 SUBSCRIPTION_SCHEDULER_THREAD: threading.Thread | None = None
+# 状态流复用现有实例认证；变更通知不携带订阅、密码等数据。
+STATUS_EVENT_CONDITION = threading.Condition()
+STATUS_EVENT_REVISION = 0
+BRIDGE_HEALTH_THREAD: threading.Thread | None = None
+BRIDGE_HEALTH_LOCK = threading.Lock()
+# 浏览器出口自检最多三路，避免批量启动时同时占满网络连接。
+BROWSER_EXIT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="browser-exit")
+# 每 60 秒最多三路检查现有测速目标；探活本身不迁移连接，可选切换另行处理。
+BRIDGE_HEALTH_INTERVAL = 60
 SMART_GATEWAY_LOCK = threading.RLock()
 POOL_RR_COUNTER = 0
 SPEED_TEST_TARGET_COUNTER = 0
@@ -403,6 +412,7 @@ def log_event(message: str, level: str = "info", category: str = "") -> None:
     }
     with SYSTEM_LOG_LOCK:
         SYSTEM_LOGS.append(entry)
+    notify_status_change()
     # 同步打印到标准输出,格式化为「时间 LEVEL [分类] 消息」便于在日志文件里检索。
     stamp = time.strftime("%H:%M:%S", time.localtime(entry["ts"]))
     tag = f"[{category}] " if category else ""
@@ -421,6 +431,13 @@ def clear_system_logs() -> dict[str, Any]:
         SYSTEM_LOGS.clear()
     log_event("系统日志已清空", category="系统")
     return {"ok": True}
+
+
+def notify_status_change() -> None:
+    global STATUS_EVENT_REVISION
+    with STATUS_EVENT_CONDITION:
+        STATUS_EVENT_REVISION += 1
+        STATUS_EVENT_CONDITION.notify_all()
 
 
 @dataclass
@@ -935,6 +952,10 @@ def runtime_log_settings_snapshot() -> dict[str, int]:
 
 
 def normalize_subscription_schedule(subscription: dict[str, Any]) -> None:
+    # 过滤规则为空时导入全部节点；正则必须由用户显式启用。
+    subscription.setdefault("filter_include", "")
+    subscription.setdefault("filter_exclude", "")
+    subscription["filter_regex"] = subscription.get("filter_regex") is True
     interval = safe_int(subscription.get("refresh_interval_minutes"), 0)
     if interval != 0:
         interval = min(max(interval, SUBSCRIPTION_REFRESH_MINUTES_MIN), SUBSCRIPTION_REFRESH_MINUTES_MAX)
@@ -1055,7 +1076,7 @@ def validate_lan_security(value: Any, current: dict[str, Any] | None = None) -> 
     if not isinstance(value, dict):
         raise ValueError("lan_security 必须是对象")
     previous = normalize_lan_security(current)
-    auth_mode = str(value.get("auth_mode") or "none").lower()
+    auth_mode = str(value.get("auth_mode", previous["auth_mode"]) or "none").lower()
     if auth_mode not in {"none", "basic", "token"}:
         raise ValueError("认证方式只能是 none、basic 或 token")
     username = _validate_lan_secret(value.get("username", previous["username"]), "用户名")
@@ -1167,27 +1188,84 @@ def parse_query(query: str) -> dict[str, str]:
     return {key.lower(): values[-1] for key, values in parsed.items() if values}
 
 
+REGION_CATALOG = {
+    "HK": ("香港", "hong kong|hongkong|hkg", "Asia/Hong_Kong", "zh-HK"),
+    "JP": ("日本", "japan|tokyo|osaka|jpn", "Asia/Tokyo", "ja-JP"),
+    "SG": ("新加坡", "singapore|sin", "Asia/Singapore", "en-SG"),
+    "TW": ("台湾", "taiwan|twn", "Asia/Taipei", "zh-TW"),
+    "KR": ("韩国", "korea|seoul|kor", "Asia/Seoul", "ko-KR"),
+    "US": ("美国", "united states|america|los angeles|san jose|usa", "America/Los_Angeles", "en-US"),
+    "GB": ("英国", "united kingdom|london|uk", "Europe/London", "en-GB"),
+    "DE": ("德国", "germany|frankfurt|deu", "Europe/Berlin", "de-DE"),
+    "FR": ("法国", "france|paris|fra", "Europe/Paris", "fr-FR"),
+    "CA": ("加拿大", "canada|toronto", "America/Toronto", "en-CA"),
+    "AU": ("澳大利亚", "australia|sydney|aus|澳洲", "Australia/Sydney", "en-AU"),
+    "NL": ("荷兰", "netherlands|amsterdam", "Europe/Amsterdam", "nl-NL"),
+    "PH": ("菲律宾", "philippines|manila", "Asia/Manila", "en-PH"),
+    "ID": ("印度尼西亚", "indonesia|jakarta|印尼", "Asia/Jakarta", "id-ID"),
+    "IN": ("印度", "india|mumbai", "Asia/Kolkata", "en-IN"),
+    "TR": ("土耳其", "turkey|turkiye|istanbul", "Europe/Istanbul", "tr-TR"),
+    "RU": ("俄罗斯", "russia|moscow", "Europe/Moscow", "ru-RU"),
+    "VN": ("越南", "vietnam|hanoi", "Asia/Ho_Chi_Minh", "vi-VN"),
+    "TH": ("泰国", "thailand|bangkok", "Asia/Bangkok", "th-TH"),
+    "MY": ("马来西亚", "malaysia|kuala lumpur", "Asia/Kuala_Lumpur", "ms-MY"),
+    "BR": ("巴西", "brazil|sao paulo", "America/Sao_Paulo", "pt-BR"),
+    "AR": ("阿根廷", "argentina|buenos aires", "America/Argentina/Buenos_Aires", "es-AR"),
+    "MX": ("墨西哥", "mexico", "America/Mexico_City", "es-MX"),
+    "CL": ("智利", "chile|santiago", "America/Santiago", "es-CL"),
+    "ES": ("西班牙", "spain|madrid", "Europe/Madrid", "es-ES"),
+    "IT": ("意大利", "italy|milan|rome", "Europe/Rome", "it-IT"),
+    "CH": ("瑞士", "switzerland|zurich", "Europe/Zurich", "de-CH"),
+    "SE": ("瑞典", "sweden|stockholm", "Europe/Stockholm", "sv-SE"),
+    "NO": ("挪威", "norway|oslo", "Europe/Oslo", "nb-NO"),
+    "FI": ("芬兰", "finland|helsinki", "Europe/Helsinki", "fi-FI"),
+    "DK": ("丹麦", "denmark|copenhagen", "Europe/Copenhagen", "da-DK"),
+    "PL": ("波兰", "poland|warsaw", "Europe/Warsaw", "pl-PL"),
+    "CZ": ("捷克", "czech|prague", "Europe/Prague", "cs-CZ"),
+    "AT": ("奥地利", "austria|vienna", "Europe/Vienna", "de-AT"),
+    "BE": ("比利时", "belgium|brussels", "Europe/Brussels", "nl-BE"),
+    "IE": ("爱尔兰", "ireland|dublin", "Europe/Dublin", "en-IE"),
+    "PT": ("葡萄牙", "portugal|lisbon", "Europe/Lisbon", "pt-PT"),
+    "NZ": ("新西兰", "new zealand|auckland", "Pacific/Auckland", "en-NZ"),
+    "AE": ("阿联酋", "united arab emirates|dubai|uae", "Asia/Dubai", "ar-AE"),
+    "IL": ("以色列", "israel|tel aviv", "Asia/Jerusalem", "he-IL"),
+    "ZA": ("南非", "south africa|johannesburg", "Africa/Johannesburg", "en-ZA"),
+    "UA": ("乌克兰", "ukraine|kyiv|kiev", "Europe/Kyiv", "uk-UA"),
+    "HU": ("匈牙利", "hungary|budapest", "Europe/Budapest", "hu-HU"),
+    "RO": ("罗马尼亚", "romania|bucharest", "Europe/Bucharest", "ro-RO"),
+    "BG": ("保加利亚", "bulgaria|sofia", "Europe/Sofia", "bg-BG"),
+    "GR": ("希腊", "greece|athens", "Europe/Athens", "el-GR"),
+    "IS": ("冰岛", "iceland|reykjavik", "Atlantic/Reykjavik", "is-IS"),
+    "LU": ("卢森堡", "luxembourg", "Europe/Luxembourg", "fr-LU"),
+    "MO": ("澳门", "macau|macao", "Asia/Macau", "zh-MO"),
+    "CN": ("中国", "china|中国大陆", "Asia/Shanghai", "zh-CN"),
+    "PK": ("巴基斯坦", "pakistan", "Asia/Karachi", "ur-PK"),
+    "BD": ("孟加拉国", "bangladesh|孟加拉", "Asia/Dhaka", "bn-BD"),
+    "KZ": ("哈萨克斯坦", "kazakhstan", "Asia/Almaty", "kk-KZ"),
+    "SA": ("沙特阿拉伯", "saudi arabia|沙特", "Asia/Riyadh", "ar-SA"),
+    "EG": ("埃及", "egypt|cairo", "Africa/Cairo", "ar-EG"),
+}
+
+
 def node_region(name: str, server: str = "") -> str:
     haystack = f"{name} {server}".lower()
-    patterns = [
-        ("香港", ("香港", "hong kong", "hongkong", "hk", "hkg")),
-        ("日本", ("日本", "japan", "tokyo", "osaka", "jp", "jpn")),
-        ("新加坡", ("新加坡", "singapore", "sg", "sin")),
-        ("台湾", ("台湾", "taiwan", "tw", "twn")),
-        ("韩国", ("韩国", "korea", "seoul", "kr", "kor")),
-        ("美国", ("美国", "united states", "america", "los angeles", "san jose", "us", "usa")),
-        ("英国", ("英国", "united kingdom", "london", "uk", "gb")),
-        ("德国", ("德国", "germany", "frankfurt", "de", "deu")),
-        ("法国", ("法国", "france", "paris", "fr", "fra")),
-        ("加拿大", ("加拿大", "canada", "ca", "toronto")),
-        ("澳大利亚", ("澳大利亚", "australia", "sydney", "au", "aus")),
-        ("荷兰", ("荷兰", "netherlands", "amsterdam", "nl")),
-    ]
-    for region, terms in patterns:
-        for term in terms:
-            if re.search(rf"(^|[^a-z0-9]){re.escape(term)}([^a-z0-9]|$)", haystack):
+    # 先匹配完整名称，避免“印度尼西亚”被“印度”或“澳大利亚”被短代码误判。
+    for code, (region, aliases, _timezone, _language) in REGION_CATALOG.items():
+        for term in (region, *aliases.split("|")):
+            if (not term.isascii() and term in haystack) or re.search(
+                rf"(?<![a-z]){re.escape(term)}(?![a-z])", haystack
+            ):
                 return region
+    for code, (region, *_rest) in REGION_CATALOG.items():
+        flag = "".join(chr(0x1F1E6 + ord(letter) - ord("A")) for letter in code)
+        if flag in haystack or re.search(rf"(?<![a-z]){code.lower()}(?![a-z])", haystack):
+            return region
     return "未分类"
+
+
+def node_region_code(region: Any) -> str:
+    value = str(region or "")
+    return next((code for code, item in REGION_CATALOG.items() if item[0] == value), "ZZ")
 
 
 # 地区 -> (时区, 主语言, Accept-Language)。用于让浏览器指纹的时区/语言与该节点
@@ -1208,6 +1286,8 @@ REGION_LOCALE_MAP: dict[str, tuple[str, str, str]] = {
 }
 # 无法识别地区时的兜底 locale。
 DEFAULT_LOCALE = ("America/Los_Angeles", "en-US", "en-US,en;q=0.9")
+for _region, _aliases, _timezone, _language in REGION_CATALOG.values():
+    REGION_LOCALE_MAP.setdefault(_region, (_timezone, _language, f"{_language},en;q=0.8"))
 GOOGLE_SEARCH_PROVIDER = {
     "enabled": True,
     "name": "Google",
@@ -2034,6 +2114,7 @@ def empty_state() -> dict[str, Any]:
         "bridges": [],
         "browser_instances": [],
         "tests": {},
+        "test_history": {},
         "request_logs": [],
         "settings": {
             "allow_lan": False,
@@ -2042,6 +2123,8 @@ def empty_state() -> dict[str, Any]:
             "speed_test": normalize_speed_test_settings({}),
             "logs": normalize_log_settings({}),
             "smart_gateway": normalize_smart_gateway_settings({}),
+            # 自动切换默认关闭；绑定浏览器记录的节点始终禁止自动改变出口。
+            "health": {"auto_switch": False},
         },
     }
 
@@ -2069,6 +2152,8 @@ def _normalize_loaded_state(state: Any, *, reset_running: bool = False) -> dict[
         state[field_name] = [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
     if not isinstance(state.get("tests"), dict):
         state["tests"] = {}
+    if not isinstance(state.get("test_history"), dict):
+        state["test_history"] = {}
     settings = state.get("settings")
     state["settings"] = settings if isinstance(settings, dict) else {}
     # 局域网共享是设备本地安全设置：只接受持久化的 JSON 布尔值，旧状态默认关闭。
@@ -2082,8 +2167,19 @@ def _normalize_loaded_state(state: Any, *, reset_running: bool = False) -> dict[
     state["settings"]["smart_gateway"] = normalize_smart_gateway_settings(
         state["settings"].get("smart_gateway")
     )
+    health = state["settings"].get("health")
+    state["settings"]["health"] = {"auto_switch": isinstance(health, dict) and health.get("auto_switch") is True}
     for node in state["nodes"]:
         normalize_node_core_settings(node)
+        node["favorite"] = node.get("favorite") is True
+        node["remark"] = str(node.get("remark") or "")[:500]
+        override = str(node.get("region_override") or "")
+        if override in REGION_CATALOG:
+            node["region"] = REGION_CATALOG[override][0]
+        elif override == "ZZ":
+            node["region"] = "未分类"
+        elif not node.get("region") or node.get("region") == "未分类":
+            node["region"] = node_region(str(node.get("name") or ""), str(node.get("server") or ""))
     for subscription in state["subscriptions"]:
         normalize_subscription_schedule(subscription)
     for result in state["tests"].values():
@@ -2098,6 +2194,12 @@ def _normalize_loaded_state(state: Any, *, reset_running: bool = False) -> dict[
         result["success_rate"] = round(result["success_count"] / result["attempt_count"], 4)
     for bridge in state["bridges"]:
         bridge["pool_health"] = normalize_pool_health(bridge.get("pool_health"))
+        health = bridge.get("health") if isinstance(bridge.get("health"), dict) else {}
+        bridge["health"] = {
+            "status": health.get("status") if health.get("status") in {"unknown", "ok", "error"} else "unknown",
+            "checked_at": max(0, safe_int(health.get("checked_at"), 0)),
+            "error": str(health.get("error") or "")[:500],
+        }
         if "enabled" not in bridge:
             bridge["enabled"] = bridge.get("status") in ACTIVE_BRIDGE_STATUSES
         else:
@@ -2232,6 +2334,7 @@ def save_state(state: dict[str, Any]) -> None:
                 temp_path=backup.with_suffix(backup.suffix + ".tmp"),
             )
     _write_private_atomic(STATE_PATH, data, temp_path=STATE_PATH.with_suffix(".tmp"))
+    notify_status_change()
 
 
 def traffic_defaults(upload_bytes: Any = 0, download_bytes: Any = 0) -> dict[str, int]:
@@ -2455,6 +2558,10 @@ def public_node(node: dict[str, Any]) -> dict[str, Any]:
         "server": node.get("server"),
         "port": node.get("port"),
         "region": node.get("region"),
+        "region_code": node_region_code(node.get("region")),
+        "region_override": str(node.get("region_override") or ""),
+        "favorite": node.get("favorite") is True,
+        "remark": str(node.get("remark") or ""),
         "source": node.get("source"),
         "tags": node.get("tags", []),
         "transport": node.get("transport"),
@@ -3727,6 +3834,19 @@ def _status_payload(
         "error": remote_error,
     }
     lan_addresses = [] if docker_enabled else lan_ipv4_addresses()
+    system_entries = system_log_entries()
+    recent_errors = [item for item in system_entries
+                     if item.get("level") == "error" and float(item.get("ts") or 0) >= time.time() - 86400]
+    error_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for entry in recent_errors:
+        message = str(entry.get("message") or "")
+        matched_node = re.search("「([^」]+)」", message)
+        node_name = matched_node.group(1) if matched_node else ""
+        category = str(entry.get("category") or "系统")
+        key = (category, node_name)
+        group = error_groups.setdefault(key, {"category": category, "node_name": node_name,
+                                              "message": message, "count": 0})
+        group["count"] += 1
     with STATE_LOCK:
         state = load_state()
         changed = sync_process_status(state)
@@ -3783,6 +3903,8 @@ def _status_payload(
             ],
             "bridges": bridges,
             "tests": public_test_results(state),
+            "health_settings": dict(state["settings"]["health"]),
+            "regions": [{"code": code, "name": item[0]} for code, item in REGION_CATALOG.items()],
             "speed_test": {
                 "settings": speed_test_settings_payload(state),
                 **speed_test_task_payload(),
@@ -3795,10 +3917,13 @@ def _status_payload(
                 "settings": log_settings_payload(state),
                 "storage": runtime_log_storage_payload(),
                 "request_total": len(state.get("request_logs", [])),
-                "system_total": len(system_log_entries()),
+                "system_total": len(system_entries),
+                "system_error_total": sum(item.get("level") == "error" for item in system_entries),
+                "system_error_24h": len(recent_errors),
+                "error_groups": sorted(error_groups.values(), key=lambda item: item["count"], reverse=True)[:5],
             },
             "request_logs": state.get("request_logs", [])[:200],
-            "system_logs": system_log_entries()[:300],
+            "system_logs": system_entries[:300],
             "pool": {
                 "member_count": len(members),
                 "base_url": f"{console_base_url()}/pool/{token}",
@@ -3881,6 +4006,45 @@ def _core_version_line(path: str, core: str) -> str:
     if completed.returncode != 0 and not line:
         raise RuntimeError(f"{core} version 返回 {completed.returncode}")
     return line[:180] or "版本未知"
+
+
+def cores_status_payload() -> dict[str, Any]:
+    paths = {**core_paths(), "fingerprint-chromium": fingerprint_chromium_path() if browser_feature_enabled() else None}
+    cores = []
+    for core, path in paths.items():
+        version, error = "", ""
+        if path:
+            try:
+                if core == "fingerprint-chromium":
+                    result = subprocess.run([str(path), "--version"], capture_output=True, text=True,
+                                            timeout=3, check=False, **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}))
+                    version = (result.stdout or result.stderr or "版本未知").splitlines()[0][:180]
+                else:
+                    version = _core_version_line(str(path), core)
+            except Exception as exc:
+                error = str(exc)[:300]
+        cores.append({"core": core, "path": path, "version": version,
+                      "installed": bool(path), "status": "ready" if path else "missing", "error": error})
+    return {"cores": cores}
+
+
+def update_proxy_core(payload: dict[str, Any]) -> dict[str, Any]:
+    core = str(payload.get("core") or "")
+    if core not in {"sing-box", "xray"}:
+        raise ValueError("核心只能是 sing-box 或 xray")
+    with BRIDGE_START_LOCK:
+        with CORE_INSTALL_LOCK:
+            _assert_kernel_upload_target_idle(core)
+            if SHUTTING_DOWN.is_set():
+                raise RuntimeError("程序正在退出")
+            release = _github_json(SING_BOX_RELEASES_API if core == "sing-box" else XRAY_RELEASES_API)
+            picker = _pick_sing_box_asset if core == "sing-box" else _pick_xray_asset
+            asset = picker(release if isinstance(release, dict) else {}, host_arch_token(), host_os_token())
+            if not asset:
+                raise RuntimeError("未找到适配当前系统的官方核心包")
+            installed = _install_core_from_asset(core, asset, str(release.get("tag_name") or ""))
+    notify_status_change()
+    return {"ok": True, "core": core, "path": installed, "version": _core_version_line(installed, core)}
 
 
 def _diagnose_cores() -> dict[str, Any]:
@@ -4925,6 +5089,100 @@ def _open_subscription_response(
     raise RuntimeError(f"订阅 URL 连接失败: {detail}") from (errors[-1] if errors else None)
 
 
+def parse_subscription_userinfo(value: Any) -> dict[str, int]:
+    usage: dict[str, int] = {}
+    for part in str(value or "").split(";"):
+        key, separator, raw_value = part.strip().partition("=")
+        if separator and key.lower() in {"upload", "download", "total", "expire"}:
+            try:
+                number = int(raw_value.strip())
+            except ValueError:
+                continue
+            if number >= 0:
+                usage[key.lower()] = number
+    return usage
+
+
+def subscription_filter_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if "filter_regex" in payload and not isinstance(payload["filter_regex"], bool):
+        raise ValueError("filter_regex 必须是布尔值")
+    rules: dict[str, Any] = {"filter_regex": payload.get("filter_regex") is True}
+    for key in ("filter_include", "filter_exclude"):
+        value = payload.get(key) or ""
+        if isinstance(value, list):
+            value = "\n".join(str(item) for item in value)
+        if not isinstance(value, str) or len(value) > 4096:
+            raise ValueError("过滤规则必须是长度不超过 4096 的文本")
+        rules[key] = value.strip()
+    return rules
+
+
+def filter_subscription_nodes(nodes: list[Node], rules: dict[str, Any]) -> list[Node]:
+    compiled: dict[str, list[Any]] = {}
+    for key in ("filter_include", "filter_exclude"):
+        separator = r"\n" if rules["filter_regex"] else r"[\n,，]"
+        values = [item.strip() for item in re.split(separator, rules[key]) if item.strip()]
+        if rules["filter_regex"]:
+            # 禁止重复分组再次重复及回溯引用，避免导入正则阻塞管理线程。
+            try:
+                from re import _parser as regex_parser
+            except ImportError:
+                import sre_parse as regex_parser
+
+            def validate_pattern(tokens: Any, repeated: bool = False) -> None:
+                for operation, argument in tokens:
+                    token = str(operation)
+                    if token in {"GROUPREF", "GROUPREF_EXISTS"}:
+                        raise ValueError("过滤正则不支持回溯引用")
+                    if token in {"MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"}:
+                        if repeated:
+                            raise ValueError("过滤正则不支持嵌套重复")
+                        validate_pattern(argument[2], True)
+                    elif token == "SUBPATTERN":
+                        validate_pattern(argument[-1], repeated)
+                    elif token == "BRANCH":
+                        if repeated:
+                            raise ValueError("过滤正则不支持重复分组中的分支")
+                        for branch in argument[1]:
+                            validate_pattern(branch, repeated)
+                    elif token in {"ASSERT", "ASSERT_NOT"}:
+                        validate_pattern(argument[1], repeated)
+
+            try:
+                for value in values:
+                    validate_pattern(regex_parser.parse(value, re.IGNORECASE))
+                compiled[key] = [re.compile(value, re.IGNORECASE) for value in values]
+            except re.error as exc:
+                raise ValueError(f"过滤正则无效：{exc}") from exc
+        else:
+            compiled[key] = [value.casefold() for value in values]
+
+    def matches(items: list[Any], name: str) -> bool:
+        return any(item.search(name) if rules["filter_regex"] else item in name.casefold() for item in items)
+
+    return [
+        node for node in nodes
+        if (not compiled["filter_include"] or matches(compiled["filter_include"], node.name))
+        and not matches(compiled["filter_exclude"], node.name)
+    ]
+
+
+def preview_subscription(payload: dict[str, Any]) -> dict[str, Any]:
+    rules = subscription_filter_settings(payload)
+    raw = str(payload.get("raw") or payload.get("content") or "").strip()
+    url = str(payload.get("url") or "").strip()
+    if not raw and url:
+        with STATE_LOCK:
+            settings = normalize_subscription_settings((load_state().get("settings") or {}).get("subscriptions"))
+        raw = str(fetch_subscription_response(url, allow_non_public=settings["allow_non_public_urls"]).get("text") or "")
+    if not raw:
+        raise ValueError("需要订阅 URL 或原始内容")
+    nodes = parse_subscription_payload(raw, str(payload.get("name") or "预览"))
+    matched = filter_subscription_nodes(nodes, rules)
+    return {"total": len(nodes), "matched": len(matched), "excluded": len(nodes) - len(matched),
+            "nodes": [public_node(asdict(node)) for node in matched]}
+
+
 def fetch_subscription_response(
     url: str,
     *,
@@ -4986,6 +5244,7 @@ def fetch_subscription_response(
                     "etag": response_etag or str(etag),
                     "last_modified": response_last_modified or str(last_modified),
                     "final_url": current_url,
+                    "usage": parse_subscription_userinfo(response.headers.get("subscription-userinfo")),
                 }
             if not 200 <= response.status < 300:
                 raise RuntimeError(f"订阅 URL 返回 HTTP {response.status}")
@@ -5021,6 +5280,7 @@ def fetch_subscription_response(
                 "etag": response_etag,
                 "last_modified": response_last_modified,
                 "final_url": current_url,
+                "usage": parse_subscription_userinfo(response.headers.get("subscription-userinfo")),
             }
         finally:
             deadline_timer.cancel()
@@ -5092,6 +5352,12 @@ def _apply_subscription_replacement(
         if isinstance(previous, dict):
             record["preferred_core"] = previous.get("preferred_core")
             record["fallback_enabled"] = previous.get("fallback_enabled") is True
+            for field_name in ("favorite", "remark", "region_override"):
+                if field_name in previous:
+                    record[field_name] = previous[field_name]
+            override = record.get("region_override")
+            if override in REGION_CATALOG:
+                record["region"] = REGION_CATALOG[override][0]
         normalize_node_core_settings(record)
         existing[record["id"]] = record
     state["nodes"] = list(existing.values())
@@ -5295,11 +5561,16 @@ def _append_subscription_refresh_history(
     return entry
 
 
-def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
+def import_subscription(payload: dict[str, Any], *, fetch_metadata: dict[str, Any] | None = None) -> dict[str, Any]:
     name = clean_name(str(payload.get("name") or ""), "未命名订阅")
     url = str(payload.get("url") or "").strip()
     raw = str(payload.get("raw") or "").strip()
-    fetch_metadata = payload.get("_fetch_metadata") if isinstance(payload.get("_fetch_metadata"), dict) else {}
+    with STATE_LOCK:
+        old_subscription = next((s for s in load_state()["subscriptions"] if url and s.get("url") == url), {})
+        rules = subscription_filter_settings({**old_subscription, **payload})
+    filter_subscription_nodes([], rules)
+    # 响应头元数据仅由服务端下载流程传入，不接受 JSON 请求伪造流量、到期或缓存字段。
+    fetch_metadata = fetch_metadata if isinstance(fetch_metadata, dict) else {}
     if url and not raw:
         with STATE_LOCK:
             state = load_state()
@@ -5322,6 +5593,7 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
         if looks_like_clash and import_yaml() is None:
             raise RuntimeError("无法解析 Clash YAML 订阅:缺少 PyYAML 解析器")
         raise ValueError("订阅中没有可用节点，已保留原有订阅状态")
+    nodes = filter_subscription_nodes(nodes, rules)
     raw_digest = hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
     imported_at = now_ts()
     node_dicts = [asdict(node) for node in nodes]
@@ -5342,6 +5614,7 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
                     interval = min(max(interval, SUBSCRIPTION_REFRESH_MINUTES_MIN), SUBSCRIPTION_REFRESH_MINUTES_MAX)
                 changes = subscription_node_diff(state, previous, node_dicts)
                 subscription = {
+                    **rules,
                     "id": subscription_id,
                     "name": name,
                     "url": url,
@@ -5359,6 +5632,7 @@ def import_subscription(payload: dict[str, Any]) -> dict[str, Any]:
                     "last_error": "",
                     "last_changes": changes,
                     "refresh_history": list((previous or {}).get("refresh_history") or [])[-SUBSCRIPTION_REFRESH_HISTORY_LIMIT:],
+                    "usage": {**((previous or {}).get("usage") or {}), **(fetch_metadata.get("usage") or {})},
                 }
                 remove_ids = _subscription_replacement_plan(
                     state,
@@ -5446,6 +5720,8 @@ def refresh_subscription(subscription_id: str) -> dict[str, Any]:
                                 "last_changes": {"added": 0, "removed": 0, "changed": 0},
                             }
                         )
+                        if fetched.get("usage"):
+                            current["usage"] = {**(current.get("usage") or {}), **fetched["usage"]}
                         save_state(state)
                         result = {
                             "subscription": dict(current),
@@ -5460,8 +5736,8 @@ def refresh_subscription(subscription_id: str) -> dict[str, Any]:
                         "url": url,
                         "raw": str(fetched.get("text") or ""),
                         "refresh_interval_minutes": subscription.get("refresh_interval_minutes"),
-                        "_fetch_metadata": fetched,
-                    }
+                    },
+                    fetch_metadata=fetched,
                 )
             with SHUTDOWN_LOCK:
                 _ensure_subscription_refresh_allowed()
@@ -5747,6 +6023,30 @@ def update_subscription_schedule(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def update_subscription_details(payload: dict[str, Any]) -> dict[str, Any]:
+    subscription_id = str(payload.get("id") or "")
+    with SUBSCRIPTION_LOCK:
+        with STATE_LOCK:
+            state = load_state()
+            subscription = next((s for s in state["subscriptions"] if s.get("id") == subscription_id), None)
+            if subscription is None:
+                raise ValueError("订阅不存在")
+            rules = subscription_filter_settings({**subscription, **payload})
+            filter_subscription_nodes([], rules)
+            rules_changed = any(subscription.get(key) != value for key, value in rules.items())
+            subscription.update(rules)
+            if "name" in payload:
+                subscription["name"] = clean_name(str(payload["name"] or ""), "未命名订阅")
+            if rules_changed:
+                # 过滤条件变化后不再使用 304 缓存，下一次刷新必须取得完整节点列表。
+                subscription["etag"] = ""
+                subscription["last_modified"] = ""
+            save_state(state)
+            result = dict(subscription)
+    mark_sync_local_change()
+    return {"ok": True, "subscription": result, "refresh_required": rules_changed}
+
+
 def update_subscription_settings(payload: dict[str, Any]) -> dict[str, bool]:
     if not isinstance(payload.get("allow_non_public_urls"), bool):
         raise ValueError("allow_non_public_urls 必须是布尔值")
@@ -5921,6 +6221,35 @@ def update_node_core_settings(payload: dict[str, Any]) -> dict[str, Any]:
         public = public_node(node)
     mark_sync_local_change()
     return {"ok": True, "node": public}
+
+
+def update_node_details(payload: dict[str, Any]) -> dict[str, Any]:
+    with STATE_LOCK:
+        state = load_state()
+        node = find_node(state, str(payload.get("node_id") or ""))
+        if "favorite" in payload:
+            if not isinstance(payload["favorite"], bool):
+                raise ValueError("favorite 必须是布尔值")
+            node["favorite"] = payload["favorite"]
+        if "remark" in payload:
+            if not isinstance(payload["remark"], str) or len(payload["remark"]) > 500:
+                raise ValueError("备注必须是不超过 500 字的文本")
+            node["remark"] = payload["remark"].strip()
+        if "region" in payload:
+            value = str(payload["region"] or "").strip()
+            code = value.upper() if value.upper() in REGION_CATALOG else node_region_code(value)
+            if value in {"", "auto"}:
+                node.pop("region_override", None)
+                node["region"] = node_region(str(node.get("name") or ""), str(node.get("server") or ""))
+            elif code == "ZZ" and value not in {"未分类", "ZZ", "zz"}:
+                raise ValueError("不支持该地区，请使用地区列表或 auto")
+            else:
+                node["region_override"] = code
+                node["region"] = REGION_CATALOG[code][0] if code in REGION_CATALOG else "未分类"
+        save_state(state)
+        result = public_node(node)
+    mark_sync_local_change()
+    return {"ok": True, "node": result}
 
 
 def active_bridge_for_node(state: dict[str, Any], node_id: str) -> dict[str, Any] | None:
@@ -6351,6 +6680,9 @@ def _prepare_bridge_start(payload: dict[str, Any]) -> dict[str, Any]:
     with STATE_LOCK:
         state = load_state()
         node = dict(find_node(state, node_id))
+        switch_from = str(payload.get("_health_switch_from") or "")
+        if switch_from and not health_switch_allowed(state, switch_from, node_id):
+            raise ValueError("自动切换条件已变化，取消切换")
         changed = sync_process_status(state)
         active_bridge = active_bridge_for_node(state, node_id)
         if active_bridge:
@@ -6385,6 +6717,8 @@ def _prepare_bridge_start(payload: dict[str, Any]) -> dict[str, Any]:
         "node": node,
         "requested_core": requested_core,
         "requested_port": requested_port,
+        # 自动切换必须复用原端口；普通启动仍允许寻找相邻空闲端口。
+        "require_exact_port": payload.get("_require_exact_port") is True,
         "core": core,
         "core_attempts": core_attempts,
         "preferred_port": preferred_port,
@@ -6418,6 +6752,8 @@ def _complete_bridge_plan(plan: dict[str, Any], command: list[str]) -> tuple[dic
             if listen_host != LOCAL_PROXY_LISTEN_HOST
             else next_free_port(plan.get("preferred_port"))
         )
+    if plan.get("require_exact_port") and local_port != plan.get("requested_port"):
+        raise ValueError("原代理端口已被占用，取消自动切换")
     core_port = next_free_port(max(local_port + 1000, 23080))
     bridge_id = stable_id(str(plan["node_id"]), str(local_port), str(plan["core"]))
     config = generate_config(str(plan["core"]), dict(plan["node"]), core_port)
@@ -6526,6 +6862,7 @@ def _run_prepared_bridge(plan: dict[str, Any], command: list[str]) -> dict[str, 
             "pid": process.pid,
             "started_at": now_ts(),
             "pool_health": normalize_pool_health({}),
+            "health": {"status": "unknown", "checked_at": 0, "error": ""},
             "config_path": str(config_path),
             "log_path": str(log_path),
             **traffic,
@@ -6591,6 +6928,9 @@ def start_bridge(payload: dict[str, Any]) -> dict[str, Any]:
                     with STATE_LOCK:
                         state = load_state()
                         node = dict(find_node(state, str(plan["node_id"])))
+                        switch_from = str(payload.get("_health_switch_from") or "")
+                        if switch_from and not health_switch_allowed(state, switch_from, str(plan["node_id"])):
+                            raise ValueError("自动切换条件已变化，取消切换")
                         normalize_node_core_settings(node)
                         active_bridge = active_bridge_for_node(state, str(plan["node_id"]))
                         if active_bridge:
@@ -7150,6 +7490,75 @@ def _run_browser_launch(
             "时区与语言按节点地区匹配,并已禁止 WebRTC 非代理 UDP。"
         ),
     }
+
+
+def lookup_browser_exit(port: int) -> dict[str, str]:
+    # 只经对应本地 HTTP CONNECT 代理访问出口服务；连接失败不回退直连。
+    connection = http.client.HTTPSConnection("127.0.0.1", port, timeout=10,
+                                             context=ssl.create_default_context())
+    connection.set_tunnel("ipwho.is", 443)
+    try:
+        connection.request("GET", "/", headers={"Accept": "application/json", "User-Agent": "ProxyBridge"})
+        response = connection.getresponse()
+        data = response.read(65537)
+        if response.status != 200 or len(data) > 65536:
+            raise RuntimeError(f"出口服务响应异常：HTTP {response.status}")
+        result = json.loads(data)
+        ip = str(ipaddress.ip_address(str(result.get("ip") or "")))
+        code = str(result.get("country_code") or "").upper()
+        if result.get("success") is False or not re.fullmatch(r"[A-Z]{2}", code):
+            raise RuntimeError("出口服务未提供有效地区")
+        return {"ip": ip, "region_code": code}
+    finally:
+        connection.close()
+
+
+def check_browser_exit(instance_id: str, generation: tuple[Any, ...]) -> None:
+    if SHUTTING_DOWN.is_set():
+        return
+    with STATE_LOCK:
+        state = load_state()
+        instance = next((item for item in state["browser_instances"] if item.get("id") == instance_id), None)
+        if not instance or instance.get("status") not in ACTIVE_BROWSER_STATUSES:
+            return
+        bridge = next((item for item in state["bridges"] if item.get("id") == instance.get("bridge_id")), None)
+        if not bridge or bridge.get("status") != "running":
+            return
+        node = find_node(state, str(instance.get("node_id") or ""))
+        expected = node_region_code(node.get("region"))
+        port = safe_int(bridge.get("port"), 0)
+    try:
+        result: dict[str, Any] = {**lookup_browser_exit(port), "checked_at": now_ts(), "status": "ok"}
+        result["expected_region_code"] = expected
+        result["mismatch"] = expected != "ZZ" and result["region_code"] != expected
+    except Exception as exc:
+        result = {"status": "error", "checked_at": now_ts(), "error": str(exc)[:500]}
+    with STATE_LOCK:
+        state = load_state()
+        instance = next((item for item in state["browser_instances"] if item.get("id") == instance_id), None)
+        if not instance or tuple(instance.get(key) for key in ("last_started_at", "launch_count", "bridge_id")) != generation:
+            return
+        if instance.get("status") not in ACTIVE_BROWSER_STATUSES:
+            return
+        instance["exit_check"] = result
+        save_state(state)
+    if result.get("mismatch"):
+        log_event(f"浏览器出口地区 {result['region_code']} 与节点地区 {expected} 不一致", level="warn", category="浏览器")
+
+
+def schedule_browser_exit_check(result: dict[str, Any]) -> None:
+    instance_id = str(result.get("instance_id") or "")
+    if not instance_id or SHUTTING_DOWN.is_set():
+        return
+    with STATE_LOCK:
+        state = load_state()
+        instance = next((item for item in state["browser_instances"] if item.get("id") == instance_id), None)
+        if not instance or instance.get("status") not in ACTIVE_BROWSER_STATUSES:
+            return
+        generation = tuple(instance.get(key) for key in ("last_started_at", "launch_count", "bridge_id"))
+        instance["exit_check"] = {"status": "checking"}
+        save_state(state)
+    BROWSER_EXIT_EXECUTOR.submit(check_browser_exit, instance_id, generation)
 
 
 def prune_browser_processes(node_id: str) -> list[subprocess.Popen]:
@@ -8639,6 +9048,11 @@ def persist_stopped_bridges(
             }
             if disable:
                 updates["enabled"] = False
+            elif not SHUTTING_DOWN.is_set():
+                updates["health"] = {"status": "error", "checked_at": stopped_at,
+                                     "error": "代理核心或监听器意外退出"}
+                log_event(f"运行中代理「{bridge.get('node_name') or bridge.get('node_id') or bridge_id}」意外退出",
+                          level="error", category="探活")
             bridge.update(updates)
             bridge.pop("error", None)
             if live_traffic is not None:
@@ -9575,6 +9989,17 @@ class SmartGatewayProxy(Socks5LogProxy):
         self.strategy = strategy
         self.region = str(region or "")[:128]
         self.query = str(query or "")[:128]
+        self._metrics_lock = threading.Lock()
+        self._allocations: dict[str, dict[str, Any]] = {}
+        self._recent_switches: collections.deque[dict[str, Any]] = collections.deque(maxlen=20)
+        self._last_member_id = ""
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        with self._metrics_lock:
+            total = sum(item["connections"] for item in self._allocations.values())
+            return {"allocations": [{**item, "share": item["connections"] / total if total else 0}
+                                    for item in self._allocations.values()],
+                    "recent_switches": list(reversed(self._recent_switches))}
 
     def settings_snapshot(self) -> dict[str, Any]:
         return {
@@ -9669,6 +10094,15 @@ class SmartGatewayProxy(Socks5LogProxy):
                 ok=True,
                 latency_ms=int(round((time.monotonic() - started) * 1000)),
             )
+            with self._metrics_lock:
+                allocation = self._allocations.setdefault(bridge_id, {
+                    "bridge_id": bridge_id, "node_id": bridge.get("node_id"),
+                    "node_name": bridge.get("node_name"), "connections": 0})
+                allocation["connections"] += 1
+                if bridge_id != self._last_member_id:
+                    self._recent_switches.append({"at": now_ts(), "from": self._last_member_id,
+                                                  "to": bridge_id, "node_name": bridge.get("node_name")})
+                    self._last_member_id = bridge_id
             return upstream, reply
         except Exception as exc:
             self._record_gateway_health(bridge_id, ok=False, error=exc)
@@ -9806,6 +10240,8 @@ def smart_gateway_status_payload(
     public_settings.update({"listen_host": listen_host, "running": running})
     return {
         "settings": public_settings,
+        **(proxy.metrics_snapshot() if running and proxy and hasattr(proxy, "metrics_snapshot")
+           else {"allocations": [], "recent_switches": []}),
         "enabled": bool(settings["enabled"]),
         "running": running,
         "port": port,
@@ -10209,6 +10645,9 @@ def persist_test_result(result: dict[str, Any]) -> dict[str, Any]:
         previous = state.setdefault("tests", {}).get(node_id)
         merged = merge_test_result(previous, result)
         state["tests"][node_id] = merged
+        # 每节点保留最近 20 次测速；旧状态无历史时使用空列表，不改现有累计成功率。
+        history = state.setdefault("test_history", {}).get(node_id)
+        state["test_history"][node_id] = [dict(result), *(history if isinstance(history, list) else [])][:20]
         for bridge in state.get("bridges", []):
             if str(bridge.get("node_id") or "") == node_id:
                 bridge["pool_health"] = update_pool_health_record(
@@ -10219,6 +10658,159 @@ def persist_test_result(result: dict[str, Any]) -> dict[str, Any]:
                 )
         save_state(state)
     return merged
+
+
+def update_health_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload.get("auto_switch"), bool):
+        raise ValueError("auto_switch 必须是布尔值")
+    with STATE_LOCK:
+        state = load_state()
+        state["settings"]["health"] = {"auto_switch": payload["auto_switch"]}
+        save_state(state)
+    return {"ok": True, "settings": dict(state["settings"]["health"])}
+
+
+def check_running_bridges() -> int:
+    with STATE_LOCK:
+        state = load_state()
+        bridges = [dict(item) for item in state["bridges"]
+                   if item.get("status") == "running" or (
+                       item.get("status") == "stopped" and item.get("enabled")
+                       and (item.get("health") or {}).get("status") == "error")]
+        settings = normalize_speed_test_settings(state["settings"].get("speed_test"))
+    if not bridges or SHUTTING_DOWN.is_set():
+        return 0
+
+    def probe(bridge: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        if bridge.get("status") == "stopped":
+            return bridge, {"ok": False, "message": "代理核心或监听器意外退出"}
+        try:
+            # 核心端口仅监听回环且无 LAN 认证，不把用户令牌加入探测或日志。
+            result = socks5_http_probe(safe_int(bridge.get("core_port"), 0),
+                                       target_url=choose_speed_test_target(settings), timeout=8.0,
+                                       cancel_event=SHUTTING_DOWN)
+        except Exception as exc:
+            result = {"ok": False, "message": str(exc)[:500]}
+        return bridge, result
+
+    checked = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3, thread_name_prefix="bridge-health") as executor:
+        futures = [executor.submit(probe, bridge) for bridge in bridges]
+        for future in concurrent.futures.as_completed(futures):
+            before, result = future.result()
+            if SHUTTING_DOWN.is_set():
+                break
+            with STATE_LOCK:
+                state = load_state()
+                bridge = next((item for item in state["bridges"] if item.get("id") == before.get("id")), None)
+                if not bridge or bridge.get("status") != before.get("status") or any(
+                    bridge.get(key) != before.get(key) for key in ("started_at", "pid", "core_port")
+                ):
+                    continue
+                previous_status = (bridge.get("health") or {}).get("status")
+                bridge["health"] = {"status": "ok" if result.get("ok") else "error",
+                                    "checked_at": now_ts(),
+                                    "error": "" if result.get("ok") else str(result.get("message") or "探活失败")}
+                bridge["pool_health"] = update_pool_health_record(
+                    bridge.get("pool_health"), ok=bool(result.get("ok")),
+                    latency_ms=result.get("latency_ms"), error=result.get("message"))
+                save_state(state)
+                checked += 1
+                failed = not result.get("ok")
+            if failed:
+                if previous_status != "error":
+                    log_event(f"运行中代理「{before.get('node_name', '')}」探活失败：{result.get('message', '')}",
+                              level="error", category="探活")
+                maybe_start_health_replacement(before)
+            elif result.get("ok") and previous_status == "error":
+                log_event(f"运行中代理「{before.get('node_name', '')}」已恢复", category="探活")
+    return checked
+
+
+def health_switch_allowed(state: dict[str, Any], source_id: str, target_id: str) -> bool:
+    if not state["settings"]["health"]["auto_switch"] or source_id == target_id:
+        return False
+    if any(item.get("node_id") in {source_id, target_id} for item in state["browser_instances"]):
+        return False
+    by_id = {str(item.get("id") or ""): item for item in state["nodes"]}
+    source, target = by_id.get(source_id), by_id.get(target_id)
+    if not source or not target or source.get("region") in {None, "", "未分类"} or source.get("region") != target.get("region"):
+        return False
+    result = public_test_results(state).get(target_id) or {}
+    return bool(result.get("ok") and not result.get("stale"))
+
+
+def maybe_start_health_replacement(failed_bridge: dict[str, Any]) -> None:
+    node_id = str(failed_bridge.get("node_id") or "")
+    with STATE_LOCK:
+        state = load_state()
+        if not state["settings"]["health"]["auto_switch"]:
+            return
+        # 即使浏览器暂时关闭，也保留它的节点出口绑定。
+        if any(item.get("node_id") == node_id for item in state["browser_instances"]):
+            return
+        node = next((item for item in state["nodes"] if item.get("id") == node_id), None)
+        if not node or node.get("region") in {None, "", "未分类"}:
+            return
+        tests = public_test_results(state)
+        candidates = [item for item in state["nodes"] if item.get("id") != node_id
+                      and item.get("region") == node["region"]
+                      and tests.get(item.get("id"), {}).get("ok")
+                      and not tests.get(item.get("id"), {}).get("stale")
+                      and active_bridge_for_node(state, str(item.get("id") or "")) is None
+                      and not any(browser.get("node_id") == item.get("id") for browser in state["browser_instances"])]
+        candidates.sort(key=lambda item: tests[item["id"]].get("latency_ms") or float("inf"))
+    if not candidates or SHUTTING_DOWN.is_set():
+        return
+    target = candidates[0]
+    try:
+        # 下载预检在停旧端口之前完成；切换失败尝试恢复原节点和原端口。
+        ensure_core_installed(str(target.get("preferred_core") or "sing-box"))
+        with BROWSER_LAUNCH_LOCK:
+            with BRIDGE_START_LOCK:
+                with STATE_LOCK:
+                    state = load_state()
+                    current = next((item for item in state["bridges"] if item.get("id") == failed_bridge.get("id")), None)
+                    if not current or current.get("status") != failed_bridge.get("status") or any(
+                        current.get(key) != failed_bridge.get(key) for key in ("started_at", "pid", "core_port")
+                    ):
+                        return
+                    if current.get("status") == "stopped" and not current.get("enabled"):
+                        return
+                    if not health_switch_allowed(state, node_id, target["id"]) or active_bridge_for_node(state, target["id"]) is not None:
+                        return
+                    if (current.get("health") or {}).get("status") != "error":
+                        return
+                    port = safe_int(current.get("port"), 0)
+                stop_bridge(str(failed_bridge["id"]))
+                try:
+                    replacement = start_bridge({"node_id": target["id"], "core": "auto", "port": port,
+                                                "_require_exact_port": True, "_health_switch_from": node_id})
+                except Exception:
+                    if not SHUTTING_DOWN.is_set():
+                        start_bridge({"node_id": node_id, "core": "auto", "port": port, "_require_exact_port": True})
+                    raise
+        log_event(f"端口 :{port} 已切换至同地区节点「{replacement.get('node_name', '')}」，后续连接使用新出口",
+                  level="warn", category="探活")
+    except Exception as exc:
+        log_event(f"自动切换失败：{exc}", level="error", category="探活")
+
+
+def start_bridge_health_monitor() -> None:
+    global BRIDGE_HEALTH_THREAD
+    with BRIDGE_HEALTH_LOCK:
+        if BRIDGE_HEALTH_THREAD is not None and BRIDGE_HEALTH_THREAD.is_alive():
+            return
+
+        def monitor() -> None:
+            while not SHUTTING_DOWN.wait(BRIDGE_HEALTH_INTERVAL):
+                try:
+                    check_running_bridges()
+                except Exception as exc:
+                    log_event(f"运行探活异常：{exc}", level="warn", category="探活")
+
+        BRIDGE_HEALTH_THREAD = threading.Thread(target=monitor, name="bridge-health-monitor", daemon=True)
+        BRIDGE_HEALTH_THREAD.start()
 
 
 def test_node(
@@ -10801,9 +11393,25 @@ def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
     with STATE_LOCK:
         current_state = load_state()
         current_security = normalize_lan_security((current_state.get("settings") or {}).get("lan_security"))
+        was_enabled = allow_lan_access(current_state)
+    generated_token = ""
+    # 新开启共享且未显式选择认证时默认 Token；既有共享和显式认证方式保持兼容。
+    security_payload = payload.get("lan_security")
+    if "lan_security" in payload and not isinstance(security_payload, dict):
+        raise ValueError("lan_security 必须是对象")
+    needs_token = security_payload is None or "auth_mode" not in security_payload or (
+        security_payload.get("auth_mode") == "token" and not security_payload.get("token") and not current_security["token"])
+    explicit_unconfigured_token = (
+        isinstance(security_payload, dict) and security_payload.get("auth_mode") == "token"
+        and not security_payload.get("token") and not current_security["token"]
+    )
+    if desired and ((not was_enabled and needs_token) or explicit_unconfigured_token):
+        generated_token = secrets.token_urlsafe(24)
+        security_payload = {**(security_payload if isinstance(security_payload, dict) else {}),
+                            "auth_mode": "token", "token": generated_token}
     desired_security = (
-        validate_lan_security(payload.get("lan_security"), current_security)
-        if "lan_security" in payload
+        validate_lan_security(security_payload, current_security)
+        if security_payload is not None
         else current_security
     )
 
@@ -10873,6 +11481,7 @@ def update_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "ok": True,
+        **({"generated_token": generated_token} if generated_token else {}),
         "network": network,
         "rebound_count": len(rebound_ids) + len(rebound_gateway_ids),
         "connections_interrupted": bool(rebound_ids or rebound_gateway_ids),
@@ -11438,6 +12047,39 @@ class AppHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             error_response(self, exc, 400)
 
+    def handle_status_events(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        send_backend_instance_header(self)
+        self.end_headers()
+        self.close_connection = True
+        connection = getattr(self, "connection", None)
+        if connection is not None:
+            connection.settimeout(15.0)
+        # 一分钟内主动结束，客户端携带实例请求头重连，避免旧实例长期占用连接。
+        deadline = time.monotonic() + 55.0
+        signature = ""
+        try:
+            while not SHUTTING_DOWN.is_set() and time.monotonic() < deadline:
+                with STATUS_EVENT_CONDITION:
+                    revision = STATUS_EVENT_REVISION
+                data = json.dumps(status_payload(), ensure_ascii=False, separators=(",", ":"))
+                current = hashlib.sha256(data.encode("utf-8")).hexdigest()
+                if current != signature:
+                    self.wfile.write(f"event: status\ndata: {data}\n\n".encode("utf-8"))
+                    signature = current
+                else:
+                    self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                with STATUS_EVENT_CONDITION:
+                    STATUS_EVENT_CONDITION.wait_for(
+                        lambda: STATUS_EVENT_REVISION != revision or SHUTTING_DOWN.is_set(), timeout=3.5)
+        except (BrokenPipeError, ConnectionError, OSError):
+            return
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
         if parsed.path.startswith("/pool/") or parsed.path in {"/pool", "/pool/"}:
@@ -11448,15 +12090,32 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/") and not self.require_api_authentication():
             return
+        if parsed.path == "/api/events":
+            self.handle_status_events()
+            return
+        if parsed.path == "/api/cores":
+            try:
+                json_response(self, cores_status_payload())
+            except Exception as exc:
+                error_response(self, exc, 400)
+            return
+        if parsed.path == "/api/nodes/history":
+            params = urllib.parse.parse_qs(parsed.query)
+            node_id = first(params, "node_id", default="")
+            with STATE_LOCK:
+                state = load_state()
+                history = state.get("test_history", {}).get(node_id, [])
+            json_response(self, {"node_id": node_id, "history": history})
+            return
         if parsed.path == "/api/status":
             try:
-                json_response(self, status_payload())
+                json_response(self, status_payload(), no_store=True)
             except Exception as exc:
                 error_response(self, exc, 500)
             return
         if parsed.path == "/api/pool":
             try:
-                json_response(self, pool_admin_payload())
+                json_response(self, pool_admin_payload(), no_store=True)
             except Exception as exc:
                 error_response(self, exc, 400)
             return
@@ -11567,6 +12226,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 sub = result.get("subscription", {}) if isinstance(result, dict) else {}
                 log_event(f"导入订阅「{sub.get('name', '')}」共 {sub.get('node_count', 0)} 个节点", category="订阅")
                 json_response(self, result)
+            elif self.path == "/api/subscriptions/preview":
+                json_response(self, preview_subscription(payload))
+            elif self.path == "/api/subscriptions/update":
+                json_response(self, update_subscription_details(payload))
             elif self.path == "/api/subscriptions/refresh":
                 result = refresh_subscription(str(payload.get("id") or ""))
                 json_response(self, result)
@@ -11618,6 +12281,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, cancel_speed_test_task(str(payload.get("id") or "")))
             elif self.path == "/api/nodes/core":
                 json_response(self, update_node_core_settings(payload))
+            elif self.path == "/api/nodes/update":
+                json_response(self, update_node_details(payload))
+            elif self.path == "/api/settings/health":
+                json_response(self, update_health_settings(payload))
+            elif self.path == "/api/cores/update":
+                json_response(self, update_proxy_core(payload))
             elif self.path == "/api/settings/speed-test":
                 json_response(self, {"ok": True, "settings": update_speed_test_settings(payload)})
             elif self.path == "/api/settings/logs":
@@ -11636,6 +12305,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, result)
             elif self.path == "/api/browser/launch":
                 result = launch_browser(payload)
+                try:
+                    schedule_browser_exit_check(result)
+                except Exception as exc:
+                    log_event(f"浏览器已启动，出口自检调度失败：{exc}", level="warn", category="浏览器")
                 log_event(f"启动指纹浏览器:{result.get('region', '')} → {result.get('proxy', '')}", category="浏览器")
                 json_response(self, result)
             elif self.path == "/api/browser/stop":
@@ -11699,7 +12372,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     f"局域网共享已{state_label}，重绑 {result.get('rebound_count', 0)} 个代理端口",
                     category="设置",
                 )
-                json_response(self, result)
+                json_response(self, result, no_store=True)
             elif self.path == "/api/sync/settings":
                 result = get_sync_engine().update_settings(payload)
                 log_event("已更新 WebDAV 同步设置", category="同步")
@@ -11716,6 +12389,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 result = get_sync_engine().pull(
                     force=force,
                     preserve_local_changes=preserve_local_changes,
+                    **({"expected_state_sha256": str(payload["expected_state_sha256"])}
+                       if "expected_state_sha256" in payload else {}),
                 )
                 log_event(
                     result.get("status")
@@ -11724,6 +12399,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     category="同步",
                 )
                 json_response(self, result)
+            elif self.path == "/api/sync/preview":
+                json_response(self, get_sync_engine().preview_pull())
             elif self.path == "/api/sync/check":
                 json_response(self, get_sync_engine().check_remote())
             else:
@@ -11753,7 +12430,8 @@ class AppHandler(BaseHTTPRequestHandler):
             content_type = "text/html; charset=utf-8"
         if resolved.suffix == ".css":
             content_type = "text/css; charset=utf-8"
-        if resolved.suffix == ".js":
+        # 普通脚本与原生模块使用明确的 JavaScript MIME，兼容各平台的模块加载器。
+        if resolved.suffix in {".js", ".mjs"}:
             content_type = "application/javascript; charset=utf-8"
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -11841,6 +12519,7 @@ def _shutdown_remote_browser_workers() -> tuple[
 
 def _shutdown_once() -> None:
     SHUTTING_DOWN.set()
+    notify_status_change()
     SUBSCRIPTION_SCHEDULER_WAKE.set()
     with SPEED_TEST_TASK_LOCK:
         for cancel_event in SPEED_TEST_CANCEL_EVENTS.values():
@@ -12132,6 +12811,7 @@ def main(argv: list[str] | None = None) -> None:
         start_core_auto_install()
     restore_enabled_bridges()
     restore_enabled_smart_gateway()
+    start_bridge_health_monitor()
     try:
         get_sync_engine().maybe_check_on_startup()
     except Exception as exc:
