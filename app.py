@@ -1693,7 +1693,8 @@ def legacy_browser_instance_id(node_id: str) -> str:
 
 
 def new_browser_instance_id(node_id: str) -> str:
-    return stable_id("browser-instance", node_id, str(time.time_ns()))
+    # Windows 的 time_ns() 精度只有毫秒级，连续新建会得到相同时间戳；加入随机数保证唯一。
+    return stable_id("browser-instance", node_id, str(time.time_ns()), secrets.token_hex(8))
 
 
 def browser_instance_seed(node_id: str, instance_id: str, legacy: bool = False) -> int:
@@ -4095,8 +4096,11 @@ def _resolve_legacy_fingerprint_executable() -> str | None:
             for child in root.iterdir()
             if child not in preferred and child.name != "versions" and not child.name.startswith((".", "_"))
         )
+        binary_names = set(_fingerprint_binary_names())
         for child in [*preferred, *others]:
-            if not child.exists() or (child.is_file() and not _is_executable_file(child)):
+            # Windows 上任何文件都视为可执行；根目录的散落文件只认浏览器可执行文件名，
+            # 避免把下载残留的安装包误认成内核。
+            if not child.exists() or (child.is_file() and (child.name not in binary_names or not _is_executable_file(child))):
                 continue
             resolved = _resolve_fingerprint_executable_in_root(child)
             if resolved:

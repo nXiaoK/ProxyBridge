@@ -436,7 +436,8 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
         self.assertEqual(app.fingerprint_chromium_path(force_refresh=True), newest)
 
         app.set_default_fingerprint_kernel({"id": "148.0.7778.215"})
-        self.assertTrue(app.fingerprint_chromium_path(force_refresh=True).endswith("148.0.7778.215/chromium/chrome"))
+        # 按路径段比较，兼容 Windows 的反斜杠分隔符。
+        self.assertEqual(Path(app.fingerprint_chromium_path(force_refresh=True)).parts[-3:], ("148.0.7778.215", "chromium", "chrome"))
         with self.assertRaises(ValueError):
             app.set_default_fingerprint_kernel({"id": "1.2.3.4"})
 
@@ -467,6 +468,26 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
         self.assertEqual(result["kernel_id"], "150.0.7871.186")
         self.assertFalse((app.fingerprint_kernel_versions_root() / "upload-abcdef012345").exists())
         self.assertEqual([item["id"] for item in app.list_fingerprint_kernels(force_refresh=True)], ["150.0.7871.186"])
+
+    def test_legacy_scan_ignores_stray_files_even_when_every_file_is_executable(self) -> None:
+        # 模拟 Windows：_is_executable_file 对任意文件返回 True。
+        root = app.fingerprint_chromium_root()
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "fingerprint-chromium_win64.zip").write_bytes(b"partial download")
+        with mock.patch.object(app, "_is_executable_file", side_effect=lambda path: Path(path).is_file()):
+            self.assertIsNone(app._resolve_legacy_fingerprint_executable())
+            (root / "chrome.exe").write_bytes(b"MZ")
+            self.assertEqual(Path(app._resolve_legacy_fingerprint_executable()).name, "chrome.exe")
+
+    def test_instance_ids_stay_unique_with_coarse_clock(self) -> None:
+        # Windows 上连续调用 time_ns() 可能得到同一个值。
+        state = app.empty_state()
+        state["nodes"] = [{"id": "n", "name": "N"}]
+        with mock.patch.object(app.time, "time_ns", return_value=1_700_000_000_000_000_000):
+            first = app.create_browser_instance_record(state, "n")
+            second = app.create_browser_instance_record(state, "n")
+        self.assertNotEqual(first["id"], second["id"])
+        self.assertNotEqual(first["fingerprint_seed"], second["fingerprint_seed"])
 
     def test_kernel_id_derivation(self) -> None:
         self.assertEqual(app.fingerprint_kernel_id_for("fingerprint-chromium_150.0.7871.186_linux.zip"), "150.0.7871.186")

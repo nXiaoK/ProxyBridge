@@ -1309,6 +1309,13 @@ class AppRemoteBrowserTests(unittest.TestCase):
         app.REMOTE_BROWSER_CLIENT = None
         app.REMOTE_BROWSER_CLIENT_KEY = None
         app.invalidate_remote_browser_session_cache()
+        # 启动前的出口查询会连接测试中并不存在的代理端口；Windows 上连接被拒约需 2 秒，
+        # 会打乱依赖时序的并发测试，因此统一模拟为立即失败（回退到节点地区）。
+        lookup_patch = mock.patch.object(app, "lookup_browser_exit", side_effect=OSError("offline"))
+        lookup_patch.start()
+        self.addCleanup(lookup_patch.stop)
+        with app.EXIT_LOCALE_CACHE_LOCK:
+            app.EXIT_LOCALE_CACHE.clear()
 
     def tearDown(self) -> None:
         app.configure_work_root(self.old_work)
