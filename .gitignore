@@ -25,6 +25,10 @@ DerivedData/
 macos/ProxyBridgeMenuBar/AppIcon.iconset/
 
 # Packaging artifacts
+# 完整版（离线包）构建时下载的官方安装包：scripts/fetch_bundled_packages.py 的默认输出目录，
+# 以及源码运行时可选的 bundled/ 离线包目录，均为体积较大的第三方二进制，不进入仓库。
+bundled-packages/
+/bundled/
 outputs/windows/
 outputs/linux/
 desktop/**/__pycache__/

@@ -3532,6 +3532,10 @@ def _foreign_os_skip_terms(host_os: str) -> tuple[str, ...]:
     return foreign.get(host_os, ("android", "openwrt"))
 
 
+# 代理核心发布页中面向旧系统的兼容构建文件名标记，选包时降低优先级。
+LEGACY_CORE_ASSET_TERMS = ("legacy", "win7", "windows-7", "macos-10")
+
+
 def _pick_sing_box_asset(
     release: dict[str, Any],
     host_arch: str,
@@ -3569,6 +3573,9 @@ def _pick_sing_box_asset(
             value += 5
         if os_token == "windows" and name.endswith(".zip"):
             value += 5
+        if any(term in name for term in LEGACY_CORE_ASSET_TERMS):
+            # 旧系统专用构建（如 legacy-windows-7）只作兜底，优先选择标准构建。
+            value -= 8
         return value
 
     candidates = [(score(asset), asset) for asset in assets]
@@ -3603,7 +3610,8 @@ def _pick_xray_asset(
         if any(term in name for term in ("arm64", "aarch64", "arm64-v8a")):
             return -1
         if any(term in name for term in ("64", "amd64", "x64", "x86_64")):
-            return 20
+            # Xray-win7-64.zip 是 Windows 7 专用构建，仅在没有标准构建时使用。
+            return 10 if any(term in name for term in LEGACY_CORE_ASSET_TERMS) else 20
         return -1
 
     candidates = [(score(asset), asset) for asset in assets]
@@ -3961,6 +3969,95 @@ def _install_core_from_asset(core: str, asset: dict[str, Any], tag: str) -> str:
         return _install_core_from_archive(core, archive_path, _asset_name(asset), tag)
 
 
+# 完整版（离线包）发布产物会在程序旁附带官方原版安装包，目录结构为：
+#   bundled/sing-box/<官方文件名>、bundled/xray/<官方文件名>、bundled/fingerprint-chromium/<官方文件名>
+# 首次启动时若对应组件尚未安装，就按「本地导入」相同的校验流程从这里安装，安装后仍可在内核管理中升级或删除。
+# PROXY_BRIDGE_BUNDLED_DIR：可选，指定离线包目录（覆盖默认位置）；未设置时依次查找
+# 程序资源目录下的 bundled/（macOS App 为 Contents/Resources/bridge/bundled）与 Windows 可执行文件旁的 bundled/。
+BUNDLED_PACKAGE_KINDS = ("sing-box", "xray", "fingerprint-chromium")
+
+
+def bundled_package_roots() -> list[Path]:
+    configured = str(os.environ.get("PROXY_BRIDGE_BUNDLED_DIR") or "").strip()
+    if configured:
+        return [Path(configured).expanduser()]
+    roots = [APP_ROOT / "bundled"]
+    if getattr(sys, "frozen", False):
+        executable_root = Path(sys.executable).resolve().parent / "bundled"
+        if executable_root not in roots:
+            roots.append(executable_root)
+    return roots
+
+
+def find_bundled_package(kind: str) -> Path | None:
+    """返回适配本机、保留官方文件名的离线安装包；多个候选时取文件名排序最后（通常是最新版本）。"""
+    if kind not in BUNDLED_PACKAGE_KINDS:
+        raise ValueError(f"未知的离线包类型：{kind}")
+    for root in bundled_package_roots():
+        directory = root / kind
+        if not directory.is_dir():
+            continue
+        candidates: list[Path] = []
+        for child in sorted(directory.iterdir()):
+            if child.name.startswith(".") or not child.is_file() or child.is_symlink():
+                continue
+            try:
+                _validate_uploaded_package_name(kind, child.name)
+            except ValueError:
+                continue
+            candidates.append(child)
+        if candidates:
+            return candidates[-1]
+    return None
+
+
+def install_bundled_core(core: str) -> str | None:
+    """从离线包安装代理核心；调用方需持有 CORE_INSTALL_LOCK。失败时记录日志并返回 None，交给在线下载兜底。"""
+    package = find_bundled_package(core)
+    if package is None:
+        return None
+    try:
+        log_event(f"正在从离线包安装 {core}:{package.name}", category="核心")
+        installed = _install_core_from_archive(core, package, package.name, "", validate_binary=True)
+    except Exception as exc:
+        log_event(f"从离线包安装 {core} 失败，改为在线下载:{exc}", level="warn", category="核心")
+        return None
+    log_event(f"已从离线包安装 {core}:{installed}", category="核心")
+    return installed
+
+
+def install_bundled_fingerprint_kernel() -> dict[str, Any] | None:
+    """尚未安装任何指纹内核时，从离线包安装一份；已有内核或没有离线包时不做任何事。"""
+    if not browser_feature_enabled() or remote_browser_feature_enabled():
+        return None
+    package = find_bundled_package("fingerprint-chromium")
+    if package is None:
+        return None
+    with BROWSER_LAUNCH_LOCK:
+        with FINGERPRINT_INSTALL_LOCK:
+            if fingerprint_chromium_path(force_refresh=True):
+                return None
+            kernel_id = fingerprint_kernel_id_for(package.name, "", _file_sha256(package))
+            log_event(f"正在从离线包安装指纹内核:{package.name}", category="浏览器")
+            result = _install_fingerprint_package(
+                package,
+                package.name,
+                "离线包",
+                kernel_id=kernel_id,
+                source="bundled",
+            )
+    log_event(f"已从离线包安装指纹内核:{result.get('kernel_id')}", category="浏览器")
+    return result
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def ensure_core_installed(core: str) -> str:
     paths = core_paths()
     if paths.get(core):
@@ -3972,6 +4069,9 @@ def ensure_core_installed(core: str) -> str:
         paths = core_paths()
         if paths.get(core):
             return str(paths[core])
+        bundled = install_bundled_core(core)
+        if bundled:
+            return bundled
         host_arch = host_arch_token()
         host_os = host_os_token()
         if core == "sing-box":
@@ -3997,7 +4097,8 @@ def ensure_proxy_cores_installed() -> None:
 def start_core_auto_install() -> None:
     if CORE_AUTO_INSTALL_STARTED.is_set():
         return
-    if all(core_paths().get(core) for core in ("sing-box", "xray")):
+    cores_ready = all(core_paths().get(core) for core in ("sing-box", "xray"))
+    if cores_ready and find_bundled_package("fingerprint-chromium") is None:
         return
     CORE_AUTO_INSTALL_STARTED.set()
 
@@ -4006,6 +4107,11 @@ def start_core_auto_install() -> None:
             ensure_proxy_cores_installed()
         except Exception as exc:
             log_event(f"自动安装代理核心失败:{exc}", level="error", category="核心")
+        # 指纹内核只从离线包安装；没有离线包时仍由用户在内核管理中下载。
+        try:
+            install_bundled_fingerprint_kernel()
+        except Exception as exc:
+            log_event(f"从离线包安装指纹内核失败:{exc}", level="error", category="浏览器")
 
     threading.Thread(target=worker, name="proxy-core-auto-install", daemon=True).start()
 

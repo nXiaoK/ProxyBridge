@@ -16,7 +16,11 @@
 
 - `ProxyBridge-macOS-arm64-<版本>.zip`：Apple Silicon、macOS 13+ 菜单栏 App。
 - `ProxyBridge-Windows-x64-<版本>.exe`：Windows 10/11 x64 便携单文件。
+- `ProxyBridge-macOS-arm64-full-<版本>.zip`：完整版 macOS App，额外内置 sing-box、Xray 与指纹浏览器内核的官方安装包。
+- `ProxyBridge-Windows-x64-full-<版本>.zip`：完整版 Windows 便携包，解压后包含 `ProxyBridge.exe` 与 `bundled\` 目录（内置同样三个官方安装包），两者需放在同一目录。
 - `SHA256SUMS.txt`：上述产物的 SHA-256 校验值。
+
+完整版首次启动时，若工作目录中还没有对应组件，会按「本地导入」相同的校验流程从包内安装（指纹内核只在尚未安装任何版本时安装），无需再从 GitHub 下载代理核心和指纹内核；之后仍可在内核管理中升级、切换或删除，内核列表中来源显示为「离线包」。macOS 完整版首次启动仍会下载 Python 运行时（本机已有 Python 3.10+ 时直接使用）。内置版本取自打包时上游的最新发布：sing-box / Xray 取最新版本，指纹内核取最近一个提供该平台安装包的版本。
 
 仓库根目录 `VERSION` 是人工维护的基础版本，当前为 `0.3.0`。`main` 每次 push 都会触发发布门禁与双平台打包；成功后使用 `0.3.0-build.<Actions 运行序号>` 创建唯一 Release。修改基础版本时只改 `VERSION`，并同步 macOS 源 plist 中的可读默认值。
 
@@ -54,6 +58,14 @@ brew install xray
 SING_BOX_BIN=/path/to/sing-box \
 XRAY_BIN=/path/to/xray \
 scripts/build_menubar_app.sh --bundle-cores
+```
+
+构建与 Release 相同的完整版时，先下载官方安装包，再用 `--bundle-packages` 放入 App（安装包保持官方文件名，首次启动自动安装，用户仍可在内核管理中升级）：
+
+```bash
+# 按目标平台选择与在线下载相同的官方包，并按 GitHub 提供的 SHA-256 校验；可选 GITHUB_TOKEN 仅用于提高 API 频率上限
+python3 scripts/fetch_bundled_packages.py --os darwin --arch arm64 --out bundled-packages
+scripts/build_menubar_app.sh --bundle-packages bundled-packages
 ```
 
 ## 菜单栏 App
@@ -203,6 +215,7 @@ Proxy Bridge console: http://127.0.0.1:8787/#token=...
 | `--no-core-auto-install` | 启动时不自动下载 `sing-box` / `xray` |
 | `PROXY_BRIDGE_SING_BOX` / `PROXY_BRIDGE_XRAY` | 手动指定核心可执行文件 |
 | `PROXY_BRIDGE_FP_CHROMIUM` | 手动指定指纹 Chromium 可执行文件；设置后始终作为默认内核，浏览器配置中固定的其他版本仍按各自版本启动 |
+| `PROXY_BRIDGE_BUNDLED_DIR` | 离线包目录，内含 `sing-box/`、`xray/`、`fingerprint-chromium/` 子目录及官方安装包；未设置时查找程序资源目录下的 `bundled/`（macOS App 为 `Contents/Resources/bridge/bundled`）以及 Windows 可执行文件旁的 `bundled\`。对应组件未安装时首次启动自动从这里安装 |
 | `PROXY_BRIDGE_BROWSER_STOP_ON_LAST_WINDOW` | 仅 macOS：默认开启，关闭浏览器最后一个窗口后自动停止该浏览器；设为 `0` / `false` / `off` 时保持 Chromium 的 Dock 驻留行为 |
 
 说明：

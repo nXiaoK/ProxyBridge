@@ -52,6 +52,7 @@ ProxyBridge 在 Windows / Linux 上提供两种形态：
 1. 获取 `ProxyBridge.exe`  
    - 自己构建：见 [2.3](#23-方式-c在-windows-上构建-proxybridgeexe)  
    - 或从 [GitHub Releases](https://github.com/nXiaoK/ProxyBridge/releases/latest) 下载名称为 `ProxyBridge-Windows-x64-<版本>.exe` 的自动发布文件
+   - 无法访问 GitHub 或希望免下载时，可改用完整版 `ProxyBridge-Windows-x64-full-<版本>.zip`：解压后保持 `ProxyBridge.exe` 与 `bundled\` 目录在一起，首次启动会自动安装内置的 sing-box、Xray 与指纹浏览器内核
 2. 把 `ProxyBridge.exe` 放到任意目录，例如：
    ```text
    D:\Apps\ProxyBridge\ProxyBridge.exe
@@ -523,6 +524,7 @@ python3 -m desktop.tray_host --enable-autostart
 | `PROXY_BRIDGE_SING_BOX` | 手动指定 sing-box |
 | `PROXY_BRIDGE_XRAY` | 手动指定 xray |
 | `PROXY_BRIDGE_FP_CHROMIUM` | 手动指定指纹 Chromium |
+| `PROXY_BRIDGE_BUNDLED_DIR` | 离线包目录（含 `sing-box\`、`xray\`、`fingerprint-chromium\` 官方安装包）；未设置时使用 `ProxyBridge.exe` 旁的 `bundled\`，组件未安装时首次启动自动从这里安装 |
 
 ---
 

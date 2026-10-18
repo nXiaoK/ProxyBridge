@@ -41,11 +41,12 @@
 |---|---|
 | macOS 菜单栏 App | Apple Silicon、macOS 13+；下载 Release 中的 `ProxyBridge-macOS-arm64-*.zip` |
 | Windows 便携版 | Windows 10/11 x64；下载 Release 中的 `ProxyBridge-Windows-x64-*.exe`，双击启动 |
+| 完整版（免下载内核） | 文件名含 `full` 的 macOS zip / Windows zip，额外内置 sing-box、Xray 与指纹浏览器内核，首次启动自动安装，适合无法访问 GitHub 的环境 |
 | 源码运行 | macOS / Windows / Linux、Python 3.10+；见下方命令，前端无需构建 |
 | Linux 托盘 | 需要桌面环境和托盘依赖，见 [安装教程](docs/windows-linux-install.md#3-linux-安装与使用) |
 | Docker / NAS | Docker Engine API 1.45+（通常为 Engine 26+）、Compose v2，见 [部署教程](docs/docker.md) |
 
-首次启动会下载代理核心；无法访问 GitHub 时，可在 **设置 → 内核管理 → 本地导入** 安装官方发布包。指纹浏览器内核需单独安装。macOS App 首次启动还会下载独立 Python 运行时。
+首次启动会下载代理核心；无法访问 GitHub 时，可改用完整版，或在 **设置 → 内核管理 → 本地导入** 安装官方发布包。轻量版的指纹浏览器内核需单独安装。macOS App 首次启动还会下载独立 Python 运行时。
 
 macOS 发布版使用 ad-hoc 签名且未公证，Windows 发布版未签名。首次启动提示的处理方式见 [macOS 说明](docs/reference.md#重新构建-app) / [Windows 说明](docs/windows-linux-install.md#25-windows-常见问题)。
 

@@ -109,7 +109,8 @@ jobs:
     name: Build macOS arm64 app
     needs: [metadata, verify]
     runs-on: macos-14
-    timeout-minutes: 35
+    # 轻量版与完整版各构建一次，完整版还需下载约 180 MB 官方安装包。
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
         with:
@@ -154,6 +155,36 @@ jobs:
             outputs/ProxyBridgeMenuBar.app \
             "release-assets/ProxyBridge-macOS-arm64-${RELEASE_VERSION}.zip"
 
+      - name: Download bundled packages for full macOS app
+        env:
+          # 只读查询公开仓库 Release，用于提高 GitHub API 频率上限；不会写入产物。
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/fetch_bundled_packages.py --os darwin --arch arm64 --out bundled-packages
+
+      - name: Build full macOS app with sing-box, Xray and fingerprint browser
+        env:
+          PROXY_BRIDGE_VERSION: ${{ needs.metadata.outputs.release_version }}
+          PROXY_BRIDGE_BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
+          TARGET_ARCH: arm64
+        # 完整版在轻量版基础上把官方安装包放入 App 的 bridge/bundled/，首次启动自动安装，无需联网下载。
+        run: scripts/build_menubar_app.sh --bundle-packages bundled-packages
+
+      - name: Verify and package full macOS asset
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="outputs/ProxyBridgeMenuBar.app"
+          bundled="$app/Contents/Resources/bridge/bundled"
+          for kind in sing-box xray fingerprint-chromium; do
+            test "$(find "$bundled/$kind" -maxdepth 1 -type f | wc -l | tr -d ' ')" = "1"
+          done
+          codesign --verify --deep --strict "$app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$app" \
+            "release-assets/ProxyBridge-macOS-arm64-full-${RELEASE_VERSION}.zip"
+
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
@@ -166,7 +197,7 @@ jobs:
     name: Build Windows x64 exe
     needs: [metadata, verify]
     runs-on: windows-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -199,11 +230,39 @@ jobs:
           Copy-Item -LiteralPath outputs\windows\release\ProxyBridge.exe `
             -Destination "release-assets\ProxyBridge-Windows-x64-$env:RELEASE_VERSION.exe"
 
+      - name: Download bundled packages for full Windows build
+        shell: pwsh
+        env:
+          # 只读查询公开仓库 Release，用于提高 GitHub API 频率上限；不会写入产物。
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python scripts/fetch_bundled_packages.py --os windows --arch x86_64 --out bundled-packages
+
+      - name: Package full Windows asset with sing-box, Xray and fingerprint browser
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
+        # 完整版是 zip：解压后 ProxyBridge.exe 与 bundled\ 目录需放在一起，首次启动自动从 bundled\ 安装。
+        run: |
+          $name = "ProxyBridge-Windows-x64-full-$env:RELEASE_VERSION"
+          $staging = Join-Path "full-staging" $name
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item -LiteralPath outputs\windows\release\ProxyBridge.exe -Destination (Join-Path $staging "ProxyBridge.exe")
+          foreach ($kind in @("sing-box", "xray", "fingerprint-chromium")) {
+            $files = @(Get-ChildItem -LiteralPath (Join-Path "bundled-packages" $kind) -File)
+            if ($files.Count -ne 1) { throw "bundled-packages\$kind must contain exactly one package" }
+            $target = Join-Path $staging "bundled\$kind"
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            Copy-Item -LiteralPath $files[0].FullName -Destination $target
+          }
+          Compress-Archive -Path $staging -DestinationPath "release-assets\$name.zip" -CompressionLevel Optimal
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-${{ needs.metadata.outputs.tag }}
-          path: release-assets/*.exe
+          path: |
+            release-assets/*.exe
+            release-assets/*.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -232,7 +291,9 @@ jobs:
         run: |
           set -euo pipefail
           test -f "release-assets/ProxyBridge-macOS-arm64-${RELEASE_VERSION}.zip"
+          test -f "release-assets/ProxyBridge-macOS-arm64-full-${RELEASE_VERSION}.zip"
           test -f "release-assets/ProxyBridge-Windows-x64-${RELEASE_VERSION}.exe"
+          test -f "release-assets/ProxyBridge-Windows-x64-full-${RELEASE_VERSION}.zip"
           (
             cd release-assets
             sha256sum ProxyBridge-* > SHA256SUMS.txt
@@ -244,6 +305,7 @@ jobs:
             "- 提交：${SOURCE_SHA}" \
             "- macOS：Apple Silicon，最低 macOS 13，使用 ad-hoc 签名但未公证。" \
             "- Windows：x64 便携单文件，未购买代码签名证书。" \
+            "- 完整版（文件名含 full）：额外内置 sing-box、Xray 与指纹浏览器内核官方安装包，首次启动自动安装，无需再单独下载代理核心与指纹内核；Windows 完整版解压后请保持 ProxyBridge.exe 与 bundled 目录在一起。" \
             "" \
             "首次打开时，macOS Gatekeeper 或 Windows SmartScreen 可能显示安全提示。" \
             > release-notes.md
@@ -253,7 +315,8 @@ jobs:
         run: |
           set -euo pipefail
           mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
-          test "${#assets[@]}" -eq 3
+          # 轻量版与完整版各两个，加 SHA256SUMS.txt。
+          test "${#assets[@]}" -eq 5
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --clobber
             gh release edit "$TAG" \

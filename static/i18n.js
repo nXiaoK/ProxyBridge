@@ -16,7 +16,7 @@
     "按节点地区": "By Node Region", "自定义": "Custom", "禁止": "Block", "询问": "Ask", "保持不变": "Keep Unchanged",
     "随种子": "From Seed", "创建": "Create", "换绑": "Rebind", "设为默认": "Set Default", "默认": "Default",
     "下载最新版本": "Download Latest", "选择版本下载": "Choose Version", "选择指纹内核版本": "Choose Fingerprint Kernel Version",
-    "下载安装": "Download & Install", "已安装": "Installed", "发布时间": "Published", "早期安装": "Legacy Install",
+    "下载安装": "Download & Install", "已安装": "Installed", "发布时间": "Published", "早期安装": "Legacy Install", "离线包": "Bundled Package",
     "修改分组": "Change Group", "修改标签": "Change Label", "CDP 调试端口": "CDP Debug Port", "开启": "On", "关闭": "Off",
     "启动数量": "Number to Start", "启动最快节点": "Start Fastest Nodes", "启动最快节点数量": "Number of fastest nodes to start",
     "默认关闭。切换会中断连接并改变出口；浏览器绑定节点始终保持原出口。": "Off by default. Switching interrupts connections and changes the exit. Browser-bound nodes retain their exit.",

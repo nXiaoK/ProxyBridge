@@ -24,6 +24,9 @@ PREVIEW_ICON_PATH="$ROOT_DIR/outputs/ProxyBridgeAppIcon.png"
 ICON_TOOL="$ROOT_DIR/work/generate_app_icon"
 ATOMIC_REPLACE_TOOL="$ROOT_DIR/work/atomic_replace_app"
 BUNDLE_CORES=0
+# 完整版（离线包）使用：指向 scripts/fetch_bundled_packages.py 的输出目录，其中的 sing-box / xray /
+# fingerprint-chromium 官方安装包会复制到 App 内 bridge/bundled/，首次启动时自动安装；为空表示构建轻量版。
+BUNDLED_PACKAGES_DIR="${PROXY_BRIDGE_BUNDLED_PACKAGES:-}"
 
 cleanup() {
   local status=$?
@@ -38,14 +41,27 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for arg in "$@"; do
+while [[ $# -gt 0 ]]; do
+  arg="$1"
+  shift
   case "$arg" in
     --bundle-cores|--with-cores)
       BUNDLE_CORES=1
       ;;
+    --bundle-packages)
+      if [[ $# -eq 0 ]]; then
+        echo "--bundle-packages 需要指定目录" >&2
+        exit 1
+      fi
+      BUNDLED_PACKAGES_DIR="$1"
+      shift
+      ;;
+    --bundle-packages=*)
+      BUNDLED_PACKAGES_DIR="${arg#*=}"
+      ;;
     -h|--help)
       cat <<'EOF'
-Usage: scripts/build_menubar_app.sh [--bundle-cores]
+Usage: scripts/build_menubar_app.sh [--bundle-cores] [--bundle-packages DIR]
 
 默认构建轻量 App,不内置 Python/sing-box/xray。首次运行时会自动下载 Python
 运行时到 ~/Library/Application Support/ProxyBridge/python-runtime,并下载代理核心到
@@ -53,6 +69,9 @@ Usage: scripts/build_menubar_app.sh [--bundle-cores]
 
 Options:
   --bundle-cores, --with-cores  从构建机复制 sing-box/xray 到 App 内部。
+  --bundle-packages DIR         构建完整版：把 DIR 下 sing-box/、xray/、fingerprint-chromium/ 中的
+                                官方安装包放入 App，首次启动自动安装（DIR 由
+                                scripts/fetch_bundled_packages.py 生成）。
   -h, --help                   显示帮助。
 
 Environment:
@@ -61,6 +80,7 @@ Environment:
   PROXY_BRIDGE_VERSION=0.3.0-build.12      写入 App 和内嵌后端的完整版本。
   PROXY_BRIDGE_BUILD_NUMBER=12             写入 CFBundleVersion 的纯数字构建号。
   TARGET_ARCH=arm64                        目标 CPU 架构；当前发布仅支持 Apple Silicon。
+  PROXY_BRIDGE_BUNDLED_PACKAGES=/path      等同 --bundle-packages，用于构建完整版。
 EOF
       exit 0
       ;;
@@ -273,6 +293,25 @@ EOS
   echo "Bundled xray: $("$CORE_DIR/xray" version | sed -n '1p')"
 }
 
+bundle_offline_packages() {
+  local kind=""
+  local count=0
+  if [[ ! -d "$BUNDLED_PACKAGES_DIR" ]]; then
+    echo "离线包目录不存在：$BUNDLED_PACKAGES_DIR" >&2
+    exit 1
+  fi
+  for kind in sing-box xray fingerprint-chromium; do
+    count="$(find "$BUNDLED_PACKAGES_DIR/$kind" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')"
+    if [[ "$count" != "1" ]]; then
+      echo "离线包目录 $BUNDLED_PACKAGES_DIR/$kind 必须恰好包含一个安装包（当前 $count 个）" >&2
+      exit 1
+    fi
+    mkdir -p "$BRIDGE_DIR/bundled/$kind"
+    find "$BUNDLED_PACKAGES_DIR/$kind" -maxdepth 1 -type f ! -name '.*' -exec cp {} "$BRIDGE_DIR/bundled/$kind/" \;
+    echo "Bundled package ($kind): $(ls "$BRIDGE_DIR/bundled/$kind")"
+  done
+}
+
 # 这两个工具只在构建机上执行，必须编译为 runner 本机架构；最终 App 仍按 SWIFT_TARGET 交叉编译。
 swiftc \
   -O \
@@ -321,6 +360,9 @@ if [[ "$BUNDLE_CORES" == "1" ]]; then
   bundle_proxy_cores
 else
   echo "Skipping bundled proxy cores; runtime will auto-download Python and sing-box/xray on first launch."
+fi
+if [[ -n "$BUNDLED_PACKAGES_DIR" ]]; then
+  bundle_offline_packages
 fi
 
 chmod +x "$MACOS_DIR/ProxyBridgeMenuBar"

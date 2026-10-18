@@ -412,7 +412,7 @@ Bridge 是一个节点到本地代理端口的运行记录，通常包含：
 3. 工作目录自动安装位置。
 4. App 内置资源或系统可执行路径。
 
-核心缺失时，普通模式可通过后台线程从 GitHub Releases 下载并事务性安装。控制台也可调用 `POST /api/cores/upload` 本地导入官方包：请求正文是 `application/octet-stream` 原始文件，后端验证官方文件名中的 OS/架构标记，以 1 MiB 分块写入工作目录的 `0700` 私有暂存目录，并在安装前核对长度、可选 SHA-256 和可执行文件的 `version` 输出。单文件上限 2 GiB，解压后上限 4 GiB、成员上限 100,000；替换失败必须保留上一份可执行文件。
+核心缺失时，先查找离线包目录（`find_bundled_package()`，只接受保留官方文件名且匹配本机平台的包），按本地导入同一流程安装；没有离线包或安装失败时，普通模式再通过后台线程从 GitHub Releases 下载并事务性安装。同一后台线程还会在尚未安装任何指纹内核时从离线包安装一份（来源记为 `bundled`）。控制台也可调用 `POST /api/cores/upload` 本地导入官方包：请求正文是 `application/octet-stream` 原始文件，后端验证官方文件名中的 OS/架构标记，以 1 MiB 分块写入工作目录的 `0700` 私有暂存目录，并在安装前核对长度、可选 SHA-256 和可执行文件的 `version` 输出。单文件上限 2 GiB，解压后上限 4 GiB、成员上限 100,000；替换失败必须保留上一份可执行文件。
 
 上传和在线下载复用 `_install_core_from_archive()`、`_install_fingerprint_package()`、安全解压及原子替换逻辑。上传代理核心前必须没有使用目标核心的活动 Bridge；上传指纹内核前必须没有活动浏览器实例。Docker 远程模式只接受 Linux x86_64 指纹包，并在替换前要求与 `chrome` 同目录存在可执行 `chrome-wrapper`。
 
@@ -931,6 +931,7 @@ diagnostics
 | `PROXY_BRIDGE_XRAY` | xray 可执行路径 |
 | `PROXY_BRIDGE_CHROME` | 普通 Chrome 路径 |
 | `PROXY_BRIDGE_FP_CHROMIUM` | 指纹 Chromium 路径 |
+| `PROXY_BRIDGE_BUNDLED_DIR` | 离线包目录（`sing-box/`、`xray/`、`fingerprint-chromium/` 官方安装包）；默认 `APP_ROOT/bundled` 与冻结程序旁的 `bundled/` |
 | `PROXY_BRIDGE_PROXY_PORT_START` | 用户代理端口起点 |
 | `PROXY_BRIDGE_PROXY_PORT_END` | 用户代理端口终点 |
 | `PROXY_BRIDGE_BROWSER_BROKER_URL` | 仅供 Docker 主服务访问的内部 Broker HTTP 地址；缺失时关闭远程浏览器 |
