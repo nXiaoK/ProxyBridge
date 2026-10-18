@@ -26,6 +26,11 @@ class FingerprintConfigTests(unittest.TestCase):
         self.assertEqual(recommended["geolocation"], "block")
         changed = {key for key in legacy if legacy[key] != recommended[key]}
         self.assertEqual(changed, {"brand", "timezone_mode", "language_mode", "geolocation"})
+        # macOS：Intl 只跟随系统语言，Canvas 噪声与字体伪装会被检测站识别。
+        mac = bf.recommended_fingerprint_config("macos")
+        self.assertEqual(mac["language_mode"], "system")
+        self.assertEqual(mac["disable_spoofing"], ["canvas", "font"])
+        self.assertEqual(bf.recommended_fingerprint_config("linux")["language_mode"], "exit_ip")
 
     def test_strict_patch_validation_merges_and_rejects_invalid_values(self) -> None:
         merged = bf.validate_fingerprint_patch(
@@ -49,6 +54,7 @@ class FingerprintConfigTests(unittest.TestCase):
             {"accept_language": "en-US;q=\"0.9\""},
             {"window_size": "100x100"},
             {"timezone_mode": "custom"},
+            {"timezone_mode": "system"},
             {"unknown": 1},
         )
         for patch in invalid:
@@ -98,9 +104,24 @@ class LaunchSwitchTests(unittest.TestCase):
                 "--fingerprint-platform=macos",
                 "--timezone=Asia/Tokyo",
                 "--lang=ja-JP",
-                "--accept-lang=ja-JP,ja;q=0.9",
+                # --accept-lang 只接受纯语言列表，权重由 Chromium 生成请求头时添加。
+                "--accept-lang=ja-JP,ja",
             ],
         )
+
+    def test_system_language_omits_language_switches(self) -> None:
+        config = bf.validate_fingerprint_patch({"language_mode": "system"}, base=bf.recommended_fingerprint_config())
+        locale = bf.resolve_locale(config, ("Asia/Tokyo", "ja-JP", "ja-JP,ja;q=0.9"), ("America/Chicago", "en-US", "en-US,en"))
+        self.assertEqual(locale["language_source"], "system")
+        self.assertEqual(locale["timezone"], "America/Chicago")
+        switches = bf.fingerprint_switches(config, seed=1, host_platform="macos", locale=locale)
+        self.assertIn("--timezone=America/Chicago", switches)
+        self.assertFalse(any(arg.startswith(("--lang=", "--accept-lang=")) for arg in switches))
+
+    def test_accept_language_list_strips_weights_and_puts_language_first(self) -> None:
+        self.assertEqual(bf.chromium_accept_languages("en-US,en;q=0.9"), "en-US,en")
+        self.assertEqual(bf.chromium_accept_languages("zh-CN,zh;q=0.9,en;q=0.8,zh;q=0.1"), "zh-CN,zh,en")
+        self.assertEqual(bf.chromium_accept_languages("en;q=0.9", "fr-FR"), "fr-FR,en")
 
     def test_full_config_emits_every_supported_switch(self) -> None:
         config = bf.validate_fingerprint_patch(
@@ -142,8 +163,8 @@ class LaunchSwitchTests(unittest.TestCase):
         )
         resolved_custom = bf.resolve_locale(custom, region, exit_locale)
         self.assertEqual(resolved_custom["timezone"], "Europe/Paris")
-        self.assertEqual(resolved_custom["accept_language"], "fr-FR,fr;q=0.9,en;q=0.8")
-        self.assertEqual(bf.default_accept_language("en-GB"), "en-GB,en;q=0.9")
+        self.assertEqual(resolved_custom["accept_language"], "fr-FR,fr,en")
+        self.assertEqual(bf.default_accept_language("en-GB"), "en-GB,en")
 
     def test_geolocation_preference_block_and_ask(self) -> None:
         prefs: dict[str, object] = {"profile": {"default_content_setting_values": {"notifications": 2}}}

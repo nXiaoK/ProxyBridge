@@ -338,7 +338,7 @@ Bridge 是一个节点到本地代理端口的运行记录，通常包含：
 
 运行期字段 `cdp_port`、`cdp_ws_path`、`runtime_kernel`、`runtime_locale` 只在运行中有效，停止后清空，不参与 WebDAV 同步。
 
-缺少 `fingerprint` 字段的记录来自升级前版本，规范化时补成 `legacy_fingerprint_config()`（与升级前的启动参数一致）；新建记录使用 `recommended_fingerprint_config()`（Chrome 品牌、按出口 IP 匹配时区语言、默认禁止地理定位）。修改默认值时必须保持这一区分，避免已登录账号的指纹在升级后变化。
+缺少 `fingerprint` 字段的记录来自升级前版本，规范化时补成 `legacy_fingerprint_config()`（与升级前的启动参数一致）；新建记录使用 `recommended_fingerprint_config(host_platform)`（Chrome 品牌、按出口 IP 匹配时区语言、默认禁止地理定位；macOS 上语言为 `system` 并关闭 Canvas 与字体伪装，原因是 macOS 版 Chromium 的 `Intl` 区域不受 `--lang` 影响，且这两项伪装会被 Pixelscan 判定为 masking）。`language_mode` 可取 `system`、`region`、`exit_ip`、`custom`，`system` 时不传 `--lang` / `--accept-lang`。修改默认值时必须保持这一区分，避免已登录账号的指纹在升级后变化。
 
 订阅刷新或删除导致节点消失时，被浏览器记录引用的节点会带上 `_webdav_browser_preserved` 标记继续保留（公开字段为 `browser_preserved`），记录与 Profile 不删除；`prune_preserved_browser_nodes()` 在换绑或删除最后一条引用后清理这些节点。只有 `/api/subscriptions/delete` 显式传 `delete_browser_profiles: true` 时才连同记录与 Profile 删除。
 

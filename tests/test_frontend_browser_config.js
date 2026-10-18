@@ -47,7 +47,9 @@ test("batch payload omits keep values and unchecked text fields", () => {
     kernel_version: KEEP, cdp_enabled: "false",
   }, { batch: true });
   assert.deepEqual(payload, { group: "", fingerprint: { brand: "Edge", language_mode: "region" }, cdp_enabled: false });
-  assert.deepEqual(browserConfig.buildConfigPayload({ platform: KEEP, kernel_version: KEEP, cdp_enabled: KEEP }, { batch: true }), {});
+  assert.deepEqual(browserConfig.buildConfigPayload({ platform: KEEP, kernel_version: KEEP, cdp_enabled: KEEP, spoofing_preset: KEEP }, { batch: true }), {});
+  assert.deepEqual(browserConfig.buildConfigPayload({ spoofing_preset: "canvas,font", language_mode: "system" }, { batch: true }).fingerprint, { language_mode: "system", disable_spoofing: ["canvas", "font"] });
+  assert.deepEqual(browserConfig.buildConfigPayload({ spoofing_preset: "none" }, { batch: true }).fingerprint, { disable_spoofing: [] });
 });
 
 test("record filter supports group, status, node and search", () => {

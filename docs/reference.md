@@ -97,8 +97,8 @@ outputs/ProxyBridgeMenuBar.app
 | 操作系统 | `跟随系统`（本机为宿主系统，Docker worker 为 Linux）或 Windows / macOS / Linux。与真实系统不同的平台仍使用真实系统的字体，可能被识别为不一致。 |
 | 浏览器品牌 | Chrome（新记录默认）、Edge、Opera、Vivaldi 或 Chromium（内核默认）；可选填品牌版本，留空跟随内核版本。 |
 | CPU 核心数 / 平台版本 / 窗口尺寸 | 留空或「随种子」时由内核决定；窗口尺寸格式为 `宽x高`。 |
-| 关闭伪装项 | Canvas、Audio、字体、ClientRects、WebGL/GPU，仅用于排查网站兼容问题，需要内核 144 及以上。 |
-| 时区 / 语言来源 | `按出口 IP`（新记录默认）：启动前经该节点代理访问 `ipwho.is` 查询出口时区与国家，结果按节点缓存 10 分钟，查询失败时回退到节点地区；`按节点地区`：使用节点名识别的地区表；`自定义`：手动填写 IANA 时区、语言与 Accept-Language。 |
+| 关闭伪装项 | Canvas、Audio、字体、ClientRects、WebGL/GPU，需要内核 144 及以上。实测 macOS 上 Canvas 噪声与字体伪装会被 Pixelscan 判定为「Masking detected」，因此 macOS 新建记录默认关闭这两项；关闭后同一台 Mac 上各环境的 Canvas 与字体相同（与大量同型号 Mac 一致），GPU 型号、音频、ClientRects 仍按种子区分。配置弹窗中的「一键应用检测友好设置」与批量配置可把已有记录改成该组合。 |
+| 时区 / 语言来源 | `按出口 IP`（新记录默认）：启动前经该节点代理访问 `ipwho.is` 查询出口时区与国家，结果按节点缓存 10 分钟，查询失败时回退到节点地区；`按节点地区`：使用节点名识别的地区表；`自定义`：手动填写 IANA 时区、语言与 Accept-Language。语言另有 `跟随系统`：不传语言参数，界面语言、`navigator.language`、`Intl` 区域与 Accept-Language 都使用系统设置。macOS 版 Chromium 的 `Intl` 区域与日期格式只跟随系统语言，改成其他语言会出现可被检测的不一致，所以 macOS 新建记录的语言默认「跟随系统」，时区仍按出口 IP。 |
 | 地理位置权限 | `禁止`（新记录默认）写入 Profile 默认权限，避免系统 / Wi-Fi 定位绕过代理暴露真实位置；`询问` 保持 Chromium 默认行为。 |
 | 内核版本 | 跟随默认版本，或固定某个已安装版本；固定版本缺失时启动会报错，不会悄悄换内核。 |
 | 扩展 | 从扩展库勾选。启动时扩展复制到 Profile 内的 `ProxyBridgeExtensions/`，随 Profile 一起同步，Docker worker 同样可用。 |
@@ -106,6 +106,7 @@ outputs/ProxyBridgeMenuBar.app
 | CDP 调试端口 | 默认关闭，仅本机模式可用。开启后以 `--remote-debugging-port=0` 监听 127.0.0.1 随机端口，用于 Cookie 导入导出，也可以把记录中显示的 `ws://` 地址交给 Playwright / Puppeteer 的 `connectOverCDP`。该端口没有密码，本机任何程序都能控制浏览器，不用时请关闭。 |
 
 - 升级前创建的记录保持原来的启动参数（Chromium 品牌、按节点地区定时区、地理位置询问），不会因为升级而改变已登录账号看到的指纹；需要时可在配置中手动改为推荐值。
+- 传给内核的 `--accept-lang` 只包含语言列表（如 `en-US,en`），请求头中的 `q` 权重由 Chromium 自动生成；参数中带 `;q=` 会让 `navigator.languages` 出现异常条目。
 - 「Cookie 与检测」中可一键打开 BrowserScan、Pixelscan、CreepJS 检测页；开启 CDP 并运行后，可导入 / 导出 JSON（Cookie-Editor、EditThisCookie、CDP 格式）或 Netscape `cookies.txt`。导出内容含登录凭据，请妥善保管。
 - 「换绑节点」把已停止的记录移到另一个节点，Profile 目录随之移动，指纹种子与 Cookie 不变；早期的「默认浏览器」记录不支持换绑。
 - 订阅刷新导致节点 ID 变化（例如机场修改了参数）时，绑定的浏览器记录与 Profile 会保留，原节点在节点列表中显示为「已从订阅移除 · 仅为浏览器记录保留」，换绑或删除最后一条记录后自动清理。手动删除订阅时默认同样保留，只有在确认框中勾选后才会连同 Profile 永久删除。

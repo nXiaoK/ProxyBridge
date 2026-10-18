@@ -31,6 +31,11 @@ FINGERPRINT_BRANDS = ("", "Chrome", "Edge", "Opera", "Vivaldi")
 SPOOFING_SWITCHES = ("font", "audio", "canvas", "clientrects", "gpu")
 # 时区/语言来源：region 按节点地区表，exit_ip 按启动前查询到的出口 IP，custom 为手动填写。
 LOCALE_MODES = ("region", "exit_ip", "custom")
+# 语言另有 system：不传 --lang/--accept-lang，界面语言、navigator.language 与 Intl 区域都跟随系统。
+# macOS 版 Chromium 的 Intl 区域只认系统语言，改成其他语言会出现可被检测的不一致。
+LANGUAGE_MODES = ("system", *LOCALE_MODES)
+# macOS 上 Canvas 噪声与字体伪装会被 Pixelscan 等检测站判定为 masking，推荐关闭。
+MACOS_DETECTION_FRIENDLY_DISABLED = ("canvas", "font")
 # 地理位置默认权限：block 写入 Profile 默认禁止；ask 保持 Chromium 默认询问。
 GEOLOCATION_MODES = ("ask", "block")
 # CPU 核心数可选值；0 表示由指纹种子派生。
@@ -87,8 +92,12 @@ def legacy_fingerprint_config() -> dict[str, Any]:
     }
 
 
-def recommended_fingerprint_config() -> dict[str, Any]:
-    """新记录默认值：Chrome 品牌、按出口 IP 匹配时区与语言、默认禁止地理定位。"""
+def recommended_fingerprint_config(host_platform: str = "") -> dict[str, Any]:
+    """新记录默认值：Chrome 品牌、按出口 IP 匹配时区与语言、默认禁止地理定位。
+
+    host_platform 为 macos 时，语言跟随系统并关闭 Canvas 与字体伪装：实测 fingerprint-chromium
+    在 macOS 上这三项会让 Pixelscan 判定为 masking，其余伪装项不受影响。
+    """
     config = legacy_fingerprint_config()
     config.update(
         {
@@ -98,6 +107,9 @@ def recommended_fingerprint_config() -> dict[str, Any]:
             "geolocation": "block",
         }
     )
+    if host_platform == "macos":
+        config["language_mode"] = "system"
+        config["disable_spoofing"] = list(MACOS_DETECTION_FRIENDLY_DISABLED)
     return config
 
 
@@ -147,10 +159,15 @@ def _field_value(name: str, value: Any) -> Any:
                 raise ValueError("关闭伪装项只能是 font、audio、canvas、clientrects、gpu")
             result.add(text)
         return [item for item in SPOOFING_SWITCHES if item in result]
-    if name in {"timezone_mode", "language_mode"}:
+    if name == "timezone_mode":
         text = str(value or "region").strip().lower()
         if text not in LOCALE_MODES:
-            raise ValueError("时区/语言来源只能是 region、exit_ip 或 custom")
+            raise ValueError("时区来源只能是 region、exit_ip 或 custom")
+        return text
+    if name == "language_mode":
+        text = str(value or "region").strip().lower()
+        if text not in LANGUAGE_MODES:
+            raise ValueError("语言来源只能是 system、region、exit_ip 或 custom")
         return text
     if name == "timezone":
         text = str(value or "").strip()
@@ -338,7 +355,10 @@ def resolve_locale(
             timezone, timezone_source = exit_locale[0], "exit_ip"
         else:
             timezone_source = "region_fallback"
-    if config.get("language_mode") == "custom" and config.get("language"):
+    if config.get("language_mode") == "system":
+        # 空语言表示不传语言参数，由浏览器使用系统语言。
+        language, accept_language, language_source = "", "", "system"
+    elif config.get("language_mode") == "custom" and config.get("language"):
         language = str(config["language"])
         accept_language = str(config.get("accept_language") or default_accept_language(language))
         language_source = "custom"
@@ -360,10 +380,26 @@ def resolve_locale(
 def default_accept_language(language: str) -> str:
     base = language.split("-", 1)[0]
     if base == language:
-        return language if base == "en" else f"{language},en;q=0.8"
+        return language if base == "en" else f"{language},en"
     if base == "en":
-        return f"{language},en;q=0.9"
-    return f"{language},{base};q=0.9,en;q=0.8"
+        return f"{language},en"
+    return f"{language},{base},en"
+
+
+def chromium_accept_languages(value: str, language: str = "") -> str:
+    """把 Accept-Language 转成 --accept-lang 需要的纯语言列表。
+
+    Chromium 会自行生成带 q 权重的请求头；参数里带 ;q= 会让 navigator.languages 出现
+    「en;q=0.9」这类真实浏览器不可能有的条目。
+    """
+    items: list[str] = []
+    for part in str(value or "").split(","):
+        tag = part.split(";", 1)[0].strip()
+        if tag and tag not in items:
+            items.append(tag)
+    if language and (not items or items[0] != language):
+        items = [language, *[item for item in items if item != language]]
+    return ",".join(items)
 
 
 def fingerprint_switches(
@@ -389,13 +425,14 @@ def fingerprint_switches(
         switches.append(f"--fingerprint-hardware-concurrency={int(config['hardware_concurrency'])}")
     if config.get("disable_spoofing"):
         switches.append("--disable-spoofing=" + ",".join(config["disable_spoofing"]))
-    switches.extend(
-        [
-            f"--timezone={locale['timezone']}",
-            f"--lang={locale['language']}",
-            f"--accept-lang={locale['accept_language']}",
-        ]
-    )
+    switches.append(f"--timezone={locale['timezone']}")
+    if locale.get("language"):
+        switches.extend(
+            [
+                f"--lang={locale['language']}",
+                f"--accept-lang={chromium_accept_languages(locale.get('accept_language') or '', locale['language'])}",
+            ]
+        )
     if config.get("window_size"):
         width, height = str(config["window_size"]).split("x", 1)
         switches.append(f"--window-size={width},{height}")

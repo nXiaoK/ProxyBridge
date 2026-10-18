@@ -12,7 +12,7 @@
 - `POST /api/settings/health`：`auto_switch` 布尔，默认关闭。浏览器绑定节点禁止自动切换，避免改变出口。
 - `GET /api/cores`：返回 `{cores: [{core,path,version,installed,status,error}]}`；代理核心更新使用 `POST /api/cores/update {core}`。
 - `GET /api/nodes/history?node_id=...`：返回 `{node_id,history}`，每节点最近 20 次测速。
-- `POST /api/browser/update`：`instance_id` 或 `instance_ids` 加可选 `name`（仅单条）、`label`、`group`、`fingerprint`（部分字段即可）、`kernel_version`、`cdp_enabled`、`extensions`、`start_urls`。返回 `{ok, updated, restart_required, instance | instances}`；运行中的记录在下次启动时生效。
+- `POST /api/browser/update`：`instance_id` 或 `instance_ids` 加可选 `name`（仅单条）、`label`、`group`、`fingerprint`（部分字段即可；`language_mode` 可为 `system` 表示跟随系统语言）、`kernel_version`、`cdp_enabled`、`extensions`、`start_urls`。返回 `{ok, updated, restart_required, instance | instances}`；运行中的记录在下次启动时生效。
 - `POST /api/browser/create`：`node_id`、`count`（1–50）及上述可编辑字段，只新建记录不启动。`POST /api/browser/rebind`：`instance_ids`、`node_id`，记录须已停止。`POST /api/browser/regenerate-fingerprint`：`instance_ids`。
 - `POST /api/browser/open-url`：`instance_id` 加 `site`（`browserscan`、`pixelscan`、`creepjs`）或 `url`。`POST /api/browser/cookies/export`：`instance_id`、`format`（`json` / `netscape`）；`POST /api/browser/cookies/import`：`instance_id`、`content`。Cookie 接口要求本机运行且开启 CDP。
 - `POST /api/browser/kernels/releases`、`default`（`id`）、`delete`（`id`）管理多版本指纹内核；`POST /api/subscriptions/delete` 新增 `delete_browser_profiles`，默认 `false` 表示保留浏览器记录与 Profile。

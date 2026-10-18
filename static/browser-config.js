@@ -25,6 +25,14 @@
     ["region", "按节点地区"],
     ["custom", "自定义"],
   ];
+  // 语言另有「跟随系统」：macOS 版 Chromium 的 Intl 区域只认系统语言，改成其他语言会被检测站识破。
+  const LANGUAGE_MODE_OPTIONS = [["system", "跟随系统"], ...LOCALE_MODE_OPTIONS];
+  // 批量修改「关闭伪装项」的预设；canvas,font 为 macOS 上通过 Pixelscan 的推荐组合。
+  const SPOOFING_PRESET_OPTIONS = [
+    ["canvas,font", "关闭 Canvas 与字体伪装（检测友好）"],
+    ["none", "全部伪装开启"],
+  ];
+  const DETECTION_FRIENDLY_DISABLED = ["canvas", "font"];
   const GEOLOCATION_OPTIONS = [
     ["block", "禁止"],
     ["ask", "询问"],
@@ -41,6 +49,7 @@
     exit_ip: "出口 IP",
     region: "节点地区",
     region_fallback: "节点地区（出口查询失败）",
+    system: "系统语言",
     custom: "自定义",
   };
   const ACTIVE_STATUSES = new Set(["running", "starting", "stopping"]);
@@ -66,6 +75,7 @@
       fp.platform && fp.platform !== "auto" ? optionLabel(PLATFORM_OPTIONS, fp.platform) : "",
       `时区${optionLabel(LOCALE_MODE_OPTIONS, fp.timezone_mode || "region")}`,
     ].filter(Boolean);
+    if (fp.language_mode === "system") parts.push("语言跟随系统");
     if (fp.geolocation === "block") parts.push("禁止定位");
     return parts.join(" · ");
   }
@@ -135,6 +145,9 @@
     if (values.hardware_concurrency !== undefined && !keep(values.hardware_concurrency)) {
       fingerprint.hardware_concurrency = Number(values.hardware_concurrency || 0);
     }
+    if (batch && values.spoofing_preset !== undefined && !keep(values.spoofing_preset)) {
+      fingerprint.disable_spoofing = values.spoofing_preset === "none" ? [] : String(values.spoofing_preset).split(",");
+    }
     if (!batch) {
       for (const key of ["platform_version", "brand_version", "timezone", "language", "accept_language", "window_size"]) {
         if (values[key] !== undefined) fingerprint[key] = text(values[key]);
@@ -161,6 +174,9 @@
     PLATFORM_OPTIONS,
     BRAND_OPTIONS,
     LOCALE_MODE_OPTIONS,
+    LANGUAGE_MODE_OPTIONS,
+    SPOOFING_PRESET_OPTIONS,
+    DETECTION_FRIENDLY_DISABLED,
     GEOLOCATION_OPTIONS,
     HARDWARE_OPTIONS,
     SPOOFING_OPTIONS,

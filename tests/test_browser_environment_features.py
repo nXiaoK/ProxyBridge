@@ -121,6 +121,10 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
 
     # ---------- 指纹与启动参数 ----------
     def test_new_records_use_recommended_config_and_legacy_records_keep_previous_flags(self) -> None:
+        # 通用推荐值以 Linux/Windows 为准；macOS 的差异由下一个测试覆盖。
+        platform_patch = mock.patch.object(app, "host_os_token", return_value="linux")
+        platform_patch.start()
+        self.addCleanup(platform_patch.stop)
         self.install_stub_kernel()
         state = app.empty_state()
         state["nodes"] = [{"id": "node-us", "name": "US East", "region": "美国", "protocol": "vless"}]
@@ -138,6 +142,7 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
         self.assertIn("--fingerprint-brand=Chrome", command)
         self.assertIn("--timezone=America/New_York", command)
         self.assertIn("--lang=en-US", command)
+        self.assertIn("--accept-lang=en-US,en", command)
         self.assertNotIn("--remote-debugging-port=0", command)
         record = next(item for item in app.load_state()["browser_instances"] if item["id"] == new_record["id"])
         self.assertEqual(record["runtime_kernel"], "150.0.7871.186")
@@ -150,6 +155,22 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
         self.assertFalse(any(arg.startswith("--fingerprint-brand") for arg in legacy_command))
         self.assertIn("--timezone=America/Los_Angeles", legacy_command)
         self.assertIn("--fingerprint=1234", legacy_command)
+
+    def test_macos_new_records_follow_system_language_and_skip_detectable_spoofing(self) -> None:
+        self.install_stub_kernel()
+        state = app.empty_state()
+        state["nodes"] = [{"id": "node-us", "name": "US", "region": "美国", "protocol": "vless"}]
+        with mock.patch.object(app, "host_os_token", return_value="darwin"):
+            record = app.create_browser_instance_record(state, "node-us")
+            state["browser_instances"] = [record]
+            app.save_state(state)
+            command = self.launch(record["id"], lambda _port: {"ip": "1.1.1.1", "region_code": "US", "timezone": "America/Chicago"})
+        self.assertEqual(record["fingerprint"]["language_mode"], "system")
+        self.assertIn("--disable-spoofing=font,canvas", command)
+        self.assertIn("--timezone=America/Chicago", command)
+        self.assertFalse(any(arg.startswith(("--lang=", "--accept-lang=")) for arg in command))
+        saved = app.load_state()["browser_instances"][0]
+        self.assertEqual(saved["runtime_locale"]["language_source"], "system")
 
     def test_exit_lookup_failure_falls_back_to_region_and_cdp_flag_is_added(self) -> None:
         self.install_stub_kernel()
@@ -612,7 +633,7 @@ class BrokerFingerprintPayloadTests(unittest.TestCase):
                 "--fingerprint-platform=linux",
                 "--timezone=America/New_York",
                 "--lang=en-US",
-                "--accept-lang=en-US,en;q=0.9",
+                "--accept-lang=en-US,en",
             ],
         )
 

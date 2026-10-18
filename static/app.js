@@ -3710,6 +3710,11 @@ function kernelOptionsMarkup(selected = "", { keep = false } = {}) {
   return `${keep ? `<option value="${browserConfig.KEEP}" selected>保持不变</option>` : ""}<option value="" ${!keep && !selected ? "selected" : ""}>跟随默认版本${defaultKernel ? `（${escapeHtml(label(defaultKernel))}）` : "（未安装）"}</option>${kernels.map((kernel) => `<option value="${escapeHtml(kernel.id)}" ${!keep && kernel.id === selected ? "selected" : ""}>${escapeHtml(label(kernel))}</option>`).join("")}${keep ? "" : missing}`;
 }
 
+// macOS 本机浏览器：Intl 区域只跟随系统语言，Canvas/字体伪装会被检测站识别。
+function macLocalBrowser() {
+  return appState.platform?.os === "darwin" && !remoteBrowserEnabled();
+}
+
 function browserConfigField(label, control, hint = "") {
   return `<label class="core-upload-field"><span>${escapeHtml(label)}</span>${control}${hint ? `<small>${escapeHtml(hint)}</small>` : ""}</label>`;
 }
@@ -3742,8 +3747,13 @@ function renderBrowserConfigFingerprint(mode, instance) {
     ? `<div class="browser-config-seed"><span>指纹种子</span><code>${escapeHtml(instance?.fingerprint_seed || "-")}</code><button class="row-button" type="button" data-action="regenerate-browser-fingerprint" data-instance="${escapeHtml(instance?.id || "")}" ${running ? "disabled title=\"停止后才能重新生成\"" : ""}>重新生成指纹</button></div><small class="browser-config-note">Canvas、WebGL、Audio、字体等特征由种子派生。重新生成后，已登录网站会把它视为一台新设备。</small>`
     : "";
   const textFields = keep ? "" : `${browserConfigField("平台版本", `<input name="platform_version" value="${value("platform_version")}" placeholder="留空使用内核默认值，例如 10.0.0">`)}${browserConfigField("品牌版本", `<input name="brand_version" value="${value("brand_version")}" placeholder="留空跟随内核版本">`)}${browserConfigField("窗口尺寸", `<input name="window_size" value="${value("window_size")}" placeholder="留空自动，例如 1920x1080">`)}`;
-  const disabled = new Set(fp.disable_spoofing || []);
-  const spoofing = keep ? "" : `<fieldset class="browser-config-checks"><legend>关闭伪装项</legend>${browserConfig.SPOOFING_OPTIONS.map(([key, label]) => `<label class="sync-checkbox"><input type="checkbox" name="disable_spoofing" value="${escapeHtml(key)}" ${disabled.has(key) ? "checked" : ""}><span>${escapeHtml(label)}</span></label>`).join("")}<small>仅在网站兼容异常时关闭；需要内核 144 及以上版本。</small></fieldset>`;
+  const disabled = new Set(mode === "create" ? (macLocalBrowser() ? browserConfig.DETECTION_FRIENDLY_DISABLED : []) : (fp.disable_spoofing || []));
+  const presetHint = macLocalBrowser()
+    ? "实测 macOS 上 Canvas 噪声与字体伪装会被 Pixelscan 等判定为 masking；关闭后同一台 Mac 上各环境的 Canvas 与字体相同，但与大量同型号 Mac 一致，GPU、音频等其他特征仍按种子区分。"
+    : "Canvas 噪声与字体伪装容易被检测站识别；关闭后同一台电脑上各环境的 Canvas 与字体相同，其他特征仍按种子区分。";
+  const spoofing = keep
+    ? browserConfigField("关闭伪装项", `<select name="spoofing_preset">${selectOptionsMarkup(browserConfig.SPOOFING_PRESET_OPTIONS, "", { keep: true })}</select>`, presetHint)
+    : `<fieldset class="browser-config-checks"><legend>关闭伪装项</legend>${browserConfig.SPOOFING_OPTIONS.map(([key, label]) => `<label class="sync-checkbox"><input type="checkbox" name="disable_spoofing" value="${escapeHtml(key)}" ${disabled.has(key) ? "checked" : ""}><span>${escapeHtml(label)}</span></label>`).join("")}<small>${escapeHtml(presetHint)} 需要内核 144 及以上版本。</small><div class="browser-config-actions"><button class="row-button" type="button" data-action="apply-detection-preset">一键应用检测友好设置</button></div></fieldset>`;
   return `<section data-config-panel="fingerprint" hidden>${seed}${browserConfigField("操作系统", `<select name="platform">${selectOptionsMarkup(browserConfig.PLATFORM_OPTIONS, current("platform"), { keep })}</select>`, "选择与真实系统不同的平台时，字体等特征仍来自真实系统，可能被识别为不一致。")}${browserConfigField("浏览器品牌", `<select name="brand">${selectOptionsMarkup(browserConfig.BRAND_OPTIONS, current("brand") ?? "", { keep })}</select>`, "Chrome 是真实用户最常见的品牌；Chromium 品牌较少见。")}${browserConfigField("CPU 核心数", `<select name="hardware_concurrency">${selectOptionsMarkup(browserConfig.HARDWARE_OPTIONS, String(current("hardware_concurrency") || 0), { keep })}</select>`)}${textFields}${spoofing}</section>`;
 }
 
@@ -3751,12 +3761,16 @@ function renderBrowserConfigLocale(mode, instance) {
   const fp = mode === "create" ? {} : browserConfig.fingerprintOf(instance);
   const keep = mode === "batch";
   const modes = keep ? browserConfig.LOCALE_MODE_OPTIONS.filter(([key]) => key !== "custom") : browserConfig.LOCALE_MODE_OPTIONS;
+  const languageModes = keep ? browserConfig.LANGUAGE_MODE_OPTIONS.filter(([key]) => key !== "custom") : browserConfig.LANGUAGE_MODE_OPTIONS;
+  const languageHint = macLocalBrowser()
+    ? "macOS 上 Chromium 的 Intl 区域与日期格式只跟随系统语言；选择其他语言会与之不一致，被检测站判定为伪装，建议「跟随系统」。"
+    : "跟随系统时不修改语言；其他选项会同时设置界面语言、navigator.language 与 Accept-Language。";
   const current = (key, fallback) => mode === "create" ? fallback : (fp[key] ?? fallback);
   const runtime = instance?.runtime_locale && ACTIVE_BROWSER_STATUS.includes(instance.status)
     ? `<div class="core-upload-platform">当前生效：${escapeHtml(instance.runtime_locale.timezone || "")}（${escapeHtml(browserConfig.localeSourceLabel(instance.runtime_locale.timezone_source))}） · ${escapeHtml(instance.runtime_locale.language || "")}（${escapeHtml(browserConfig.localeSourceLabel(instance.runtime_locale.language_source))}）</div>`
     : "";
   const custom = keep ? "" : `${browserConfigField("自定义时区", `<input name="timezone" value="${escapeHtml(fp.timezone || "")}" placeholder="IANA 名称，例如 America/New_York">`)}${browserConfigField("自定义语言", `<input name="language" value="${escapeHtml(fp.language || "")}" placeholder="例如 en-US">`)}${browserConfigField("Accept-Language", `<input name="accept_language" value="${escapeHtml(fp.accept_language || "")}" placeholder="留空按语言生成，例如 en-US,en;q=0.9">`)}`;
-  return `<section data-config-panel="locale" hidden>${runtime}${browserConfigField("时区来源", `<select name="timezone_mode">${selectOptionsMarkup(modes, current("timezone_mode", "exit_ip"), { keep })}</select>`, "按出口 IP：启动前经该节点代理查询出口所在时区，失败时回退到节点地区。")}${browserConfigField("语言来源", `<select name="language_mode">${selectOptionsMarkup(modes, current("language_mode", "exit_ip"), { keep })}</select>`)}${custom}${browserConfigField("地理位置权限", `<select name="geolocation">${selectOptionsMarkup(browserConfig.GEOLOCATION_OPTIONS, current("geolocation", "block"), { keep })}</select>`, "系统定位基于 Wi-Fi 等信号，不经过代理；建议禁止，避免暴露真实位置。")}</section>`;
+  return `<section data-config-panel="locale" hidden>${runtime}${browserConfigField("时区来源", `<select name="timezone_mode">${selectOptionsMarkup(modes, current("timezone_mode", "exit_ip"), { keep })}</select>`, "按出口 IP：启动前经该节点代理查询出口所在时区，失败时回退到节点地区。")}${browserConfigField("语言来源", `<select name="language_mode">${selectOptionsMarkup(languageModes, current("language_mode", macLocalBrowser() ? "system" : "exit_ip"), { keep })}</select>`, languageHint)}${custom}${browserConfigField("地理位置权限", `<select name="geolocation">${selectOptionsMarkup(browserConfig.GEOLOCATION_OPTIONS, current("geolocation", "block"), { keep })}</select>`, "系统定位基于 Wi-Fi 等信号，不经过代理；建议禁止，避免暴露真实位置。")}</section>`;
 }
 
 function renderBrowserExtensionList(selectedIds) {
@@ -3931,6 +3945,7 @@ function readBrowserConfigForm() {
     accept_language: value("accept_language"),
     geolocation: value("geolocation"),
     kernel_version: value("kernel_version"),
+    spoofing_preset: value("spoofing_preset"),
     cdp_enabled: batch ? value("cdp_enabled") : checked("cdp_enabled"),
     start_urls: value("start_urls"),
   };
@@ -4682,6 +4697,7 @@ function actionUsesSpinner(action) {
     "open-browser-rebind",
     "close-browser-config",
     "clear-browser-selection",
+    "apply-detection-preset",
     "close-kernel-releases",
     "close-remote-browser-launch",
     "generate-remote-browser-password",
@@ -4912,6 +4928,14 @@ async function handleAction(event) {
       await regenerateBrowserFingerprints([...appState.selectedBrowserIds]);
     } else if (action === "batch-browser-delete") {
       await batchDeleteSelectedBrowsers();
+    } else if (action === "apply-detection-preset") {
+      const form = $("#browserConfigForm");
+      form.querySelectorAll('[name="disable_spoofing"]').forEach((input) => {
+        input.checked = browserConfig.DETECTION_FRIENDLY_DISABLED.includes(input.value);
+      });
+      const languageMode = form.querySelector('[name="language_mode"]');
+      if (languageMode && macLocalBrowser()) languageMode.value = "system";
+      showToast(macLocalBrowser() ? "已关闭 Canvas 与字体伪装，语言改为跟随系统；保存后重启浏览器生效" : "已关闭 Canvas 与字体伪装；保存后重启浏览器生效");
     } else if (action === "regenerate-browser-fingerprint") {
       if (await regenerateBrowserFingerprints([button.dataset.instance])) {
         const instance = browserInstanceById(button.dataset.instance);

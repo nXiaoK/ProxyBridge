@@ -1773,8 +1773,9 @@ def default_browser_instance_options() -> dict[str, Any]:
     return {
         # 自由分组名，用于浏览器页筛选与批量操作，最长 40 字。
         "group": "",
-        # 指纹参数，字段含义见 browser_fingerprint.FINGERPRINT_FIELDS。
-        "fingerprint": browser_fingerprint.recommended_fingerprint_config(),
+        # 指纹参数，字段含义见 browser_fingerprint.FINGERPRINT_FIELDS；macOS 上默认语言跟随系统、
+        # 关闭 Canvas 与字体伪装，避免被检测站判定为 masking。
+        "fingerprint": browser_fingerprint.recommended_fingerprint_config(fingerprint_platform_token()),
         # 固定内核版本 ID；空字符串表示跟随「内核管理」中的默认版本。
         "kernel_version": "",
         # 是否开放本机 CDP 调试端口（127.0.0.1 随机端口），用于 Cookie 导入导出与自动化。
@@ -1900,7 +1901,7 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
         fingerprint_fallback = (
             browser_fingerprint.legacy_fingerprint_config()
             if not isinstance(raw.get("fingerprint"), dict)
-            else browser_fingerprint.recommended_fingerprint_config()
+            else browser_fingerprint.recommended_fingerprint_config(fingerprint_platform_token())
         )
         active = status in ACTIVE_BROWSER_STATUSES
         cdp_port = safe_int(record.get("cdp_port"), 0)
@@ -8044,7 +8045,12 @@ def launch_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
             region_locale(region),
             browser_launch_exit_locale(node_id, local_port, config),
         )
-        timezone, language, accept_language = locale["timezone"], locale["language"], locale["accept_language"]
+        timezone = locale["timezone"]
+        # Linux worker 的 --lang 会同时设置 Intl 区域；「跟随系统」时交给 Broker 的默认 en-US。
+        language = locale["language"]
+        accept_language = (
+            browser_fingerprint.chromium_accept_languages(locale["accept_language"], language) if language else ""
+        )
         # worker 的 CHROME_CLI 按空白拆分参数；非 ASCII 等字符先做百分号编码，再交给 Broker 白名单复核。
         start_urls = [
             urllib.parse.quote(url, safe=":/?#[]@!$&()*+,;=%-._~")

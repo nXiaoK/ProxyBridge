@@ -621,7 +621,14 @@ def _validate_start_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise BrokerError("远程浏览器代理端口无效")
     seed = _safe_positive_int(payload.get("fingerprint_seed"), 1, 1, 0x7FFFFFFF)
     language = str(payload.get("language") or "en-US")
-    accept_language = str(payload.get("accept_language") or "en-US,en;q=0.9")
+    # --accept-lang 需要纯语言列表；带 ;q= 权重会让 navigator.languages 出现异常条目。
+    accept_language = ",".join(
+        dict.fromkeys(
+            part.split(";", 1)[0].strip()
+            for part in str(payload.get("accept_language") or "en-US,en").split(",")
+            if part.split(";", 1)[0].strip()
+        )
+    )
     timezone = str(payload.get("timezone") or "UTC")
     for label, value in (("language", language), ("accept_language", accept_language), ("timezone", timezone)):
         if re.fullmatch(r"[A-Za-z0-9,;=._/+:-]{1,100}", value) is None:
