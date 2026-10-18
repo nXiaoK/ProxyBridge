@@ -1030,7 +1030,7 @@ sequenceDiagram
 
 ## References
 
-- 代码：`app.py`  
+- 代码：`app.py`
   - `ACTIVE_BRIDGE_STATUSES`, `start_bridge` / `_start_bridge`, `stop_bridge`, `restore_enabled_bridges`  
   - `status_payload` / `_status_payload`  
   - `AppHandler.is_trusted_request`, `do_GET`, `do_HEAD`, `do_POST`, `log_message`  
