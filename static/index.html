@@ -353,7 +353,19 @@
 
         <!-- ---------- 全局指纹浏览器 ---------- -->
         <section class="view" data-view="browsers" aria-labelledby="browsersTitle" hidden>
-          <header class="view-toolbar"><div class="view-heading"><h1 id="browsersTitle">指纹浏览器</h1><span class="countline" id="browserCount">0 条记录</span></div><div class="toolbar-controls"><div class="search-field"><svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="browserSearchInput" type="search" placeholder="搜索名称或标签" aria-label="搜索浏览器名称或标签" autocomplete="off"></div><label class="field-inline"><span>节点</span><select id="browserNodeFilter"><option value="all">全部节点</option></select></label><label class="field-inline"><span>状态</span><select id="browserStatusFilter"><option value="all">全部状态</option><option value="running">运行中</option><option value="stopped">已停止</option></select></label><button class="toolbar-button danger" id="stopBrowsers" type="button" data-action="stop-all-browsers" hidden>停止运行中的浏览器</button></div></header>
+          <header class="view-toolbar"><div class="view-heading"><h1 id="browsersTitle">指纹浏览器</h1><span class="countline" id="browserCount">0 条记录</span></div><div class="toolbar-controls"><div class="search-field"><svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg><input id="browserSearchInput" type="search" placeholder="搜索名称、标签或分组" aria-label="搜索浏览器名称、标签或分组" autocomplete="off"></div><label class="field-inline"><span>分组</span><select id="browserGroupFilter"><option value="all">全部分组</option></select></label><label class="field-inline"><span>节点</span><select id="browserNodeFilter"><option value="all">全部节点</option></select></label><label class="field-inline"><span>状态</span><select id="browserStatusFilter"><option value="all">全部状态</option><option value="running">运行中</option><option value="stopped">已停止</option></select></label><button class="toolbar-button danger" id="stopBrowsers" type="button" data-action="stop-all-browsers" hidden>停止运行中的浏览器</button><button class="primary-button" id="createBrowserButton" type="button" data-action="open-browser-create">新建浏览器</button></div></header>
+          <div class="batch-actions" id="browserBatchBar" hidden>
+            <div class="batch-info"><span id="browserBatchCount">已选择 0 条记录</span></div>
+            <div class="batch-buttons">
+              <button class="row-button" type="button" data-action="clear-browser-selection">取消选择</button>
+              <button class="row-button" type="button" data-action="batch-browser-launch">启动</button>
+              <button class="row-button" type="button" data-action="batch-browser-stop">停止</button>
+              <button class="row-button" type="button" data-action="open-browser-batch-edit">批量配置</button>
+              <button class="row-button" type="button" data-action="open-browser-rebind">换绑节点</button>
+              <button class="row-button" type="button" data-action="batch-browser-regenerate">重新生成指纹</button>
+              <button class="row-button danger" type="button" data-action="batch-browser-delete">删除</button>
+            </div>
+          </div>
           <div class="view-body"><div class="browser-list-table" id="browserList"></div></div>
         </section>
 
@@ -625,7 +637,7 @@
             <section class="sync-status-card" id="syncStatusCard" aria-live="polite"></section>
             <p class="view-hint" id="syncDescription">
               在多台 Mac 之间同步<strong>订阅 / 节点</strong>与<strong>已停止的指纹浏览器 Profile</strong>（Cookie、LocalStorage 等），实现换机接力。
-              删除订阅会清理关联节点的浏览器记录与本地 Profile，并在启用同步时<strong>自动上传</strong>（远端对应数据一并删除）。
+              删除订阅时默认保留关联节点的浏览器记录与本地 Profile，可在确认框中选择一并删除；启用同步时会<strong>自动上传</strong>（被删除的远端数据一并清理）。
               请先在本机关闭目标浏览器再上传；不要两边同时打开同一浏览器实例。
             </p>
             <form id="syncForm" class="sync-card">
@@ -814,7 +826,7 @@
 
     <div class="modal-backdrop" id="confirmDialog" hidden>
       <section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMessage" tabindex="-1">
-        <div class="confirm-mark" aria-hidden="true">!</div><h2 id="confirmTitle">确认操作</h2><p id="confirmMessage"></p><div id="confirmDetails" class="confirm-details" hidden></div>
+        <div class="confirm-mark" aria-hidden="true">!</div><h2 id="confirmTitle">确认操作</h2><p id="confirmMessage"></p><div id="confirmDetails" class="confirm-details" hidden></div><label class="confirm-option" id="confirmOption" hidden><input type="checkbox" id="confirmOptionInput"><span id="confirmOptionLabel"></span></label>
         <footer><button class="toolbar-button" type="button" data-action="cancel-confirm">取消</button><button class="danger-button" id="confirmAccept" type="button" data-action="accept-confirm">继续</button></footer>
       </section>
     </div>
@@ -855,6 +867,52 @@
           </button>
         </header>
         <div class="browser-record-body" id="browserRecordBody"></div>
+      </section>
+    </div>
+
+    <!-- ============ 浏览器配置弹窗（新建 / 编辑 / 批量配置 / 换绑） ============ -->
+    <div class="modal-backdrop" id="browserConfigModal" hidden>
+      <section class="core-upload-modal browser-config-modal" role="dialog" aria-modal="true" aria-labelledby="browserConfigTitle" tabindex="-1">
+        <header class="modal-head">
+          <div>
+            <h2 id="browserConfigTitle">浏览器配置</h2>
+            <p id="browserConfigMeta" class="modal-subtitle"></p>
+          </div>
+          <button class="icon-button" type="button" data-action="close-browser-config" aria-label="关闭浏览器配置" title="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </header>
+        <div class="drawer-tabs browser-config-tabs" id="browserConfigTabs" role="tablist" aria-label="浏览器配置分类">
+          <button class="drawer-tab is-active" type="button" role="tab" data-config-tab="basic" aria-selected="true">基本</button>
+          <button class="drawer-tab" type="button" role="tab" data-config-tab="fingerprint" aria-selected="false">指纹</button>
+          <button class="drawer-tab" type="button" role="tab" data-config-tab="locale" aria-selected="false">时区与语言</button>
+          <button class="drawer-tab" type="button" role="tab" data-config-tab="runtime" aria-selected="false">内核与扩展</button>
+          <button class="drawer-tab" type="button" role="tab" data-config-tab="tools" aria-selected="false">Cookie 与检测</button>
+        </div>
+        <form class="core-upload-form browser-config-form" id="browserConfigForm" novalidate>
+          <div class="browser-config-body" id="browserConfigBody"></div>
+          <div class="core-upload-error" id="browserConfigError" role="alert" hidden></div>
+          <footer class="core-upload-actions">
+            <button class="row-button" type="button" data-action="close-browser-config"><span>取消</span></button>
+            <button class="primary-button" id="browserConfigSubmit" type="submit"><span>保存</span></button>
+          </footer>
+        </form>
+      </section>
+    </div>
+
+    <!-- ============ 指纹内核版本选择弹窗 ============ -->
+    <div class="modal-backdrop" id="kernelReleaseModal" hidden>
+      <section class="core-upload-modal" role="dialog" aria-modal="true" aria-labelledby="kernelReleaseTitle" tabindex="-1">
+        <header class="modal-head">
+          <div>
+            <h2 id="kernelReleaseTitle">选择指纹内核版本</h2>
+            <p id="kernelReleaseMeta" class="modal-subtitle"></p>
+          </div>
+          <button class="icon-button" type="button" data-action="close-kernel-releases" aria-label="关闭版本选择" title="关闭">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18"/><path d="M6 6l12 12"/></svg>
+          </button>
+        </header>
+        <div class="core-upload-form" id="kernelReleaseBody"></div>
       </section>
     </div>
 

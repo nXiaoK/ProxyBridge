@@ -14,7 +14,7 @@
       const coreLabel = node.preferred_core || (node.core_options || ["sing-box"])[0] || "sing-box";
       const runningBrowserCount = browserEnabled() ? runningBrowserInstancesForNode(node.id).length : 0;
       const favorite = Boolean(node.favorite);
-      const subtitle = bridge ? `:${bridge.port} · ${healthError ? "探测异常" : "运行中"}` : healthError ? `上次退出异常 · ${previousBridge.health.error || "查看系统日志"}` : (node.remark || server);
+      const subtitle = bridge ? `:${bridge.port} · ${healthError ? "探测异常" : "运行中"}` : healthError ? `上次退出异常 · ${previousBridge.health.error || "查看系统日志"}` : node.browser_preserved ? "已从订阅移除 · 仅为浏览器记录保留" : (node.remark || server);
       return `
         <tr class="node-row ${bridge ? "is-running" : ""} ${healthError ? "is-unhealthy" : ""} ${isSelected ? "is-selected" : ""}" data-ui-key="node:${escapeHtml(node.id)}" data-node-id="${escapeHtml(node.id)}">
           <td class="checkbox-col">

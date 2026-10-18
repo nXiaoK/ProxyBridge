@@ -43,7 +43,7 @@ class StateAndParsingTests(unittest.TestCase):
 
         self.assertEqual([node["name"] for node in app.load_state()["nodes"]], ["B"])
 
-    def test_refresh_stops_removed_node_runtime_and_removes_profile(self):
+    def test_refresh_stops_removed_node_runtime_and_preserves_browser_profile(self):
         original = app.import_subscription(
             {"name": "same", "url": "https://example.test/sub", "raw": "vless://a@example.com:443#A"}
         )
@@ -116,11 +116,15 @@ class StateAndParsingTests(unittest.TestCase):
 
         saved = app.load_state()
         self.assertIn(process.pid, killed)
-        self.assertEqual([node["name"] for node in saved["nodes"]], ["B"])
-        self.assertEqual(saved["browser_instances"], [])
+        # 刷新导致节点 ID 变化时，浏览器记录与 Profile 保留，原节点转为仅供浏览器换绑的保留节点。
+        self.assertEqual(sorted(node["name"] for node in saved["nodes"]), ["A", "B"])
+        preserved = next(node for node in saved["nodes"] if node["id"] == node_id)
+        self.assertTrue(preserved[app.webdav_sync.LOCAL_BROWSER_NODE_MARKER])
+        self.assertEqual([item["id"] for item in saved["browser_instances"]], [instance_id])
+        self.assertEqual(saved["browser_instances"][0]["status"], "stopped")
         self.assertEqual(saved["bridges"][0]["status"], "stopped")
         self.assertFalse(saved["bridges"][0]["enabled"])
-        self.assertFalse(profile_root.exists())
+        self.assertTrue((profile_root / "marker").exists())
         self.assertNotIn(bridge_id, app.TRAFFIC_TABLE)
 
     def test_refresh_rejects_zero_nodes_without_replacing_existing_state(self):

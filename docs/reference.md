@@ -85,13 +85,44 @@ outputs/ProxyBridgeMenuBar.app
 ~/Library/Application Support/ProxyBridge
 ```
 
-浏览器 Profile 保存在同一目录下的 `browser_profiles/`，按节点与浏览器记录隔离，持久保留 Cookies、LocalStorage、SessionStorage。Python 运行时位于 `python-runtime/`，代理核心位于 `proxy-cores/`，指纹内核位于 `fingerprint-chromium/`。fingerprint-chromium 可调整 Canvas、WebGL、AudioContext、字体、屏幕、User-Agent 等浏览器指纹信息：
+浏览器 Profile 保存在同一目录下的 `browser_profiles/`，按节点与浏览器记录隔离，持久保留 Cookies、LocalStorage、SessionStorage。Python 运行时位于 `python-runtime/`，代理核心位于 `proxy-cores/`，指纹内核位于 `fingerprint-chromium/`，扩展库位于 `browser_extensions/library/`。fingerprint-chromium 可调整 Canvas、WebGL、AudioContext、字体、屏幕、User-Agent 等浏览器指纹信息。
 
-- 每条新浏览器记录根据节点与实例 ID 派生固定的 `--fingerprint` 种子，复用记录时沿用该种子；旧记录保留原有种子。实际指纹还会受内核版本和运行环境影响，不保证匿名性或无法被网站关联。
-- 时区（`--timezone`）与语言（`--lang` / `--accept-lang`）按节点标记的地区匹配；地区标记不一定等于实际出口地区，可在浏览器记录中查看出口自检结果。
+### 指纹浏览器配置
+
+每条浏览器记录都可以在「指纹浏览器 → 配置」中单独设置，也可多选后批量配置。修改在下次启动时生效：
+
+| 配置 | 取值与说明 |
+|---|---|
+| 指纹种子 | 每条记录固定一个 `--fingerprint` 种子，Canvas、WebGL、Audio、字体等特征由它派生。「重新生成指纹」会换一个随机种子，已登录网站会把它视为新设备。 |
+| 操作系统 | `跟随系统`（本机为宿主系统，Docker worker 为 Linux）或 Windows / macOS / Linux。与真实系统不同的平台仍使用真实系统的字体，可能被识别为不一致。 |
+| 浏览器品牌 | Chrome（新记录默认）、Edge、Opera、Vivaldi 或 Chromium（内核默认）；可选填品牌版本，留空跟随内核版本。 |
+| CPU 核心数 / 平台版本 / 窗口尺寸 | 留空或「随种子」时由内核决定；窗口尺寸格式为 `宽x高`。 |
+| 关闭伪装项 | Canvas、Audio、字体、ClientRects、WebGL/GPU，仅用于排查网站兼容问题，需要内核 144 及以上。 |
+| 时区 / 语言来源 | `按出口 IP`（新记录默认）：启动前经该节点代理访问 `ipwho.is` 查询出口时区与国家，结果按节点缓存 10 分钟，查询失败时回退到节点地区；`按节点地区`：使用节点名识别的地区表；`自定义`：手动填写 IANA 时区、语言与 Accept-Language。 |
+| 地理位置权限 | `禁止`（新记录默认）写入 Profile 默认权限，避免系统 / Wi-Fi 定位绕过代理暴露真实位置；`询问` 保持 Chromium 默认行为。 |
+| 内核版本 | 跟随默认版本，或固定某个已安装版本；固定版本缺失时启动会报错，不会悄悄换内核。 |
+| 扩展 | 从扩展库勾选。启动时扩展复制到 Profile 内的 `ProxyBridgeExtensions/`，随 Profile 一起同步，Docker worker 同样可用。 |
+| 启动网址 | 每次启动打开的 http(s) 地址，最多 10 个；留空则首次打开出口检测页、之后打开空白页。 |
+| CDP 调试端口 | 默认关闭，仅本机模式可用。开启后以 `--remote-debugging-port=0` 监听 127.0.0.1 随机端口，用于 Cookie 导入导出，也可以把记录中显示的 `ws://` 地址交给 Playwright / Puppeteer 的 `connectOverCDP`。该端口没有密码，本机任何程序都能控制浏览器，不用时请关闭。 |
+
+- 升级前创建的记录保持原来的启动参数（Chromium 品牌、按节点地区定时区、地理位置询问），不会因为升级而改变已登录账号看到的指纹；需要时可在配置中手动改为推荐值。
+- 「Cookie 与检测」中可一键打开 BrowserScan、Pixelscan、CreepJS 检测页；开启 CDP 并运行后，可导入 / 导出 JSON（Cookie-Editor、EditThisCookie、CDP 格式）或 Netscape `cookies.txt`。导出内容含登录凭据，请妥善保管。
+- 「换绑节点」把已停止的记录移到另一个节点，Profile 目录随之移动，指纹种子与 Cookie 不变；早期的「默认浏览器」记录不支持换绑。
+- 订阅刷新导致节点 ID 变化（例如机场修改了参数）时，绑定的浏览器记录与 Profile 会保留，原节点在节点列表中显示为「已从订阅移除 · 仅为浏览器记录保留」，换绑或删除最后一条记录后自动清理。手动删除订阅时默认同样保留，只有在确认框中勾选后才会连同 Profile 永久删除。
+- 实际指纹还会受内核版本和运行环境影响，不保证匿名性或无法被网站关联。
 - 使用代理时强制 `--webrtc-ip-handling-policy=disable_non_proxied_udp`，阻止非代理 UDP 候选。
 
-指纹内核约 150–250MB,可点击控制台「设置 → 内核管理」的 `下载安装` 一键安装(按本机架构从 GitHub Releases 下载并去除 Gatekeeper 隔离属性)，也可点击旁边的 `本地导入` 上传完整发布包，或手动下载后用环境变量 `PROXY_BRIDGE_FP_CHROMIUM` 指向 Chromium 可执行文件。由于该内核并非每个版本都发布 macOS 包,如自动下载未命中可稍后重试或使用本地导入。
+### 指纹内核版本
+
+指纹内核约 150–250MB,可在「设置 → 内核管理」点击 `下载安装` / `下载最新版本` 一键安装(按本机架构从 GitHub Releases 下载并去除 Gatekeeper 隔离属性)，或用 `选择版本下载` 安装指定版本，也可点击 `本地导入` 上传完整发布包，或手动下载后用环境变量 `PROXY_BRIDGE_FP_CHROMIUM` 指向 Chromium 可执行文件。由于该内核并非每个版本都发布 macOS 包,如自动下载未命中可稍后重试或使用本地导入。
+
+- 多个版本并存：每个版本安装到 `fingerprint-chromium/versions/<版本号>/`，目录下的 `.proxybridge-kernel.json` 记录版本、来源与可执行文件相对路径；升级前直接装在 `fingerprint-chromium/` 下的内核显示为「早期安装」并继续可用。
+- 默认版本：未设定时使用最新已安装版本；在内核管理中「设为默认」后写入 `fingerprint-chromium/.proxybridge-default-kernel.json`（内容为 `{"id": "<版本号>"}`，空 ID 表示自动选择最新版本）。该文件只对本机生效，不参与 WebDAV 同步。设置了 `PROXY_BRIDGE_FP_CHROMIUM` 时，环境变量指定的内核始终是默认版本。
+- 安装新版本不需要停止浏览器；原地替换已安装的同一版本或删除版本前需要停止所有浏览器。有记录固定使用的版本不能删除。
+
+### 扩展库
+
+在浏览器配置的「内核与扩展」中点击「上传扩展包」，可导入 `.zip`（解压后的扩展目录打包）或 `.crx` 文件，单个上限 64 MiB。扩展以安装包 SHA-256 前 16 位为 ID 保存在 `browser_extensions/library/<ID>/`，同一安装包重复上传不会产生重复条目。从扩展库删除扩展会把它从所有记录中移除，各 Profile 内的副本在下次启动时清理。
 
 ## 本地导入代理与指纹内核
 
@@ -169,7 +200,7 @@ Proxy Bridge console: http://127.0.0.1:8787/#token=...
 | `--open` | 启动后用系统浏览器打开控制台 |
 | `--no-core-auto-install` | 启动时不自动下载 `sing-box` / `xray` |
 | `PROXY_BRIDGE_SING_BOX` / `PROXY_BRIDGE_XRAY` | 手动指定核心可执行文件 |
-| `PROXY_BRIDGE_FP_CHROMIUM` | 手动指定指纹 Chromium 可执行文件 |
+| `PROXY_BRIDGE_FP_CHROMIUM` | 手动指定指纹 Chromium 可执行文件；设置后始终作为默认内核，浏览器配置中固定的其他版本仍按各自版本启动 |
 
 说明：
 
@@ -401,7 +432,8 @@ Windows 额外可用快捷方式脚本（桌面 + 开机启动）：
 
 - 运行中的浏览器**不会**被上传；请先关闭再同步。
 - 不要两边同时打开同一浏览器实例。
-- **删除订阅**会停止并删除关联节点的指纹浏览器记录与本地 Profile；WebDAV 已启用时会**自动全量上传**，远端 `state` 与多余 `profiles/*.tar.gz` 一并清理。
+- **删除订阅**默认保留关联节点的浏览器记录与 Profile（原节点转为保留节点，可换绑）；只有在确认框中勾选「同时永久删除」时才会停止并删除这些记录与本地 Profile。WebDAV 已启用时会**自动全量上传**，远端 `state` 与多余 `profiles/*.tar.gz` 一并清理。
+- 浏览器记录的指纹配置、分组、固定内核版本、扩展列表与启动网址参与同步；CDP 端口、实际运行内核与生效时区等运行期信息不同步，Profile 中的 `DevToolsActivePort` 也不会打包。
 - 在 macOS、Windows 或 Docker 的 **浏览器记录** 中单条点击「删除」，会先停止对应进程/worker，再永久删除该记录及本地 Profile；WebDAV 已启用时同样自动全量上传并清理远端记录与 Profile 包。
 - 打开节点 **浏览器记录** 时（WebDAV 已启用）会先**自动拉取**一次远端；若检测到本地未上传变更，会保留本地记录并提示先上传，避免旧远端快照覆盖新记录。
 - 浏览器记录按最近创建、启动或停止时间倒序显示，并支持 **标签**（如「访问 xx 的浏览器」）；保存标签会标记本地变更并尝试同步。

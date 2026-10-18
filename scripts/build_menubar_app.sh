@@ -310,6 +310,8 @@ cp "$ROOT_DIR/app.py" "$BRIDGE_DIR/app.py"
 cp "$ROOT_DIR/webdav_sync.py" "$BRIDGE_DIR/webdav_sync.py"
 # 主模块会导入远程浏览器 Broker 客户端；菜单栏包需保留该同级模块。
 cp "$ROOT_DIR/remote_browser.py" "$BRIDGE_DIR/remote_browser.py"
+# 指纹浏览器配置、Cookie 格式与本机 CDP 客户端模块。
+cp "$ROOT_DIR/browser_fingerprint.py" "$BRIDGE_DIR/browser_fingerprint.py"
 # 完整构建版本写入包内，运行时 API 与 macOS/Windows 文件元数据使用同一来源。
 cp "$ROOT_DIR/proxybridge_version.py" "$BRIDGE_DIR/proxybridge_version.py"
 printf '%s\n' "$APP_VERSION" > "$BRIDGE_DIR/VERSION"

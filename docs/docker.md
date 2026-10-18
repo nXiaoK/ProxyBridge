@@ -12,6 +12,7 @@ Docker 模式适合 Linux 服务器、NAS、家庭服务器和不需要桌面壳
 - Web 控制台默认发布到宿主机 `127.0.0.1:8787`。
 - 默认 Compose 通过内部 Browser Broker 为每条运行记录创建一个独立 `lscr.io/linuxserver/chromium` worker；单容器 `docker run` 未配置 Broker 时不显示浏览器入口。
 - 每个实例使用独立 Profile、由记录派生的固定指纹、对应节点代理以及独立登录密码；停止 worker 不删除 Profile。
+- 记录的指纹配置（平台、品牌、CPU 核心数、关闭伪装项、窗口尺寸、时区语言来源、地理位置权限、固定内核版本、扩展与启动网址）同样作用于远程 worker；「跟随系统」平台在 worker 中上报为 Linux。CDP 调试端口与 Cookie 导入导出暂只支持本机模式。
 - 浏览器记录按最近使用时间倒序显示；运行记录可按需查看当前凭证，所有记录都可永久删除，删除会先回收 worker 再物理删除 Profile。
 - worker 的 `/config` 是随容器删除的匿名运行卷，持久化命名卷仅挂入 `/config/browser-profile`；Selkies 的 TLS、认证和其他运行文件不会进入 Profile 或 WebDAV 快照。
 - worker 访问节点代理时，主服务只对 Broker 确认的“精确 worker IP + 分配给该实例的代理端口”免除二次认证，不会放行整个 worker 子网或其他容器。
@@ -154,7 +155,8 @@ proxybridge-browser-control:/control
 - `/data/state.json`：订阅、节点、设置和运行记录
 - `/data/runtime/`：核心配置与日志
 - `/data/proxy-cores/`：自动下载的 `sing-box` / `xray`
-- `/data/fingerprint-chromium/`：控制台首次下载的 Linux 指纹内核
+- `/data/fingerprint-chromium/versions/<版本号>/`：控制台下载或导入的 Linux 指纹内核，可多个版本并存；升级前装在 `/data/fingerprint-chromium/` 下的内核显示为「早期安装」
+- `/data/browser_extensions/library/`：上传的浏览器扩展库，启动时复制到各 Profile 的 `ProxyBridgeExtensions/` 后由 worker 加载
 - `/data/browser_profiles/`：每个远程浏览器实例的独立 Profile
 
 Broker 通过 Docker Engine API 1.45+ 的 `volume-subpath` 从这个命名卷挂载两个经过校验的子目录：当前实例 Profile 以读写方式挂到 worker 的 `/config/browser-profile`，指纹内核以只读方式挂到 `/opt/fingerprint-chromium`。worker 自己的 `/config` 是匿名运行卷，删除容器时一并删除；自签名证书、Basic Auth 配置和其他 Selkies 运行文件不会混入持久化 Profile。
@@ -206,7 +208,7 @@ environment:
 
 1. 使用最新启动日志中的完整认证 URL 打开控制台。
 2. 点击控制台的「下载指纹内核」，或点击「本地导入」上传已下载的 Linux x86_64 完整包，等待约 150–250 MB 的文件安装完成。
-3. 内核会保存到 `proxybridge-data` 卷的 `/data/fingerprint-chromium/`；不要只把一个可执行文件放到卷外，Broker 必须通过命名卷 `volume-subpath` 把包含 `chrome-wrapper` 及相邻资源的完整目录只读挂载给 worker。
+3. 内核会保存到 `proxybridge-data` 卷的 `/data/fingerprint-chromium/versions/<版本号>/`；不要只把一个可执行文件放到卷外，Broker 必须通过命名卷 `volume-subpath` 把包含 `chrome-wrapper` 及相邻资源的完整目录只读挂载给 worker。每个 worker 挂载其记录固定的版本，未固定时使用默认版本。
 4. 第一次启动浏览器时，Broker 还会拉取 `lscr.io/linuxserver/chromium:latest`，所需时间取决于镜像缓存和网络速度。
 
 控制台下载器会按 Linux release 选择指纹内核。当前 Linux 上游包为 x86_64，因此 Compose worker 显式使用 `linux/amd64`。在 arm64 NAS/服务器上，先确认 Docker 支持 amd64 仿真；即使能启动，也应预期更高 CPU 占用、更低交互帧率，以及 GPU/硬件视频加速不可用。对交互性能有要求时使用 amd64 宿主机。

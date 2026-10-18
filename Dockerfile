@@ -21,8 +21,9 @@ WORKDIR /app
 COPY docker/requirements.txt /tmp/requirements.txt
 RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
 
-# remote_browser.py 仅包含主服务访问内部 Browser Broker 所需的受限客户端。
-COPY --chown=proxybridge:proxybridge app.py webdav_sync.py remote_browser.py ./
+# remote_browser.py 仅包含主服务访问内部 Browser Broker 所需的受限客户端；
+# browser_fingerprint.py 是指纹浏览器配置校验、Cookie 格式与本机 CDP 客户端模块。
+COPY --chown=proxybridge:proxybridge app.py webdav_sync.py remote_browser.py browser_fingerprint.py ./
 # VERSION 是基础版本唯一来源；解析模块允许发布构建通过环境变量覆盖完整版本。
 COPY --chown=proxybridge:proxybridge VERSION proxybridge_version.py ./
 COPY --chown=proxybridge:proxybridge static ./static

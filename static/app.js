@@ -7,6 +7,11 @@ const appState = {
   remoteBrowser: { configured: false, available: false, active_sessions: 0, error: "" },
   platform: null,
   fingerprint_chromium: null,
+  // 多版本指纹内核、扩展库与检测站点，均来自 /api/status。
+  fingerprint_kernels: [],
+  fingerprint_default_kernel: "",
+  browser_extensions: [],
+  fingerprint_check_sites: {},
   active_browsers: [],
   browser_instances: [],
   subscriptions: [],
@@ -54,10 +59,13 @@ const appState = {
   diagnostics: { result: null, webrtc: null, running: false },
   // 批量选择功能：存储选中的节点 ID
   selectedNodeIds: new Set(),
+  // 指纹浏览器页的多选记录 ID
+  selectedBrowserIds: new Set(),
 };
 
 const managementAuth = window.ProxyBridgeAuth;
 const browserUi = window.ProxyBridgeBrowserUi;
+const browserConfig = window.ProxyBridgeBrowserConfig;
 const coreUploadClient = window.ProxyBridgeCoreUpload;
 const uiCore = window.ProxyBridgeUiCore;
 const i18n = window.ProxyBridgeI18n;
@@ -78,6 +86,11 @@ let lastRemoteBrowserCredentialsTriggerKey = null;
 let lastRemoteBrowserCredentialsTriggerAction = null;
 let pendingRemoteBrowserLaunch = null;
 let pendingRemoteBrowserBatchNodeIds = [];
+// 浏览器页多选启动远程浏览器时的目标记录：[{ nodeId, instanceId }]
+let pendingRemoteBrowserBatchInstances = [];
+let browserConfigState = null;
+let lastBrowserConfigTrigger = null;
+let confirmOptionChecked = false;
 let remoteBrowserLaunchPromise = null;
 let viewedRemoteBrowserInstanceId = null;
 let remoteBrowserCredentialsRequestGeneration = 0;
@@ -105,11 +118,11 @@ let statusEventController = null;
 let statusEventConnected = false;
 let nodeVirtualFrame = 0;
 const revealedSecrets = new Set();
-let browserPageFilter = { node: "all", status: "all", search: "" };
+let browserPageFilter = { node: "all", status: "all", search: "", group: "all" };
 
 const renderOverview = window.ProxyBridgePages.createOverviewRenderer({ $, appState, runningBridges, escapeHtml, formatLogTime, icon });
 const renderKernelPage = window.ProxyBridgePages.createKernelRenderer({ $, appState, browserEnabled, escapeHtml });
-const renderBrowserPage = window.ProxyBridgePages.createBrowserRenderer({ $, appState, browserPageFilter, browserUi, browserEnabled, remoteBrowserEnabled, escapeHtml, nodeById, safeRemoteBrowserUrl, formatRelativeTime, browserStatusLabel, uiCore });
+const renderBrowserPage = window.ProxyBridgePages.createBrowserRenderer({ $, appState, browserPageFilter, browserUi, browserConfig, browserEnabled, remoteBrowserEnabled, escapeHtml, nodeById, safeRemoteBrowserUrl, formatRelativeTime, browserStatusLabel, uiCore });
 const renderNodes = window.ProxyBridgePages.createNodeRenderer({ $, appState, bridgeForNode, mostRecentBridgeForNode, browserEnabled, browserInstancesForNode, runningBrowserInstancesForNode, escapeHtml, icon, latencyCell, isNodeGroupCollapsed, groupAverageLatency, initials, filteredNodes, groupNodesBySubscription, renderSpeedTestTaskControls, updateBatchActionsBar, bindNodeCheckboxes, uiCore });
 let currentPoolLinkFormat = "list_json";
 let poolLinksExpanded = null;
@@ -191,7 +204,8 @@ function renderNav() {
   }
 }
 
-function confirmAction(message, { title = "确认操作", confirmLabel = "继续", details = "" } = {}) {
+// option 为可选复选框 { label, checked }；用户确认后通过 confirmOptionChecked 读取勾选结果。
+function confirmAction(message, { title = "确认操作", confirmLabel = "继续", details = "", option = null } = {}) {
   const dialog = $("#confirmDialog");
   if (!dialog) return Promise.reject(new Error("无法打开操作确认对话框，请刷新页面后重试"));
   $("#confirmTitle").textContent = title;
@@ -199,6 +213,13 @@ function confirmAction(message, { title = "确认操作", confirmLabel = "继续
   const detailEl = $("#confirmDetails");
   detailEl.textContent = details;
   detailEl.hidden = !details;
+  const optionEl = $("#confirmOption");
+  confirmOptionChecked = false;
+  if (optionEl) {
+    optionEl.hidden = !option;
+    $("#confirmOptionLabel").textContent = option?.label || "";
+    $("#confirmOptionInput").checked = Boolean(option?.checked);
+  }
   $("#confirmAccept").textContent = confirmLabel;
   dialog.hidden = false;
   dialog.querySelector("[role=alertdialog]").focus();
@@ -209,6 +230,7 @@ function finishConfirmation(accepted) {
   const dialog = $("#confirmDialog");
   if (!dialog || dialog.hidden) return;
   dialog.hidden = true;
+  confirmOptionChecked = Boolean(accepted && !$("#confirmOption")?.hidden && $("#confirmOptionInput")?.checked);
   if (confirmResolver) confirmResolver(Boolean(accepted));
   confirmResolver = null;
 }
@@ -288,7 +310,7 @@ function renderNodeDetailDrawer() {
   const regionOptions = [...appState.regions, { code: "ZZ", name: "未分类" }];
   const history = Array.isArray(appState.nodeHistories[node.id]) ? appState.nodeHistories[node.id] : (Array.isArray(tests?.history) ? tests.history.slice().reverse() : (tests ? [tests] : []));
   if (currentNodeDetailTab === "overview") content.innerHTML = `<div class="detail-stat-grid"><div><span>地区</span><strong>${escapeHtml(node.region_code || node.region || "未分类")}</strong></div><div><span>协议</span><strong>${escapeHtml([node.protocol, node.transport, node.security].filter(Boolean).join(" · ") || "—")}</strong></div><div><span>延迟</span><strong>${escapeHtml(tests?.ok ? `${tests.latency_ms} ms` : tests ? "测速失败" : "未测试")}</strong></div></div><section class="drawer-section"><h3>服务器</h3><code>${escapeHtml(`${node.server}:${node.port}`)}</code></section><section class="drawer-section"><h3>备注</h3><p>${escapeHtml(node.remark || "暂无备注")}</p></section><section class="drawer-section"><h3>运行状态</h3><p>${bridge ? `本地端口 :${escapeHtml(bridge.port)} · SOCKS5 与 HTTP 可用` : "当前未运行"}</p><button class="row-button" data-action="${bridge ? "copy" : "start"}" ${bridge ? `data-text="${escapeHtml(bridge.socks_url)}"` : `data-node="${escapeHtml(node.id)}"`}>${bridge ? "复制 SOCKS5 地址" : "启动节点"}</button></section>`;
-  else if (currentNodeDetailTab === "browsers") content.innerHTML = `<div class="drawer-browser-list">${browserInstancesForNode(node.id).length ? browserInstancesForNode(node.id).map((instance) => `<div class="drawer-browser-row"><div><strong>${escapeHtml(instance.label || instance.name || "浏览器")}</strong><span>${escapeHtml(browserStatusLabel(instance.status))} · ${escapeHtml(formatTime(browserUi.browserInstanceLastUsedAt(instance)))}</span></div><button class="row-button" data-action="${["running", "starting", "stopping"].includes(instance.status) ? "stop-browser-instance" : "launch-browser-instance"}" data-instance="${escapeHtml(instance.id)}" data-node="${escapeHtml(node.id)}">${["running", "starting", "stopping"].includes(instance.status) ? "停止" : "启动"}</button><button class="icon-button danger" data-action="delete-browser-instance" data-instance="${escapeHtml(instance.id)}" aria-label="删除浏览器记录">×</button></div>`).join("") : `<div class="compact-empty">此节点还没有浏览器记录。</div>`}</div>`;
+  else if (currentNodeDetailTab === "browsers") content.innerHTML = `<div class="drawer-browser-list">${browserInstancesForNode(node.id).length ? browserInstancesForNode(node.id).map((instance) => `<div class="drawer-browser-row"><div><strong>${escapeHtml(instance.label || instance.name || "浏览器")}</strong><span>${escapeHtml(browserStatusLabel(instance.status))} · ${escapeHtml(formatTime(browserUi.browserInstanceLastUsedAt(instance)))}</span></div><button class="row-button" data-action="open-browser-config" data-instance="${escapeHtml(instance.id)}">配置</button><button class="row-button" data-action="${["running", "starting", "stopping"].includes(instance.status) ? "stop-browser-instance" : "launch-browser-instance"}" data-instance="${escapeHtml(instance.id)}" data-node="${escapeHtml(node.id)}">${["running", "starting", "stopping"].includes(instance.status) ? "停止" : "启动"}</button><button class="icon-button danger" data-action="delete-browser-instance" data-instance="${escapeHtml(instance.id)}" aria-label="删除浏览器记录">×</button></div>`).join("") : `<div class="compact-empty">此节点还没有浏览器记录。</div>`}</div>${node.browser_preserved ? `<p class="text-warning">该节点已从订阅中移除，仅为浏览器记录保留。请在浏览器配置中换绑到当前订阅的节点。</p>` : `<button class="toolbar-button" data-action="open-browser-create" data-node="${escapeHtml(node.id)}">新建浏览器记录…</button>`}`;
   else if (currentNodeDetailTab === "history") content.innerHTML = history.length ? `<div class="test-history-list">${history.map((item) => `<div><span class="state-dot ${item.ok ? "is-ok" : "is-error"}"></span><strong>${item.ok ? `${escapeHtml(item.latency_ms)} ms` : "失败"}</strong><span>${escapeHtml(item.message || "测速完成")}</span><time>${escapeHtml(formatTime(item.tested_at || item.ts || item.at))}</time></div>`).join("")}</div><button class="toolbar-button" data-action="test" data-node="${escapeHtml(node.id)}">重新测速</button>` : `<div class="compact-empty">暂无测速历史。<button class="toolbar-button" data-action="test" data-node="${escapeHtml(node.id)}">立即测速</button></div>`;
   else content.innerHTML = `<form class="node-config-form" id="nodeDetailForm"><label><span>地区覆盖</span><select id="nodeDetailRegion"><option value="">自动识别</option>${regionOptions.map(({ code, name }) => `<option value="${escapeHtml(code)}" ${node.region_override === code ? "selected" : ""}>${escapeHtml(code)} · ${escapeHtml(name)}</option>`).join("")}</select></label><label><span>备注名</span><input id="nodeDetailRemark" maxlength="500" value="${escapeHtml(node.remark || "")}" placeholder="用于识别节点的自定义备注"></label><label><span>首选核心</span><select data-core-select="${escapeHtml(node.id)}" ${bridge ? "disabled" : ""}>${coreOptions.map((core) => `<option value="${escapeHtml(core)}" ${core === node.preferred_core ? "selected" : ""}>${escapeHtml(core)}</option>`).join("")}</select></label><label class="sync-checkbox"><input type="checkbox" data-core-fallback="${escapeHtml(node.id)}" ${node.fallback_enabled ? "checked" : ""} ${bridge ? "disabled" : ""}><span>首选核心失败后尝试备用核心</span></label><label class="sync-checkbox"><input id="nodeDetailFavorite" type="checkbox" ${node.favorite ? "checked" : ""}><span>收藏节点并置顶</span></label><button class="primary-button" type="button" data-action="save-node-details" data-node="${escapeHtml(node.id)}">保存详情</button></form><details class="technical-details"><summary>技术信息</summary><dl><dt>节点 ID</dt><dd><code>${escapeHtml(node.id)}</code></dd><dt>服务器</dt><dd><code>${escapeHtml(`${node.server}:${node.port}`)}</code></dd><dt>核心回退</dt><dd>${node.fallback_enabled ? "已启用" : "关闭"}</dd></dl></details>`;
   document.querySelectorAll("[data-node-tab]").forEach((tab) => {
@@ -1260,7 +1282,7 @@ function renderSync() {
   const description = $("#syncDescription");
   if (description) {
     description.innerHTML = browserSyncEnabled
-      ? "在多台设备之间同步<strong>订阅 / 节点</strong>与<strong>已停止的指纹浏览器 Profile</strong>（Cookie、LocalStorage 等），实现换机接力。删除订阅会清理关联浏览器数据；上传前请先关闭目标浏览器。"
+      ? "在多台设备之间同步<strong>订阅 / 节点</strong>与<strong>已停止的指纹浏览器 Profile</strong>（Cookie、LocalStorage 等），实现换机接力。删除订阅时默认保留关联浏览器数据，可在确认框中选择一并删除；上传前请先关闭目标浏览器。"
       : "当前为 Docker / 无浏览器模式，WebDAV 仅同步<strong>订阅与节点</strong>。上传不会打包、覆盖或删除远端已有的浏览器 Profile；拉取也会保留本地浏览器数据。";
   }
   const autoUploadOption = $("#syncAutoUploadOption");
@@ -1597,7 +1619,7 @@ function renderActiveView({ force = false } = {}) {
       }, force);
       break;
     case "browsers":
-      renderWhenChanged("browsers", { instances: appState.browser_instances, nodes: appState.nodes, filter: browserPageFilter }, renderBrowserPage, force);
+      renderWhenChanged("browsers", { instances: appState.browser_instances, nodes: appState.nodes, filter: browserPageFilter, selected: [...appState.selectedBrowserIds], sync: appState.sync?.enabled === true }, renderBrowserPage, force);
       break;
     case "cores":
       renderKernelPage();
@@ -1668,6 +1690,10 @@ function applyStatusSnapshot(status) {
   appState.platform = status.platform || null;
   appState.cores = status.cores || {};
   appState.fingerprint_chromium = status.fingerprint_chromium || null;
+  appState.fingerprint_kernels = Array.isArray(status.fingerprint_kernels) ? status.fingerprint_kernels : [];
+  appState.fingerprint_default_kernel = status.fingerprint_default_kernel || "";
+  appState.browser_extensions = Array.isArray(status.browser_extensions) ? status.browser_extensions : [];
+  appState.fingerprint_check_sites = status.fingerprint_check_sites || {};
   appState.active_browsers = status.active_browsers || [];
   appState.browser_instances = status.browser_instances || [];
   const subscriptionUrls = new Map((status.subscriptions || []).map((item) => [item.id, item.url]));
@@ -1763,6 +1789,7 @@ function render() {
     },
     renderCores
   );
+  refreshBrowserConfigTools();
   const footerStatus = $("#footerStatus");
   if (footerStatus) footerStatus.textContent = `${appState.cores["sing-box"] || appState.cores.xray ? "核心正常" : "核心待安装"} · 局域网${appState.network?.allow_lan ? "已开启" : "关闭"} · ${appState.sync?.last_push_at ? `同步 ${formatRelativeTime(appState.sync.last_push_at)}` : "同步未运行"}`;
   const remoteLaunchModal = $("#remoteBrowserLaunchModal");
@@ -2763,6 +2790,8 @@ function closeModal(modal) {
     && $("#browserRecordModal").hidden
     && $("#remoteBrowserLaunchModal").hidden
     && $("#remoteBrowserCredentialsModal").hidden
+    && $("#browserConfigModal").hidden
+    && $("#kernelReleaseModal").hidden
   ) {
     const shell = $(".app-shell");
     if (shell) {
@@ -3229,13 +3258,16 @@ function showRemoteBrowserLaunchModal(nodeId, instanceId = "", trigger = null) {
   lastRemoteBrowserLaunchTrigger = trigger;
   lastRemoteBrowserLaunchTriggerKey = trigger ? actionLockKey(trigger) : null;
   lastRemoteBrowserLaunchTriggerAction = trigger?.dataset?.action || null;
-  $("#remoteBrowserLaunchTitle").textContent = pendingRemoteBrowserBatchNodeIds.length > 1
-    ? `启动 ${pendingRemoteBrowserBatchNodeIds.length} 个远程浏览器`
+  const batchCount = pendingRemoteBrowserBatchInstances.length || pendingRemoteBrowserBatchNodeIds.length;
+  $("#remoteBrowserLaunchTitle").textContent = batchCount > 1
+    ? `启动 ${batchCount} 个远程浏览器`
     : instance
     ? `启动 ${instance.name || "远程浏览器"}`
     : "启动远程浏览器";
-  $("#remoteBrowserLaunchMeta").textContent = pendingRemoteBrowserBatchNodeIds.length > 1
-    ? `为 ${pendingRemoteBrowserBatchNodeIds.length} 个所选节点各建独立 Worker 与 Profile；同一组访问凭据会用于本批次。`
+  $("#remoteBrowserLaunchMeta").textContent = pendingRemoteBrowserBatchInstances.length > 1
+    ? `为 ${batchCount} 条所选记录各建独立 Worker，复用各自 Profile；同一组访问凭据会用于本批次。`
+    : batchCount > 1
+    ? `为 ${batchCount} 个所选节点各建独立 Worker 与 Profile；同一组访问凭据会用于本批次。`
     : `${node.name || nodeId} · ${instance ? "复用独立 Profile" : "新建独立 Worker 与 Profile"}`;
   $("#remoteBrowserUsername").value = String(instance?.remote_username || "proxybridge");
   $("#remoteBrowserPassword").value = "";
@@ -3271,6 +3303,7 @@ function closeRemoteBrowserLaunchModal({ force = false } = {}) {
   delete modal.dataset.returnToBrowserRecords;
   pendingRemoteBrowserLaunch = null;
   pendingRemoteBrowserBatchNodeIds = [];
+  pendingRemoteBrowserBatchInstances = [];
   showRemoteBrowserLaunchError();
   resetRemoteBrowserLaunchContent();
 
@@ -3530,7 +3563,11 @@ function renderBrowserRecords(nodeId) {
             <span class="status ${escapeHtml(instance.status || "stopped")}">${escapeHtml(browserStatusLabel(instance.status))}</span>
           </header>
           <div class="browser-record-grid">
-            <span>指纹</span><code>${escapeHtml(instance.fingerprint_seed || "-")}</code>
+            <span>指纹</span><code>${escapeHtml(instance.fingerprint_seed || "-")} · ${escapeHtml(browserConfig.fingerprintSummary(instance))}</code>
+            ${instance.group ? `<span>分组</span><code>${escapeHtml(instance.group)}</code>` : ""}
+            ${running && instance.runtime_locale?.timezone ? `<span>时区 / 语言</span><code>${escapeHtml(instance.runtime_locale.timezone)} · ${escapeHtml(instance.runtime_locale.language || "")}（${escapeHtml(browserConfig.localeSourceLabel(instance.runtime_locale.timezone_source))}）</code>` : ""}
+            ${running && instance.runtime_kernel ? `<span>运行内核</span><code>${escapeHtml(instance.runtime_kernel)}</code>` : instance.kernel_version ? `<span>固定内核</span><code>${escapeHtml(instance.kernel_version)}</code>` : ""}
+            ${browserConfig.cdpEndpoint(instance) ? `<span>CDP</span><code title="${escapeHtml(browserConfig.cdpEndpoint(instance))}">${escapeHtml(browserConfig.cdpEndpoint(instance))}</code>` : ""}
             <span>Profile</span><code title="${escapeHtml(profilePath)}">${escapeHtml(compactPath(profilePath))}</code>
             <span>最近使用</span><code>${escapeHtml(formatTime(lastUsedAt))}</code>
             <span>上次启动</span><code>${escapeHtml(formatTime(instance.last_started_at))}</code>
@@ -3584,6 +3621,9 @@ function renderBrowserRecords(nodeId) {
                   ${icon("link")}<span>远程打开</span>
                 </button>`
               : ""}
+            <button class="row-button" type="button" data-action="open-browser-config" data-instance="${escapeHtml(instance.id)}" aria-label="配置 ${escapeHtml(instance.name || "浏览器")}">
+              <span>配置</span>
+            </button>
             <button class="row-button ${running ? "danger" : ""}" type="button" data-action="${action}" data-node="${escapeHtml(nodeId)}" data-instance="${escapeHtml(instance.id)}" aria-label="${actionLabel} ${escapeHtml(instance.name || "浏览器")}">
               ${icon(actionIcon)}<span>${actionLabel}</span>
             </button>
@@ -3645,6 +3685,528 @@ async function deleteBrowserInstance(instanceId) {
   if (appState.browserRecordNodeId) renderBrowserRecords(appState.browserRecordNodeId);
   showToast(syncEnabled ? "浏览器记录与本地数据已删除，正在同步清理 WebDAV" : "浏览器记录与本地数据已永久删除");
   return result;
+}
+
+// ============ 浏览器配置：新建 / 编辑 / 批量配置 / 换绑 ============
+const ACTIVE_BROWSER_STATUS = ["running", "starting", "stopping"];
+
+function selectOptionsMarkup(options, selected, { keep = false } = {}) {
+  const keepOption = keep ? `<option value="${browserConfig.KEEP}" selected>保持不变</option>` : "";
+  return keepOption + options.map(([value, label]) => `<option value="${escapeHtml(value)}" ${!keep && String(value) === String(selected ?? "") ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
+}
+
+function browserNodeOptionsMarkup(selectedId = "") {
+  const nodes = appState.nodes.filter((node) => !node.browser_preserved || node.id === selectedId);
+  return nodes.map((node) => `<option value="${escapeHtml(node.id)}" ${node.id === selectedId ? "selected" : ""}>${escapeHtml(node.name || node.id)}${node.region_code && node.region_code !== "ZZ" ? ` · ${escapeHtml(node.region_code)}` : ""}${node.browser_preserved ? "（已从订阅移除）" : ""}</option>`).join("");
+}
+
+function kernelOptionsMarkup(selected = "", { keep = false } = {}) {
+  const kernels = appState.fingerprint_kernels || [];
+  const defaultKernel = kernels.find((kernel) => kernel.default);
+  const label = (kernel) => `${kernel.version || kernel.label || kernel.id}${kernel.id === "legacy" ? " · 早期安装" : kernel.id === "env" ? " · 环境变量" : ""}`;
+  const missing = selected && !kernels.some((kernel) => kernel.id === selected)
+    ? `<option value="${escapeHtml(selected)}" selected>${escapeHtml(selected)}（本机未安装）</option>`
+    : "";
+  return `${keep ? `<option value="${browserConfig.KEEP}" selected>保持不变</option>` : ""}<option value="" ${!keep && !selected ? "selected" : ""}>跟随默认版本${defaultKernel ? `（${escapeHtml(label(defaultKernel))}）` : "（未安装）"}</option>${kernels.map((kernel) => `<option value="${escapeHtml(kernel.id)}" ${!keep && kernel.id === selected ? "selected" : ""}>${escapeHtml(label(kernel))}</option>`).join("")}${keep ? "" : missing}`;
+}
+
+function browserConfigField(label, control, hint = "") {
+  return `<label class="core-upload-field"><span>${escapeHtml(label)}</span>${control}${hint ? `<small>${escapeHtml(hint)}</small>` : ""}</label>`;
+}
+
+function renderBrowserConfigBasic(mode, instance) {
+  if (mode === "rebind") {
+    const ids = browserConfigState.instanceIds;
+    return `<section data-config-panel="basic"><p class="core-upload-description">将 ${ids.length} 条已停止的记录移到目标节点，Profile 目录随之移动，指纹种子与 Cookie 不变。运行中的记录需先停止。</p>${browserConfigField("目标节点", `<select name="node_id" required>${browserNodeOptionsMarkup("")}</select>`)}</section>`;
+  }
+  if (mode === "batch") {
+    return `<section data-config-panel="basic"><p class="core-upload-description">将修改 ${browserConfigState.instanceIds.length} 条记录。选择「保持不变」的项不会提交；运行中的记录在下次启动时生效。</p><label class="sync-checkbox"><input type="checkbox" name="groupEnabled"><span>修改分组</span></label>${browserConfigField("分组", `<input name="group" maxlength="40" placeholder="留空表示移出分组">`)}<label class="sync-checkbox"><input type="checkbox" name="labelEnabled"><span>修改标签</span></label>${browserConfigField("标签", `<input name="label" maxlength="120" placeholder="留空表示清除标签">`)}</section>`;
+  }
+  const running = instance && ACTIVE_BROWSER_STATUS.includes(instance.status);
+  const nodeSelect = mode === "create"
+    ? browserConfigField("绑定节点", `<select name="node_id" required>${browserNodeOptionsMarkup(browserConfigState.nodeId || "")}</select>`, "浏览器通过该节点的本地代理上网；未启动的节点会在打开浏览器时自动启动。")
+    : browserConfigField("绑定节点", `<select name="node_id" ${running || instance?.legacy ? "disabled" : ""}>${browserNodeOptionsMarkup(instance?.node_id || "")}</select>`, instance?.legacy ? "早期默认浏览器记录不支持换绑。" : running ? "停止浏览器后才能换绑节点。" : "换绑后 Profile 随记录移动，指纹种子不变。");
+  return `<section data-config-panel="basic">${nodeSelect}${mode === "create"
+    ? browserConfigField("新建数量", `<input name="count" type="number" min="1" max="50" value="1" inputmode="numeric">`, "每条记录拥有独立的指纹种子与 Profile。")
+    : browserConfigField("名称", `<input name="name" maxlength="40" value="${escapeHtml(instance?.name || "")}" required>`)}${browserConfigField("标签", `<input name="label" maxlength="120" value="${escapeHtml(instance?.label || "")}" placeholder="例如：访问 xx 的浏览器">`)}${browserConfigField("分组", `<input name="group" maxlength="40" list="browserGroupSuggestions" value="${escapeHtml(instance?.group || "")}" placeholder="例如：电商店铺"><datalist id="browserGroupSuggestions">${browserConfig.browserGroups(appState.browser_instances).map((group) => `<option value="${escapeHtml(group)}"></option>`).join("")}</datalist>`)}${browserConfigField("启动网址", `<textarea name="start_urls" rows="3" placeholder="每行一个 http(s) 地址；留空则首次打开出口检测页">${escapeHtml((instance?.start_urls || []).join("\n"))}</textarea>`, "最多 10 个，每次启动时打开。")}</section>`;
+}
+
+function renderBrowserConfigFingerprint(mode, instance) {
+  const fp = mode === "create" ? {} : browserConfig.fingerprintOf(instance);
+  const keep = mode === "batch";
+  const value = (key, fallback = "") => escapeHtml(fp[key] ?? fallback);
+  const createDefaults = { platform: "auto", brand: "Chrome", hardware_concurrency: 0 };
+  const current = (key) => mode === "create" ? createDefaults[key] : fp[key];
+  const running = instance && ACTIVE_BROWSER_STATUS.includes(instance.status);
+  const seed = mode === "edit"
+    ? `<div class="browser-config-seed"><span>指纹种子</span><code>${escapeHtml(instance?.fingerprint_seed || "-")}</code><button class="row-button" type="button" data-action="regenerate-browser-fingerprint" data-instance="${escapeHtml(instance?.id || "")}" ${running ? "disabled title=\"停止后才能重新生成\"" : ""}>重新生成指纹</button></div><small class="browser-config-note">Canvas、WebGL、Audio、字体等特征由种子派生。重新生成后，已登录网站会把它视为一台新设备。</small>`
+    : "";
+  const textFields = keep ? "" : `${browserConfigField("平台版本", `<input name="platform_version" value="${value("platform_version")}" placeholder="留空使用内核默认值，例如 10.0.0">`)}${browserConfigField("品牌版本", `<input name="brand_version" value="${value("brand_version")}" placeholder="留空跟随内核版本">`)}${browserConfigField("窗口尺寸", `<input name="window_size" value="${value("window_size")}" placeholder="留空自动，例如 1920x1080">`)}`;
+  const disabled = new Set(fp.disable_spoofing || []);
+  const spoofing = keep ? "" : `<fieldset class="browser-config-checks"><legend>关闭伪装项</legend>${browserConfig.SPOOFING_OPTIONS.map(([key, label]) => `<label class="sync-checkbox"><input type="checkbox" name="disable_spoofing" value="${escapeHtml(key)}" ${disabled.has(key) ? "checked" : ""}><span>${escapeHtml(label)}</span></label>`).join("")}<small>仅在网站兼容异常时关闭；需要内核 144 及以上版本。</small></fieldset>`;
+  return `<section data-config-panel="fingerprint" hidden>${seed}${browserConfigField("操作系统", `<select name="platform">${selectOptionsMarkup(browserConfig.PLATFORM_OPTIONS, current("platform"), { keep })}</select>`, "选择与真实系统不同的平台时，字体等特征仍来自真实系统，可能被识别为不一致。")}${browserConfigField("浏览器品牌", `<select name="brand">${selectOptionsMarkup(browserConfig.BRAND_OPTIONS, current("brand") ?? "", { keep })}</select>`, "Chrome 是真实用户最常见的品牌；Chromium 品牌较少见。")}${browserConfigField("CPU 核心数", `<select name="hardware_concurrency">${selectOptionsMarkup(browserConfig.HARDWARE_OPTIONS, String(current("hardware_concurrency") || 0), { keep })}</select>`)}${textFields}${spoofing}</section>`;
+}
+
+function renderBrowserConfigLocale(mode, instance) {
+  const fp = mode === "create" ? {} : browserConfig.fingerprintOf(instance);
+  const keep = mode === "batch";
+  const modes = keep ? browserConfig.LOCALE_MODE_OPTIONS.filter(([key]) => key !== "custom") : browserConfig.LOCALE_MODE_OPTIONS;
+  const current = (key, fallback) => mode === "create" ? fallback : (fp[key] ?? fallback);
+  const runtime = instance?.runtime_locale && ACTIVE_BROWSER_STATUS.includes(instance.status)
+    ? `<div class="core-upload-platform">当前生效：${escapeHtml(instance.runtime_locale.timezone || "")}（${escapeHtml(browserConfig.localeSourceLabel(instance.runtime_locale.timezone_source))}） · ${escapeHtml(instance.runtime_locale.language || "")}（${escapeHtml(browserConfig.localeSourceLabel(instance.runtime_locale.language_source))}）</div>`
+    : "";
+  const custom = keep ? "" : `${browserConfigField("自定义时区", `<input name="timezone" value="${escapeHtml(fp.timezone || "")}" placeholder="IANA 名称，例如 America/New_York">`)}${browserConfigField("自定义语言", `<input name="language" value="${escapeHtml(fp.language || "")}" placeholder="例如 en-US">`)}${browserConfigField("Accept-Language", `<input name="accept_language" value="${escapeHtml(fp.accept_language || "")}" placeholder="留空按语言生成，例如 en-US,en;q=0.9">`)}`;
+  return `<section data-config-panel="locale" hidden>${runtime}${browserConfigField("时区来源", `<select name="timezone_mode">${selectOptionsMarkup(modes, current("timezone_mode", "exit_ip"), { keep })}</select>`, "按出口 IP：启动前经该节点代理查询出口所在时区，失败时回退到节点地区。")}${browserConfigField("语言来源", `<select name="language_mode">${selectOptionsMarkup(modes, current("language_mode", "exit_ip"), { keep })}</select>`)}${custom}${browserConfigField("地理位置权限", `<select name="geolocation">${selectOptionsMarkup(browserConfig.GEOLOCATION_OPTIONS, current("geolocation", "block"), { keep })}</select>`, "系统定位基于 Wi-Fi 等信号，不经过代理；建议禁止，避免暴露真实位置。")}</section>`;
+}
+
+function renderBrowserExtensionList(selectedIds) {
+  const library = appState.browser_extensions || [];
+  const selected = new Set(selectedIds || []);
+  const known = new Set(library.map((item) => item.id));
+  const orphan = [...selected].filter((id) => !known.has(id));
+  const rows = [
+    ...library.map((item) => `<div class="browser-extension-row"><label class="sync-checkbox"><input type="checkbox" name="extensions" value="${escapeHtml(item.id)}" ${selected.has(item.id) ? "checked" : ""}><span>${escapeHtml(item.name)}${item.version ? ` <small>${escapeHtml(item.version)}</small>` : ""}</span></label><button class="icon-button danger" type="button" data-action="delete-browser-extension" data-id="${escapeHtml(item.id)}" aria-label="从扩展库删除 ${escapeHtml(item.name)}" title="从扩展库删除">×</button></div>`),
+    ...orphan.map((id) => `<div class="browser-extension-row"><label class="sync-checkbox"><input type="checkbox" name="extensions" value="${escapeHtml(id)}" checked><span>${escapeHtml(id)} <small>扩展库中已删除，继续使用 Profile 内副本</small></span></label></div>`),
+  ];
+  return `<div class="browser-extension-list" id="browserExtensionList">${rows.length ? rows.join("") : `<div class="compact-empty">扩展库为空。上传 .zip 或 .crx 扩展包后可在此勾选。</div>`}</div><label class="toolbar-button browser-extension-upload"><input type="file" id="browserExtensionFile" accept=".zip,.crx" hidden><span>上传扩展包</span></label>`;
+}
+
+function renderBrowserConfigRuntime(mode, instance) {
+  const keep = mode === "batch";
+  const cdpControl = remoteBrowserEnabled()
+    ? `<div class="core-upload-platform">Docker 远程浏览器暂不支持 CDP 调试端口与 Cookie 导入导出。</div>`
+    : keep
+    ? browserConfigField("CDP 调试端口", `<select name="cdp_enabled"><option value="${browserConfig.KEEP}" selected>保持不变</option><option value="true">开启</option><option value="false">关闭</option></select>`)
+    : `<label class="sync-checkbox"><input type="checkbox" name="cdp_enabled" ${instance?.cdp_enabled ? "checked" : ""}><span>开启 CDP 调试端口（仅 127.0.0.1，随机端口）</span></label><small class="browser-config-note">用于 Cookie 导入导出，也可让 Playwright / Puppeteer 通过 connectOverCDP 接管。端口没有密码，本机任何程序都能控制该浏览器，不用时请关闭。修改后需重启浏览器。</small>`;
+  const extensions = keep ? "" : `<fieldset class="browser-config-checks"><legend>扩展</legend>${renderBrowserExtensionList(mode === "create" ? [] : instance?.extensions)}</fieldset>`;
+  return `<section data-config-panel="runtime" hidden>${browserConfigField("指纹内核版本", `<select name="kernel_version">${kernelOptionsMarkup(mode === "create" ? "" : instance?.kernel_version || "", { keep })}</select>`, "固定版本可避免默认内核升级后 UA 等特征变化；版本在「内核管理」中安装。")}${cdpControl}${extensions}</section>`;
+}
+
+function browserToolsStatus(instance) {
+  const running = ACTIVE_BROWSER_STATUS.includes(instance?.status);
+  if (remoteBrowserEnabled()) return { cookies: false, reason: "Docker 远程浏览器暂不支持 Cookie 导入导出，请在远程页面中使用浏览器自带功能。" };
+  if (!running) return { cookies: false, reason: "启动浏览器后才能导入或导出 Cookie。" };
+  if (!instance?.cdp_enabled) return { cookies: false, reason: "请在「内核与扩展」中开启 CDP 调试端口并重启浏览器。" };
+  if (!browserConfig.cdpEndpoint(instance)) return { cookies: false, reason: "调试端口正在就绪；若开启 CDP 前已在运行，请重启浏览器。" };
+  return { cookies: true, reason: "" };
+}
+
+function renderBrowserConfigToolsStatus(instance) {
+  const status = browserToolsStatus(instance);
+  const endpoint = browserConfig.cdpEndpoint(instance);
+  return `${endpoint ? `<div class="browser-config-seed"><span>CDP 地址</span><code title="${escapeHtml(endpoint)}">${escapeHtml(endpoint)}</code><button class="row-button" type="button" data-action="copy" data-text="${escapeHtml(endpoint)}">复制</button></div>` : ""}${status.reason ? `<div class="core-upload-platform">${escapeHtml(status.reason)}</div>` : ""}`;
+}
+
+function renderBrowserConfigTools(mode, instance) {
+  if (mode !== "edit") return `<section data-config-panel="tools" hidden></section>`;
+  const sites = Object.entries(appState.fingerprint_check_sites || {});
+  const siteLabels = { browserscan: "BrowserScan", pixelscan: "Pixelscan", creepjs: "CreepJS" };
+  const status = browserToolsStatus(instance);
+  const disabled = status.cookies ? "" : "disabled";
+  return `<section data-config-panel="tools" hidden><fieldset class="browser-config-checks"><legend>指纹检测</legend><div class="browser-config-actions">${sites.map(([key]) => `<button class="row-button" type="button" data-action="open-fingerprint-check" data-site="${escapeHtml(key)}" data-instance="${escapeHtml(instance.id)}">${escapeHtml(siteLabels[key] || key)}</button>`).join("")}</div><small>${remoteBrowserEnabled() ? "远程浏览器请在远程页面中手动打开检测网址。" : "浏览器运行中会新开标签页；未运行时会带检测页启动。"}</small></fieldset><div id="browserConfigToolsStatus">${renderBrowserConfigToolsStatus(instance)}</div><fieldset class="browser-config-checks"><legend>Cookie</legend><div class="browser-config-actions"><button class="row-button" type="button" data-action="export-browser-cookies" data-format="json" data-instance="${escapeHtml(instance.id)}" ${disabled}>导出 JSON</button><button class="row-button" type="button" data-action="export-browser-cookies" data-format="netscape" data-instance="${escapeHtml(instance.id)}" ${disabled}>导出 Netscape</button></div><label class="core-upload-field"><span>导入 Cookie</span><textarea id="browserCookieImport" rows="5" placeholder="粘贴 JSON（Cookie-Editor / EditThisCookie / CDP 格式）或 Netscape cookies.txt" ${disabled}></textarea></label><div class="browser-config-actions"><label class="toolbar-button ${status.cookies ? "" : "is-disabled"}"><input type="file" id="browserCookieFile" accept=".json,.txt" hidden ${disabled}><span>选择文件</span></label><button class="row-button" type="button" data-action="import-browser-cookies" data-instance="${escapeHtml(instance.id)}" ${disabled}>导入到浏览器</button></div><small>导出内容包含登录凭据，请妥善保管，不要发给他人。</small></fieldset></section>`;
+}
+
+function setBrowserConfigTab(tab) {
+  if (!browserConfigState) return;
+  const available = [...document.querySelectorAll("#browserConfigTabs [data-config-tab]")].filter((button) => !button.hidden).map((button) => button.dataset.configTab);
+  const next = available.includes(tab) ? tab : available[0] || "basic";
+  browserConfigState.tab = next;
+  document.querySelectorAll("#browserConfigTabs [data-config-tab]").forEach((button) => {
+    const active = button.dataset.configTab === next;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  document.querySelectorAll("#browserConfigBody [data-config-panel]").forEach((panel) => {
+    panel.hidden = panel.dataset.configPanel !== next;
+  });
+}
+
+function showBrowserConfigError(message = "") {
+  const element = $("#browserConfigError");
+  if (!element) return;
+  element.textContent = message;
+  element.hidden = !message;
+}
+
+function openBrowserConfig(mode, { instanceIds = [], nodeId = "", trigger = null, tab = "basic" } = {}) {
+  if (!browserEnabled()) throw new Error("当前运行模式不提供浏览器功能");
+  const instance = mode === "edit" ? browserInstanceById(instanceIds[0]) : null;
+  if (mode === "edit" && !instance) throw new Error("找不到浏览器记录");
+  if ((mode === "batch" || mode === "rebind") && !instanceIds.length) throw new Error("请先选择浏览器记录");
+  if ((mode === "create" || mode === "rebind") && !appState.nodes.some((node) => !node.browser_preserved)) {
+    throw new Error("没有可用节点，请先导入订阅");
+  }
+  browserConfigState = { mode, instanceIds: [...instanceIds], nodeId, tab };
+  lastBrowserConfigTrigger = trigger;
+  const titles = {
+    create: "新建浏览器",
+    edit: `配置 ${instance?.name || "浏览器"}`,
+    batch: `批量配置 ${instanceIds.length} 条记录`,
+    rebind: `换绑 ${instanceIds.length} 条记录`,
+  };
+  $("#browserConfigTitle").textContent = titles[mode];
+  $("#browserConfigMeta").textContent = mode === "edit"
+    ? `${nodeById(instance.node_id)?.name || "已删除节点"} · ${browserStatusLabel(instance.status)}${ACTIVE_BROWSER_STATUS.includes(instance.status) ? " · 指纹与内核修改在下次启动时生效" : ""}`
+    : mode === "create" ? "创建后可在列表中启动；首次启动时创建 Profile。" : "";
+  $("#browserConfigSubmit").querySelector("span").textContent = mode === "create" ? "创建" : mode === "rebind" ? "换绑" : "保存";
+  document.querySelectorAll("#browserConfigTabs [data-config-tab]").forEach((button) => {
+    button.hidden = mode === "rebind" || (button.dataset.configTab === "tools" && mode !== "edit");
+  });
+  $("#browserConfigTabs").hidden = mode === "rebind";
+  $("#browserConfigBody").innerHTML = [
+    renderBrowserConfigBasic(mode, instance),
+    mode === "rebind" ? "" : renderBrowserConfigFingerprint(mode, instance),
+    mode === "rebind" ? "" : renderBrowserConfigLocale(mode, instance),
+    mode === "rebind" ? "" : renderBrowserConfigRuntime(mode, instance),
+    mode === "rebind" ? "" : renderBrowserConfigTools(mode, instance),
+  ].join("");
+  showBrowserConfigError();
+  setBrowserConfigTab(tab);
+  const modal = $("#browserConfigModal");
+  const recordsModal = $("#browserRecordModal");
+  modal.dataset.returnToBrowserRecords = recordsModal.hidden ? "false" : "true";
+  if (!recordsModal.hidden) {
+    recordsModal.inert = true;
+    recordsModal.setAttribute("aria-hidden", "true");
+  }
+  openModal(modal);
+  requestAnimationFrame(() => modal.querySelector("#browserConfigBody input:not([type=hidden]):not([disabled]), #browserConfigBody select:not([disabled])")?.focus());
+}
+
+function closeBrowserConfig() {
+  const modal = $("#browserConfigModal");
+  if (!modal || modal.hidden) return;
+  closeModal(modal);
+  if (modal.dataset.returnToBrowserRecords === "true") {
+    const recordsModal = $("#browserRecordModal");
+    recordsModal.inert = false;
+    recordsModal.removeAttribute("aria-hidden");
+    if (appState.browserRecordNodeId) renderBrowserRecords(appState.browserRecordNodeId);
+  }
+  delete modal.dataset.returnToBrowserRecords;
+  browserConfigState = null;
+  $("#browserConfigBody").innerHTML = "";
+  const trigger = lastBrowserConfigTrigger?.isConnected ? lastBrowserConfigTrigger : null;
+  trigger?.focus();
+  lastBrowserConfigTrigger = null;
+}
+
+// 状态轮询只刷新「Cookie 与检测」的运行状态，其余表单草稿保持不变。
+function refreshBrowserConfigTools() {
+  if (!browserConfigState || browserConfigState.mode !== "edit") return;
+  const instance = browserInstanceById(browserConfigState.instanceIds[0]);
+  const target = $("#browserConfigToolsStatus");
+  if (!instance || !target) return;
+  const markup = renderBrowserConfigToolsStatus(instance);
+  if (target.innerHTML !== markup) target.innerHTML = markup;
+  const enabled = browserToolsStatus(instance).cookies;
+  document.querySelectorAll('#browserConfigBody [data-action="export-browser-cookies"], #browserConfigBody [data-action="import-browser-cookies"], #browserCookieImport, #browserCookieFile').forEach((element) => {
+    element.disabled = !enabled;
+  });
+  document.querySelector("#browserCookieFile")?.closest("label")?.classList.toggle("is-disabled", !enabled);
+}
+
+function readBrowserConfigForm() {
+  const form = $("#browserConfigForm");
+  const field = (name) => form.querySelector(`[name="${name}"]`);
+  const value = (name) => field(name)?.value;
+  const checked = (name) => (field(name) ? field(name).checked : undefined);
+  const batch = browserConfigState?.mode === "batch";
+  const values = {
+    name: value("name"),
+    label: value("label"),
+    labelEnabled: checked("labelEnabled"),
+    group: value("group"),
+    groupEnabled: checked("groupEnabled"),
+    platform: value("platform"),
+    platform_version: value("platform_version"),
+    brand: value("brand"),
+    brand_version: value("brand_version"),
+    hardware_concurrency: value("hardware_concurrency"),
+    window_size: value("window_size"),
+    timezone_mode: value("timezone_mode"),
+    timezone: value("timezone"),
+    language_mode: value("language_mode"),
+    language: value("language"),
+    accept_language: value("accept_language"),
+    geolocation: value("geolocation"),
+    kernel_version: value("kernel_version"),
+    cdp_enabled: batch ? value("cdp_enabled") : checked("cdp_enabled"),
+    start_urls: value("start_urls"),
+  };
+  if (!batch) {
+    if (form.querySelector('[name="disable_spoofing"]')) {
+      values.disable_spoofing = [...form.querySelectorAll('[name="disable_spoofing"]:checked')].map((input) => input.value);
+    }
+    if (form.querySelector("#browserExtensionList")) {
+      values.extensions = [...form.querySelectorAll('[name="extensions"]:checked')].map((input) => input.value);
+    }
+  }
+  return { values, nodeId: value("node_id") || "", count: Number(value("count") || 1) };
+}
+
+async function submitBrowserConfig(event) {
+  event.preventDefault();
+  if (!browserConfigState) return;
+  const submit = $("#browserConfigSubmit");
+  if (submit.disabled) return;
+  const { mode, instanceIds } = browserConfigState;
+  const { values, nodeId, count } = readBrowserConfigForm();
+  showBrowserConfigError();
+  submit.disabled = true;
+  try {
+    let message = "";
+    if (mode === "rebind") {
+      if (!nodeId) throw new Error("请选择目标节点");
+      const result = await api("/api/browser/rebind", { instance_ids: instanceIds, node_id: nodeId });
+      appState.selectedBrowserIds.clear();
+      message = `已换绑 ${result.updated} 条记录到「${nodeById(nodeId)?.name || nodeId}」`;
+    } else if (mode === "create") {
+      if (!nodeId) throw new Error("请选择绑定节点");
+      if (!Number.isInteger(count) || count < 1 || count > 50) throw new Error("新建数量需在 1–50 之间");
+      const result = await api("/api/browser/create", { ...browserConfig.buildConfigPayload(values), node_id: nodeId, count });
+      message = `已新建 ${result.created} 条浏览器记录`;
+    } else if (mode === "batch") {
+      const payload = browserConfig.buildConfigPayload(values, { batch: true });
+      if (!Object.keys(payload).length) throw new Error("没有选择要修改的项");
+      const result = await api("/api/browser/update", { ...payload, instance_ids: instanceIds });
+      message = `已更新 ${result.updated} 条记录${result.restart_required ? "，运行中的浏览器重启后生效" : ""}`;
+    } else {
+      const instance = browserInstanceById(instanceIds[0]);
+      const result = await api("/api/browser/update", { ...browserConfig.buildConfigPayload(values), instance_id: instanceIds[0] });
+      message = result.restart_required ? "已保存，重启浏览器后生效" : "浏览器配置已保存";
+      if (nodeId && instance && nodeId !== instance.node_id) {
+        await api("/api/browser/rebind", { instance_ids: instanceIds, node_id: nodeId });
+        message = `已保存并换绑到「${nodeById(nodeId)?.name || nodeId}」`;
+      }
+    }
+    await loadStatus({ forceFresh: true });
+    closeBrowserConfig();
+    showToast(message);
+  } catch (error) {
+    showBrowserConfigError(error.message);
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+async function uploadBrowserExtension(file) {
+  if (!file) return;
+  if (!/\.(zip|crx)$/i.test(file.name)) throw new Error("扩展包只支持 .zip 或 .crx");
+  if (file.size > 64 * 1024 * 1024) throw new Error("扩展包不能超过 64 MiB");
+  const headers = {
+    "Content-Type": "application/octet-stream",
+    "X-ProxyBridge-Upload-Name": encodeURIComponent(file.name),
+  };
+  if (managementToken) headers[managementAuth.headerName] = managementToken;
+  const response = await fetch("/api/browser/extensions/upload", { method: "POST", headers, body: file });
+  const responseToken = response.headers.get(managementAuth.headerName) || "";
+  if (!managementAuth.validateResponseToken(window, managementToken, responseToken)) {
+    managementToken = "";
+    throw new Error("管理 API 凭证已失效，请从启动入口重新打开控制台");
+  }
+  const payload = await response.json();
+  if (!response.ok || payload.error) throw new Error(payload.error || `HTTP ${response.status}`);
+  appState.browser_extensions = Array.isArray(payload.extensions) ? payload.extensions : appState.browser_extensions;
+  refreshBrowserExtensionList(payload.extension?.id);
+  showToast(payload.already_installed ? `扩展已在库中：${payload.extension?.name || file.name}` : `已导入扩展：${payload.extension?.name || file.name}`);
+}
+
+// 扩展库变化后只重绘扩展列表，保留已勾选状态与其他表单草稿。
+function refreshBrowserExtensionList(checkId = "") {
+  const list = $("#browserExtensionList");
+  if (!list) return;
+  const checked = new Set([...list.querySelectorAll('[name="extensions"]:checked')].map((input) => input.value));
+  if (checkId) checked.add(checkId);
+  const wrapper = list.parentElement;
+  const legend = wrapper.querySelector("legend")?.outerHTML || "";
+  wrapper.innerHTML = legend + renderBrowserExtensionList([...checked]);
+}
+
+async function deleteBrowserExtension(extensionId) {
+  const item = (appState.browser_extensions || []).find((entry) => entry.id === extensionId);
+  const users = (appState.browser_instances || []).filter((instance) => (instance.extensions || []).includes(extensionId)).length;
+  if (!await confirmAction(
+    `从扩展库删除「${item?.name || extensionId}」${users ? `，并从 ${users} 条浏览器记录中移除` : ""}。各 Profile 内的扩展副本会在下次启动时清理，扩展数据随之删除。`,
+    { title: "删除扩展", confirmLabel: "删除扩展" }
+  )) return;
+  const result = await api("/api/browser/extensions/delete", { id: extensionId });
+  appState.browser_extensions = result.extensions || [];
+  const checkbox = document.querySelector(`#browserExtensionList [name="extensions"][value="${browserUi.cssEscape(extensionId, window.CSS)}"]`);
+  if (checkbox) checkbox.checked = false;
+  refreshBrowserExtensionList();
+  await loadStatus({ forceFresh: true });
+  showToast("扩展已删除");
+}
+
+function downloadTextFile(filename, content, type = "text/plain") {
+  const blob = new Blob([content], { type: `${type};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function exportBrowserCookies(instanceId, format) {
+  const result = await api("/api/browser/cookies/export", { instance_id: instanceId, format });
+  downloadTextFile(result.filename || browserConfig.cookieFileName(browserInstanceById(instanceId), format), result.content || "", format === "json" ? "application/json" : "text/plain");
+  showToast(`已导出 ${result.count} 条 Cookie`);
+}
+
+async function importBrowserCookies(instanceId) {
+  const textarea = $("#browserCookieImport");
+  const content = String(textarea?.value || "").trim();
+  if (!content) throw new Error("请粘贴 Cookie 内容或选择文件");
+  if (content.length > 900_000) throw new Error("Cookie 内容过大，请拆分后分批导入");
+  const result = await api("/api/browser/cookies/import", { instance_id: instanceId, content, format: "auto" });
+  if (textarea) textarea.value = "";
+  showToast(result.failed ? `已导入 ${result.imported}/${result.total} 条 Cookie，${result.failed} 条被浏览器拒绝` : `已导入 ${result.imported} 条 Cookie`, result.failed ? "error" : "ok");
+  if (result.failed) console.warn("Cookie 导入失败项", result.errors);
+}
+
+async function openFingerprintCheck(instanceId, site) {
+  const instance = browserInstanceById(instanceId);
+  if (!instance) throw new Error("找不到浏览器记录");
+  if (remoteBrowserEnabled()) {
+    const url = appState.fingerprint_check_sites?.[site] || "";
+    await copyText(url);
+    showToast(`已复制检测网址，请在远程浏览器中打开：${url}`);
+    return;
+  }
+  const result = await api("/api/browser/open-url", { instance_id: instanceId, site });
+  await loadStatus({ forceFresh: true });
+  showToast(result.method === "launch" ? "已带检测页启动浏览器" : "已在浏览器中打开检测页");
+}
+
+async function regenerateBrowserFingerprints(instanceIds) {
+  const records = instanceIds.map(browserInstanceById).filter(Boolean);
+  if (!records.length) throw new Error("请先选择浏览器记录");
+  if (records.some((item) => ACTIVE_BROWSER_STATUS.includes(item.status))) throw new Error("请先停止所选浏览器，再重新生成指纹");
+  if (!await confirmAction(
+    `将为 ${records.length} 条记录生成新的指纹种子。Canvas、WebGL、Audio 等特征会全部改变，已登录的网站可能把它们识别为新设备并要求重新验证。`,
+    { title: "重新生成指纹", confirmLabel: "重新生成" }
+  )) return false;
+  const result = await api("/api/browser/regenerate-fingerprint", { instance_ids: records.map((item) => item.id) });
+  await loadStatus({ forceFresh: true });
+  showToast(`已重新生成 ${result.updated} 条记录的指纹`);
+  return true;
+}
+
+function selectedBrowserRecords() {
+  return [...appState.selectedBrowserIds].map(browserInstanceById).filter(Boolean);
+}
+
+async function batchLaunchSelectedBrowsers() {
+  const records = selectedBrowserRecords().filter((item) => !ACTIVE_BROWSER_STATUS.includes(item.status));
+  if (!records.length) return showToast("所选记录都已在运行", "error");
+  if (remoteBrowserEnabled()) {
+    pendingRemoteBrowserBatchInstances = records.map((item) => ({ nodeId: item.node_id, instanceId: item.id }));
+    showRemoteBrowserLaunchModal(records[0].node_id, records[0].id, document.querySelector('[data-action="batch-browser-launch"]'));
+    return;
+  }
+  let started = 0;
+  const failed = [];
+  for (const record of records) {
+    try { await requestBrowserLaunch(record.node_id, record.id); started += 1; }
+    catch (error) { failed.push(`${record.name || record.id}: ${error.message}`); }
+  }
+  await loadStatus({ forceFresh: true });
+  showToast(failed.length ? `已启动 ${started} 个浏览器，${failed.length} 个失败：${failed[0]}` : `已启动 ${started} 个浏览器`, failed.length ? "error" : "ok");
+}
+
+async function batchStopSelectedBrowsers() {
+  const records = selectedBrowserRecords().filter((item) => ACTIVE_BROWSER_STATUS.includes(item.status));
+  if (!records.length) return showToast("所选记录中没有运行中的浏览器", "error");
+  if (!await confirmAction(`将停止 ${records.length} 个指纹浏览器，Profile 和本地数据会保留。`, { title: "停止所选浏览器", confirmLabel: "停止" })) return;
+  for (const record of records) await api("/api/browser/stop", { instance_id: record.id });
+  await loadStatus({ forceFresh: true });
+  showToast(`已停止 ${records.length} 个浏览器`);
+}
+
+async function batchDeleteSelectedBrowsers() {
+  const records = selectedBrowserRecords();
+  if (!records.length) return;
+  const syncEnabled = Boolean(appState.sync?.enabled && appState.sync?.url);
+  if (!await confirmAction(
+    `将先停止并永久删除 ${records.length} 条浏览器记录及其 Profile、Cookie 和本地存储；此操作无法恢复。${syncEnabled ? " WebDAV 已启用，远端对应数据也会同步删除。" : ""}`,
+    { title: "永久删除浏览器 Profile", confirmLabel: "永久删除", details: records.slice(0, 5).map((item) => item.label || item.name).join("、") + (records.length > 5 ? ` 等 ${records.length} 条` : "") }
+  )) return;
+  const failed = [];
+  for (const record of records) {
+    try { await api("/api/browser/delete", { instance_id: record.id }); appState.selectedBrowserIds.delete(record.id); }
+    catch (error) { failed.push(`${record.name || record.id}: ${error.message}`); }
+  }
+  await loadStatus({ forceFresh: true });
+  showToast(failed.length ? `已删除 ${records.length - failed.length} 条，${failed.length} 条失败：${failed[0]}` : `已删除 ${records.length} 条浏览器记录`, failed.length ? "error" : "ok");
+}
+
+// ============ 指纹内核版本 ============
+async function setDefaultFingerprintKernel(kernelId) {
+  await api("/api/browser/kernels/default", { id: kernelId });
+  await loadStatus({ forceFresh: true });
+  await loadCoreCatalog();
+  showToast("默认指纹内核已更新，新启动的浏览器将使用该版本");
+}
+
+async function deleteFingerprintKernel(kernelId) {
+  const kernel = (appState.fingerprint_kernels || []).find((item) => item.id === kernelId);
+  if (!await confirmAction(
+    `删除指纹内核「${kernel?.version || kernel?.label || kernelId}」会移除其安装文件；需要先停止所有浏览器。浏览器 Profile 不受影响。`,
+    { title: "删除指纹内核版本", confirmLabel: "删除" }
+  )) return;
+  await api("/api/browser/kernels/delete", { id: kernelId });
+  await loadStatus({ forceFresh: true });
+  await loadCoreCatalog();
+  showToast("指纹内核版本已删除");
+}
+
+async function installFingerprintKernel(payload, label) {
+  if (kernelDownloadPromise) return kernelDownloadPromise;
+  showToast(`正在下载指纹内核${label ? ` ${label}` : ""}，约 150-250MB，请耐心等待…`);
+  kernelDownloadPromise = (async () => {
+    const result = await api("/api/browser/download-kernel", payload);
+    await loadStatus({ forceFresh: true });
+    await loadCoreCatalog();
+    if (result.already_installed) showToast(`该版本已安装${result.kernel_id ? `：${result.kernel_id}` : ""}`);
+    else if (result.arch_warning) showToast(result.arch_warning, "error");
+    else showToast(`指纹内核安装完成：${result.kernel_version || result.kernel_id || ""}`);
+    return result;
+  })().finally(() => {
+    kernelDownloadPromise = null;
+  });
+  return kernelDownloadPromise;
+}
+
+async function openKernelReleases(trigger = null) {
+  const modal = $("#kernelReleaseModal");
+  const body = $("#kernelReleaseBody");
+  modal.dataset.trigger = trigger ? actionLockKey(trigger) : "";
+  body.innerHTML = `<div class="compact-empty">正在获取上游版本列表…</div>`;
+  $("#kernelReleaseMeta").textContent = "";
+  openModal(modal);
+  modal.querySelector('[data-action="close-kernel-releases"]')?.focus();
+  try {
+    const result = await api("/api/browser/kernels/releases", {});
+    $("#kernelReleaseMeta").textContent = `${result.os}/${result.arch} · 来自 adryfish/fingerprint-chromium`;
+    const releases = Array.isArray(result.releases) ? result.releases : [];
+    body.innerHTML = releases.length
+      ? `<div class="responsive-table"><table><thead><tr><th>版本</th><th>发布时间</th><th>操作</th></tr></thead><tbody>${releases.map((release) => `<tr><td><strong>${escapeHtml(release.kernel_id)}</strong><small title="${escapeHtml(release.asset)}">${escapeHtml(release.asset)}</small></td><td>${escapeHtml(String(release.published_at || "").slice(0, 10) || "—")}</td><td>${release.installed ? `<span class="status-pill is-ok">已安装</span>` : `<button class="row-button" data-action="install-kernel-release" data-tag="${escapeHtml(release.tag)}" data-id="${escapeHtml(release.kernel_id)}">下载安装</button>`}</td></tr>`).join("")}</tbody></table></div>`
+      : `<div class="compact-empty">上游暂未发布适配本机的版本，可稍后重试或使用「本地导入」。</div>`;
+  } catch (error) {
+    body.innerHTML = `<div class="core-upload-error" role="alert">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function closeKernelReleases() {
+  const modal = $("#kernelReleaseModal");
+  if (!modal || modal.hidden) return;
+  closeModal(modal);
+  findActionTrigger(modal.dataset.trigger || "")?.focus();
+  delete modal.dataset.trigger;
 }
 
 function showBrowserRecords(nodeId, trigger = null) {
@@ -3809,14 +4371,11 @@ async function batchExcludePoolMembers() {
 }
 
 async function stopAllVisibleBrowsers() {
-  const records = browserUi.sortBrowserInstancesByRecentUse(appState.browser_instances || []).filter((item) => {
-    if (!["running", "starting", "stopping"].includes(item.status)) return false;
-    if (browserPageFilter.node !== "all" && item.node_id !== browserPageFilter.node) return false;
-    const query = String(browserPageFilter.search || "").trim().toLowerCase();
-    const node = nodeById(item.node_id);
-    if (query && ![item.label, item.name, item.node_name, node?.name].some((value) => String(value || "").toLowerCase().includes(query))) return false;
-    return true;
-  });
+  const records = browserConfig.filterBrowserRecords(
+    browserUi.sortBrowserInstancesByRecentUse(appState.browser_instances || []),
+    browserPageFilter,
+    nodeById,
+  ).filter((item) => browserConfig.isActive(item));
   if (!records.length) return;
   if (!await confirmAction(`将停止 ${records.length} 个指纹浏览器，Profile 和本地数据会保留。`, { title: "停止指纹浏览器", confirmLabel: "全部停止" })) return;
   for (const record of records) await api("/api/browser/stop", { instance_id: record.id });
@@ -3954,25 +4513,25 @@ async function handleRemoteBrowserLaunchSubmit(event) {
   let result = null;
   let openedAutomatically = false;
   const isRemoteBatchLaunch = pendingRemoteBrowserBatchNodeIds.length > 0;
-  const batchNodeIds = pendingRemoteBrowserBatchNodeIds.length
-    ? [...pendingRemoteBrowserBatchNodeIds]
-    : [pending.nodeId];
+  const isRemoteRecordBatch = pendingRemoteBrowserBatchInstances.length > 0;
+  const batchTargets = isRemoteRecordBatch
+    ? pendingRemoteBrowserBatchInstances.map((item) => ({ ...item }))
+    : pendingRemoteBrowserBatchNodeIds.length
+    ? pendingRemoteBrowserBatchNodeIds.map((nodeId) => ({ nodeId, instanceId: "" }))
+    : [{ nodeId: pending.nodeId, instanceId: pending.instanceId }];
   remoteBrowserLaunchPromise = (async () => {
     let lastResult = null;
     const failures = [];
-    for (const nodeId of batchNodeIds) {
+    for (const target of batchTargets) {
       try {
-        lastResult = await requestBrowserLaunch(
-          nodeId,
-          batchNodeIds.length === 1 ? pending.instanceId : "",
-          { username, password }
-        );
+        lastResult = await requestBrowserLaunch(target.nodeId, target.instanceId, { username, password });
       } catch (error) {
-        failures.push(`${nodeById(nodeId)?.name || nodeId}: ${error.message}`);
+        const label = target.instanceId ? browserInstanceById(target.instanceId)?.name : nodeById(target.nodeId)?.name;
+        failures.push(`${label || target.instanceId || target.nodeId}: ${error.message}`);
       }
     }
     if (!lastResult) throw new Error(failures.join("；") || "没有成功启动远程浏览器");
-    lastResult.batch_count = batchNodeIds.length - failures.length;
+    lastResult.batch_count = batchTargets.length - failures.length;
     lastResult.batch_failures = failures;
     return lastResult;
   })();
@@ -3983,7 +4542,9 @@ async function handleRemoteBrowserLaunchSubmit(event) {
     showRemoteBrowserLaunchSuccess(result, { username, password });
     pendingRemoteBrowserLaunch = null;
     pendingRemoteBrowserBatchNodeIds = [];
+    pendingRemoteBrowserBatchInstances = [];
     if (isRemoteBatchLaunch) clearNodeSelections();
+    if (isRemoteRecordBatch) appState.selectedBrowserIds.clear();
     if (remoteWindow && !remoteWindow.closed) {
       try {
         remoteWindow.location.replace(remoteUrl);
@@ -4115,6 +4676,13 @@ function actionUsesSpinner(action) {
     "show-core-upload",
     "close-core-upload",
     "close-browser-records",
+    "open-browser-create",
+    "open-browser-config",
+    "open-browser-batch-edit",
+    "open-browser-rebind",
+    "close-browser-config",
+    "clear-browser-selection",
+    "close-kernel-releases",
     "close-remote-browser-launch",
     "generate-remote-browser-password",
     "copy-remote-browser-password",
@@ -4323,6 +4891,54 @@ async function handleAction(event) {
       await showRemoteBrowserCredentials(button.dataset.instance, button);
     } else if (action === "delete-browser-instance") {
       await deleteBrowserInstance(button.dataset.instance);
+    } else if (action === "open-browser-create") {
+      openBrowserConfig("create", { nodeId: button.dataset.node || (browserPageFilter.node !== "all" ? browserPageFilter.node : ""), trigger: button });
+    } else if (action === "open-browser-config") {
+      openBrowserConfig("edit", { instanceIds: [button.dataset.instance], trigger: button, tab: button.dataset.tab || "basic" });
+    } else if (action === "open-browser-batch-edit") {
+      openBrowserConfig("batch", { instanceIds: [...appState.selectedBrowserIds], trigger: button });
+    } else if (action === "open-browser-rebind") {
+      openBrowserConfig("rebind", { instanceIds: button.dataset.instance ? [button.dataset.instance] : [...appState.selectedBrowserIds], trigger: button });
+    } else if (action === "close-browser-config") {
+      closeBrowserConfig();
+    } else if (action === "clear-browser-selection") {
+      appState.selectedBrowserIds.clear();
+      renderBrowserPage();
+    } else if (action === "batch-browser-launch") {
+      await batchLaunchSelectedBrowsers();
+    } else if (action === "batch-browser-stop") {
+      await batchStopSelectedBrowsers();
+    } else if (action === "batch-browser-regenerate") {
+      await regenerateBrowserFingerprints([...appState.selectedBrowserIds]);
+    } else if (action === "batch-browser-delete") {
+      await batchDeleteSelectedBrowsers();
+    } else if (action === "regenerate-browser-fingerprint") {
+      if (await regenerateBrowserFingerprints([button.dataset.instance])) {
+        const instance = browserInstanceById(button.dataset.instance);
+        const seed = button.closest(".browser-config-seed")?.querySelector("code");
+        if (seed && instance) seed.textContent = String(instance.fingerprint_seed || "-");
+      }
+    } else if (action === "open-fingerprint-check") {
+      await openFingerprintCheck(button.dataset.instance, button.dataset.site);
+    } else if (action === "export-browser-cookies") {
+      await exportBrowserCookies(button.dataset.instance, button.dataset.format);
+    } else if (action === "import-browser-cookies") {
+      await importBrowserCookies(button.dataset.instance);
+    } else if (action === "delete-browser-extension") {
+      await deleteBrowserExtension(button.dataset.id);
+    } else if (action === "set-default-kernel") {
+      await setDefaultFingerprintKernel(button.dataset.id);
+    } else if (action === "delete-fingerprint-kernel") {
+      await deleteFingerprintKernel(button.dataset.id);
+    } else if (action === "download-latest-kernel") {
+      await installFingerprintKernel({ latest: true }, "最新版本");
+    } else if (action === "open-kernel-releases") {
+      await openKernelReleases(button);
+    } else if (action === "close-kernel-releases") {
+      closeKernelReleases();
+    } else if (action === "install-kernel-release") {
+      await installFingerprintKernel({ tag: button.dataset.tag }, button.dataset.id);
+      if (!$("#kernelReleaseModal").hidden) await openKernelReleases();
     } else if (action === "download-kernel") {
       await downloadKernel();
     } else if (action === "update-core") {
@@ -4415,9 +5031,22 @@ async function handleAction(event) {
       }
       const name = subscription.name || "该订阅";
       const nodeCount = Number(subscription.node_count || (subscription.node_ids || []).length || 0);
-      if (!await confirmAction(`删除「${name}」将清理最多 ${nodeCount} 个未被其他订阅引用的节点及浏览器 Profile。此操作可能删除 Cookie 和登录态。`, { title: "删除订阅", confirmLabel: "删除订阅" })) return;
+      const affectedBrowsers = browserEnabled()
+        ? (appState.browser_instances || []).filter((item) => (subscription.node_ids || []).includes(item.node_id)).length
+        : 0;
+      if (!await confirmAction(
+        affectedBrowsers
+          ? `删除「${name}」将清理最多 ${nodeCount} 个未被其他订阅引用的节点。其中 ${affectedBrowsers} 条浏览器记录默认保留，原节点转为「已移除」状态，可稍后换绑到其他节点。`
+          : `删除「${name}」将清理最多 ${nodeCount} 个未被其他订阅引用的节点。`,
+        {
+          title: "删除订阅",
+          confirmLabel: "删除订阅",
+          option: affectedBrowsers ? { label: `同时永久删除这 ${affectedBrowsers} 条浏览器记录及 Profile（Cookie、登录态无法恢复）`, checked: false } : null,
+        }
+      )) return;
+      const deleteBrowserProfiles = confirmOptionChecked;
       try {
-        await api("/api/subscriptions/delete", { id: subscriptionId });
+        await api("/api/subscriptions/delete", { id: subscriptionId, delete_browser_profiles: deleteBrowserProfiles });
       } catch (error) {
         try {
           await loadStatus({ forceFresh: true });
@@ -4627,6 +5256,10 @@ function trapModalFocus(event) {
       ? $("#remoteBrowserLaunchModal")
       : !$("#coreUploadModal").hidden
         ? $("#coreUploadModal")
+        : !$("#browserConfigModal").hidden
+        ? $("#browserConfigModal")
+        : !$("#kernelReleaseModal").hidden
+        ? $("#kernelReleaseModal")
         : !$("#browserRecordModal").hidden
           ? $("#browserRecordModal")
           : !$("#coreLogModal").hidden
@@ -4904,6 +5537,7 @@ function bindEvents() {
   $("#batchStartResultDialog")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closeBatchStartResults(); });
   $("#commandPalette")?.addEventListener("click", (event) => { if (event.target === event.currentTarget) closeCommandPalette(); });
   $("#browserNodeFilter")?.addEventListener("change", (event) => { browserPageFilter.node = event.target.value; renderBrowserPage(); });
+  $("#browserGroupFilter")?.addEventListener("change", (event) => { browserPageFilter.group = event.target.value; renderBrowserPage(); });
   $("#browserStatusFilter")?.addEventListener("change", (event) => { browserPageFilter.status = event.target.value; renderBrowserPage(); });
   $("#browserSearchInput")?.addEventListener("input", (event) => { browserPageFilter.search = event.target.value; renderBrowserPage(); });
   $("#languageSelect")?.addEventListener("change", (event) => {
@@ -5082,6 +5716,46 @@ function bindEvents() {
       closeBrowserRecordModal();
     }
   });
+  $("#browserConfigModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeBrowserConfig();
+  });
+  $("#kernelReleaseModal").addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeKernelReleases();
+  });
+  $("#browserConfigForm").addEventListener("submit", submitBrowserConfig);
+  $("#browserConfigTabs").addEventListener("click", (event) => {
+    const tab = event.target.closest("[data-config-tab]");
+    if (tab) setBrowserConfigTab(tab.dataset.configTab);
+  });
+  $("#browserConfigBody").addEventListener("change", async (event) => {
+    const target = event.target;
+    if (target.id === "browserExtensionFile") {
+      const file = target.files?.[0];
+      target.value = "";
+      try { await uploadBrowserExtension(file); } catch (error) { showToast(error.message, "error"); }
+    } else if (target.id === "browserCookieFile") {
+      const file = target.files?.[0];
+      target.value = "";
+      if (!file) return;
+      if (file.size > 900_000) return showToast("Cookie 文件过大，请拆分后分批导入", "error");
+      $("#browserCookieImport").value = await file.text();
+    }
+  });
+  $("#browserList").addEventListener("change", (event) => {
+    const target = event.target;
+    if (target.id === "browserSelectAll") {
+      const records = browserConfig.filterBrowserRecords(appState.browser_instances || [], browserPageFilter, nodeById);
+      for (const record of records) {
+        if (target.checked) appState.selectedBrowserIds.add(record.id);
+        else appState.selectedBrowserIds.delete(record.id);
+      }
+      renderBrowserPage();
+    } else if (target.classList.contains("browser-checkbox")) {
+      if (target.checked) appState.selectedBrowserIds.add(target.dataset.instance);
+      else appState.selectedBrowserIds.delete(target.dataset.instance);
+      renderBrowserPage();
+    }
+  });
   $("#remoteBrowserLaunchModal").addEventListener("click", (event) => {
     if (event.target === event.currentTarget) {
       closeRemoteBrowserLaunchModal();
@@ -5131,6 +5805,10 @@ function bindEvents() {
       closeRemoteBrowserLaunchModal();
     } else if (event.key === "Escape" && !$("#coreUploadModal").hidden) {
       closeCoreUploadModal();
+    } else if (event.key === "Escape" && !$("#browserConfigModal").hidden) {
+      closeBrowserConfig();
+    } else if (event.key === "Escape" && !$("#kernelReleaseModal").hidden) {
+      closeKernelReleases();
     } else if (event.key === "Escape" && !$("#coreLogModal").hidden) {
       closeCoreLogModal();
     } else if (event.key === "Escape" && !$("#browserRecordModal").hidden) {

@@ -225,6 +225,7 @@ Write-Host "Building ProxyBridge.exe (onefile, windowed)..."
 $AppSource = Join-Path $RootDir "app.py"
 $WebDavSource = Join-Path $RootDir "webdav_sync.py"
 $RemoteBrowserSource = Join-Path $RootDir "remote_browser.py"
+$BrowserFingerprintSource = Join-Path $RootDir "browser_fingerprint.py"
 $VersionModuleSource = Join-Path $RootDir "proxybridge_version.py"
 $StaticSource = Join-Path $RootDir "static"
 $DesktopSource = Join-Path $RootDir "desktop"
@@ -234,6 +235,8 @@ $addData = @(
   "$WebDavSource;.",
   # 主模块会导入远程浏览器 Broker 客户端；Windows 包需收集该同级模块。
   "$RemoteBrowserSource;.",
+  # 指纹浏览器配置与 CDP 客户端模块同样由主模块静态导入。
+  "$BrowserFingerprintSource;.",
   # 版本解析模块和构建生成的 VERSION 必须同时进入 onefile 临时目录。
   "$VersionModuleSource;.",
   "$BundledVersionPath;.",
@@ -263,6 +266,7 @@ $pyiArgs += @(
   "--hidden-import", "webdav_sync",
   # 明确声明隐藏导入，避免动态加载 app 时遗漏 Broker 客户端模块。
   "--hidden-import", "remote_browser",
+  "--hidden-import", "browser_fingerprint",
   "--hidden-import", "proxybridge_version",
   "--hidden-import", "desktop",
   "--hidden-import", "desktop.tray_host",

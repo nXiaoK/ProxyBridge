@@ -1945,7 +1945,10 @@ class RemoteBrowserDeploymentContractTests(unittest.TestCase):
         main = (self.root / "Dockerfile").read_text(encoding="utf-8")
         broker = (self.root / "docker" / "Dockerfile.broker").read_text(encoding="utf-8")
 
-        self.assertIn("COPY --chown=proxybridge:proxybridge app.py webdav_sync.py remote_browser.py ./", main)
+        self.assertIn(
+            "COPY --chown=proxybridge:proxybridge app.py webdav_sync.py remote_browser.py browser_fingerprint.py ./",
+            main,
+        )
         self.assertIn("USER proxybridge", main)
         self.assertIn("COPY browser_broker.py ./", broker)
         self.assertIn("EXPOSE 8765", broker)

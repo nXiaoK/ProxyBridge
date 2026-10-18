@@ -4,6 +4,7 @@ const { createOverviewRenderer } = require("../static/pages/overview.js");
 const { createKernelRenderer } = require("../static/pages/kernels.js");
 const { createBrowserRenderer } = require("../static/pages/browsers.js");
 const { createNodeRenderer } = require("../static/pages/nodes.js");
+const browserConfig = require("../static/browser-config.js");
 
 const escapeHtml = (value) => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll('"', "&quot;");
 const element = () => ({ innerHTML: "", textContent: "", hidden: false, classList: { toggle() {}, remove() {} } });
@@ -43,6 +44,7 @@ test("browser renderer handles real records without reporting unknown node regio
     appState: { nodes: [node], browser_instances: [{ id: "browser", node_id: "node", label: "Start", status: "stopped", exit_check: { ip: "1.1.1.1", region_code: "US" } }] },
     browserPageFilter: { node: "all", status: "all", search: "start" },
     browserUi: { sortBrowserInstancesByRecentUse: (records) => records, browserInstanceLastUsedAt: () => 1 },
+    browserConfig,
     browserEnabled: () => true, remoteBrowserEnabled: () => false, nodeById: () => node,
     escapeHtml, safeRemoteBrowserUrl: () => "", formatRelativeTime: () => "now", browserStatusLabel: () => "已停止",
     uiCore: { patchKeyedHtml: (target, html) => { target.innerHTML = html; } },

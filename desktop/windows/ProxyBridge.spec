@@ -16,6 +16,8 @@ datas = [
     (str(root / "webdav_sync.py"), "."),
     # 主模块会静态导入 Broker 客户端；桌面包也必须包含该模块以保证启动一致。
     (str(root / "remote_browser.py"), "."),
+    # 指纹浏览器配置、Cookie 格式与 CDP 客户端模块，由主模块静态导入。
+    (str(root / "browser_fingerprint.py"), "."),
     (str(root / "static"), "static"),
     (str(root / "desktop"), "desktop"),
 ]
@@ -26,6 +28,7 @@ hiddenimports = [
     "webdav_sync",
     # PyInstaller 的隐藏导入用于收集远程浏览器客户端，不会在桌面模式启用 Docker worker。
     "remote_browser",
+    "browser_fingerprint",
     "desktop",
     "desktop.tray_host",
     "desktop.autostart",

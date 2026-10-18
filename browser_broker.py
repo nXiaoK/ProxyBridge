@@ -507,6 +507,102 @@ def _fingerprint_relative_path(value: Any) -> str:
     return "/".join(parts)
 
 
+# 指纹参数白名单：与主服务 browser_fingerprint.py 的取值保持一致。Broker 是持有 Docker
+# Socket 的安全边界，这里独立复核，确保 CHROME_CLI 中不会出现空白、引号或额外参数。
+WORKER_PLATFORMS = frozenset({"auto", "windows", "macos", "linux"})
+WORKER_BRANDS = frozenset({"", "Chrome", "Edge", "Opera", "Vivaldi"})
+WORKER_SPOOFING_SWITCHES = ("font", "audio", "canvas", "clientrects", "gpu")
+WORKER_HARDWARE_CONCURRENCY = frozenset({0, 2, 4, 6, 8, 10, 12, 16, 20, 24, 32})
+WORKER_VERSION_PATTERN = re.compile(r"\d{1,4}(?:\.\d{1,6}){0,3}")
+WORKER_WINDOW_SIZE_PATTERN = re.compile(r"(\d{3,4})x(\d{3,4})")
+WORKER_EXTENSION_ID_PATTERN = re.compile(r"[a-f0-9]{16}")
+WORKER_START_URL_PATTERN = re.compile(r"https?://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]{1,2040}")
+WORKER_PROFILE_MOUNT = "/config/browser-profile"
+
+
+def _validate_worker_fingerprint(payload: dict[str, Any]) -> dict[str, Any]:
+    platform = str(payload.get("platform") or "auto")
+    if platform not in WORKER_PLATFORMS:
+        raise BrokerError("远程浏览器平台参数无效")
+    brand = str(payload.get("brand") or "")
+    if brand not in WORKER_BRANDS:
+        raise BrokerError("远程浏览器品牌参数无效")
+    values: dict[str, Any] = {"platform": "linux" if platform == "auto" else platform, "brand": brand}
+    for key in ("platform_version", "brand_version"):
+        text = str(payload.get(key) or "")
+        if text and WORKER_VERSION_PATTERN.fullmatch(text) is None:
+            raise BrokerError(f"远程浏览器 {key} 参数无效")
+        values[key] = text
+    if not brand:
+        values["brand_version"] = ""
+    concurrency = payload.get("hardware_concurrency") or 0
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency not in WORKER_HARDWARE_CONCURRENCY:
+        raise BrokerError("远程浏览器 CPU 核心数参数无效")
+    values["hardware_concurrency"] = concurrency
+    raw_spoofing = payload.get("disable_spoofing") or []
+    if not isinstance(raw_spoofing, list) or any(item not in WORKER_SPOOFING_SWITCHES for item in raw_spoofing):
+        raise BrokerError("远程浏览器关闭伪装项参数无效")
+    values["disable_spoofing"] = [item for item in WORKER_SPOOFING_SWITCHES if item in raw_spoofing]
+    window_size = str(payload.get("window_size") or "")
+    match = WORKER_WINDOW_SIZE_PATTERN.fullmatch(window_size) if window_size else None
+    if window_size and (
+        match is None or not (640 <= int(match.group(1)) <= 7680 and 480 <= int(match.group(2)) <= 4320)
+    ):
+        raise BrokerError("远程浏览器窗口尺寸参数无效")
+    values["window_size"] = window_size
+    raw_extensions = payload.get("extension_ids") or []
+    if (
+        not isinstance(raw_extensions, list)
+        or len(raw_extensions) > 20
+        or any(not isinstance(item, str) or WORKER_EXTENSION_ID_PATTERN.fullmatch(item) is None for item in raw_extensions)
+    ):
+        raise BrokerError("远程浏览器扩展参数无效")
+    values["extension_ids"] = list(dict.fromkeys(raw_extensions))
+    raw_urls = payload.get("start_urls") or []
+    if (
+        not isinstance(raw_urls, list)
+        or len(raw_urls) > 10
+        or any(not isinstance(item, str) or WORKER_START_URL_PATTERN.fullmatch(item) is None for item in raw_urls)
+    ):
+        raise BrokerError("远程浏览器启动网址参数无效")
+    values["start_urls"] = list(dict.fromkeys(raw_urls))
+    return values
+
+
+def _worker_fingerprint_switches(values: dict[str, Any]) -> list[str]:
+    switches = [
+        f"--fingerprint={values['fingerprint_seed']}",
+        f"--fingerprint-platform={values.get('platform') or 'linux'}",
+    ]
+    if values.get("platform_version"):
+        switches.append(f"--fingerprint-platform-version={values['platform_version']}")
+    if values.get("brand"):
+        switches.append(f"--fingerprint-brand={values['brand']}")
+        if values.get("brand_version"):
+            switches.append(f"--fingerprint-brand-version={values['brand_version']}")
+    if values.get("hardware_concurrency"):
+        switches.append(f"--fingerprint-hardware-concurrency={values['hardware_concurrency']}")
+    if values.get("disable_spoofing"):
+        switches.append("--disable-spoofing=" + ",".join(values["disable_spoofing"]))
+    switches.extend(
+        [
+            f"--timezone={values['timezone']}",
+            f"--lang={values['language']}",
+            f"--accept-lang={values['accept_language']}",
+        ]
+    )
+    if values.get("window_size"):
+        width, height = values["window_size"].split("x", 1)
+        switches.append(f"--window-size={width},{height}")
+    if values.get("extension_ids"):
+        # 扩展由主服务复制到 Profile 内 ProxyBridgeExtensions/<ID>/，随 Profile 挂载进 worker。
+        switches.append(
+            "--load-extension="
+            + ",".join(f"{WORKER_PROFILE_MOUNT}/ProxyBridgeExtensions/{item}" for item in values["extension_ids"])
+        )
+    return switches
+
+
 def _validate_start_payload(payload: dict[str, Any]) -> dict[str, Any]:
     instance_id = str(payload.get("instance_id") or "")
     if INSTANCE_ID_PATTERN.fullmatch(instance_id) is None:
@@ -542,6 +638,7 @@ def _validate_start_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "language": language,
         "accept_language": accept_language,
         "timezone": timezone,
+        **_validate_worker_fingerprint(payload),
     }
 
 
@@ -1122,16 +1219,12 @@ class BrowserWorkerBroker:
         cli = " ".join(
             (
                 f"--proxy-server=socks5://{self.config.proxy_host}:{values['proxy_port']}",
-                "--user-data-dir=/config/browser-profile",
-                f"--fingerprint={values['fingerprint_seed']}",
-                "--fingerprint-platform=linux",
-                f"--timezone={values['timezone']}",
-                f"--lang={values['language']}",
-                f"--accept-lang={values['accept_language']}",
+                f"--user-data-dir={WORKER_PROFILE_MOUNT}",
+                *_worker_fingerprint_switches(values),
                 "--webrtc-ip-handling-policy=disable_non_proxied_udp",
                 "--no-first-run",
                 "--no-default-browser-check",
-                "https://ip.skk.moe/",
+                *(values.get("start_urls") or ["https://ip.skk.moe/"]),
             )
         )
         return {

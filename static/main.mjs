@@ -2,6 +2,7 @@
 import "./auth.js";
 import "./diagnostics.js";
 import "./browser-ui.js";
+import "./browser-config.js";
 import "./core-upload.js";
 import "./ui-core.js";
 import "./i18n.js";

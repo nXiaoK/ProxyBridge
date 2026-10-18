@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import browser_fingerprint
 import webdav_sync
 from proxybridge_version import VERSION as APP_VERSION
 from remote_browser import RemoteBrowserBrokerClient, RemoteBrowserError
@@ -239,6 +240,9 @@ RUNTIME_LOG_PUMP_TABLE: dict[str, threading.Thread] = {}
 # 兼容旧的节点级浏览器进程表;新的多开浏览器以 BROWSER_PROCESS_TABLE 按实例记录。
 BROWSER_TABLE: dict[str, list[subprocess.Popen]] = {}
 BROWSER_PROCESS_TABLE: dict[str, subprocess.Popen] = {}
+# 本机浏览器最近一次启动命令（仅内存）：未开启 CDP 时「打开网址」复用完整参数交给
+# Chromium 单实例转发，即使原进程恰好退出，新进程也仍带代理与指纹参数。
+BROWSER_LAUNCH_COMMANDS: dict[str, list[str]] = {}
 LOG_PROXY_TABLE: dict[str, "Socks5LogProxy"] = {}
 TRAFFIC_TABLE: dict[str, dict[str, int]] = {}
 REQUEST_LOG_PENDING_UPDATES: dict[str, dict[str, Any]] = {}
@@ -298,6 +302,22 @@ SPEED_TEST_TARGET_COUNTER = 0
 CORE_AUTO_INSTALL_STARTED = threading.Event()
 FINGERPRINT_CHROMIUM_CACHE_TTL = 300.0
 FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checked_at": 0.0}
+# 节点出口 IP 查询缓存：键为节点 ID，值含时区/国家与单调时钟时间。启动前按出口匹配时区
+# 与语言时复用，避免批量启动时重复访问 ipwho.is；默认 10 分钟内有效。
+EXIT_LOCALE_CACHE_TTL = 600.0
+EXIT_LOCALE_CACHE: dict[str, dict[str, Any]] = {}
+EXIT_LOCALE_CACHE_LOCK = threading.Lock()
+# 扩展库上传/删除与 Profile 内扩展副本同步共用一把锁，防止并发复制半成品目录。
+BROWSER_EXTENSION_LOCK = threading.RLock()
+# 扩展包上传上限 64 MiB；解压后的文件数与体积仍受通用归档限制约束。
+BROWSER_EXTENSION_UPLOAD_LIMIT = 64 * 1024 * 1024
+BROWSER_EXTENSION_UPLOAD_PATH = "/api/browser/extensions/upload"
+# 一键检测可打开的指纹检测站点；前端只显示这些固定目标。
+FINGERPRINT_CHECK_SITES = {
+    "browserscan": "https://www.browserscan.net/",
+    "pixelscan": "https://pixelscan.net/",
+    "creepjs": "https://abrahamjuliot.github.io/creepjs/",
+}
 LAN_ADDRESS_CACHE_TTL = 30.0
 LAN_ADDRESS_CACHE: dict[str, Any] = {"addresses": [], "checked_at": 0.0}
 PROXY_REBIND_RETRY_TIMEOUT = 1.0
@@ -1328,7 +1348,7 @@ def fingerprint_seed(node_id: str) -> int:
     return seed or 1
 
 
-def configure_browser_profile_defaults(profile_path: Path) -> None:
+def _read_profile_preferences(profile_path: Path) -> tuple[Path, dict[str, Any]]:
     default_dir = profile_path / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
     prefs_path = default_dir / "Preferences"
@@ -1341,11 +1361,30 @@ def configure_browser_profile_defaults(profile_path: Path) -> None:
                 prefs = loaded
         except Exception:
             prefs = {}
-    prefs["default_search_provider"] = dict(GOOGLE_SEARCH_PROVIDER)
+    return prefs_path, prefs
+
+
+def _write_profile_preferences(prefs_path: Path, prefs: dict[str, Any]) -> None:
     tmp = prefs_path.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(prefs, f, ensure_ascii=False, indent=2)
     tmp.replace(prefs_path)
+
+
+def configure_browser_profile_defaults(profile_path: Path) -> None:
+    prefs_path, prefs = _read_profile_preferences(profile_path)
+    prefs["default_search_provider"] = dict(GOOGLE_SEARCH_PROVIDER)
+    _write_profile_preferences(prefs_path, prefs)
+
+
+def apply_browser_profile_preferences(profile_path: Path, config: dict[str, Any]) -> None:
+    """写入记录级 Profile 偏好；目前是地理位置默认权限。"""
+    prefs_path, prefs = _read_profile_preferences(profile_path)
+    before = json.dumps(prefs, sort_keys=True)
+    # 地理位置默认权限：block 时写入禁止，避免系统/Wi-Fi 定位绕过代理暴露真实位置。
+    browser_fingerprint.apply_geolocation_preference(prefs, str(config.get("geolocation") or "ask"))
+    if json.dumps(prefs, sort_keys=True) != before:
+        _write_profile_preferences(prefs_path, prefs)
 
 
 def ensure_google_search_extension() -> Path:
@@ -1357,6 +1396,162 @@ def ensure_google_search_extension() -> Path:
         json.dump(GOOGLE_SEARCH_EXTENSION_MANIFEST, f, ensure_ascii=False, indent=2)
     tmp.replace(manifest_path)
     return extension_dir
+
+
+# 扩展库：上传的扩展解压到 browser_extensions/library/<扩展 ID>/，ID 取安装包 SHA-256 前 16 位。
+# 启动时把选中的扩展复制到 Profile 内 ProxyBridgeExtensions/<扩展 ID>/，随 Profile 一起同步，
+# Docker worker 也能通过已挂载的 Profile 路径加载。
+BROWSER_EXTENSION_METADATA_FILE = ".proxybridge-extension.json"
+PROFILE_EXTENSIONS_DIR = "ProxyBridgeExtensions"
+
+
+def browser_extension_library_root() -> Path:
+    return browser_extensions_root() / "library"
+
+
+def browser_extension_library() -> list[dict[str, Any]]:
+    root = browser_extension_library_root()
+    if not root.is_dir():
+        return []
+    items: list[dict[str, Any]] = []
+    for entry in root.iterdir():
+        if not entry.is_dir() or browser_fingerprint.EXTENSION_ID_PATTERN.fullmatch(entry.name) is None:
+            continue
+        if not (entry / "manifest.json").is_file():
+            continue
+        try:
+            metadata = json.loads((entry / BROWSER_EXTENSION_METADATA_FILE).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        items.append(
+            {
+                "id": entry.name,
+                "name": str(metadata.get("name") or entry.name)[:200],
+                "version": str(metadata.get("version") or "")[:64],
+                "filename": str(metadata.get("filename") or "")[:180],
+                "installed_at": safe_int(metadata.get("installed_at"), 0) or None,
+            }
+        )
+    return sorted(items, key=lambda item: (item["name"].lower(), item["id"]))
+
+
+def install_browser_extension_package(package_path: Path, filename: str, sha256: str) -> dict[str, Any]:
+    """校验并解压 .zip/.crx 扩展包到扩展库；同一安装包重复上传时直接返回已有条目。"""
+    require_browser_feature()
+    extension_id = sha256[:16]
+    library_root = browser_extension_library_root()
+    target = library_root / extension_id
+    with BROWSER_EXTENSION_LOCK:
+        if (target / "manifest.json").is_file():
+            existing = next((item for item in browser_extension_library() if item["id"] == extension_id), None)
+            return {"ok": True, "already_installed": True, "extension": existing}
+        library_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        staging = library_root / f".install-{secrets.token_hex(6)}"
+        staging.mkdir(mode=0o700)
+        try:
+            with package_path.open("rb") as handle:
+                header = handle.read(16)
+                offset = browser_fingerprint.crx_zip_offset(header)
+                zip_path = staging / "package.zip"
+                handle.seek(offset)
+                with zip_path.open("wb") as output:
+                    shutil.copyfileobj(handle, output, 1024 * 1024)
+            extract_root = staging / "extract"
+            extract_root.mkdir()
+            try:
+                _safe_extract_zip(zip_path, extract_root)
+            except zipfile.BadZipFile as exc:
+                raise ValueError("扩展包不是有效的 zip 或 crx 文件") from exc
+            zip_path.unlink(missing_ok=True)
+            extension_root = extract_root
+            if not (extension_root / "manifest.json").is_file():
+                children = [child for child in extract_root.iterdir() if not child.name.startswith("__MACOSX")]
+                if len(children) == 1 and (children[0] / "manifest.json").is_file():
+                    extension_root = children[0]
+            # macOS 压缩包会附带 __MACOSX/；Chromium 拒绝加载含下划线开头目录的解压扩展。
+            shutil.rmtree(extension_root / "__MACOSX", ignore_errors=True)
+            manifest = browser_fingerprint.read_extension_manifest(extension_root)
+            metadata = {
+                "id": extension_id,
+                "name": manifest["name"],
+                "version": manifest["version"],
+                "filename": filename,
+                "sha256": sha256,
+                "installed_at": now_ts(),
+            }
+            (extension_root / BROWSER_EXTENSION_METADATA_FILE).write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            extension_root.replace(target)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    return {
+        "ok": True,
+        "already_installed": False,
+        "extension": next((item for item in browser_extension_library() if item["id"] == extension_id), None),
+    }
+
+
+def delete_browser_extension(payload: dict[str, Any]) -> dict[str, Any]:
+    """从扩展库删除扩展，并从所有浏览器记录的扩展列表中移除；Profile 内副本在下次启动时清理。"""
+    require_browser_feature()
+    extension_id = str(payload.get("id") or "").strip().lower()
+    if browser_fingerprint.EXTENSION_ID_PATTERN.fullmatch(extension_id) is None:
+        raise ValueError("扩展 ID 无效")
+    with BROWSER_EXTENSION_LOCK:
+        target = browser_extension_library_root() / extension_id
+        if not target.is_dir():
+            raise ValueError("扩展不存在")
+        shutil.rmtree(target)
+    changed = False
+    with STATE_LOCK:
+        state = load_state()
+        for instance in state.get("browser_instances", []):
+            if extension_id in (instance.get("extensions") or []):
+                instance["extensions"] = [item for item in instance["extensions"] if item != extension_id]
+                changed = True
+        if changed:
+            save_state(state)
+    if changed:
+        _push_browser_change("删除浏览器扩展")
+    return {"ok": True, "deleted": extension_id, "extensions": browser_extension_library()}
+
+
+def sync_profile_extensions(profile_path: Path, extension_ids: list[str]) -> list[str]:
+    """把选中的扩展同步到 Profile 内并返回可加载的扩展 ID；库中缺失但 Profile 已有副本时继续使用副本。"""
+    profile_root = profile_path / PROFILE_EXTENSIONS_DIR
+    library_root = browser_extension_library_root()
+    selected = [item for item in extension_ids if browser_fingerprint.EXTENSION_ID_PATTERN.fullmatch(item)]
+    usable: list[str] = []
+    with BROWSER_EXTENSION_LOCK:
+        if profile_root.is_dir():
+            for child in profile_root.iterdir():
+                if child.name not in selected:
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+        for extension_id in selected:
+            source = library_root / extension_id
+            destination = profile_root / extension_id
+            if (source / "manifest.json").is_file():
+                if not (destination / BROWSER_EXTENSION_METADATA_FILE).is_file():
+                    profile_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    staged = profile_root / f".{extension_id}.copy-{secrets.token_hex(4)}"
+                    try:
+                        shutil.copytree(source, staged, symlinks=False)
+                        if destination.exists():
+                            shutil.rmtree(destination, ignore_errors=True)
+                        staged.replace(destination)
+                    finally:
+                        shutil.rmtree(staged, ignore_errors=True)
+            if (destination / "manifest.json").is_file():
+                usable.append(extension_id)
+            else:
+                log_event(f"扩展 {extension_id} 已不在扩展库中，启动时跳过", level="warn", category="浏览器")
+    return usable
 
 
 def browser_node_profile_root(node_id: str) -> Path:
@@ -1443,7 +1638,29 @@ def normalize_browser_label(value: Any) -> str:
     return text
 
 
-def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[str, Any]:
+def default_browser_instance_options() -> dict[str, Any]:
+    """新建记录的可编辑字段默认值；旧记录缺少这些字段时由 normalize 补成升级前的等效值。"""
+    return {
+        # 自由分组名，用于浏览器页筛选与批量操作，最长 40 字。
+        "group": "",
+        # 指纹参数，字段含义见 browser_fingerprint.FINGERPRINT_FIELDS。
+        "fingerprint": browser_fingerprint.recommended_fingerprint_config(),
+        # 固定内核版本 ID；空字符串表示跟随「内核管理」中的默认版本。
+        "kernel_version": "",
+        # 是否开放本机 CDP 调试端口（127.0.0.1 随机端口），用于 Cookie 导入导出与自动化。
+        "cdp_enabled": False,
+        # 扩展库中的扩展 ID 列表，启动时复制到 Profile 内并加载。
+        "extensions": [],
+        # 每次启动打开的网址；为空时沿用首次打开出口检测页、之后打开空白页的旧行为。
+        "start_urls": [],
+    }
+
+
+def create_browser_instance_record(
+    state: dict[str, Any],
+    node_id: str,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     existing_ids = {str(item.get("id") or "") for item in state.get("browser_instances", [])}
     instance_id = new_browser_instance_id(node_id)
     while instance_id in existing_ids:
@@ -1476,6 +1693,8 @@ def create_browser_instance_record(state: dict[str, Any], node_id: str) -> dict[
         # Chromium Profile 在桌面进程与 Docker worker 间保持同一布局；Selkies
         # TLS/认证运行文件由 worker 匿名卷承载，不写入这个同步目录。
         "profile_layout": "native-v1",
+        **default_browser_instance_options(),
+        **(options or {}),
     }
 
 
@@ -1547,6 +1766,41 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
         )
         # Prefer explicit label; accept legacy "tag" key if present.
         label = normalize_browser_label(record.get("label") if "label" in record else record.get("tag"))
+        # 缺少 fingerprint 字段的是升级前创建的记录：按旧启动参数补齐，避免指纹悄然变化。
+        fingerprint_fallback = (
+            browser_fingerprint.legacy_fingerprint_config()
+            if not isinstance(raw.get("fingerprint"), dict)
+            else browser_fingerprint.recommended_fingerprint_config()
+        )
+        active = status in ACTIVE_BROWSER_STATUSES
+        cdp_port = safe_int(record.get("cdp_port"), 0)
+        cdp_ws_path = str(record.get("cdp_ws_path") or "")
+        if (
+            not active
+            or remote_worker
+            or not 1024 <= cdp_port <= 65535
+            or re.fullmatch(r"/devtools/browser/[A-Za-z0-9-]{8,64}", cdp_ws_path) is None
+        ):
+            cdp_port, cdp_ws_path = 0, ""
+        record.update(
+            {
+                "group": browser_fingerprint.normalize_group(record.get("group")),
+                "fingerprint": browser_fingerprint.normalize_fingerprint_config(
+                    record.get("fingerprint"), fingerprint_fallback
+                ),
+                "kernel_version": browser_fingerprint.normalize_kernel_id(
+                    record.get("kernel_version"), strict=False
+                ),
+                "cdp_enabled": record.get("cdp_enabled") is True,
+                "extensions": browser_fingerprint.normalize_extension_ids(record.get("extensions"), strict=False),
+                "start_urls": browser_fingerprint.normalize_start_urls(record.get("start_urls"), strict=False),
+                # 以下为运行期信息：调试端口、实际内核、生效的时区语言，停止后清空。
+                "cdp_port": cdp_port or None,
+                "cdp_ws_path": cdp_ws_path,
+                "runtime_kernel": str(record.get("runtime_kernel") or "") if active else "",
+                "runtime_locale": record.get("runtime_locale") if active and isinstance(record.get("runtime_locale"), dict) else {},
+            }
+        )
         record.update(
             {
                 "id": instance_id,
@@ -1586,28 +1840,278 @@ def normalize_browser_instances(state: dict[str, Any]) -> None:
     ensure_legacy_browser_instances(state)
 
 
-def update_browser_instance(payload: dict[str, Any]) -> dict[str, Any]:
-    """Update editable fields on a browser instance (currently: label)."""
-    require_browser_feature()
-    instance_id = str(payload.get("instance_id") or payload.get("id") or "")
-    if not instance_id:
+def validate_browser_options_patch(
+    payload: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    batch: bool = False,
+) -> dict[str, Any]:
+    """严格校验浏览器记录的可编辑字段，只返回本次提交涉及的字段。"""
+    patch: dict[str, Any] = {}
+    if "label" in payload or "tag" in payload:
+        patch["label"] = normalize_browser_label(payload.get("label") if "label" in payload else payload.get("tag"))
+    if "name" in payload:
+        if batch:
+            raise ValueError("批量编辑不能修改名称")
+        name = browser_fingerprint.normalize_name(payload.get("name"))
+        if not name:
+            raise ValueError("名称不能为空")
+        patch["name"] = name
+    if "group" in payload:
+        patch["group"] = browser_fingerprint.normalize_group(payload.get("group"))
+    if "fingerprint" in payload:
+        patch["fingerprint"] = browser_fingerprint.validate_fingerprint_patch(
+            payload.get("fingerprint"),
+            base=current.get("fingerprint") if isinstance(current.get("fingerprint"), dict) else None,
+        )
+    if "kernel_version" in payload:
+        kernel_id = browser_fingerprint.normalize_kernel_id(payload.get("kernel_version"), strict=True)
+        if kernel_id and kernel_id != current.get("kernel_version") and kernel_id not in fingerprint_kernel_ids():
+            raise ValueError(f"指纹内核版本 {kernel_id} 未安装")
+        patch["kernel_version"] = kernel_id
+    if "cdp_enabled" in payload:
+        if not isinstance(payload.get("cdp_enabled"), bool):
+            raise ValueError("cdp_enabled 必须是布尔值")
+        if payload["cdp_enabled"] and remote_browser_feature_enabled():
+            raise ValueError("Docker 远程浏览器暂不支持 CDP 调试端口")
+        patch["cdp_enabled"] = payload["cdp_enabled"]
+    if "extensions" in payload:
+        extension_ids = browser_fingerprint.normalize_extension_ids(payload.get("extensions"), strict=True)
+        known = {item["id"] for item in browser_extension_library()} | set(current.get("extensions") or [])
+        missing = [item for item in extension_ids if item not in known]
+        if missing:
+            raise ValueError(f"扩展 {missing[0]} 不在扩展库中")
+        patch["extensions"] = extension_ids
+    if "start_urls" in payload:
+        patch["start_urls"] = browser_fingerprint.normalize_start_urls(payload.get("start_urls"), strict=True)
+    return patch
+
+
+def _requested_browser_instance_ids(payload: dict[str, Any]) -> list[str]:
+    raw_ids = payload.get("instance_ids")
+    if raw_ids is None:
+        single = str(payload.get("instance_id") or payload.get("id") or "")
+        raw_ids = [single] if single else []
+    if not isinstance(raw_ids, list) or not raw_ids:
         raise ValueError("缺少浏览器实例 ID")
-    if "label" not in payload and "tag" not in payload:
-        raise ValueError("没有可更新的字段")
-    label = normalize_browser_label(payload.get("label") if "label" in payload else payload.get("tag"))
-    with STATE_LOCK:
-        state = load_state()
-        instance = find_browser_instance(state, instance_id)
-        instance["label"] = label
-        save_state(state)
-        saved = dict(instance)
+    if len(raw_ids) > 500:
+        raise ValueError("单次最多操作 500 条浏览器记录")
+    result: list[str] = []
+    for item in raw_ids:
+        instance_id = str(item or "")
+        if not instance_id:
+            raise ValueError("浏览器实例 ID 无效")
+        if instance_id not in result:
+            result.append(instance_id)
+    return result
+
+
+def _browser_instance_live(instance: dict[str, Any]) -> bool:
+    if instance.get("status") in ACTIVE_BROWSER_STATUSES:
+        return True
+    with PROCESS_LOCK:
+        process = BROWSER_PROCESS_TABLE.get(str(instance.get("id") or ""))
+        return process is not None and process.poll() is None
+
+
+def _push_browser_change(reason: str) -> None:
     mark_sync_local_change()
-    # Push label to WebDAV when sync is enabled so other machines see the tag soon.
+    # WebDAV 已启用时尽快上传，其他设备可及时看到配置变化。
     try:
-        get_sync_engine().maybe_auto_push(reason="更新浏览器标签")
+        get_sync_engine().maybe_auto_push(reason=reason)
     except Exception:
         pass
-    return {"ok": True, "instance": saved}
+
+
+def update_browser_instance(payload: dict[str, Any]) -> dict[str, Any]:
+    """更新一条或多条浏览器记录的可编辑字段；运行中的记录在下次启动时生效。"""
+    require_browser_feature()
+    instance_ids = _requested_browser_instance_ids(payload)
+    batch = "instance_ids" in payload
+    editable = {"label", "tag", "name", "group", "fingerprint", "kernel_version", "cdp_enabled", "extensions", "start_urls"}
+    if not editable & set(payload):
+        raise ValueError("没有可更新的字段")
+    saved: list[dict[str, Any]] = []
+    restart_required = False
+    with STATE_LOCK:
+        state = load_state()
+        instances = [find_browser_instance(state, instance_id) for instance_id in instance_ids]
+        patches = [validate_browser_options_patch(payload, instance, batch=batch) for instance in instances]
+        for instance, patch in zip(instances, patches):
+            changed_runtime = any(key not in {"label", "name", "group"} for key in patch)
+            if changed_runtime and instance.get("status") in ACTIVE_BROWSER_STATUSES:
+                restart_required = True
+            instance.update(patch)
+            saved.append(dict(instance))
+        save_state(state)
+    _push_browser_change("更新浏览器配置")
+    result: dict[str, Any] = {"ok": True, "updated": len(saved), "restart_required": restart_required}
+    if batch:
+        result["instances"] = saved
+    else:
+        result["instance"] = saved[0]
+    return result
+
+
+def create_browser_instances(payload: dict[str, Any]) -> dict[str, Any]:
+    """为节点批量新建浏览器记录（不启动）。Profile 目录在首次启动时创建。"""
+    require_browser_feature()
+    node_id = str(payload.get("node_id") or "")
+    if not node_id:
+        raise ValueError("缺少节点 ID")
+    count = safe_int(payload.get("count"), 1)
+    if not 1 <= count <= 50:
+        raise ValueError("单次可新建 1–50 条浏览器记录")
+    with BROWSER_LAUNCH_LOCK:
+        with STATE_LOCK:
+            state = load_state()
+            find_node(state, node_id)
+            base = default_browser_instance_options()
+            options_patch = validate_browser_options_patch(payload, base, batch=count > 1)
+            created: list[dict[str, Any]] = []
+            for _ in range(count):
+                record = create_browser_instance_record(state, node_id, {**base, **options_patch})
+                if count > 1 or "name" not in options_patch:
+                    record["name"] = next_browser_instance_name(state, node_id)
+                state["browser_instances"].append(record)
+                created.append(dict(record))
+            save_state(state)
+    _push_browser_change("新建浏览器记录")
+    return {"ok": True, "created": len(created), "instances": created}
+
+
+def _remote_sessions_for_browser_edit() -> Any:
+    if not remote_browser_feature_enabled():
+        return REMOTE_BROWSER_SESSIONS_UNSET
+    sessions, broker_error = remote_browser_sessions(force=True)
+    if sessions is None:
+        raise RuntimeError(f"无法确认远程浏览器是否已停止：{broker_error or 'Broker 不可用'}")
+    return sessions
+
+
+def regenerate_browser_fingerprints(payload: dict[str, Any]) -> dict[str, Any]:
+    """为已停止的记录生成新的随机指纹种子；已登录网站会把它视为新设备。"""
+    require_browser_feature()
+    instance_ids = _requested_browser_instance_ids(payload)
+    sessions = _remote_sessions_for_browser_edit()
+    with BROWSER_LAUNCH_LOCK:
+        with STATE_LOCK:
+            state = load_state()
+            if sync_browser_instance_status(state, remote_sessions_snapshot=sessions):
+                save_state(state)
+            instances = [find_browser_instance(state, instance_id) for instance_id in instance_ids]
+            running = [item for item in instances if _browser_instance_live(item)]
+            if running:
+                raise ValueError(f"请先停止「{running[0].get('name') or '浏览器'}」再重新生成指纹")
+            for instance in instances:
+                old_seed = safe_int(instance.get("fingerprint_seed"), 0)
+                seed = old_seed
+                while seed == old_seed:
+                    seed = secrets.randbelow(0x7FFFFFFE) + 1
+                instance["fingerprint_seed"] = seed
+            saved = [dict(item) for item in instances]
+            save_state(state)
+    _push_browser_change("重新生成浏览器指纹")
+    return {"ok": True, "updated": len(saved), "instances": saved}
+
+
+def prune_preserved_browser_nodes(state: dict[str, Any]) -> list[str]:
+    """移除不再被任何浏览器记录引用的保留节点（订阅中已不存在，仅为浏览器保留）。"""
+    referenced = {
+        str(item.get("node_id") or "")
+        for item in state.get("browser_instances", [])
+        if isinstance(item, dict)
+    }
+    removed: list[str] = []
+    retained: list[dict[str, Any]] = []
+    for node in state.get("nodes", []):
+        node_id = str(node.get("id") or "")
+        if node.get(webdav_sync.LOCAL_BROWSER_NODE_MARKER) is True and node_id not in referenced:
+            removed.append(node_id)
+            continue
+        retained.append(node)
+    if removed:
+        state["nodes"] = retained
+        for node_id in removed:
+            state.get("tests", {}).pop(node_id, None)
+            state.get("test_history", {}).pop(node_id, None)
+    return removed
+
+
+def rebind_browser_instances(payload: dict[str, Any]) -> dict[str, Any]:
+    """把已停止的浏览器记录换绑到另一个节点，并移动 Profile 目录；指纹种子保持不变。"""
+    require_browser_feature()
+    instance_ids = _requested_browser_instance_ids(payload)
+    target_node_id = str(payload.get("node_id") or "")
+    if not target_node_id:
+        raise ValueError("缺少目标节点 ID")
+    sessions = _remote_sessions_for_browser_edit()
+    moved: list[tuple[Path, Path]] = []
+    with BROWSER_LAUNCH_LOCK:
+        with SHUTDOWN_LOCK:
+            if SHUTTING_DOWN.is_set():
+                raise RuntimeError("程序正在退出，不能换绑浏览器")
+            with STATE_LOCK:
+                state = load_state()
+                if sync_browser_instance_status(state, remote_sessions_snapshot=sessions):
+                    save_state(state)
+                target = find_node(state, target_node_id)
+                if target.get(webdav_sync.LOCAL_BROWSER_NODE_MARKER) is True:
+                    raise ValueError("目标节点已从订阅中移除，请选择当前订阅中的节点")
+                instances = [find_browser_instance(state, instance_id) for instance_id in instance_ids]
+                for instance in instances:
+                    if _browser_instance_live(instance):
+                        raise ValueError(f"请先停止「{instance.get('name') or '浏览器'}」再换绑节点")
+                    if instance.get("legacy"):
+                        raise ValueError("早期的默认浏览器记录不支持换绑，请新建记录")
+                try:
+                    for instance in instances:
+                        old_node_id = str(instance.get("node_id") or "")
+                        if old_node_id == target_node_id:
+                            continue
+                        instance_id = str(instance["id"])
+                        source = browser_instance_profile_path(old_node_id, instance_id)
+                        destination = browser_instance_profile_path(target_node_id, instance_id)
+                        if destination.exists():
+                            raise RuntimeError(f"目标节点下已存在同名 Profile 目录：{destination}")
+                        if source.exists():
+                            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            source.replace(destination)
+                            moved.append((destination, source))
+                            try:
+                                source.parent.rmdir()
+                            except OSError:
+                                pass
+                        instance.update(
+                            {
+                                "node_id": target_node_id,
+                                "profile_path": str(destination),
+                                "bridge_id": None,
+                                "proxy": "",
+                            }
+                        )
+                        instance.pop("exit_check", None)
+                        instance.pop("error", None)
+                    pruned = prune_preserved_browser_nodes(state)
+                    save_state(state)
+                except BaseException:
+                    # 状态未提交时把已移动的目录放回原处，保证记录与 Profile 位置一致。
+                    for destination, source in reversed(moved):
+                        try:
+                            source.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                            destination.replace(source)
+                        except OSError:
+                            log_event(f"回滚 Profile 移动失败：{destination}", level="warn", category="浏览器")
+                    raise
+                saved = [dict(item) for item in instances]
+    _push_browser_change("换绑浏览器节点")
+    return {
+        "ok": True,
+        "updated": len(saved),
+        "node_id": target_node_id,
+        "instances": saved,
+        "removed_preserved_node_ids": pruned,
+    }
 
 
 def ensure_legacy_browser_instances(state: dict[str, Any]) -> None:
@@ -1639,6 +2143,9 @@ def ensure_legacy_browser_instances(state: dict[str, Any]) -> None:
                 "proxy": "",
                 "launch_count": 0,
                 "legacy": True,
+                **default_browser_instance_options(),
+                # 早期默认浏览器沿用升级前的指纹参数。
+                "fingerprint": browser_fingerprint.legacy_fingerprint_config(),
             }
         )
         existing_ids.add(instance_id)
@@ -2571,6 +3078,8 @@ def public_node(node: dict[str, Any]) -> dict[str, Any]:
         "fallback_core": next((core for core in options if core != node.get("preferred_core")), None),
         "core_options": options,
         "has_secret": bool(settings.get("password") or settings.get("uuid")),
+        # 订阅中已不存在、仅因浏览器记录引用而保留的节点；界面提示换绑，代理池不再使用。
+        "browser_preserved": node.get(webdav_sync.LOCAL_BROWSER_NODE_MARKER) is True,
     }
 
 
@@ -3384,9 +3893,23 @@ def _bundle_executable(app_dir: Path) -> Path | None:
     return None
 
 
+# 多版本指纹内核：每个版本安装在 fingerprint-chromium/versions/<内核 ID>/，
+# 该目录下的 .proxybridge-kernel.json 记录版本、来源与可执行文件相对路径。
+# 升级前直接装在 fingerprint-chromium/ 下的内核视为 ID「legacy」继续可用。
+FINGERPRINT_KERNEL_METADATA_FILE = ".proxybridge-kernel.json"
+# 设备本地的默认内核选择（JSON：{"id": "<内核 ID>"}；空 ID 表示自动选择最新版本），不参与 WebDAV 同步。
+FINGERPRINT_DEFAULT_KERNEL_FILE = ".proxybridge-default-kernel.json"
+FINGERPRINT_KERNEL_LIST_CACHE: dict[str, Any] = {"key": None, "kernels": None, "checked_at": 0.0}
+
+
+def fingerprint_kernel_versions_root() -> Path:
+    return fingerprint_chromium_root() / "versions"
+
+
 def invalidate_fingerprint_chromium_cache() -> None:
     with PATH_CACHE_LOCK:
         FINGERPRINT_CHROMIUM_CACHE.update({"key": None, "path": None, "checked_at": 0.0})
+        FINGERPRINT_KERNEL_LIST_CACHE.update({"key": None, "kernels": None, "checked_at": 0.0})
 
 
 def _fingerprint_chromium_cache_key() -> tuple[str | None, str, str]:
@@ -3431,21 +3954,22 @@ def _resolve_fingerprint_executable_in_root(root: Path) -> str | None:
     return None
 
 
-def _resolve_fingerprint_chromium_path() -> str | None:
-    # 定位指纹内核可执行文件。优先级:环境变量 > 工作目录安装位 > 系统 Applications。
-    # 指纹内核必须是打过补丁的 Chromium(而非本机 Google Chrome),否则无法在底层伪造指纹。
-    env_path = os.environ.get("PROXY_BRIDGE_FP_CHROMIUM")
-    if env_path:
-        resolved = _resolve_fingerprint_executable_in_root(Path(env_path).expanduser())
-        if resolved:
-            return resolved
-
-    # 下载器会把内核安装到工作目录下,这里允许递归查找以兼容 dmg/zip 内部层级。
-    install_root = fingerprint_chromium_root()
-    resolved = _resolve_fingerprint_executable_in_root(install_root)
-    if resolved:
-        return resolved
-
+def _resolve_legacy_fingerprint_executable() -> str | None:
+    # 升级前的安装位直接位于 fingerprint-chromium/ 下；跳过 versions/ 与安装临时目录。
+    root = fingerprint_chromium_root()
+    if root.is_dir():
+        preferred = [root / "Chromium.app", root / "chromium"]
+        others = sorted(
+            child
+            for child in root.iterdir()
+            if child not in preferred and child.name != "versions" and not child.name.startswith((".", "_"))
+        )
+        for child in [*preferred, *others]:
+            if not child.exists() or (child.is_file() and not _is_executable_file(child)):
+                continue
+            resolved = _resolve_fingerprint_executable_in_root(child)
+            if resolved:
+                return resolved
     # 系统应用目录只检查常见直接安装位置。递归扫描整个 /Applications 在状态轮询中代价太高。
     if host_os_token() == "darwin":
         for app_dir in (Path("/Applications/Chromium.app"), Path.home() / "Applications/Chromium.app"):
@@ -3455,7 +3979,169 @@ def _resolve_fingerprint_chromium_path() -> str | None:
     return None
 
 
-def fingerprint_chromium_path(force_refresh: bool = False) -> str | None:
+def _read_fingerprint_kernel_metadata(kernel_dir: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads((kernel_dir / FINGERPRINT_KERNEL_METADATA_FILE).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _versioned_fingerprint_executable(kernel_dir: Path, metadata: dict[str, Any]) -> str | None:
+    relative = str(metadata.get("executable") or "")
+    if relative:
+        candidate = (kernel_dir / relative).resolve()
+        try:
+            candidate.relative_to(kernel_dir.resolve())
+        except ValueError:
+            return None
+        return str(candidate) if _is_executable_file(candidate) else None
+    # 元数据缺失时退回浅层查找；不做递归扫描，避免状态轮询遍历整个内核目录。
+    for child in (kernel_dir / "Chromium.app", kernel_dir / "chromium"):
+        if child.suffix == ".app":
+            exe = _bundle_executable(child)
+            if exe:
+                return str(exe)
+        else:
+            for name in _fingerprint_binary_names():
+                if _is_executable_file(child / name):
+                    return str(child / name)
+    return None
+
+
+def _app_bundle_version(executable: str) -> str:
+    app_root = next((parent for parent in Path(executable).parents if parent.suffix == ".app"), None)
+    if app_root is None:
+        return ""
+    try:
+        import plistlib
+
+        with (app_root / "Contents" / "Info.plist").open("rb") as handle:
+            info = plistlib.load(handle)
+    except Exception:
+        return ""
+    return str(info.get("CFBundleShortVersionString") or "")[:40] if isinstance(info, dict) else ""
+
+
+def read_default_fingerprint_kernel_id() -> str:
+    try:
+        loaded = json.loads((fingerprint_chromium_root() / FINGERPRINT_DEFAULT_KERNEL_FILE).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(loaded, dict):
+        return ""
+    return browser_fingerprint.normalize_kernel_id(loaded.get("id"), strict=False)
+
+
+def _scan_fingerprint_kernels() -> list[dict[str, Any]]:
+    kernels: list[dict[str, Any]] = []
+    env_path = os.environ.get("PROXY_BRIDGE_FP_CHROMIUM")
+    if env_path:
+        resolved = _resolve_fingerprint_executable_in_root(Path(env_path).expanduser())
+        if resolved:
+            kernels.append(
+                {
+                    "id": "env",
+                    "version": _app_bundle_version(resolved),
+                    "label": "环境变量 PROXY_BRIDGE_FP_CHROMIUM",
+                    "path": resolved,
+                    "source": "env",
+                }
+            )
+    versions_root = fingerprint_kernel_versions_root()
+    versioned: list[dict[str, Any]] = []
+    if versions_root.is_dir():
+        for kernel_dir in versions_root.iterdir():
+            if not kernel_dir.is_dir() or browser_fingerprint.KERNEL_ID_PATTERN.fullmatch(kernel_dir.name) is None:
+                continue
+            if kernel_dir.name in {"env", "legacy"}:
+                continue
+            metadata = _read_fingerprint_kernel_metadata(kernel_dir)
+            executable = _versioned_fingerprint_executable(kernel_dir, metadata)
+            if not executable:
+                continue
+            versioned.append(
+                {
+                    "id": kernel_dir.name,
+                    "version": str(metadata.get("version") or "")[:40],
+                    "label": str(metadata.get("version") or kernel_dir.name)[:64],
+                    "path": executable,
+                    "source": str(metadata.get("source") or "")[:40],
+                    "asset": str(metadata.get("asset") or "")[:180],
+                    "installed_at": safe_int(metadata.get("installed_at"), 0) or None,
+                    "arch": str(metadata.get("arch") or "")[:20],
+                }
+            )
+    versioned.sort(
+        key=lambda item: (browser_fingerprint.version_sort_key(item["version"] or item["id"]), item["id"]),
+        reverse=True,
+    )
+    kernels.extend(versioned)
+    legacy = _resolve_legacy_fingerprint_executable()
+    if legacy:
+        kernels.append(
+            {
+                "id": "legacy",
+                "version": _app_bundle_version(legacy),
+                "label": "早期安装",
+                "path": legacy,
+                "source": "legacy",
+            }
+        )
+    return kernels
+
+
+def list_fingerprint_kernels(force_refresh: bool = False) -> list[dict[str, Any]]:
+    key = (*_fingerprint_chromium_cache_key(), read_default_fingerprint_kernel_id())
+    now = time.monotonic()
+    with PATH_CACHE_LOCK:
+        cached = FINGERPRINT_KERNEL_LIST_CACHE.get("kernels")
+        if (
+            not force_refresh
+            and cached is not None
+            and FINGERPRINT_KERNEL_LIST_CACHE.get("key") == key
+            and now - float(FINGERPRINT_KERNEL_LIST_CACHE.get("checked_at") or 0.0) < FINGERPRINT_CHROMIUM_CACHE_TTL
+            and all(Path(str(item.get("path") or "")).exists() for item in cached)
+        ):
+            kernels = [dict(item) for item in cached]
+        else:
+            kernels = _scan_fingerprint_kernels()
+            FINGERPRINT_KERNEL_LIST_CACHE.update({"key": key, "kernels": kernels, "checked_at": now})
+            kernels = [dict(item) for item in kernels]
+    default_id = _default_fingerprint_kernel_id(kernels)
+    for item in kernels:
+        item["default"] = item["id"] == default_id
+    return kernels
+
+
+def _default_fingerprint_kernel_id(kernels: list[dict[str, Any]]) -> str:
+    # 默认内核优先级：环境变量 > 用户设定的默认版本 > 最新已安装版本 > 早期安装。
+    ids = [str(item.get("id") or "") for item in kernels]
+    if "env" in ids:
+        return "env"
+    configured = read_default_fingerprint_kernel_id()
+    if configured and configured in ids:
+        return configured
+    return ids[0] if ids else ""
+
+
+def fingerprint_kernel_ids() -> set[str]:
+    return {str(item["id"]) for item in list_fingerprint_kernels()}
+
+
+def _resolve_fingerprint_chromium_path() -> str | None:
+    # 定位默认指纹内核可执行文件。优先级:环境变量 > 默认/最新版本 > 早期安装位 > 系统 Applications。
+    # 指纹内核必须是打过补丁的 Chromium(而非本机 Google Chrome),否则无法在底层伪造指纹。
+    kernels = list_fingerprint_kernels()
+    default_id = _default_fingerprint_kernel_id(kernels)
+    return next((str(item["path"]) for item in kernels if item["id"] == default_id), None)
+
+
+def fingerprint_chromium_path(force_refresh: bool = False, kernel_id: str | None = None) -> str | None:
+    if kernel_id:
+        # 指定版本不走默认路径缓存；版本列表本身已有缓存。
+        kernels = list_fingerprint_kernels(force_refresh=force_refresh)
+        return next((str(item["path"]) for item in kernels if item["id"] == kernel_id), None)
     key = _fingerprint_chromium_cache_key()
     now = time.monotonic()
     with PATH_CACHE_LOCK:
@@ -3468,10 +4154,33 @@ def fingerprint_chromium_path(force_refresh: bool = False) -> str | None:
         ):
             return str(cached_path) if cached_path else None
 
+        if force_refresh:
+            FINGERPRINT_KERNEL_LIST_CACHE.update({"key": None, "kernels": None, "checked_at": 0.0})
         resolved = _resolve_fingerprint_chromium_path()
         normalized = str(resolved) if resolved else None
         FINGERPRINT_CHROMIUM_CACHE.update({"key": key, "path": normalized, "checked_at": now})
         return normalized
+
+
+def resolve_browser_kernel(kernel_version: str) -> tuple[str, str]:
+    """返回 (内核 ID, 可执行路径)。固定版本缺失时报错而不是静默换内核，避免指纹漂移。"""
+    if kernel_version:
+        path = fingerprint_chromium_path(kernel_id=kernel_version)
+        if not path:
+            raise RuntimeError(
+                f"该浏览器固定使用指纹内核 {kernel_version}，但本机未安装。"
+                "请在「内核管理」安装该版本，或在浏览器配置中改为默认内核。"
+            )
+        return kernel_version, path
+    path = fingerprint_chromium_path()
+    if not path:
+        raise RuntimeError(
+            "未找到指纹内核 fingerprint-chromium。请点击「下载指纹内核」自动安装,"
+            "或手动下载后设置 PROXY_BRIDGE_FP_CHROMIUM 指向 Chromium 可执行文件。"
+        )
+    kernels = list_fingerprint_kernels()
+    kernel_id = next((str(item["id"]) for item in kernels if str(item["path"]) == path), "")
+    return kernel_id, path
 
 
 def allow_lan_access(state: dict[str, Any]) -> bool:
@@ -3886,11 +4595,17 @@ def _status_payload(
                 "browser_profile_sync": browser_enabled,
                 "remote_browser": remote_browser_enabled,
                 "browser_kernel_download": browser_enabled,
+                # CDP 调试端口、Cookie 导入导出与「在运行中的浏览器打开网址」仅本机浏览器支持。
+                "browser_cdp": browser_enabled and not remote_browser_enabled,
                 "docker": docker_enabled,
             },
             "cores": core_paths(),
             "chrome": chrome_path() if browser_enabled and not remote_browser_enabled else None,
             "fingerprint_chromium": fingerprint_chromium_path() if browser_enabled else None,
+            "fingerprint_kernels": list_fingerprint_kernels() if browser_enabled else [],
+            "fingerprint_default_kernel": read_default_fingerprint_kernel_id() if browser_enabled else "",
+            "browser_extensions": browser_extension_library() if browser_enabled else [],
+            "fingerprint_check_sites": dict(FINGERPRINT_CHECK_SITES) if browser_enabled else {},
             "remote_browser": remote_runtime,
             "active_browsers": active_browser_node_ids_from_state(state) if browser_enabled else [],
             "browser_instances": public_browser_instances(state) if browser_enabled else [],
@@ -5364,8 +6079,15 @@ def _apply_subscription_replacement(
     return set(remove_ids)
 
 
-def _browser_node_ids_to_preserve(state: dict[str, Any], node_ids: set[str]) -> set[str]:
-    if browser_feature_enabled():
+def _browser_node_ids_to_preserve(
+    state: dict[str, Any],
+    node_ids: set[str],
+    *,
+    purge_browser_records: bool = False,
+) -> set[str]:
+    # 订阅刷新改变节点 ID（机场改参数）时保留浏览器记录与 Profile，原节点标记为保留节点，
+    # 由用户换绑；只有手动删除订阅并明确勾选时才连同 Profile 一起删除。
+    if purge_browser_records and browser_feature_enabled():
         return set()
     candidates = {str(node_id) for node_id in node_ids if node_id}
     return {
@@ -5443,15 +6165,37 @@ def _stop_runtime_for_nodes(snapshot: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _mark_removed_nodes_stopped(state: dict[str, Any], node_ids: set[str], traffic_by_bridge: dict[str, dict[str, int]]) -> None:
+def _mark_removed_nodes_stopped(
+    state: dict[str, Any],
+    node_ids: set[str],
+    traffic_by_bridge: dict[str, dict[str, int]],
+    *,
+    preserved_node_ids: set[str] | None = None,
+) -> None:
     node_ids = {str(node_id) for node_id in node_ids if node_id}
+    preserved = {str(node_id) for node_id in (preserved_node_ids or set()) if node_id}
+    stopped_at = now_ts()
     if browser_feature_enabled():
+        removed = node_ids - preserved
         state["browser_instances"] = [
             item
             for item in state.get("browser_instances", [])
-            if not (isinstance(item, dict) and str(item.get("node_id") or "") in node_ids)
+            if not (isinstance(item, dict) and str(item.get("node_id") or "") in removed)
         ]
-    stopped_at = now_ts()
+        for item in state["browser_instances"]:
+            if str(item.get("node_id") or "") in preserved and item.get("status") in ACTIVE_BROWSER_STATUSES:
+                # 运行时清理已结束这些浏览器；记录保留，状态改为已停止。
+                item.update(
+                    {
+                        "status": "stopped",
+                        "pid": None,
+                        "remote_url": "",
+                        "remote_container_id": "",
+                        "remote_host_port": None,
+                        "last_stopped_at": stopped_at,
+                        "last_used_at": stopped_at,
+                    }
+                )
     for bridge in state.get("bridges", []):
         if not isinstance(bridge, dict) or str(bridge.get("node_id") or "") not in node_ids:
             continue
@@ -5659,10 +6403,21 @@ def import_subscription(payload: dict[str, Any], *, fetch_metadata: dict[str, An
                     node_dicts=node_dicts,
                     remove_ids=remove_ids,
                 )
-                _mark_removed_nodes_stopped(state, remove_ids, runtime_cleanup["traffic_by_bridge"])
+                preserved_node_ids = {
+                    str(node.get("id") or "")
+                    for node in state["nodes"]
+                    if str(node.get("id") or "") in remove_ids
+                }
+                _mark_removed_nodes_stopped(
+                    state,
+                    remove_ids,
+                    runtime_cleanup["traffic_by_bridge"],
+                    preserved_node_ids=preserved_node_ids,
+                )
                 save_state(state)
             release_persisted_bridge_traffic(runtime_cleanup["traffic_by_bridge"])
-        removed_profiles = _remove_profiles_for_nodes(remove_ids) if remove_ids and browser_feature_enabled() else 0
+        purge_ids = remove_ids - preserved_node_ids
+        removed_profiles = _remove_profiles_for_nodes(purge_ids) if purge_ids and browser_feature_enabled() else 0
     mark_sync_local_change()
     return {
         "subscription": subscription,
@@ -6120,7 +6875,7 @@ def start_subscription_scheduler() -> None:
         thread.start()
 
 
-def delete_subscription(subscription_id: str) -> dict[str, Any]:
+def delete_subscription(subscription_id: str, *, delete_browser_profiles: bool = False) -> dict[str, Any]:
     with SUBSCRIPTION_LOCK:
         with SHUTDOWN_LOCK:
             _ensure_subscription_refresh_allowed()
@@ -6152,7 +6907,11 @@ def delete_subscription(subscription_id: str) -> dict[str, Any]:
                     for node_id in (set(subscription.get("node_ids") or []) - referenced_node_ids(state["subscriptions"]))
                     if node_id
                 }
-                preserved_browser_node_ids = _browser_node_ids_to_preserve(state, current_remove_ids)
+                preserved_browser_node_ids = _browser_node_ids_to_preserve(
+                    state,
+                    current_remove_ids,
+                    purge_browser_records=delete_browser_profiles,
+                )
                 retained_nodes: list[dict[str, Any]] = []
                 for node in state["nodes"]:
                     node_id = str(node.get("id") or "")
@@ -6163,20 +6922,30 @@ def delete_subscription(subscription_id: str) -> dict[str, Any]:
                         record[webdav_sync.LOCAL_BROWSER_NODE_MARKER] = True
                     retained_nodes.append(record)
                 state["nodes"] = retained_nodes
-                _mark_removed_nodes_stopped(state, current_remove_ids, runtime_cleanup["traffic_by_bridge"])
+                _mark_removed_nodes_stopped(
+                    state,
+                    current_remove_ids,
+                    runtime_cleanup["traffic_by_bridge"],
+                    preserved_node_ids=preserved_browser_node_ids,
+                )
                 save_state(state)
             release_persisted_bridge_traffic(runtime_cleanup["traffic_by_bridge"])
             purge_summary = {
                 "removed_instances": [
                     str(item.get("id") or "")
                     for item in runtime_snapshot["browser_instances"]
-                    if item.get("id")
+                    if item.get("id") and str(item.get("node_id") or "") not in preserved_browser_node_ids
+                ],
+                "preserved_instances": [
+                    str(item.get("id") or "")
+                    for item in state.get("browser_instances", [])
+                    if str(item.get("node_id") or "") in preserved_browser_node_ids
                 ],
                 "killed_browsers": runtime_cleanup["killed_browsers"],
                 "removed_profiles": 0,
             }
         purge_summary["removed_profiles"] = (
-            _remove_profiles_for_nodes(remove_ids) if browser_feature_enabled() else 0
+            _remove_profiles_for_nodes(remove_ids - preserved_browser_node_ids) if browser_feature_enabled() else 0
         )
 
     mark_sync_local_change()
@@ -7021,16 +7790,23 @@ def remote_browser_profile_relative(profile_path: Path) -> str:
     return relative.as_posix()
 
 
-def remote_browser_fingerprint_relative() -> str:
-    executable = fingerprint_chromium_path(force_refresh=True)
+def remote_browser_fingerprint_relative(kernel_version: str = "") -> str:
+    executable = fingerprint_chromium_path(force_refresh=True, kernel_id=kernel_version or None)
     if not executable:
+        if kernel_version:
+            raise RuntimeError(f"该浏览器固定使用指纹内核 {kernel_version}，但数据目录中未安装该版本。")
         raise RuntimeError(
             "未找到 Linux 指纹内核。请先点击「下载指纹内核」，再启动远程浏览器。"
         )
     root = Path(executable).resolve().parent
     wrapper = root / "chrome-wrapper"
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
-        candidates = [path for path in fingerprint_chromium_root().glob("**/chrome-wrapper") if path.is_file()]
+        search_root = (
+            fingerprint_kernel_versions_root() / kernel_version
+            if kernel_version and kernel_version not in {"env", "legacy"}
+            else fingerprint_chromium_root()
+        )
+        candidates = [path for path in search_root.glob("**/chrome-wrapper") if path.is_file()]
         wrapper = next((path for path in candidates if os.access(path, os.X_OK)), wrapper)
         root = wrapper.parent
     if not wrapper.is_file() or not os.access(wrapper, os.X_OK):
@@ -7122,11 +7898,28 @@ def launch_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
             chromium_profile.chmod(0o700)
         except OSError:
             pass
+        config = browser_fingerprint.normalize_fingerprint_config(
+            instance_snapshot.get("fingerprint"), browser_fingerprint.legacy_fingerprint_config()
+        )
         configure_browser_profile_defaults(chromium_profile)
-        fingerprint_rel = remote_browser_fingerprint_relative()
+        apply_browser_profile_preferences(chromium_profile, config)
+        kernel_version = str(instance_snapshot.get("kernel_version") or "")
+        fingerprint_rel = remote_browser_fingerprint_relative(kernel_version)
+        kernel_id = kernel_version or _default_fingerprint_kernel_id(list_fingerprint_kernels())
+        extension_ids = sync_profile_extensions(chromium_profile, list(instance_snapshot.get("extensions") or []))
         seed = safe_int(instance.get("fingerprint_seed"), browser_instance_seed(node_id, instance_id))
         region = node.get("region") or node_region(node.get("name") or "", node.get("server") or "")
-        timezone, language, accept_language = region_locale(region)
+        locale = browser_fingerprint.resolve_locale(
+            config,
+            region_locale(region),
+            browser_launch_exit_locale(node_id, local_port, config),
+        )
+        timezone, language, accept_language = locale["timezone"], locale["language"], locale["accept_language"]
+        # worker 的 CHROME_CLI 按空白拆分参数；非 ASCII 等字符先做百分号编码，再交给 Broker 白名单复核。
+        start_urls = [
+            urllib.parse.quote(url, safe=":/?#[]@!$&()*+,;=%-._~")
+            for url in instance_snapshot.get("start_urls") or []
+        ]
         broker_client = remote_browser_broker_client()
         # 镜像下载可能耗时数分钟，但不会创建容器；先在生命周期操作之外完成，
         # 避免关机为等待一个无副作用的拉取而留下竞态。
@@ -7151,6 +7944,16 @@ def launch_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
                 "timezone": timezone,
                 "language": language,
                 "accept_language": accept_language,
+                # worker 运行 Linux；auto 平台在 Broker 中解析为 linux。
+                "platform": config["platform"],
+                "platform_version": config["platform_version"],
+                "brand": config["brand"],
+                "brand_version": config["brand_version"],
+                "hardware_concurrency": config["hardware_concurrency"],
+                "disable_spoofing": config["disable_spoofing"],
+                "window_size": config["window_size"],
+                "extension_ids": extension_ids,
+                "start_urls": start_urls,
             }
         )
         invalidate_remote_browser_session_cache()
@@ -7205,6 +8008,8 @@ def launch_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
                     "last_stopped_at": None,
                     "last_used_at": started_at,
                     "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
+                    "runtime_kernel": kernel_id,
+                    "runtime_locale": locale,
                 }
             )
             saved_instance.pop("error", None)
@@ -7262,9 +8067,11 @@ def launch_remote_browser(payload: dict[str, Any]) -> dict[str, Any]:
         "bridge_id": bridge.get("id"),
         "profile_path": str(profile_root),
         "fingerprint_seed": seed,
+        "kernel_id": kernel_id,
         "region": region,
         "timezone": timezone,
         "language": language,
+        "locale": locale,
         "remote": True,
         "remote_url": remote_url,
         "remote_username": username,
@@ -7289,14 +8096,7 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         synchronize_process_state()
     node_id = str(payload.get("node_id") or "")
     requested_instance_id = str(payload.get("instance_id") or "")
-    # 方案 B:使用打过补丁的指纹内核(fingerprint-chromium),从底层伪造 Canvas/WebGL/Audio/
-    # 字体/屏幕/硬件并发/设备内存/Client Hints 等全部指纹维度;若内核缺失则明确提示去下载。
-    fp_chromium = fingerprint_chromium_path()
-    if not fp_chromium:
-        raise RuntimeError(
-            "未找到指纹内核 fingerprint-chromium。请点击「下载指纹内核」自动安装,"
-            "或手动下载后设置 PROXY_BRIDGE_FP_CHROMIUM 指向 Chromium 可执行文件。"
-        )
+    extra_urls = browser_fingerprint.normalize_start_urls(payload.get("open_urls"), strict=True)
 
     with STATE_LOCK:
         state = load_state()
@@ -7308,6 +8108,12 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
         if not node_id:
             raise ValueError("缺少节点 ID")
         node = find_node(state, node_id)
+        # 方案 B:使用打过补丁的指纹内核(fingerprint-chromium),从底层伪造 Canvas/WebGL/Audio/
+        # 字体/屏幕/硬件并发/设备内存/Client Hints 等全部指纹维度;若内核缺失则明确提示去下载。
+        # 先解析内核再创建记录，避免内核缺失时留下空记录。
+        kernel_id, fp_chromium = resolve_browser_kernel(
+            str((instance or {}).get("kernel_version") or "")
+        )
         changed = sync_process_status(state)
         changed |= sync_browser_instance_status(state)
         created_browser_record = False
@@ -7332,6 +8138,13 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
     if not bridge:
         bridge = start_bridge({"node_id": node_id, "core": "auto"})
 
+    # 出口查询是网络请求，必须在关机屏障之外完成；失败时回退到节点地区表。
+    exit_locale = browser_launch_exit_locale(
+        node_id,
+        safe_int(bridge.get("port"), 0),
+        instance.get("fingerprint") if isinstance(instance.get("fingerprint"), dict) else {},
+    )
+
     # start_bridge() has its own two-phase lifecycle barrier and may spend minutes
     # resolving a core. Never hold SHUTDOWN_LOCK while calling it. Reacquire the
     # barrier only for the final browser-process launch, then re-read all state that
@@ -7355,6 +8168,9 @@ def _launch_browser(payload: dict[str, Any]) -> dict[str, Any]:
             instance=instance,
             bridge=dict(bridge),
             fp_chromium=fp_chromium,
+            kernel_id=kernel_id,
+            exit_locale=exit_locale,
+            extra_urls=extra_urls,
         )
 
 
@@ -7365,6 +8181,9 @@ def _run_browser_launch(
     instance: dict[str, Any],
     bridge: dict[str, Any],
     fp_chromium: str,
+    kernel_id: str = "",
+    exit_locale: tuple[str, str, str] | None = None,
+    extra_urls: list[str] | None = None,
 ) -> dict[str, Any]:
     """Launch and register Chromium while the caller holds SHUTDOWN_LOCK."""
     local_port = safe_int(bridge.get("port"), 0)
@@ -7381,34 +8200,51 @@ def _run_browser_launch(
     )
     first_profile_launch = not profile_path.exists()
     profile_path.mkdir(parents=True, exist_ok=True)
+    config = browser_fingerprint.normalize_fingerprint_config(
+        instance.get("fingerprint"), browser_fingerprint.legacy_fingerprint_config()
+    )
     configure_browser_profile_defaults(profile_path)
+    apply_browser_profile_preferences(profile_path, config)
     search_extension_path = ensure_google_search_extension()
+    extension_ids = sync_profile_extensions(profile_path, list(instance.get("extensions") or []))
+    extension_paths = [str(search_extension_path)] + [
+        str(profile_path / PROFILE_EXTENSIONS_DIR / extension_id) for extension_id in extension_ids
+    ]
     proxy = f"socks5://127.0.0.1:{local_port}"
 
-    # 每个节点派生固定指纹种子,并按地区匹配时区/语言,使指纹与代理出口地区一致。
+    # 每条记录有固定指纹种子；时区/语言按配置取出口 IP、节点地区或手动值，使指纹与代理出口一致。
     seed = safe_int(instance.get("fingerprint_seed"), browser_instance_seed(node_id, instance_id, legacy))
     region = node.get("region") or node_region(node.get("name") or "", node.get("server") or "")
-    timezone, language, accept_language = region_locale(region)
+    locale = browser_fingerprint.resolve_locale(config, region_locale(region), exit_locale)
+    timezone, language = locale["timezone"], locale["language"]
+    cdp_enabled = instance.get("cdp_enabled") is True
+    if cdp_enabled:
+        # 端口 0 让 Chromium 选择随机空闲端口，并把实际端口写入 Profile 的 DevToolsActivePort。
+        (profile_path / browser_fingerprint.DEVTOOLS_ACTIVE_PORT_FILE).unlink(missing_ok=True)
+    start_urls = list(extra_urls or []) or list(instance.get("start_urls") or [])
+    if not start_urls:
+        start_urls = [DEFAULT_BROWSER_START_URL if first_profile_launch else "about:blank"]
 
     command = [
         fp_chromium,
         f"--user-data-dir={profile_path}",
-        # --fingerprint 是指纹伪造的总开关:同种子必得同指纹,不同种子必得不同指纹。
-        f"--fingerprint={seed}",
-        f"--fingerprint-platform={fingerprint_platform_token()}",
-        f"--timezone={timezone}",
-        f"--lang={language}",
-        f"--accept-lang={accept_language}",
+        *browser_fingerprint.fingerprint_switches(
+            config,
+            seed=seed,
+            host_platform=fingerprint_platform_token(),
+            locale=locale,
+        ),
         # 使用代理时强制 WebRTC 只走代理,禁止非代理 UDP,防止通过 STUN 泄漏真实 IP。
         # 用标准 Chromium 开关 --webrtc-ip-handling-policy + 枚举值(经内核二进制验证存在),
         # 而非独立布尔开关 --disable-non-proxied-udp(该 build 中不存在,会被静默忽略)。
         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
         "--no-first-run",
         "--no-default-browser-check",
-        f"--load-extension={search_extension_path}",
+        f"--load-extension={','.join(extension_paths)}",
         f"--proxy-server={proxy}",
+        *(["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"] if cdp_enabled else []),
         "--new-window",
-        DEFAULT_BROWSER_START_URL if first_profile_launch else "about:blank",
+        *start_urls,
     ]
     process = subprocess.Popen(
         command,
@@ -7424,6 +8260,7 @@ def _run_browser_launch(
             procs.append(process)
             BROWSER_TABLE[node_id] = procs
             BROWSER_PROCESS_TABLE[instance_id] = process
+            BROWSER_LAUNCH_COMMANDS[instance_id] = [arg for arg in command if arg not in start_urls]
         with STATE_LOCK:
             state = load_state()
             try:
@@ -7449,6 +8286,10 @@ def _run_browser_launch(
                     "last_stopped_at": None,
                     "last_used_at": started_at,
                     "launch_count": safe_int(saved_instance.get("launch_count"), 0) + 1,
+                    "runtime_kernel": kernel_id,
+                    "runtime_locale": locale,
+                    "cdp_port": None,
+                    "cdp_ws_path": "",
                 }
             )
             save_state(state)
@@ -7480,14 +8321,17 @@ def _run_browser_launch(
         "bridge_id": bridge.get("id"),
         "profile_path": str(profile_root),
         "chromium_path": fp_chromium,
+        "kernel_id": kernel_id,
         "fingerprint_seed": seed,
         "region": region,
         "timezone": timezone,
         "language": language,
+        "locale": locale,
+        "cdp_enabled": cdp_enabled,
         "isolation": "fingerprint-chromium 底层指纹伪造 + 独立 Profile + 节点本地代理",
         "fingerprint_note": (
-            "已按节点派生独立指纹(Canvas/WebGL/Audio/字体/屏幕/硬件并发/设备内存/Client Hints),"
-            "时区与语言按节点地区匹配,并已禁止 WebRTC 非代理 UDP。"
+            "已按记录种子派生独立指纹(Canvas/WebGL/Audio/字体/屏幕/硬件并发/设备内存/Client Hints),"
+            "时区与语言按记录配置匹配,并已禁止 WebRTC 非代理 UDP。"
         ),
     }
 
@@ -7508,9 +8352,56 @@ def lookup_browser_exit(port: int) -> dict[str, str]:
         code = str(result.get("country_code") or "").upper()
         if result.get("success") is False or not re.fullmatch(r"[A-Z]{2}", code):
             raise RuntimeError("出口服务未提供有效地区")
-        return {"ip": ip, "region_code": code}
+        info = {"ip": ip, "region_code": code}
+        timezone_info = result.get("timezone")
+        timezone_id = str(timezone_info.get("id") or "") if isinstance(timezone_info, dict) else ""
+        if browser_fingerprint.TIMEZONE_PATTERN.fullmatch(timezone_id):
+            info["timezone"] = timezone_id
+        return info
     finally:
         connection.close()
+
+
+def exit_locale_from_lookup(info: dict[str, Any]) -> tuple[str, str, str] | None:
+    """把出口查询结果转换为 (时区, 语言, Accept-Language)；国家不在地区目录时只提供时区。"""
+    code = str(info.get("region_code") or "").upper()
+    timezone = str(info.get("timezone") or "")
+    catalog = REGION_CATALOG.get(code)
+    language = accept_language = ""
+    if catalog:
+        region_timezone, language, accept_language = region_locale(catalog[0])
+        timezone = timezone or region_timezone
+    if not timezone and not language:
+        return None
+    return timezone, language, accept_language
+
+
+def cache_exit_lookup(node_id: str, info: dict[str, Any]) -> None:
+    with EXIT_LOCALE_CACHE_LOCK:
+        EXIT_LOCALE_CACHE[node_id] = {"info": dict(info), "checked_at": time.monotonic()}
+
+
+def cached_exit_lookup(node_id: str, max_age: float = EXIT_LOCALE_CACHE_TTL) -> dict[str, Any] | None:
+    with EXIT_LOCALE_CACHE_LOCK:
+        entry = EXIT_LOCALE_CACHE.get(node_id)
+        if not entry or time.monotonic() - float(entry.get("checked_at") or 0.0) > max_age:
+            return None
+        return dict(entry["info"])
+
+
+def browser_launch_exit_locale(node_id: str, port: int, config: dict[str, Any]) -> tuple[str, str, str] | None:
+    """启动前按需查询节点出口；查询失败返回 None，由调用方回退到节点地区表。"""
+    if "exit_ip" not in {config.get("timezone_mode"), config.get("language_mode")} or port <= 0:
+        return None
+    info = cached_exit_lookup(node_id)
+    if info is None:
+        try:
+            info = lookup_browser_exit(port)
+        except Exception as exc:
+            log_event(f"启动前出口查询失败，时区/语言改用节点地区：{exc}", level="warn", category="浏览器")
+            return None
+        cache_exit_lookup(node_id, info)
+    return exit_locale_from_lookup(info)
 
 
 def check_browser_exit(instance_id: str, generation: tuple[Any, ...]) -> None:
@@ -7528,7 +8419,11 @@ def check_browser_exit(instance_id: str, generation: tuple[Any, ...]) -> None:
         expected = node_region_code(node.get("region"))
         port = safe_int(bridge.get("port"), 0)
     try:
-        result: dict[str, Any] = {**lookup_browser_exit(port), "checked_at": now_ts(), "status": "ok"}
+        node_id = str(instance.get("node_id") or "")
+        # 启动前刚查过出口时直接复用，避免同一次启动访问两次出口服务。
+        lookup = cached_exit_lookup(node_id, max_age=30.0) or lookup_browser_exit(port)
+        cache_exit_lookup(node_id, lookup)
+        result: dict[str, Any] = {**lookup, "checked_at": now_ts(), "status": "ok"}
         result["expected_region_code"] = expected
         result["mismatch"] = expected != "ZZ" and result["region_code"] != expected
     except Exception as exc:
@@ -7546,6 +8441,150 @@ def check_browser_exit(instance_id: str, generation: tuple[Any, ...]) -> None:
         log_event(f"浏览器出口地区 {result['region_code']} 与节点地区 {expected} 不一致", level="warn", category="浏览器")
 
 
+def browser_cdp_endpoint(instance: dict[str, Any]) -> tuple[int, str] | None:
+    """返回运行中本机浏览器的 CDP (端口, 浏览器 ws 路径)；未开启或尚未就绪时返回 None。"""
+    if instance.get("remote_worker") is True or instance.get("cdp_enabled") is not True:
+        return None
+    port = safe_int(instance.get("cdp_port"), 0)
+    ws_path = str(instance.get("cdp_ws_path") or "")
+    if 1024 <= port <= 65535 and ws_path:
+        return port, ws_path
+    node_id = str(instance.get("node_id") or "")
+    instance_id = str(instance.get("id") or "")
+    if not node_id or not instance_id:
+        return None
+    profile_root = browser_instance_profile_path(node_id, instance_id, legacy=bool(instance.get("legacy")))
+    profile_path = (
+        profile_root / "chromium-profile" if instance.get("profile_layout") == "remote-worker-v1" else profile_root
+    )
+    return browser_fingerprint.read_devtools_active_port(profile_path)
+
+
+def discover_browser_cdp_endpoint(instance_id: str, generation: tuple[Any, ...]) -> None:
+    # Chromium 启动后才写 DevToolsActivePort；最多等待 20 秒，写入状态供界面显示与 Cookie 操作。
+    deadline = time.monotonic() + 20.0
+    while not SHUTTING_DOWN.is_set() and time.monotonic() < deadline:
+        with STATE_LOCK:
+            state = load_state()
+            instance = next((item for item in state["browser_instances"] if item.get("id") == instance_id), None)
+            if (
+                not instance
+                or instance.get("status") not in ACTIVE_BROWSER_STATUSES
+                or tuple(instance.get(key) for key in ("last_started_at", "launch_count", "bridge_id")) != generation
+            ):
+                return
+            endpoint = browser_cdp_endpoint({**instance, "cdp_port": None, "cdp_ws_path": ""})
+            if endpoint:
+                instance["cdp_port"], instance["cdp_ws_path"] = endpoint
+                save_state(state)
+                return
+        time.sleep(0.5)
+
+
+def _live_local_browser_instance(instance_id: str) -> dict[str, Any]:
+    require_browser_feature()
+    if remote_browser_feature_enabled():
+        raise ValueError("Docker 远程浏览器暂不支持该操作，请在远程浏览器页面中手动处理")
+    with STATE_LOCK:
+        state = load_state()
+        if sync_browser_instance_status(state):
+            save_state(state)
+        instance = dict(find_browser_instance(state, instance_id))
+    if not _browser_instance_live(instance):
+        raise ValueError("浏览器未运行，请先启动")
+    return instance
+
+
+def _require_browser_cdp(instance_id: str) -> tuple[dict[str, Any], tuple[int, str]]:
+    instance = _live_local_browser_instance(instance_id)
+    if instance.get("cdp_enabled") is not True:
+        raise ValueError("请先在浏览器配置中开启 CDP 调试端口，并重新启动浏览器")
+    endpoint = browser_cdp_endpoint(instance)
+    if not endpoint:
+        raise RuntimeError("调试端口尚未就绪；如果是开启 CDP 前启动的浏览器，请重启后再试")
+    return instance, endpoint
+
+
+def _safe_download_name(value: Any, fallback: str) -> str:
+    text = re.sub(r"[^\w.-]+", "-", str(value or ""), flags=re.UNICODE).strip("-.")
+    return (text or fallback)[:60]
+
+
+def export_browser_cookies(payload: dict[str, Any]) -> dict[str, Any]:
+    instance_id = str(payload.get("instance_id") or "")
+    fmt = str(payload.get("format") or "json").lower()
+    if fmt not in {"json", "netscape"}:
+        raise ValueError("导出格式只能是 json 或 netscape")
+    instance, (port, ws_path) = _require_browser_cdp(instance_id)
+    try:
+        result = browser_fingerprint.cdp_call(port, ws_path, "Storage.getCookies")
+    except browser_fingerprint.CdpError as exc:
+        raise RuntimeError(f"读取 Cookie 失败：{exc}") from exc
+    cookies = [item for item in result.get("cookies") or [] if isinstance(item, dict)]
+    content = (
+        browser_fingerprint.format_cookies_json(cookies)
+        if fmt == "json"
+        else browser_fingerprint.format_cookies_netscape(cookies)
+    )
+    base_name = _safe_download_name(instance.get("label") or instance.get("name"), "browser")
+    return {
+        "ok": True,
+        "count": len(cookies),
+        "format": fmt,
+        "content": content,
+        "filename": f"{base_name}-cookies.{'json' if fmt == 'json' else 'txt'}",
+    }
+
+
+def import_browser_cookies(payload: dict[str, Any]) -> dict[str, Any]:
+    instance_id = str(payload.get("instance_id") or "")
+    params = browser_fingerprint.parse_cookie_text(str(payload.get("content") or ""), str(payload.get("format") or "auto"))
+    _instance, (port, ws_path) = _require_browser_cdp(instance_id)
+    try:
+        with browser_fingerprint.CdpSession(port, ws_path, timeout=20.0) as session:
+            imported, failures = browser_fingerprint.set_cookies(session, params)
+    except browser_fingerprint.CdpError as exc:
+        raise RuntimeError(f"写入 Cookie 失败：{exc}") from exc
+    return {"ok": True, "total": len(params), "imported": imported, "failed": len(failures), "errors": failures[:20]}
+
+
+def open_browser_url(payload: dict[str, Any]) -> dict[str, Any]:
+    """在运行中的本机浏览器打开网址（指纹检测等）；浏览器未运行时带该网址启动。"""
+    require_browser_feature()
+    instance_id = str(payload.get("instance_id") or "")
+    site = str(payload.get("site") or "")
+    url = FINGERPRINT_CHECK_SITES.get(site) or browser_fingerprint.validate_start_url(payload.get("url"))
+    with STATE_LOCK:
+        state = load_state()
+        instance = dict(find_browser_instance(state, instance_id))
+    if remote_browser_feature_enabled():
+        raise ValueError(f"请在远程浏览器中手动打开：{url}")
+    if not _browser_instance_live(instance):
+        result = launch_browser({"instance_id": instance_id, "open_urls": [url]})
+        return {**result, "opened": url, "method": "launch"}
+    endpoint = browser_cdp_endpoint(instance)
+    if endpoint:
+        try:
+            browser_fingerprint.cdp_call(*endpoint, "Target.createTarget", {"url": url})
+            return {"ok": True, "opened": url, "method": "cdp", "instance_id": instance_id}
+        except browser_fingerprint.CdpError as exc:
+            log_event(f"CDP 打开网址失败，改用单实例转发：{exc}", level="warn", category="浏览器")
+    with PROCESS_LOCK:
+        command = list(BROWSER_LAUNCH_COMMANDS.get(instance_id) or [])
+    if not command:
+        raise RuntimeError("找不到该浏览器的启动参数，请重启浏览器后再试")
+    # Chromium 检测到同一 user-data-dir 已在运行时会把网址转交给原进程，新进程随即退出。
+    process = subprocess.Popen(
+        [*command, url],
+        cwd=str(APP_ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **_popen_kwargs(),
+    )
+    threading.Thread(target=process.wait, name="browser-open-url", daemon=True).start()
+    return {"ok": True, "opened": url, "method": "singleton", "instance_id": instance_id}
+
+
 def schedule_browser_exit_check(result: dict[str, Any]) -> None:
     instance_id = str(result.get("instance_id") or "")
     if not instance_id or SHUTTING_DOWN.is_set():
@@ -7558,7 +8597,10 @@ def schedule_browser_exit_check(result: dict[str, Any]) -> None:
         generation = tuple(instance.get(key) for key in ("last_started_at", "launch_count", "bridge_id"))
         instance["exit_check"] = {"status": "checking"}
         save_state(state)
+        discover_cdp = instance.get("cdp_enabled") is True and instance.get("remote_worker") is not True
     BROWSER_EXIT_EXECUTOR.submit(check_browser_exit, instance_id, generation)
+    if discover_cdp:
+        BROWSER_EXIT_EXECUTOR.submit(discover_browser_cdp_endpoint, instance_id, generation)
 
 
 def prune_browser_processes(node_id: str) -> list[subprocess.Popen]:
@@ -8044,6 +9086,8 @@ def _finalize_browser_instance_delete(
             for item in state.get("browser_instances", [])
             if not (isinstance(item, dict) and str(item.get("id") or "") == instance_id)
         ]
+        # 删除最后一条引用后，仅为浏览器保留的节点也一并移除。
+        prune_preserved_browser_nodes(state)
         save_state(state)
     return profile_deleted, dict(current)
 
@@ -8313,15 +9357,36 @@ def _install_fingerprint_from_archive(
         shutil.rmtree(extract_root, ignore_errors=True)
 
 
+def fingerprint_kernel_id_for(asset_name: str, tag: str = "", sha256: str = "") -> str:
+    """由安装包文件名/Release tag 推导内核 ID；无法识别版本时用 tag 或文件摘要区分。"""
+    version = browser_fingerprint.fingerprint_version_from_name(asset_name) or browser_fingerprint.fingerprint_version_from_name(tag)
+    if version:
+        return version
+    cleaned_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", str(tag or "")).strip("-._")[:48]
+    if cleaned_tag and browser_fingerprint.KERNEL_ID_PATTERN.fullmatch(cleaned_tag) and cleaned_tag not in {"env", "legacy", "upload"}:
+        return cleaned_tag
+    if sha256:
+        return f"upload-{sha256[:12]}"
+    return f"custom-{int(time.time())}"
+
+
 def _install_fingerprint_package(
     package_path: Path,
     source_name: str,
     version: str,
+    *,
+    kernel_id: str | None = None,
+    source: str = "download",
 ) -> dict[str, Any]:
     host_os = host_os_token()
     host_arch = host_arch_token()
     fingerprint_arch = "x86_64" if remote_browser_feature_enabled() else host_arch
-    dest_root = fingerprint_chromium_root()
+    kernel_id = kernel_id or fingerprint_kernel_id_for(source_name, version)
+    if browser_fingerprint.KERNEL_ID_PATTERN.fullmatch(kernel_id) is None or kernel_id in {"env", "legacy"}:
+        raise RuntimeError("指纹内核版本标识无效")
+    versions_root = fingerprint_kernel_versions_root()
+    versions_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    dest_root = versions_root / kernel_id
     dest_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     lowered = source_name.lower()
     if lowered.endswith(".dmg"):
@@ -8343,8 +9408,50 @@ def _install_fingerprint_package(
         elif host_arch == "arm64" and binary_arch == "x86_64":
             arch_warning = "提示:导入的是 x86_64 内核,将通过 Rosetta 在 Apple Silicon 上运行。"
 
+    executable = _resolve_fingerprint_executable_in_root(Path(target))
+    detected_version = browser_fingerprint.fingerprint_version_from_name(source_name) or browser_fingerprint.fingerprint_version_from_name(version)
+    if not detected_version and executable:
+        detected_version = browser_fingerprint.fingerprint_version_from_name(_app_bundle_version(executable))
+    if not detected_version and executable:
+        # Windows 发布包在 chrome.exe 旁有以完整版本号命名的资源目录。
+        detected_version = next(
+            (
+                child.name
+                for child in sorted(Path(executable).parent.iterdir())
+                if child.is_dir() and re.fullmatch(r"\d{2,4}\.\d+\.\d+\.\d+", child.name)
+            ),
+            "",
+        )
+    if (
+        detected_version
+        and kernel_id != detected_version
+        and browser_fingerprint.KERNEL_ID_PATTERN.fullmatch(detected_version)
+        and not (versions_root / detected_version).exists()
+    ):
+        # 内核 ID 统一使用版本号，确保同步到其他设备后「固定版本」仍能对应到同一内核。
+        renamed = versions_root / detected_version
+        dest_root.replace(renamed)
+        if executable:
+            executable = str(renamed / Path(executable).resolve().relative_to(dest_root.resolve()))
+        dest_root = renamed
+        kernel_id = detected_version
+    metadata = {
+        "id": kernel_id,
+        "version": detected_version or kernel_id,
+        "asset": source_name,
+        "tag": version,
+        "source": source,
+        "installed_at": now_ts(),
+        "arch": binary_arch or fingerprint_arch,
+        "executable": Path(executable).resolve().relative_to(dest_root.resolve()).as_posix() if executable else "",
+    }
+    metadata_path = dest_root / FINGERPRINT_KERNEL_METADATA_FILE
+    temporary = metadata_path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(metadata_path)
+
     invalidate_fingerprint_chromium_cache()
-    resolved = fingerprint_chromium_path(force_refresh=True)
+    resolved = fingerprint_chromium_path(force_refresh=True, kernel_id=kernel_id)
     if not resolved:
         raise RuntimeError("指纹内核安装后未找到可执行文件")
     return {
@@ -8352,6 +9459,8 @@ def _install_fingerprint_package(
         "already_installed": False,
         "path": resolved,
         "version": version,
+        "kernel_id": kernel_id,
+        "kernel_version": metadata["version"],
         "host_os": host_os,
         "host_arch": host_arch,
         "fingerprint_arch": fingerprint_arch,
@@ -8367,27 +9476,71 @@ def download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
         return _download_fingerprint_chromium(payload)
 
 
-def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
-    # 一键下载指纹内核:查询 GitHub Releases,按当前 OS 选择包并安装到工作目录。
-    existing = fingerprint_chromium_path()
-    if existing and not truthy(payload.get("force")):
-        return {"ok": True, "already_installed": True, "path": existing}
-
+def _fingerprint_release_target() -> tuple[str, str, bool]:
     host_os = host_os_token()
-    host_arch = host_arch_token()
     # Docker worker 与其 Linux 指纹内核必须使用同一架构。当前 worker 固定
     # linux/amd64，因此 arm64 主服务容器也必须选择 x86_64 指纹包。
-    fingerprint_arch = "x86_64" if remote_browser_feature_enabled() else host_arch
+    fingerprint_arch = "x86_64" if remote_browser_feature_enabled() else host_arch_token()
+    return host_os, fingerprint_arch, remote_browser_feature_enabled()
+
+
+def list_fingerprint_kernel_releases() -> dict[str, Any]:
+    """列出上游 Release 中适配本机的版本，供「选择版本下载」使用。"""
+    require_browser_feature()
+    host_os, fingerprint_arch, strict_arch = _fingerprint_release_target()
     try:
-        releases = _github_json(f"{FP_CHROMIUM_RELEASES_API}?per_page=20")
+        releases = _github_json(f"{FP_CHROMIUM_RELEASES_API}?per_page=30")
     except Exception as error:
         raise RuntimeError(f"获取指纹内核版本列表失败:{error}") from error
+    installed = fingerprint_kernel_ids()
+    result: list[dict[str, Any]] = []
+    for release in releases if isinstance(releases, list) else []:
+        if not isinstance(release, dict):
+            continue
+        asset = _pick_fingerprint_asset([release], host_os=host_os, host_arch=fingerprint_arch, strict_arch=strict_arch)
+        if not asset:
+            continue
+        tag = str(release.get("tag_name") or "")
+        kernel_id = fingerprint_kernel_id_for(str(asset.get("name") or ""), tag)
+        result.append(
+            {
+                "tag": tag,
+                "kernel_id": kernel_id,
+                "asset": str(asset.get("name") or ""),
+                "size": safe_int(asset.get("size"), 0) or None,
+                "published_at": str(release.get("published_at") or "")[:40],
+                "installed": kernel_id in installed,
+            }
+        )
+    return {"ok": True, "os": host_os, "arch": fingerprint_arch, "releases": result[:30]}
+
+
+def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
+    # 一键下载指纹内核:查询 GitHub Releases,按当前 OS 选择包并安装到 versions/<版本>/。
+    # payload.tag 指定 Release；payload.latest 表示即使已安装其他版本也下载最新版；
+    # 都未提供时保持旧语义：已有可用内核则直接返回。
+    requested_tag = str(payload.get("tag") or "").strip()
+    force = truthy(payload.get("force"))
+    existing = fingerprint_chromium_path()
+    if existing and not force and not requested_tag and not truthy(payload.get("latest")):
+        return {"ok": True, "already_installed": True, "path": existing}
+
+    host_os, fingerprint_arch, strict_arch = _fingerprint_release_target()
+    try:
+        releases = _github_json(f"{FP_CHROMIUM_RELEASES_API}?per_page=30")
+    except Exception as error:
+        raise RuntimeError(f"获取指纹内核版本列表失败:{error}") from error
+    candidates = releases if isinstance(releases, list) else []
+    if requested_tag:
+        candidates = [item for item in candidates if isinstance(item, dict) and str(item.get("tag_name") or "") == requested_tag]
+        if not candidates:
+            raise RuntimeError(f"上游没有名为 {requested_tag} 的 Release")
 
     asset = _pick_fingerprint_asset(
-        releases if isinstance(releases, list) else [],
+        candidates,
         host_os=host_os,
         host_arch=fingerprint_arch,
-        strict_arch=remote_browser_feature_enabled(),
+        strict_arch=strict_arch,
     )
     if not asset:
         raise RuntimeError(
@@ -8395,6 +9548,13 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
             "该项目并非每个版本都为全部平台发布安装包;可稍后重试,"
             "或手动下载后设置 PROXY_BRIDGE_FP_CHROMIUM 指向 Chromium 可执行文件。"
         )
+    kernel_id = fingerprint_kernel_id_for(str(asset["name"]), str(asset.get("tag") or ""))
+    installed_path = fingerprint_chromium_path(kernel_id=kernel_id)
+    if installed_path and not force:
+        return {"ok": True, "already_installed": True, "path": installed_path, "kernel_id": kernel_id}
+    if installed_path:
+        # 原地替换同一版本前必须确认没有浏览器正在使用内核文件。
+        _assert_kernel_upload_target_idle("fingerprint-chromium")
 
     dest_root = fingerprint_chromium_root()
     dest_root.mkdir(parents=True, exist_ok=True)
@@ -8410,9 +9570,62 @@ def _download_fingerprint_chromium(payload: dict[str, Any]) -> dict[str, Any]:
             package_path,
             str(asset["name"]),
             str(asset.get("tag") or ""),
+            kernel_id=kernel_id,
+            source="download",
         )
     finally:
         package_path.unlink(missing_ok=True)
+
+
+def set_default_fingerprint_kernel(payload: dict[str, Any]) -> dict[str, Any]:
+    require_browser_feature()
+    kernel_id = browser_fingerprint.normalize_kernel_id(payload.get("id"), strict=True)
+    if kernel_id and kernel_id not in fingerprint_kernel_ids():
+        raise ValueError(f"指纹内核版本 {kernel_id} 未安装")
+    root = fingerprint_chromium_root()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = root / FINGERPRINT_DEFAULT_KERNEL_FILE
+    temporary = target.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"id": kernel_id}, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(target)
+    invalidate_fingerprint_chromium_cache()
+    return {"ok": True, "default": kernel_id, "kernels": list_fingerprint_kernels(force_refresh=True)}
+
+
+def delete_fingerprint_kernel(payload: dict[str, Any]) -> dict[str, Any]:
+    """删除一个已安装的内核版本；有记录固定使用或有浏览器运行时拒绝。"""
+    require_browser_feature()
+    kernel_id = browser_fingerprint.normalize_kernel_id(payload.get("id"), strict=True)
+    if not kernel_id:
+        raise ValueError("缺少内核版本")
+    if kernel_id == "env":
+        raise ValueError("环境变量指定的内核请修改 PROXY_BRIDGE_FP_CHROMIUM，而不是在这里删除")
+    with BROWSER_LAUNCH_LOCK:
+        with FINGERPRINT_INSTALL_LOCK:
+            if kernel_id not in fingerprint_kernel_ids():
+                raise ValueError(f"指纹内核版本 {kernel_id} 未安装")
+            with STATE_LOCK:
+                state = load_state()
+                pinned = [item for item in state.get("browser_instances", []) if item.get("kernel_version") == kernel_id]
+            if pinned:
+                raise ValueError(f"有 {len(pinned)} 条浏览器记录固定使用该版本，请先修改它们的内核设置")
+            _assert_kernel_upload_target_idle("fingerprint-chromium")
+            if kernel_id == "legacy":
+                root = fingerprint_chromium_root()
+                targets = [
+                    child
+                    for child in root.iterdir()
+                    if child.name not in {"versions", FINGERPRINT_DEFAULT_KERNEL_FILE} and not child.name.startswith(".")
+                ]
+            else:
+                targets = [fingerprint_kernel_versions_root() / kernel_id]
+            for target in targets:
+                if target.is_dir() and not target.is_symlink():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+            invalidate_fingerprint_chromium_cache()
+    return {"ok": True, "deleted": kernel_id, "kernels": list_fingerprint_kernels(force_refresh=True)}
 
 
 def _safe_uploaded_filename(encoded_name: Any) -> str:
@@ -8476,7 +9689,14 @@ def _validate_uploaded_package_name(kind: str, filename: str) -> None:
         )
 
 
-def _assert_kernel_upload_target_idle(kind: str) -> None:
+def _assert_kernel_upload_target_idle(kind: str, *, fingerprint_kernel_id: str | None = None) -> None:
+    if (
+        kind == "fingerprint-chromium"
+        and fingerprint_kernel_id
+        and fingerprint_kernel_id not in fingerprint_kernel_ids()
+    ):
+        # 新版本安装到独立目录，不会替换正在运行的内核文件。
+        return
     with STATE_LOCK:
         state = load_state()
         matching_bridge_ids = {
@@ -8576,11 +9796,18 @@ def install_uploaded_kernel(
         }
 
     require_browser_feature()
+    kernel_id = fingerprint_kernel_id_for(filename, "", sha256)
     # 阻止上传校验后又启动新实例；锁顺序与浏览器启动路径保持一致。
     with BROWSER_LAUNCH_LOCK:
         with FINGERPRINT_INSTALL_LOCK:
-            _assert_kernel_upload_target_idle(kind)
-            result = _install_fingerprint_package(package_path, filename, "本地上传")
+            _assert_kernel_upload_target_idle(kind, fingerprint_kernel_id=kernel_id)
+            result = _install_fingerprint_package(
+                package_path,
+                filename,
+                "本地上传",
+                kernel_id=kernel_id,
+                source="upload",
+            )
     return {
         **result,
         "kind": kind,
@@ -11850,13 +13077,49 @@ class AppHandler(BaseHTTPRequestHandler):
         data = self.rfile.read(length)
         return json.loads(data.decode("utf-8"))
 
+    def handle_browser_extension_upload(self) -> None:
+        require_browser_feature()
+        content_type = _single_upload_header(self.headers, "Content-Type")
+        if content_type.strip().lower() != "application/octet-stream":
+            raise CoreUploadUnsupportedMediaType("扩展上传仅支持 application/octet-stream")
+        if _single_upload_header(self.headers, "Transfer-Encoding", required=False):
+            raise ValueError("扩展上传不支持 Transfer-Encoding")
+        raw_length = _single_upload_header(self.headers, "Content-Length", required=False)
+        if not raw_length:
+            raise CoreUploadLengthRequired("扩展上传必须提供 Content-Length")
+        if re.fullmatch(r"[0-9]+", raw_length) is None or int(raw_length) < 1:
+            raise ValueError("Content-Length 无效")
+        length = int(raw_length)
+        if length > BROWSER_EXTENSION_UPLOAD_LIMIT:
+            raise CoreUploadTooLarge(f"扩展包不能超过 {BROWSER_EXTENSION_UPLOAD_LIMIT // (1024 * 1024)} MiB")
+        filename = _safe_uploaded_filename(_single_upload_header(self.headers, CORE_UPLOAD_NAME_HEADER))
+        if not filename.lower().endswith((".zip", ".crx")):
+            raise ValueError("扩展包只支持 .zip 或 .crx")
+        ensure_dirs()
+        with tempfile.TemporaryDirectory(prefix="proxybridge-extension-", dir=str(RUNTIME_ROOT)) as temp_dir:
+            staged_path = Path(temp_dir) / "package.bin"
+            with staged_path.open("wb") as destination:
+                actual_sha256 = _stream_core_upload(self.rfile, destination, length)
+            result = install_browser_extension_package(staged_path, filename, actual_sha256)
+        extension = result.get("extension") or {}
+        log_event(f"导入浏览器扩展：{extension.get('name') or filename}", category="浏览器")
+        json_response(self, {**result, "extensions": browser_extension_library()})
+
     def handle_core_upload(self) -> None:
         kind, filename, length, expected_sha256 = _parse_core_upload_headers(self.headers)
         _validate_uploaded_package_name(kind, filename)
         if kind == "fingerprint-chromium":
             require_browser_feature()
         # 大文件写盘前先给出可恢复的运行状态错误；安装锁内还会再次检查，防止上传期间启动实例。
-        _assert_kernel_upload_target_idle(kind)
+        # 无法从文件名识别版本时按「新目录」处理，实际内核 ID 在校验摘要后确定。
+        _assert_kernel_upload_target_idle(
+            kind,
+            fingerprint_kernel_id=(
+                browser_fingerprint.fingerprint_version_from_name(filename) or "upload-pending"
+                if kind == "fingerprint-chromium"
+                else None
+            ),
+        )
         if not CORE_UPLOAD_LOCK.acquire(blocking=False):
             raise CoreUploadBusy("已有内核文件正在上传或安装，请等待完成后重试")
         connection = getattr(self, "connection", None)
@@ -12202,6 +13465,18 @@ class AppHandler(BaseHTTPRequestHandler):
         if not self.require_api_authentication():
             return
         parsed_path = urllib.parse.urlsplit(self.path).path
+        if parsed_path == BROWSER_EXTENSION_UPLOAD_PATH:
+            try:
+                self.handle_browser_extension_upload()
+            except CoreUploadTooLarge as exc:
+                error_response(self, exc, 413)
+            except CoreUploadUnsupportedMediaType as exc:
+                error_response(self, exc, 415)
+            except CoreUploadLengthRequired as exc:
+                error_response(self, exc, 411)
+            except Exception as exc:
+                error_response(self, exc, 400)
+            return
         if parsed_path == CORE_UPLOAD_PATH:
             try:
                 self.handle_core_upload()
@@ -12253,7 +13528,13 @@ class AppHandler(BaseHTTPRequestHandler):
                 log_event(f"非公网订阅地址访问已{state_label}", category="设置")
                 json_response(self, {"ok": True, "settings": settings})
             elif self.path == "/api/subscriptions/delete":
-                json_response(self, delete_subscription(str(payload.get("id") or "")))
+                json_response(
+                    self,
+                    delete_subscription(
+                        str(payload.get("id") or ""),
+                        delete_browser_profiles=payload.get("delete_browser_profiles") is True,
+                    ),
+                )
                 log_event("删除订阅", category="订阅")
             elif self.path == "/api/bridges/start":
                 result = start_bridge(payload)
@@ -12330,15 +13611,55 @@ class AppHandler(BaseHTTPRequestHandler):
                 )
             elif self.path == "/api/browser/update":
                 result = update_browser_instance(payload)
-                label = (result.get("instance") or {}).get("label") or ""
-                log_event(
-                    f"更新浏览器标签:{label or '（清空）'}",
-                    category="浏览器",
-                )
+                if set(payload) & {"label", "tag"} and "instance" in result and len(payload) <= 2:
+                    label = (result.get("instance") or {}).get("label") or ""
+                    log_event(f"更新浏览器标签:{label or '（清空）'}", category="浏览器")
+                else:
+                    log_event(f"更新浏览器配置 {result.get('updated', 0)} 条", category="浏览器")
                 json_response(self, result)
             elif self.path == "/api/browser/download-kernel":
                 result = download_fingerprint_chromium(payload)
-                log_event(f"指纹内核下载/安装:{result.get('version') or '完成'}", category="浏览器")
+                log_event(f"指纹内核下载/安装:{result.get('kernel_id') or result.get('version') or '完成'}", category="浏览器")
+                json_response(self, result)
+            elif self.path == "/api/browser/create":
+                result = create_browser_instances(payload)
+                log_event(f"新建浏览器记录 {result.get('created', 0)} 条", category="浏览器")
+                json_response(self, result)
+            elif self.path == "/api/browser/rebind":
+                result = rebind_browser_instances(payload)
+                log_event(f"换绑浏览器记录 {result.get('updated', 0)} 条", category="浏览器")
+                json_response(self, result)
+            elif self.path == "/api/browser/regenerate-fingerprint":
+                result = regenerate_browser_fingerprints(payload)
+                log_event(f"重新生成浏览器指纹 {result.get('updated', 0)} 条", category="浏览器")
+                json_response(self, result)
+            elif self.path == "/api/browser/open-url":
+                result = open_browser_url(payload)
+                if result.get("method") == "launch":
+                    try:
+                        schedule_browser_exit_check(result)
+                    except Exception as exc:
+                        log_event(f"浏览器已启动，出口自检调度失败：{exc}", level="warn", category="浏览器")
+                json_response(self, result)
+            elif self.path == "/api/browser/cookies/export":
+                result = export_browser_cookies(payload)
+                log_event(f"导出浏览器 Cookie {result.get('count', 0)} 条", category="浏览器")
+                json_response(self, result, no_store=True)
+            elif self.path == "/api/browser/cookies/import":
+                result = import_browser_cookies(payload)
+                log_event(f"导入浏览器 Cookie {result.get('imported', 0)}/{result.get('total', 0)} 条", category="浏览器")
+                json_response(self, result)
+            elif self.path == "/api/browser/extensions/delete":
+                json_response(self, delete_browser_extension(payload))
+            elif self.path == "/api/browser/kernels/releases":
+                json_response(self, list_fingerprint_kernel_releases())
+            elif self.path == "/api/browser/kernels/default":
+                result = set_default_fingerprint_kernel(payload)
+                log_event(f"默认指纹内核设为：{result.get('default') or '自动（最新版本）'}", category="浏览器")
+                json_response(self, result)
+            elif self.path == "/api/browser/kernels/delete":
+                result = delete_fingerprint_kernel(payload)
+                log_event(f"删除指纹内核版本：{result.get('deleted')}", category="浏览器")
                 json_response(self, result)
             elif self.path == "/api/clipboard":
                 json_response(self, copy_to_clipboard(str(payload.get("text") or "")))

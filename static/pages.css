@@ -1269,6 +1269,88 @@ tbody tr.node-group-header td {
   .settings-save-bar { bottom: 4px; flex-wrap: wrap; }
   .settings-save-bar > span { flex-basis: 100%; }
 }
+/* ---------- 指纹浏览器：配置弹窗、批量栏与内核版本 ---------- */
+.text-warning,
+.responsive-table td small.text-warning { display: block; margin-top: 2px; color: var(--warning); font-size: var(--font-size-xs); overflow-wrap: anywhere; }
+.confirm-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in oklab, var(--danger) 30%, var(--border-subtle));
+  border-radius: var(--radius-sm);
+  background: color-mix(in oklab, var(--danger) 6%, var(--bg-panel));
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+  text-align: left;
+}
+.confirm-option[hidden] { display: none; }
+.confirm-option input { flex: 0 0 auto; margin-top: 3px; }
+#browserBatchCount { font-size: var(--font-size-sm); font-weight: 500; color: var(--text-primary); }
+#browserBatchBar { margin: 0 var(--space-4) 0; border-radius: var(--radius-md); border: 1px solid var(--border-subtle); }
+#browserBatchBar .batch-buttons { flex-wrap: wrap; justify-content: flex-end; }
+.browser-config-modal { width: min(640px, 100%); height: min(720px, calc(100dvh - 48px)); }
+.browser-config-tabs { padding: 8px 16px; }
+.browser-config-tabs[hidden] { display: none; }
+.browser-config-form { flex: 1 1 auto; }
+.browser-config-body { display: flex; flex-direction: column; gap: 14px; }
+.browser-config-body > section { display: flex; flex-direction: column; gap: 14px; }
+.browser-config-body > section[hidden] { display: none; }
+.browser-config-body input:not([type="checkbox"]):not([type="radio"]):not([type="file"]),
+.browser-config-body textarea { width: 100%; }
+.browser-config-body textarea { min-height: 72px; }
+.browser-config-body .sync-checkbox { padding-top: 0; font-size: var(--font-size-sm); }
+.browser-config-seed {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+  background: var(--bg-panel);
+  font-size: var(--font-size-sm);
+}
+.browser-config-seed > span { color: var(--text-secondary); font-size: var(--font-size-xs); font-weight: 550; }
+.browser-config-seed > code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: var(--font-size-xs); }
+.browser-config-note,
+.browser-config-checks > small { color: var(--text-tertiary); font-size: var(--font-size-xs); line-height: 1.45; }
+.browser-config-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 10px 12px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-md);
+}
+.browser-config-checks > legend { padding: 0 4px; color: var(--text-secondary); font-size: var(--font-size-xs); font-weight: 550; }
+.browser-config-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.browser-config-actions .toolbar-button.is-disabled,
+.browser-extension-upload.is-disabled { opacity: 0.5; pointer-events: none; }
+.browser-config-actions label.toolbar-button,
+.browser-extension-upload { display: inline-flex; align-items: center; align-self: flex-start; padding: 4px 10px; cursor: pointer; }
+.browser-extension-list { display: flex; flex-direction: column; gap: 4px; }
+.browser-extension-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 30px; }
+.browser-extension-row small { color: var(--text-tertiary); font-size: var(--font-size-xs); }
+/* 内核卡片网格中，核心表与多版本列表各占整行。 */
+.kernel-list > .responsive-table,
+.kernel-version-section { grid-column: 1 / -1; }
+.kernel-version-section { margin-top: var(--space-3); }
+.kernel-version-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.kernel-version-head h2 { font-size: var(--font-size-lg); font-weight: 600; }
+.kernel-version-head p { margin: 4px 0 0; color: var(--text-secondary); font-size: var(--font-size-sm); line-height: 1.5; }
+.kernel-version-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+@media (max-width: 720px) {
+  .browser-config-modal { height: calc(100dvh - 24px); }
+  .browser-config-seed { grid-template-columns: minmax(0, 1fr) auto; }
+  .browser-config-seed > span { grid-column: 1 / -1; }
+  .kernel-version-head { flex-direction: column; align-items: flex-start; }
+  #browserBatchBar { flex-direction: column; align-items: stretch; margin: 0 10px; }
+  #browserBatchBar .batch-buttons { justify-content: flex-start; }
+}
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }

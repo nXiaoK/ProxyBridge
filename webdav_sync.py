@@ -88,6 +88,8 @@ PROFILE_EXCLUDE_FILE_NAMES = {
     "SingletonSocket",
     "LOG",
     "LOG.old",
+    # CDP 调试端口文件只对本次运行有效，同步到其他设备会指向错误端口。
+    "DevToolsActivePort",
 }
 PROFILE_EXCLUDE_NAME_SUBSTR = (
     "Cache",
@@ -676,6 +678,9 @@ def sanitize_browser_instance_for_sync(instance: dict[str, Any]) -> dict[str, An
     record.pop("tag", None)
     # 出口自检结果属于本机网络环境，不应被其他设备上的旧结果覆盖。
     record.pop("exit_check", None)
+    # 调试端口、实际内核与生效时区语言都是本机运行期信息，不跨设备同步。
+    for runtime_field in ("cdp_port", "cdp_ws_path", "runtime_kernel", "runtime_locale"):
+        record.pop(runtime_field, None)
     # Drop absolute path; receiver rebuilds from node_id + instance id.
     record.pop("profile_path", None)
     return record
@@ -2557,6 +2562,20 @@ def apply_remote_state(
             new_browsers.append(record)
             new_browser_ids.add(iid)
         local_state["browser_instances"] = new_browsers
+        # 上传时会去掉本机标记；拉取后重新标出「订阅中已不存在、仅被浏览器记录引用」的节点，
+        # 让界面继续提示换绑，并在最后一条引用移除后自动清理。
+        subscription_node_ids = {
+            str(node_id)
+            for item in local_state.get("subscriptions") or []
+            if isinstance(item, dict)
+            for node_id in item.get("node_ids") or []
+            if node_id
+        }
+        browser_node_ids = {str(item.get("node_id") or "") for item in new_browsers}
+        for node in local_state.get("nodes") or []:
+            node_id = str(node.get("id") or "")
+            if node_id in browser_node_ids and node_id not in subscription_node_ids:
+                node[LOCAL_BROWSER_NODE_MARKER] = True
 
     new_node_ids = {
         str(item.get("id") or "")

@@ -1306,8 +1306,8 @@ class LifecycleRegressionTests(unittest.TestCase):
                 return io.BytesIO(json.dumps(release_payload).encode("utf-8"))
             return io.BytesIO(b"fake-dmg")
 
-        def fake_fingerprint_path(force_refresh: bool = False) -> str | None:
-            del force_refresh
+        def fake_fingerprint_path(force_refresh: bool = False, kernel_id: str | None = None) -> str | None:
+            del force_refresh, kernel_id
             return str(installed_binary) if installed.is_set() else None
 
         def fake_install(_dmg_path: Path, dest_root: Path) -> Path:

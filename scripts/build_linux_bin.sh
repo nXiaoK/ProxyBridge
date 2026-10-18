@@ -21,6 +21,7 @@ python3 -m PyInstaller \
   --add-data "app.py:." \
   --add-data "webdav_sync.py:." \
   --add-data "remote_browser.py:." \
+  --add-data "browser_fingerprint.py:." \
   --add-data "VERSION:." \
   --add-data "proxybridge_version.py:." \
   --add-data "static:static" \
@@ -28,6 +29,7 @@ python3 -m PyInstaller \
   --hidden-import app \
   --hidden-import webdav_sync \
   --hidden-import remote_browser \
+  --hidden-import browser_fingerprint \
   --hidden-import proxybridge_version \
   --hidden-import desktop \
   --hidden-import desktop.tray_host \

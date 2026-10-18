@@ -98,6 +98,7 @@ Web 前端
 |---|---|
 | `app.py` | 主后端、协议解析、HTTP API、核心与代理生命周期、浏览器、日志、诊断 |
 | `remote_browser.py` | 主服务到内部 Browser Broker 的带 Bearer token 客户端 |
+| `browser_fingerprint.py` | 浏览器记录的指纹配置校验、启动参数拼接、时区语言选择、Cookie 格式转换、CRX 解析与仅连 127.0.0.1 的 CDP WebSocket 客户端（纯逻辑，不读写状态） |
 | `browser_broker.py` | Docker Engine 客户端、远程浏览器 worker 创建/查询/销毁与端口分配 |
 | `webdav_sync.py` | WebDAV 客户端、同步引擎、Profile 打包、校验、加密和 LWW 应用 |
 | `static/index.html` | Web 控制台页面结构与所有视图 |
@@ -228,8 +229,14 @@ work/
     {bridge_id}.json
     {bridge_id}.log
   browser_profiles/
+    {node_stable_id}/{instance_id}/      # Profile；内含 ProxyBridgeExtensions/<扩展 ID>/ 扩展副本
+  browser_extensions/
+    google_search/                       # 内置默认搜索扩展
+    library/{extension_id}/              # 上传的扩展库，含 .proxybridge-extension.json
   proxy-cores/
   fingerprint-chromium/
+    versions/{kernel_id}/                # 多版本内核，含 .proxybridge-kernel.json
+    .proxybridge-default-kernel.json     # 本机默认内核 {"id": "..."}，空 ID 表示最新版本
 ```
 
 实际根目录由 `PROXY_BRIDGE_WORKDIR` 或 `--workdir` 决定。
@@ -316,7 +323,26 @@ Bridge 是一个节点到本地代理端口的运行记录，通常包含：
 
 前端根据 `tested_at` 计算结果年龄与过期状态。批量任务本身属于运行时状态，不作为长期业务数据依赖。
 
-### 7.7 原子保存与恢复
+### 7.7 浏览器记录
+
+`browser_instances[]` 中每条记录除名称、标签、`node_id`、`fingerprint_seed`、`profile_path` 与运行状态外，还包含以下可编辑字段（由 `normalize_browser_instances()` 补齐兼容默认值）：
+
+| 字段 | 说明 |
+|---|---|
+| `group` | 自由分组名，最长 40 字，用于筛选与批量操作 |
+| `fingerprint` | 指纹参数对象：`platform`、`platform_version`、`brand`、`brand_version`、`hardware_concurrency`、`disable_spoofing`、`timezone_mode`、`timezone`、`language_mode`、`language`、`accept_language`、`geolocation`、`window_size`；取值见 `browser_fingerprint.py` |
+| `kernel_version` | 固定的内核版本 ID，空字符串表示跟随默认版本 |
+| `cdp_enabled` | 是否开放本机 CDP 调试端口（127.0.0.1 随机端口，默认关闭，仅本机模式） |
+| `extensions` | 扩展库中的扩展 ID 列表 |
+| `start_urls` | 每次启动打开的 http(s) 网址，最多 10 个 |
+
+运行期字段 `cdp_port`、`cdp_ws_path`、`runtime_kernel`、`runtime_locale` 只在运行中有效，停止后清空，不参与 WebDAV 同步。
+
+缺少 `fingerprint` 字段的记录来自升级前版本，规范化时补成 `legacy_fingerprint_config()`（与升级前的启动参数一致）；新建记录使用 `recommended_fingerprint_config()`（Chrome 品牌、按出口 IP 匹配时区语言、默认禁止地理定位）。修改默认值时必须保持这一区分，避免已登录账号的指纹在升级后变化。
+
+订阅刷新或删除导致节点消失时，被浏览器记录引用的节点会带上 `_webdav_browser_preserved` 标记继续保留（公开字段为 `browser_preserved`），记录与 Profile 不删除；`prune_preserved_browser_nodes()` 在换绑或删除最后一条引用后清理这些节点。只有 `/api/subscriptions/delete` 显式传 `delete_browser_profiles: true` 时才连同记录与 Profile 删除。
+
+### 7.8 原子保存与恢复
 
 `save_state()` 使用临时文件、`fsync` 和原子替换，并维护 `state.json.bak`。`load_state()` 的原则是：
 
@@ -735,7 +761,9 @@ http://127.0.0.1:8787/#token=...
 | 内核安装 | `/api/cores/upload`（`application/octet-stream`，不是 JSON） |
 | 设置 | `/api/settings/subscriptions`、`speed-test`、`logs`、`network` |
 | 诊断 | `/api/diagnostics/run` |
-| 浏览器 | `/api/browser/launch`、`stop`、`delete`、`credentials`、`update`、`download-kernel` |
+| 浏览器 | `/api/browser/launch`、`stop`、`delete`、`credentials`、`update`（单条 `instance_id` 或批量 `instance_ids`）、`create`、`rebind`、`regenerate-fingerprint`、`open-url`、`cookies/export`、`cookies/import`、`extensions/delete`、`download-kernel`（可选 `tag` / `latest`） |
+| 浏览器扩展 | `/api/browser/extensions/upload`（`application/octet-stream`，文件名放在 `X-ProxyBridge-Upload-Name`，上限 64 MiB） |
+| 指纹内核版本 | `/api/browser/kernels/releases`、`default`、`delete` |
 | 日志 | `/api/logs/clear`、`/api/system/logs/clear` |
 | 代理池 | `/api/pool/token/rotate`、`feedback`、`exclude` |
 | 客户端 | `/api/network/clients/kick` |
@@ -1043,6 +1071,9 @@ xcrun swiftc -parse macos/ProxyBridgeMenuBar/main.swift
 | `test_frontend_auth.js` | fragment token 和会话认证 |
 | `test_frontend_diagnostics.js` | ICE 解析、WebRTC 风险分类和失败结果 |
 | `test_frontend_browser_ui.js` | 远程浏览器凭据保留/清除、复制回退、URL 与 CSS 选择器安全 |
+| `test_browser_fingerprint.py` | 指纹配置校验、启动参数、时区来源、Cookie 格式、CRX 与 CDP WebSocket 客户端 |
+| `test_browser_environment_features.py` | 新旧记录启动参数、出口时区、批量编辑、换绑、订阅保留、多版本内核、扩展库、Cookie 与 Broker 参数白名单 |
+| `test_frontend_browser_config.js` | 浏览器配置表单载荷、记录筛选与 CDP 地址显示 |
 | `test_frontend_core_upload.js` | 文件格式、上传请求头/正文、SHA 与响应实例令牌校验 |
 
 ### 21.3 测试策略
@@ -1072,7 +1103,7 @@ scripts/build_menubar_app.sh --bundle-cores
 流程包括：
 
 - 编译 Swift 菜单栏程序、图标和原子替换工具。
-- 复制 `app.py`、`webdav_sync.py`、`remote_browser.py` 和 `static/`；桌面模式只打包 Broker 客户端，不启用 Docker worker。
+- 复制 `app.py`、`webdav_sync.py`、`remote_browser.py`、`browser_fingerprint.py` 和 `static/`；桌面模式只打包 Broker 客户端，不启用 Docker worker。
 - 安装锁定的 PyYAML vendored 依赖。
 - 可选复制核心。
 - 输出 `outputs/ProxyBridgeMenuBar.app`。
