@@ -1911,8 +1911,8 @@ def default_browser_instance_options() -> dict[str, Any]:
     return {
         # 自由分组名，用于浏览器页筛选与批量操作，最长 40 字。
         "group": "",
-        # 指纹参数，字段含义见 browser_fingerprint.FINGERPRINT_FIELDS；macOS 上默认语言跟随系统、
-        # 关闭 Canvas 与字体伪装，避免被检测站判定为 masking。
+        # 指纹参数，字段含义见 browser_fingerprint.FINGERPRINT_FIELDS；时区与语言默认按出口 IP，
+        # macOS 上另外默认关闭 Canvas 与字体伪装，避免被检测站判定为 masking。
         "fingerprint": browser_fingerprint.recommended_fingerprint_config(fingerprint_platform_token()),
         # 固定内核版本 ID；空字符串表示跟随「内核管理」中的默认版本。
         "kernel_version": "",

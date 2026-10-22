@@ -170,7 +170,7 @@ outputs/ProxyBridgeMenuBar.app
 | 浏览器品牌 | Chrome（新记录默认）、Edge、Opera、Vivaldi 或 Chromium（内核默认）；可选填品牌版本，留空跟随内核版本。 |
 | CPU 核心数 / 平台版本 / 窗口尺寸 | 留空或「随种子」时由内核决定；窗口尺寸格式为 `宽x高`。 |
 | 关闭伪装项 | Canvas、Audio、字体、ClientRects、WebGL/GPU，需要内核 144 及以上。实测 macOS 上 Canvas 噪声与字体伪装会被 Pixelscan 判定为「Masking detected」，因此 macOS 新建记录默认关闭这两项；关闭后同一台 Mac 上各环境的 Canvas 与字体相同（与大量同型号 Mac 一致），GPU 型号、音频、ClientRects 仍按种子区分。配置弹窗中的「一键应用检测友好设置」与批量配置可把已有记录改成该组合。 |
-| 时区 / 语言来源 | `按出口 IP`（新记录默认）：启动前经该节点代理访问 `ipwho.is` 查询出口时区与国家，结果按节点缓存 10 分钟，查询失败时回退到节点地区；`按节点地区`：使用节点名识别的地区表；`自定义`：手动填写 IANA 时区、语言与 Accept-Language。语言另有 `跟随系统`：不传语言参数，界面语言、`navigator.language`、`Intl` 区域与 Accept-Language 都使用系统设置。macOS 版 Chromium 的 `Intl` 区域与日期格式只跟随系统语言，改成其他语言会出现可被检测的不一致，所以 macOS 新建记录的语言默认「跟随系统」，时区仍按出口 IP。 |
+| 时区 / 语言来源 | `按出口 IP`（新记录默认）：启动前经该节点代理访问 `ipwho.is` 查询出口时区与国家，结果按节点缓存 10 分钟，查询失败时回退到节点地区；`按节点地区`：使用节点名识别的地区表；`自定义`：手动填写 IANA 时区、语言与 Accept-Language。语言另有 `跟随系统`：不传语言参数，界面语言、`navigator.language`、`Intl` 区域与 Accept-Language 都使用系统设置。所有平台新建记录的时区与语言都默认按出口 IP。macOS 版 Chromium 的 `Intl` 区域与日期格式只跟随系统语言，语言与系统不同时会出现可被检测的不一致；需要规避时可改为「跟随系统」，或使用「一键应用检测友好设置」（macOS 上会同时把语言改为跟随系统）。 |
 | 地理位置权限 | `禁止`（新记录默认）写入 Profile 默认权限，避免系统 / Wi-Fi 定位绕过代理暴露真实位置；`询问` 保持 Chromium 默认行为。 |
 | 内核版本 | 跟随默认版本，或固定某个已安装版本；固定版本缺失时启动会报错，不会悄悄换内核。 |
 | 扩展 | 从扩展库勾选。启动时扩展复制到 Profile 内的 `ProxyBridgeExtensions/`，随 Profile 一起同步，Docker worker 同样可用。 |

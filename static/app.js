@@ -3916,14 +3916,14 @@ function renderBrowserConfigLocale(mode, instance) {
   const modes = keep ? browserConfig.LOCALE_MODE_OPTIONS.filter(([key]) => key !== "custom") : browserConfig.LOCALE_MODE_OPTIONS;
   const languageModes = keep ? browserConfig.LANGUAGE_MODE_OPTIONS.filter(([key]) => key !== "custom") : browserConfig.LANGUAGE_MODE_OPTIONS;
   const languageHint = macLocalBrowser()
-    ? "macOS 上 Chromium 的 Intl 区域与日期格式只跟随系统语言；选择其他语言会与之不一致，被检测站判定为伪装，建议「跟随系统」。"
-    : "跟随系统时不修改语言；其他选项会同时设置界面语言、navigator.language 与 Accept-Language。";
+    ? "按出口 IP：启动前经该节点代理查询出口所在国家的语言，失败时回退到节点地区。macOS 上 Chromium 的 Intl 区域与日期格式只跟随系统语言，与出口语言不一致时可能被检测站识别；需要规避时可改为「跟随系统」。"
+    : "按出口 IP：启动前经该节点代理查询出口所在国家的语言，失败时回退到节点地区；跟随系统时不修改语言。";
   const current = (key, fallback) => mode === "create" ? fallback : (fp[key] ?? fallback);
   const runtime = instance?.runtime_locale && ACTIVE_BROWSER_STATUS.includes(instance.status)
     ? `<div class="core-upload-platform">当前生效：${escapeHtml(instance.runtime_locale.timezone || "")}（${escapeHtml(browserConfig.localeSourceLabel(instance.runtime_locale.timezone_source))}） · ${escapeHtml(instance.runtime_locale.language || "")}（${escapeHtml(browserConfig.localeSourceLabel(instance.runtime_locale.language_source))}）</div>`
     : "";
   const custom = keep ? "" : `${browserConfigField("自定义时区", `<input name="timezone" value="${escapeHtml(fp.timezone || "")}" placeholder="IANA 名称，例如 America/New_York">`)}${browserConfigField("自定义语言", `<input name="language" value="${escapeHtml(fp.language || "")}" placeholder="例如 en-US">`)}${browserConfigField("Accept-Language", `<input name="accept_language" value="${escapeHtml(fp.accept_language || "")}" placeholder="留空按语言生成，例如 en-US,en;q=0.9">`)}`;
-  return `<section data-config-panel="locale" hidden>${runtime}${browserConfigField("时区来源", `<select name="timezone_mode">${selectOptionsMarkup(modes, current("timezone_mode", "exit_ip"), { keep })}</select>`, "按出口 IP：启动前经该节点代理查询出口所在时区，失败时回退到节点地区。")}${browserConfigField("语言来源", `<select name="language_mode">${selectOptionsMarkup(languageModes, current("language_mode", macLocalBrowser() ? "system" : "exit_ip"), { keep })}</select>`, languageHint)}${custom}${browserConfigField("地理位置权限", `<select name="geolocation">${selectOptionsMarkup(browserConfig.GEOLOCATION_OPTIONS, current("geolocation", "block"), { keep })}</select>`, "系统定位基于 Wi-Fi 等信号，不经过代理；建议禁止，避免暴露真实位置。")}</section>`;
+  return `<section data-config-panel="locale" hidden>${runtime}${browserConfigField("时区来源", `<select name="timezone_mode">${selectOptionsMarkup(modes, current("timezone_mode", "exit_ip"), { keep })}</select>`, "按出口 IP：启动前经该节点代理查询出口所在时区，失败时回退到节点地区。")}${browserConfigField("语言来源", `<select name="language_mode">${selectOptionsMarkup(languageModes, current("language_mode", "exit_ip"), { keep })}</select>`, languageHint)}${custom}${browserConfigField("地理位置权限", `<select name="geolocation">${selectOptionsMarkup(browserConfig.GEOLOCATION_OPTIONS, current("geolocation", "block"), { keep })}</select>`, "系统定位基于 Wi-Fi 等信号，不经过代理；建议禁止，避免暴露真实位置。")}</section>`;
 }
 
 function renderBrowserExtensionList(selectedIds) {

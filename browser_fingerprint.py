@@ -95,8 +95,9 @@ def legacy_fingerprint_config() -> dict[str, Any]:
 def recommended_fingerprint_config(host_platform: str = "") -> dict[str, Any]:
     """新记录默认值：Chrome 品牌、按出口 IP 匹配时区与语言、默认禁止地理定位。
 
-    host_platform 为 macos 时，语言跟随系统并关闭 Canvas 与字体伪装：实测 fingerprint-chromium
-    在 macOS 上这三项会让 Pixelscan 判定为 masking，其余伪装项不受影响。
+    host_platform 为 macos 时关闭 Canvas 与字体伪装：实测 fingerprint-chromium 在 macOS 上这两项
+    会让 Pixelscan 判定为 masking。语言在所有平台都默认按出口 IP；macOS 上 Intl 区域只跟随系统语言，
+    需要规避这类不一致时可在配置里改为「跟随系统」或使用「一键应用检测友好设置」。
     """
     config = legacy_fingerprint_config()
     config.update(
@@ -108,7 +109,6 @@ def recommended_fingerprint_config(host_platform: str = "") -> dict[str, Any]:
         }
     )
     if host_platform == "macos":
-        config["language_mode"] = "system"
         config["disable_spoofing"] = list(MACOS_DETECTION_FRIENDLY_DISABLED)
     return config
 

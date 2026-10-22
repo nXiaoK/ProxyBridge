@@ -26,9 +26,9 @@ class FingerprintConfigTests(unittest.TestCase):
         self.assertEqual(recommended["geolocation"], "block")
         changed = {key for key in legacy if legacy[key] != recommended[key]}
         self.assertEqual(changed, {"brand", "timezone_mode", "language_mode", "geolocation"})
-        # macOS：Intl 只跟随系统语言，Canvas 噪声与字体伪装会被检测站识别。
+        # macOS：语言同样默认按出口 IP，仅默认关闭会被检测站识别的 Canvas 噪声与字体伪装。
         mac = bf.recommended_fingerprint_config("macos")
-        self.assertEqual(mac["language_mode"], "system")
+        self.assertEqual(mac["language_mode"], "exit_ip")
         self.assertEqual(mac["disable_spoofing"], ["canvas", "font"])
         self.assertEqual(bf.recommended_fingerprint_config("linux")["language_mode"], "exit_ip")
 

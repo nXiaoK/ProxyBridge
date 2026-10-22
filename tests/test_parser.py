@@ -630,11 +630,8 @@ class ParserTests(unittest.TestCase):
                 self.assertIn(f"--fingerprint-platform={app.fingerprint_platform_token()}", command)
                 self.assertIn("--webrtc-ip-handling-policy=disable_non_proxied_udp", command)
                 self.assertTrue(any(arg.startswith("--timezone=") for arg in command))
-                # macOS 新记录语言跟随系统（Intl 区域无法通过 --lang 修改），其他平台按地区设置语言。
-                self.assertEqual(
-                    any(arg.startswith("--lang=") for arg in command),
-                    app.fingerprint_platform_token() != "macos",
-                )
+                # 新记录在所有平台都按出口 IP 设置语言；出口查询失败时回退节点地区，同样下发 --lang。
+                self.assertTrue(any(arg.startswith("--lang=") for arg in command))
                 self.assertEqual(result["fingerprint_seed"], app.fingerprint_seed(f"{node_id}:{instance_id}"))
                 self.assertNotEqual(result["fingerprint_seed"], app.fingerprint_seed(node_id))
                 profile_arg = next(arg for arg in command if arg.startswith("--user-data-dir="))

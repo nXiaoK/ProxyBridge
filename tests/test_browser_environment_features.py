@@ -156,7 +156,7 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
         self.assertIn("--timezone=America/Los_Angeles", legacy_command)
         self.assertIn("--fingerprint=1234", legacy_command)
 
-    def test_macos_new_records_follow_system_language_and_skip_detectable_spoofing(self) -> None:
+    def test_macos_new_records_use_exit_language_and_skip_detectable_spoofing(self) -> None:
         self.install_stub_kernel()
         state = app.empty_state()
         state["nodes"] = [{"id": "node-us", "name": "US", "region": "美国", "protocol": "vless"}]
@@ -165,12 +165,13 @@ class BrowserEnvironmentFeatureTests(unittest.TestCase):
             state["browser_instances"] = [record]
             app.save_state(state)
             command = self.launch(record["id"], lambda _port: {"ip": "1.1.1.1", "region_code": "US", "timezone": "America/Chicago"})
-        self.assertEqual(record["fingerprint"]["language_mode"], "system")
+        self.assertEqual(record["fingerprint"]["language_mode"], "exit_ip")
         self.assertIn("--disable-spoofing=font,canvas", command)
         self.assertIn("--timezone=America/Chicago", command)
-        self.assertFalse(any(arg.startswith(("--lang=", "--accept-lang=")) for arg in command))
+        self.assertIn("--lang=en-US", command)
+        self.assertIn("--accept-lang=en-US,en", command)
         saved = app.load_state()["browser_instances"][0]
-        self.assertEqual(saved["runtime_locale"]["language_source"], "system")
+        self.assertEqual(saved["runtime_locale"]["language_source"], "exit_ip")
 
     def test_exit_lookup_failure_falls_back_to_region_and_cdp_flag_is_added(self) -> None:
         self.install_stub_kernel()
