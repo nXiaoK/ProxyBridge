@@ -72,11 +72,51 @@ test("node page module renders stable keys and escapes node names", (t) => {
     icon: () => "", latencyCell: () => "未测试", isNodeGroupCollapsed: () => false,
     groupAverageLatency: () => "—", initials: () => "G", filteredNodes: () => [node],
     groupNodesBySubscription: () => [{ id: "group", name: "Group", kind: "source", nodes: [node] }],
-    renderSpeedTestTaskControls() {}, updateBatchActionsBar() {}, bindNodeCheckboxes() {},
+    renderSpeedTestTaskControls() {}, updateBatchActionsBar() {}, bindNodeCheckboxes() {}, formatDuration: () => "1 分钟",
     uiCore: { patchKeyedHtml: (target, html) => { target.innerHTML = html; } },
   });
   render();
   assert.match(rows.innerHTML, /data-ui-key="node:node"/);
   assert.match(rows.innerHTML, /&lt;img onerror=bad>/);
   assert.doesNotMatch(rows.innerHTML, /<img onerror/);
+  assert.match(rows.innerHTML, /class="exit-cell is-empty" title="测速成功后显示节点真实出口 IP">—/);
+  assert.match(rows.innerHTML, /<td colspan="8">/);
+});
+
+test("node page shows the tested exit IP separately from the entry server", (t) => {
+  const previousDocument = global.document;
+  const previousComputedStyle = global.getComputedStyle;
+  global.document = { documentElement: { dataset: { nodeDensity: "compact" } } };
+  global.getComputedStyle = () => ({ getPropertyValue: () => "36px" });
+  t.after(() => { global.document = previousDocument; global.getComputedStyle = previousComputedStyle; });
+  const rows = element();
+  const nodes = [
+    { id: "relay", name: "HK relay", server: "relay.example.test", port: 443, protocol: "vless", region_code: "HK" },
+    { id: "down", name: "SG down", server: "203.0.113.1", port: 443, protocol: "trojan", region_code: "SG" },
+    { id: "failed-lookup", name: "US", server: "us.example.test", port: 443, protocol: "vless", region_code: "US" },
+  ];
+  const tests = {
+    relay: { ok: true, latency_ms: 80, exit: { ip: "198.51.100.7", region_code: "JP", age_seconds: 60 } },
+    down: { ok: false, message: "HTTP 502", exit: { ip: "203.0.113.9", region_code: "SG", age_seconds: 60 } },
+    "failed-lookup": { ok: true, latency_ms: 90, exit_error: "www.cloudflare.com: timed out" },
+  };
+  const render = createNodeRenderer({
+    $: (selector) => selector === "#nodeRows" ? rows : element(),
+    appState: { nodes, tests, selectedNodeIds: new Set(), filters: { search: "" } },
+    bridgeForNode: () => null, mostRecentBridgeForNode: () => null, browserEnabled: () => false,
+    browserInstancesForNode: () => [], runningBrowserInstancesForNode: () => [], escapeHtml,
+    icon: () => "", latencyCell: () => "", isNodeGroupCollapsed: () => false,
+    groupAverageLatency: () => "—", initials: () => "G", filteredNodes: () => nodes,
+    groupNodesBySubscription: () => [{ id: "group", name: "Group", kind: "source", nodes }],
+    renderSpeedTestTaskControls() {}, updateBatchActionsBar() {}, bindNodeCheckboxes() {}, formatDuration: () => "1 分钟",
+    uiCore: { patchKeyedHtml: (target, html) => { target.innerHTML = html; } },
+  });
+  render();
+  const row = (id) => rows.innerHTML.split('data-ui-key="node:').find((chunk) => chunk.startsWith(`${id}"`));
+  assert.match(row("relay"), /class="exit-cell is-mismatch "[^>]*data-action="copy" data-text="198\.51\.100\.7"/);
+  assert.match(row("relay"), /入口 relay\.example\.test:443\n出口 198\.51\.100\.7 · JP\n出口地区与节点标注 HK 不一致\n检测于 1 分钟前/);
+  assert.match(row("relay"), /<span class="exit-region">JP<\/span>/);
+  assert.match(row("down"), /class="exit-cell  is-stale"/);
+  assert.match(row("down"), /最近一次测速失败，显示的是上次检测结果/);
+  assert.match(row("failed-lookup"), /title="出口检测失败：www\.cloudflare\.com: timed out">—/);
 });

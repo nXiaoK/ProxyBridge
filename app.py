@@ -326,6 +326,16 @@ FINGERPRINT_CHROMIUM_CACHE: dict[str, Any] = {"key": None, "path": None, "checke
 EXIT_LOCALE_CACHE_TTL = 600.0
 EXIT_LOCALE_CACHE: dict[str, dict[str, Any]] = {}
 EXIT_LOCALE_CACHE_LOCK = threading.Lock()
+# 节点列表「出口 IP」：入口地址可能只是中转，测速成功后经同一临时 SOCKS5 端口查询节点真实出口。
+# 按顺序尝试 (域名或 IP, 路径, 响应格式)：先用 1.1.1.1 的 Cloudflare trace 取 IPv4 出口（便于与入口对比），
+# 仅有 IPv6 出口的节点再走双栈的 www.cloudflare.com，最后回退 ipwho.is（JSON）。trace 为纯文本且无需密钥。
+# 每个服务单独限时 5 秒；查询失败只记录原因，不影响测速成功与否。
+NODE_EXIT_LOOKUP_ENDPOINTS = (
+    ("1.1.1.1", "/cdn-cgi/trace", "trace"),
+    ("www.cloudflare.com", "/cdn-cgi/trace", "trace"),
+    ("ipwho.is", "/", "json"),
+)
+NODE_EXIT_LOOKUP_TIMEOUT = 5.0
 # 扩展库上传/删除与 Profile 内扩展副本同步共用一把锁，防止并发复制半成品目录。
 BROWSER_EXTENSION_LOCK = threading.RLock()
 # 扩展包上传上限 64 MiB；解压后的文件数与体积仍受通用归档限制约束。
@@ -3357,6 +3367,9 @@ def merge_test_result(previous: Any, current: dict[str, Any]) -> dict[str, Any]:
     if current.get("ok"):
         successes += 1
     merged = dict(current)
+    # 本次没拿到出口（测速失败或出口查询失败）时沿用上次结果；exit.checked_at 标明其检测时间。
+    if not isinstance(merged.get("exit"), dict) and isinstance(prior.get("exit"), dict):
+        merged["exit"] = dict(prior["exit"])
     merged.update(
         {
             "attempt_count": attempts,
@@ -3380,6 +3393,11 @@ def public_test_results(state: dict[str, Any], current_time: int | None = None) 
         age_seconds = max(0, now - tested_at) if tested_at else None
         item["age_seconds"] = age_seconds
         item["stale"] = age_seconds is None or age_seconds >= stale_after
+        if isinstance(item.get("exit"), dict):
+            exit_info = dict(item["exit"])
+            checked_at = max(0, safe_int(exit_info.get("checked_at"), 0))
+            exit_info["age_seconds"] = max(0, now - checked_at) if checked_at else None
+            item["exit"] = exit_info
         results[str(node_id)] = item
     return results
 
@@ -8829,6 +8847,13 @@ def check_browser_exit(instance_id: str, generation: tuple[Any, ...]) -> None:
         if instance.get("status") not in ACTIVE_BROWSER_STATUSES:
             return
         instance["exit_check"] = result
+        # 浏览器自检与测速看到的是同一节点出口；已有测速记录时同步刷新节点列表里的出口 IP。
+        test_record = state["tests"].get(str(instance.get("node_id") or ""))
+        if result.get("status") == "ok" and isinstance(test_record, dict):
+            test_record["exit"] = {
+                **{key: result[key] for key in ("ip", "region_code") if result.get(key)},
+                "checked_at": result["checked_at"],
+            }
         save_state(state)
     if result.get("mismatch"):
         log_event(f"浏览器出口地区 {result['region_code']} 与节点地区 {expected} 不一致", level="warn", category="浏览器")
@@ -12156,6 +12181,60 @@ def choose_speed_test_target(settings: dict[str, Any] | None = None) -> str:
     return target
 
 
+def socks5_connect(sock: socket.socket, host: str, port: int) -> None:
+    """在已连上本地 SOCKS5 入站的套接字上完成无认证握手，并以域名发起 CONNECT。"""
+    sock.sendall(b"\x05\x01\x00")
+    greeting = read_exact(sock, 2)
+    if greeting != b"\x05\x00":
+        raise RuntimeError("本地 SOCKS5 握手失败")
+
+    host_bytes = host.encode("idna")
+    if len(host_bytes) > 255:
+        raise RuntimeError("探测域名过长")
+    request = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + port.to_bytes(2, "big")
+    sock.sendall(request)
+    reply = read_exact(sock, 4)
+    if reply[0] != 5 or reply[1] != 0:
+        raise RuntimeError(f"节点无法连接探测目标，SOCKS5 状态码 {reply[1]}")
+    atyp = reply[3]
+    if atyp == 1:
+        read_exact(sock, 4)
+    elif atyp == 3:
+        size = read_exact(sock, 1)[0]
+        read_exact(sock, size)
+    elif atyp == 4:
+        read_exact(sock, 16)
+    else:
+        raise RuntimeError("SOCKS5 返回了未知地址类型")
+    read_exact(sock, 2)
+
+
+def _start_cancel_watcher(
+    transport_holder: list[socket.socket | None],
+    cancel_event: threading.Event | None,
+    done: threading.Event,
+) -> threading.Thread | None:
+    """取消事件触发时关闭当前传输套接字，让阻塞中的探测立即返回。"""
+    if cancel_event is None:
+        return None
+
+    def watch() -> None:
+        while not done.is_set():
+            if cancel_event.wait(timeout=0.1):
+                transport = transport_holder[0]
+                if transport is not None:
+                    try:
+                        transport.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    transport.close()
+                return
+
+    watcher = threading.Thread(target=watch, name="speed-test-cancel", daemon=True)
+    watcher.start()
+    return watcher
+
+
 def socks5_http_probe(
     local_port: int,
     target_url: str | None = None,
@@ -12172,52 +12251,12 @@ def socks5_http_probe(
     probe_done = threading.Event()
     transport_holder: list[socket.socket | None] = [None]
 
-    def cancel_probe() -> None:
-        if cancel_event is None:
-            return
-        while not probe_done.is_set():
-            if cancel_event.wait(timeout=0.1):
-                transport = transport_holder[0]
-                if transport is not None:
-                    try:
-                        transport.shutdown(socket.SHUT_RDWR)
-                    except OSError:
-                        pass
-                    transport.close()
-                return
-
     with socket.create_connection(("127.0.0.1", local_port), timeout=timeout) as sock:
         transport_holder[0] = sock
-        watcher: threading.Thread | None = None
-        if cancel_event is not None:
-            watcher = threading.Thread(target=cancel_probe, name="speed-test-cancel", daemon=True)
-            watcher.start()
+        watcher = _start_cancel_watcher(transport_holder, cancel_event, probe_done)
         try:
             sock.settimeout(timeout)
-            sock.sendall(b"\x05\x01\x00")
-            greeting = read_exact(sock, 2)
-            if greeting != b"\x05\x00":
-                raise RuntimeError("本地 SOCKS5 握手失败")
-
-            host_bytes = target_host.encode("idna")
-            if len(host_bytes) > 255:
-                raise RuntimeError("探测域名过长")
-            request = b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + target_port.to_bytes(2, "big")
-            sock.sendall(request)
-            reply = read_exact(sock, 4)
-            if reply[0] != 5 or reply[1] != 0:
-                raise RuntimeError(f"节点无法连接探测目标，SOCKS5 状态码 {reply[1]}")
-            atyp = reply[3]
-            if atyp == 1:
-                read_exact(sock, 4)
-            elif atyp == 3:
-                size = read_exact(sock, 1)[0]
-                read_exact(sock, size)
-            elif atyp == 4:
-                read_exact(sock, 16)
-            else:
-                raise RuntimeError("SOCKS5 返回了未知地址类型")
-            read_exact(sock, 2)
+            socks5_connect(sock, target_host, target_port)
 
             transport: socket.socket = sock
             if parsed.scheme == "https":
@@ -12256,6 +12295,81 @@ def socks5_http_probe(
             probe_done.set()
             if watcher is not None:
                 watcher.join(timeout=0.2)
+
+
+def socks5_https_get(
+    local_port: int,
+    host: str,
+    path: str,
+    timeout: float,
+    cancel_event: threading.Event | None = None,
+    limit: int = 65536,
+) -> bytes:
+    """经本地 SOCKS5 端口以 HTTPS GET 读取小型响应体；非 200 或超过 limit 时报错。"""
+    done = threading.Event()
+    transport_holder: list[socket.socket | None] = [None]
+    with socket.create_connection(("127.0.0.1", local_port), timeout=timeout) as sock:
+        transport_holder[0] = sock
+        watcher = _start_cancel_watcher(transport_holder, cancel_event, done)
+        try:
+            sock.settimeout(timeout)
+            socks5_connect(sock, host, 443)
+            transport = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+            transport_holder[0] = transport
+            transport.settimeout(timeout)
+            # 复用已建立的隧道：预先设置 sock 后 http.client 不会自行直连目标。
+            connection = http.client.HTTPSConnection(host, timeout=timeout)
+            connection.sock = transport
+            try:
+                connection.request("GET", path, headers={
+                    "Accept": "*/*", "Connection": "close", "User-Agent": "ProxyBridge",
+                })
+                response = connection.getresponse()
+                data = response.read(limit + 1)
+                if response.status != 200 or len(data) > limit:
+                    raise RuntimeError(f"HTTP {response.status}")
+                return data
+            finally:
+                connection.close()
+        finally:
+            done.set()
+            if watcher is not None:
+                watcher.join(timeout=0.2)
+
+
+def parse_exit_lookup(kind: str, body: bytes) -> dict[str, str]:
+    """把出口服务响应规范化为 {ip, region_code?}；地区未知（XX）时省略 region_code。"""
+    if kind == "trace":
+        text = body.decode("utf-8", errors="replace")
+        fields = dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+        raw_ip, raw_code = fields.get("ip"), fields.get("loc")
+    else:
+        result = json.loads(body)
+        if not isinstance(result, dict) or result.get("success") is False:
+            raise RuntimeError("出口服务未返回有效结果")
+        raw_ip, raw_code = result.get("ip"), result.get("country_code")
+    info = {"ip": str(ipaddress.ip_address(str(raw_ip or "").strip()))}
+    code = str(raw_code or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{2}", code) and code != "XX":
+        info["region_code"] = code
+    return info
+
+
+def socks5_exit_lookup(
+    local_port: int,
+    timeout: float = NODE_EXIT_LOOKUP_TIMEOUT,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, str]:
+    """经本地 SOCKS5 端口查询节点真实出口，按 NODE_EXIT_LOOKUP_ENDPOINTS 顺序回退。"""
+    errors: list[str] = []
+    for host, path, kind in NODE_EXIT_LOOKUP_ENDPOINTS:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("测速已取消")
+        try:
+            return parse_exit_lookup(kind, socks5_https_get(local_port, host, path, timeout, cancel_event))
+        except Exception as exc:
+            errors.append(f"{host}: {exc}")
+    raise RuntimeError("；".join(errors))
 
 
 def persist_test_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -12541,6 +12655,12 @@ def test_node(
             "core": core,
             "tested_at": now_ts(),
         }
+        if probe.get("ok") and not (cancel_event is not None and cancel_event.is_set()):
+            # 入口地址可能只是中转，出口以经节点访问外部服务看到的 IP 为准；查询失败不改变测速结论。
+            try:
+                result["exit"] = {**socks5_exit_lookup(local_port, cancel_event=cancel_event), "checked_at": now_ts()}
+            except Exception as exc:
+                result["exit_error"] = str(exc)[:300]
     except Exception as exc:
         result = {
             "ok": False,

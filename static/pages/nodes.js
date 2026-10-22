@@ -2,7 +2,31 @@
   "use strict";
 
   function createNodeRenderer(context) {
-    const { $, appState, bridgeForNode, mostRecentBridgeForNode, browserEnabled, browserInstancesForNode, runningBrowserInstancesForNode, escapeHtml, icon, latencyCell, isNodeGroupCollapsed, groupAverageLatency, initials, filteredNodes, groupNodesBySubscription, renderSpeedTestTaskControls, updateBatchActionsBar, bindNodeCheckboxes, uiCore } = context;
+    const { $, appState, bridgeForNode, mostRecentBridgeForNode, browserEnabled, browserInstancesForNode, runningBrowserInstancesForNode, escapeHtml, icon, latencyCell, isNodeGroupCollapsed, groupAverageLatency, initials, filteredNodes, groupNodesBySubscription, renderSpeedTestTaskControls, updateBatchActionsBar, bindNodeCheckboxes, formatDuration, uiCore } = context;
+    // 出口 IP 来自测速成功后经节点访问外部服务的结果；入口地址可能只是中转，两者不一定相同。
+    function renderExitCell(node) {
+      const result = appState.tests?.[node.id];
+      const exit = result?.exit && typeof result.exit === "object" ? result.exit : null;
+      if (!exit?.ip) {
+        const hint = result?.exit_error ? `出口检测失败：${result.exit_error}` : "测速成功后显示节点真实出口 IP";
+        return `<span class="exit-cell is-empty" title="${escapeHtml(hint)}">—</span>`;
+      }
+      const exitRegion = String(exit.region_code || "").toUpperCase();
+      const nodeRegion = String(node.region_code || "").toUpperCase();
+      const mismatch = Boolean(exitRegion && nodeRegion && nodeRegion !== "ZZ" && exitRegion !== nodeRegion);
+      // 最近一次测速失败时，后端保留的是上次检测到的出口。
+      const outdated = !result.ok;
+      const details = [
+        `入口 ${node.server}:${node.port}`,
+        `出口 ${exit.ip}${exitRegion ? ` · ${exitRegion}` : ""}`,
+        mismatch ? `出口地区与节点标注 ${nodeRegion} 不一致` : "",
+        exit.age_seconds == null ? "" : `检测于 ${formatDuration(exit.age_seconds)}前`,
+        outdated ? "最近一次测速失败，显示的是上次检测结果" : "",
+        "点击复制出口 IP",
+      ].filter(Boolean).join("\n");
+      return `<button type="button" class="exit-cell ${mismatch ? "is-mismatch" : ""} ${outdated ? "is-stale" : ""}" data-action="copy" data-text="${escapeHtml(exit.ip)}" title="${escapeHtml(details)}" aria-label="复制出口 IP ${escapeHtml(exit.ip)}"><span class="exit-ip">${escapeHtml(exit.ip)}</span>${exitRegion ? `<span class="exit-region">${escapeHtml(exitRegion)}</span>` : ""}</button>`;
+    }
+
     function renderNodeRow(node) {
       const bridge = bridgeForNode(node.id);
       const previousBridge = !bridge ? mostRecentBridgeForNode(node.id) : null;
@@ -31,6 +55,7 @@
             </div>
           </td>
           <td><span class="region-cell" title="${escapeHtml(node.region || "未分类")}">${escapeHtml(regionCode)}</span></td>
+          <td>${renderExitCell(node)}</td>
           <td><span class="tag protocol-tag" title="${escapeHtml([node.protocol, node.transport, node.security].filter(Boolean).join(" · "))}">${escapeHtml([node.protocol, node.transport, node.security].filter(Boolean).join(" · "))}</span></td>
           <td><span class="tag core-tag" title="${node.fallback_enabled ? "启动失败时会尝试备用核心" : "首选代理核心"}">${escapeHtml(coreLabel)}${node.fallback_enabled ? " ↗" : ""}</span></td>
           <td>${latencyCell(node.id)}</td>
@@ -57,7 +82,7 @@
       const meta = metaBits.join(" · ");
       return `
         <tr class="node-group-header ${collapsed ? "is-collapsed" : ""}" data-ui-key="group:${escapeHtml(group.id)}" data-group-id="${escapeHtml(group.id)}">
-          <td colspan="7">
+          <td colspan="8">
             <button
               type="button"
               class="node-group-toggle"
@@ -133,9 +158,9 @@
         const topHeight = flattened.slice(0, start).reduce((sum, item) => sum + item.height, 0);
         const bottomHeight = flattened.slice(end).reduce((sum, item) => sum + item.height, 0);
         visibleItems = [
-          ...(topHeight ? [{ key: "virtual:top", height: topHeight, html: `<tr data-ui-key="virtual:top" class="virtual-spacer"><td colspan="7" style="height:${topHeight}px"></td></tr>` }] : []),
+          ...(topHeight ? [{ key: "virtual:top", height: topHeight, html: `<tr data-ui-key="virtual:top" class="virtual-spacer"><td colspan="8" style="height:${topHeight}px"></td></tr>` }] : []),
           ...flattened.slice(start, end),
-          ...(bottomHeight ? [{ key: "virtual:bottom", height: bottomHeight, html: `<tr data-ui-key="virtual:bottom" class="virtual-spacer"><td colspan="7" style="height:${bottomHeight}px"></td></tr>` }] : []),
+          ...(bottomHeight ? [{ key: "virtual:bottom", height: bottomHeight, html: `<tr data-ui-key="virtual:bottom" class="virtual-spacer"><td colspan="8" style="height:${bottomHeight}px"></td></tr>` }] : []),
         ];
       }
       uiCore.patchKeyedHtml(rows, visibleItems.map((item) => item.html).join(""), { keyAttribute: "data-ui-key" });

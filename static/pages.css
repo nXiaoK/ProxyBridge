@@ -277,7 +277,7 @@ input:disabled { cursor: not-allowed; }
 
 /* Node table density and compact action layout */
 .table-shell { overscroll-behavior: contain; }
-.table-shell > table { min-width: 790px; }
+.table-shell > table { min-width: 900px; }
 .table-shell > table thead th { padding: 8px 11px; }
 /* 行高只由 tr 控制；td 用 auto，避免表格布局将 height 与纵向 padding 叠加。 */
 tbody tr.node-row { height: var(--node-row-height); }
@@ -334,6 +334,33 @@ tbody tr.node-row > td.checkbox-col { padding: 0 8px; }
 .favorite-toggle:focus-visible,
 .favorite-toggle.is-favorite { color: var(--warning); opacity: 1; }
 .node-row .region-cell { font-size: var(--font-size-xs); }
+/* 出口 IP：等宽数字便于逐列比对；整格可点击复制，地区与节点标注不一致时地区码用警告色。 */
+.node-row .exit-cell {
+  display: inline-flex;
+  max-width: 200px;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  background: var(--color-transparent);
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: 16px;
+  text-align: left;
+}
+.node-row .exit-ip {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-row .exit-region { flex: 0 0 auto; color: var(--text-tertiary); font-size: var(--font-size-2xs); }
+.node-row button.exit-cell:hover .exit-ip { color: var(--accent); }
+.node-row .exit-cell.is-mismatch .exit-region { color: var(--warning); font-weight: 600; }
+.node-row .exit-cell.is-stale { opacity: 0.62; }
+.node-row .exit-cell.is-empty { color: var(--text-tertiary); }
 .node-row .tag { max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .node-row .row-actions { align-items: center; gap: 4px; }
 .node-row .row-actions .row-button { min-height: 26px; padding: 3px 8px; font-size: var(--font-size-xs); }
@@ -1041,7 +1068,7 @@ tbody tr.node-group-header td {
 @media (max-width: 720px) {
   :root { --sidebar-width: 56px; }
   :root[data-node-density] {
-    --node-row-height: 126px;
+    --node-row-height: 148px;
     --node-group-row-height: 100px;
   }
   .sidebar { padding-top: 8px; }
@@ -1109,7 +1136,7 @@ tbody tr.node-group-header td {
     width: 100%;
     height: calc(var(--node-row-height) - 8px);
     grid-template-columns: 26px minmax(0, 1fr) minmax(0, 1fr);
-    grid-template-rows: 28px 18px 18px 28px;
+    grid-template-rows: 28px 18px 18px 18px 28px;
     align-items: center;
     gap: 4px 8px;
     margin: 0 0 8px;
@@ -1131,23 +1158,27 @@ tbody tr.node-group-header td {
   }
   #nodeViewport > table > tbody > tr.node-row > td.checkbox-col { grid-row: 1; grid-column: 1; padding: 0 !important; }
   #nodeViewport > table > tbody > tr.node-row > td:nth-child(2) { grid-row: 1; grid-column: 2 / 4; }
+  /* 卡片：地区/协议、核心/延迟各占一行，出口 IP 独占整行以容纳 IPv6，最后一行为操作。 */
   #nodeViewport > table > tbody > tr.node-row > td:nth-child(3) { grid-row: 2; grid-column: 2; }
-  #nodeViewport > table > tbody > tr.node-row > td:nth-child(4) { grid-row: 2; grid-column: 3; }
-  #nodeViewport > table > tbody > tr.node-row > td:nth-child(5) { grid-row: 3; grid-column: 2; }
-  #nodeViewport > table > tbody > tr.node-row > td:nth-child(6) { grid-row: 3; grid-column: 3; }
-  #nodeViewport > table > tbody > tr.node-row > td:nth-child(7) { grid-row: 4; grid-column: 2 / 4; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(4) { grid-row: 4; grid-column: 2 / 4; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(5) { grid-row: 2; grid-column: 3; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(6) { grid-row: 3; grid-column: 2; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(7) { grid-row: 3; grid-column: 3; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(8) { grid-row: 5; grid-column: 2 / 4; }
   #nodeViewport > table > tbody > tr.node-row > td:nth-child(3)::before { content: "地区"; }
-  #nodeViewport > table > tbody > tr.node-row > td:nth-child(4)::before { content: "协议"; }
-  #nodeViewport > table > tbody > tr.node-row > td:nth-child(5)::before { content: "核心"; }
-  #nodeViewport > table > tbody > tr.node-row > td:nth-child(6)::before { content: "延迟"; }
-  #nodeViewport > table > tbody > tr.node-row > td:nth-child(7)::before { content: "操作"; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(4)::before { content: "出口 IP"; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(5)::before { content: "协议"; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(6)::before { content: "核心"; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(7)::before { content: "延迟"; }
+  #nodeViewport > table > tbody > tr.node-row > td:nth-child(8)::before { content: "操作"; }
   /* 卡片的伪元素标签跟随界面语言，不修改节点、地址等用户数据。 */
   :root[data-locale="en"] #nodeViewport > table > thead .checkbox-wrapper::after { content: "Select visible nodes"; }
   :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(3)::before { content: "Region"; }
-  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(4)::before { content: "Protocol"; }
-  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(5)::before { content: "Core"; }
-  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(6)::before { content: "Latency"; }
-  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(7)::before { content: "Actions"; }
+  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(4)::before { content: "Exit IP"; }
+  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(5)::before { content: "Protocol"; }
+  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(6)::before { content: "Core"; }
+  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(7)::before { content: "Latency"; }
+  :root[data-locale="en"] #nodeViewport > table > tbody > tr.node-row > td:nth-child(8)::before { content: "Actions"; }
   #nodeViewport > table > tbody > tr.node-row > td:nth-child(n+3)::before {
     flex: 0 0 auto;
     color: var(--text-tertiary);
@@ -1163,6 +1194,7 @@ tbody tr.node-group-header td {
   #nodeViewport .node-row .node-source { max-width: 100%; }
   #nodeViewport .node-row .tag { min-width: 0; max-width: 100%; padding: 2px 6px; font-size: var(--font-size-xs); }
   #nodeViewport .node-row .latency-badge { min-height: 24px; padding: 2px 7px; }
+  #nodeViewport .node-row .exit-cell { max-width: 100%; }
   #nodeViewport .node-row .row-actions { min-width: 0; flex: 1 1 auto; justify-content: flex-end; gap: 5px; flex-wrap: nowrap; }
   #nodeViewport .node-row .row-actions .row-button { min-height: 26px; padding: 2px 8px; }
   #nodeViewport .node-row .row-actions .icon-button { width: 26px; height: 26px; min-height: 26px; }
