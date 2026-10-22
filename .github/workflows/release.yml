@@ -14,7 +14,8 @@ on:
         default: main
         type: string
 
-# 创建标签与 Release 必须写仓库内容；各构建任务不使用额外长期密钥。
+# 创建标签与 Release 必须写仓库内容；构建任务不使用额外长期密钥，
+# 只有发布任务读取 PROXY_BRIDGE_UPDATE_SIGNING_KEY 为软件更新清单签名。
 permissions:
   contents: write
 
@@ -33,6 +34,9 @@ jobs:
       release_version: ${{ steps.version.outputs.release_version }}
       source_sha: ${{ steps.version.outputs.source_sha }}
       tag: ${{ steps.version.outputs.tag }}
+      # 外壳修订号：构建任务写入 App / exe，发布任务写入更新清单，三处必须使用同一个值。
+      macos_shell_revision: ${{ steps.version.outputs.macos_shell_revision }}
+      windows_shell_revision: ${{ steps.version.outputs.windows_shell_revision }}
     env:
       # push 使用事件提交；手动运行时使用输入的 ref，默认 main。
       SOURCE_REF: ${{ github.event_name == 'push' && github.sha || inputs.ref }}
@@ -59,6 +63,9 @@ jobs:
           release_version="${base_version}-build.${build_number}"
           source_sha="$(git rev-parse HEAD)"
           tag="v${release_version}"
+          # 外壳源文件未变化时修订号不变，已安装的客户端只需热更新后端载荷。
+          macos_shell_revision="$(python3 scripts/build_update_release.py shell-revision --shell macos-app)"
+          windows_shell_revision="$(python3 scripts/build_update_release.py shell-revision --shell windows-exe)"
 
           {
             echo "base_version=$base_version"
@@ -66,6 +73,8 @@ jobs:
             echo "release_version=$release_version"
             echo "source_sha=$source_sha"
             echo "tag=$tag"
+            echo "macos_shell_revision=$macos_shell_revision"
+            echo "windows_shell_revision=$windows_shell_revision"
           } >> "$GITHUB_OUTPUT"
 
   verify:
@@ -128,6 +137,8 @@ jobs:
           # 完整版本进入包内 API；纯数字构建号进入 CFBundleVersion。
           PROXY_BRIDGE_VERSION: ${{ needs.metadata.outputs.release_version }}
           PROXY_BRIDGE_BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
+          # 写入 bridge/SHELL_REVISION，供软件更新判断能否只热更新后端载荷。
+          PROXY_BRIDGE_SHELL_REVISION: ${{ needs.metadata.outputs.macos_shell_revision }}
           TARGET_ARCH: arm64
         run: scripts/build_menubar_app.sh
 
@@ -136,6 +147,7 @@ jobs:
           EXPECTED_BASE_VERSION: ${{ needs.metadata.outputs.base_version }}
           EXPECTED_BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
           EXPECTED_RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
+          EXPECTED_SHELL_REVISION: ${{ needs.metadata.outputs.macos_shell_revision }}
         shell: bash
         run: |
           set -euo pipefail
@@ -145,6 +157,8 @@ jobs:
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$EXPECTED_BASE_VERSION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$EXPECTED_BUILD_NUMBER"
           test "$(tr -d '\r\n' < "$bundled_version")" = "$EXPECTED_RELEASE_VERSION"
+          test "$(tr -d '\r\n' < "$app/Contents/Resources/bridge/SHELL_REVISION")" = "$EXPECTED_SHELL_REVISION"
+          test -f "$app/Contents/Resources/bridge/app_payload.py"
           file "$app/Contents/MacOS/ProxyBridgeMenuBar" | grep -q arm64
           codesign --verify --deep --strict "$app"
 
@@ -169,6 +183,7 @@ jobs:
         env:
           PROXY_BRIDGE_VERSION: ${{ needs.metadata.outputs.release_version }}
           PROXY_BRIDGE_BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
+          PROXY_BRIDGE_SHELL_REVISION: ${{ needs.metadata.outputs.macos_shell_revision }}
           TARGET_ARCH: arm64
         # 完整版在轻量版基础上把官方安装包放入 App 的 bridge/bundled/，首次启动自动安装，无需联网下载。
         run: scripts/build_menubar_app.sh --bundle-packages bundled-packages
@@ -223,6 +238,8 @@ jobs:
           # 脚本会同时写入 Windows 版本资源和 onefile 包内 VERSION。
           PROXY_BRIDGE_VERSION: ${{ needs.metadata.outputs.release_version }}
           PROXY_BRIDGE_BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
+          # 写入 exe 包内 SHELL_REVISION，供软件更新判断能否只热更新后端载荷。
+          PROXY_BRIDGE_SHELL_REVISION: ${{ needs.metadata.outputs.windows_shell_revision }}
         run: .\scripts\build_windows_exe.ps1 -Python (Get-Command python).Source -SkipInstall
 
       - name: Package Windows asset
@@ -270,9 +287,36 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  build-payload:
+    name: Build backend update payload
+    needs: [metadata, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Package backend payload for in-app updates
+        env:
+          RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
+        # 载荷与 App / exe 内置后端来自同一提交：后端模块、static/、纯 Python 版 PyYAML 与 VERSION。
+        run: python scripts/build_update_release.py payload --version "$RELEASE_VERSION" --out release-assets
+
+      - name: Upload payload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: payload-${{ needs.metadata.outputs.tag }}
+          path: release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
   release:
     name: Publish GitHub Release
-    needs: [metadata, build-macos, build-windows]
+    needs: [metadata, build-macos, build-windows, build-payload]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -284,6 +328,13 @@ jobs:
       RELEASE_VERSION: ${{ needs.metadata.outputs.release_version }}
       SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
     steps:
+      # 只用于运行 scripts/build_update_release.py 生成更新清单，不参与打包。
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.source_sha }}
+          path: source
+
       - name: Download packaged assets
         uses: actions/download-artifact@v4
         with:
@@ -298,6 +349,7 @@ jobs:
           test -f "release-assets/ProxyBridge-macOS-arm64-full-${RELEASE_VERSION}.zip"
           test -f "release-assets/ProxyBridge-Windows-x64-${RELEASE_VERSION}.exe"
           test -f "release-assets/ProxyBridge-Windows-x64-full-${RELEASE_VERSION}.zip"
+          test -f "release-assets/ProxyBridge-payload-${RELEASE_VERSION}.zip"
           (
             cd release-assets
             sha256sum ProxyBridge-* > SHA256SUMS.txt
@@ -310,17 +362,40 @@ jobs:
             "- macOS：Apple Silicon，最低 macOS 13，使用 ad-hoc 签名但未公证。" \
             "- Windows：x64 便携单文件，未购买代码签名证书。" \
             "- 完整版（文件名含 full）：额外内置 sing-box、Xray 与指纹浏览器内核官方安装包，首次启动自动安装，无需再单独下载代理核心与指纹内核；Windows 完整版解压后请保持 ProxyBridge.exe 与 bundled 目录在一起。" \
+            "- 软件更新：已安装支持应用内更新的版本后，可在 设置 → 通用 → 软件更新 中直接升级；update-manifest.json 与 ProxyBridge-payload-*.zip 供客户端使用，无需手动下载。" \
             "" \
             "首次打开时，macOS Gatekeeper 或 Windows SmartScreen 可能显示安全提示。" \
             > release-notes.md
+
+      - name: Generate signed update manifest
+        shell: bash
+        env:
+          # 软件更新清单签名私钥（64 位十六进制 Ed25519 种子），只配置在仓库 Secret 中。
+          # 未配置时生成未签名清单，客户端只提示手动下载；配置后客户端可应用内更新。
+          PROXY_BRIDGE_UPDATE_SIGNING_KEY: ${{ secrets.PROXY_BRIDGE_UPDATE_SIGNING_KEY }}
+          MACOS_SHELL_REVISION: ${{ needs.metadata.outputs.macos_shell_revision }}
+          WINDOWS_SHELL_REVISION: ${{ needs.metadata.outputs.windows_shell_revision }}
+        run: |
+          set -euo pipefail
+          python3 source/scripts/build_update_release.py manifest \
+            --version "$RELEASE_VERSION" \
+            --tag "$TAG" \
+            --commit "$SOURCE_SHA" \
+            --assets-dir release-assets \
+            --macos-revision "$MACOS_SHELL_REVISION" \
+            --windows-revision "$WINDOWS_SHELL_REVISION"
 
       - name: Create or update Release
         shell: bash
         run: |
           set -euo pipefail
           mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
-          # 轻量版与完整版各两个，加 SHA256SUMS.txt。
-          test "${#assets[@]}" -eq 5
+          # 轻量版与完整版各两个、后端载荷、SHA256SUMS.txt 与更新清单；已签名时另有清单签名。
+          expected_assets=7
+          if [[ -f release-assets/update-manifest.json.sig ]]; then
+            expected_assets=8
+          fi
+          test "${#assets[@]}" -eq "$expected_assets"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${assets[@]}" --clobber
             gh release edit "$TAG" \

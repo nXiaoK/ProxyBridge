@@ -21,6 +21,7 @@ const appState = {
   tests: {},
   nodeHistories: {},
   healthSettings: { auto_switch: false },
+  update: null,
   speedTest: { settings: null, tasks: [] },
   subscriptionSettings: { allow_non_public_urls: false },
   subscriptionRefresh: { tasks: [] },
@@ -990,6 +991,146 @@ function syncNetworkSettingsControlState() {
   }
 }
 
+const UPDATE_BUSY_LABELS = Object.freeze({
+  checking: "正在检查更新…",
+  downloading: "正在下载新版本…",
+  installing: "正在安装新版本…",
+});
+// 点击「立即更新」或「回退」时记录当前版本；重启后的后端报告不同版本时重新加载页面，载入新的前端文件。
+let updateReloadFromVersion = "";
+
+function updateStatusSummary(update) {
+  if (!update) return { pill: "未检查", tone: "is-idle", text: "尚未检查更新" };
+  if (update.busy) return { pill: "进行中", tone: "is-idle", text: UPDATE_BUSY_LABELS[update.busy] || "正在处理…" };
+  if (update.restarting) return { pill: "重启中", tone: "is-idle", text: update.message || "正在重启以完成更新…" };
+  if (update.error) return { pill: "失败", tone: "is-error", text: update.error };
+  const checked = update.checked_at ? `上次检查：${formatRelativeTime(update.checked_at)}` : "尚未检查更新";
+  if (update.available) {
+    const latest = update.latest?.version || "";
+    const failure = update.previous_failure
+      ? `此版本曾${update.previous_failure.kind === "rollback" ? "被手动回退" : "启动失败并自动回退"}。`
+      : "";
+    if (update.mode === "payload") return { pill: "有新版本", tone: "is-ok", text: `${failure}可直接更新到 v${latest}，只替换后端与界面文件，约需数秒并会重启后端。` };
+    if (update.mode === "shell") return { pill: "有新版本", tone: "is-ok", text: `${failure}v${latest} 包含外壳更新，将下载完整程序并自动重新启动 ProxyBridge。` };
+    return { pill: "有新版本", tone: "is-ok", text: `${failure}发现 v${latest}。${update.reason || "请前往发布页下载"}` };
+  }
+  const message = update.message ? `${update.message}。` : "";
+  return { pill: update.checked_at ? "已是最新" : "未检查", tone: update.checked_at ? "is-ok" : "is-idle", text: `${message}${checked}` };
+}
+
+function renderUpdateSettings() {
+  const update = appState.update;
+  const card = $("#updateSettingsCard");
+  if (!card) return;
+  const summary = updateStatusSummary(update);
+  const pill = $("#updateStatusPill");
+  pill.textContent = summary.pill;
+  pill.className = `status-pill ${summary.tone}`;
+  $("#updateStatusText").textContent = summary.text;
+  const current = update?.current_version || appState.version || "";
+  const bundled = update?.bundled_version || "";
+  $("#updateCurrentVersion").textContent = current
+    ? `v${current}${update?.payload_version && bundled ? `（内置 v${bundled}）` : ""}`
+    : "—";
+  $("#updateLatestVersion").textContent = update?.latest?.version ? `v${update.latest.version}` : "—";
+  const autoCheck = $("#updateAutoCheck");
+  if (autoCheck && document.activeElement !== autoCheck) autoCheck.checked = update?.auto_check !== false;
+  const busy = Boolean(update?.busy || update?.restarting);
+  const checkButton = $("#updateCheckButton");
+  checkButton.disabled = busy;
+  checkButton.classList.toggle("is-busy", update?.busy === "checking");
+  const applyButton = $("#updateApplyButton");
+  const inApp = Boolean(update?.available && (update.mode === "payload" || update.mode === "shell"));
+  applyButton.hidden = !inApp;
+  applyButton.disabled = busy;
+  applyButton.textContent = update?.mode === "shell" ? "下载并重新启动" : "立即更新";
+  const download = $("#updateDownloadLink");
+  download.hidden = !(update?.available && update.mode === "manual");
+  if (update?.releases_url) download.href = update.releases_url;
+  const rollback = $("#updateRollbackButton");
+  rollback.hidden = !update?.can_rollback;
+  rollback.disabled = busy;
+}
+
+function noteUpdateStatus(previous, update) {
+  if (updateReloadFromVersion && appState.version && appState.version !== updateReloadFromVersion) {
+    updateReloadFromVersion = "";
+    window.location.reload();
+    return;
+  }
+  if (previous?.busy && update && !update.busy && update.error && !update.restarting) {
+    updateReloadFromVersion = "";
+    showToast(update.error, "error");
+  }
+  const latest = update?.available ? update.latest?.version : "";
+  if (!latest) return;
+  const key = `pb-update-notified-${latest}`;
+  try {
+    if (sessionStorage.getItem(key)) return;
+    sessionStorage.setItem(key, "1");
+  } catch (_) {
+    if (noteUpdateStatus.notified === latest) return;
+    noteUpdateStatus.notified = latest;
+  }
+  showToast(`发现新版本 v${latest}，可在「设置 → 通用 → 软件更新」中查看`, "ok", { duration: 6000 });
+}
+
+async function checkForUpdates() {
+  const button = $("#updateCheckButton");
+  button.disabled = true;
+  button.classList.add("is-busy");
+  try {
+    appState.update = await api("/api/update/check", {});
+    renderUpdateSettings();
+    showToast(appState.update.available ? `发现新版本 v${appState.update.latest?.version}` : "当前已是最新版本");
+  } catch (error) {
+    showToast(error.message, "error");
+    await loadStatus({ forceFresh: true }).catch(() => {});
+  } finally {
+    renderUpdateSettings();
+  }
+}
+
+async function applyUpdate() {
+  const update = appState.update;
+  const version = update?.latest?.version;
+  if (!version) return;
+  const shell = update.mode === "shell";
+  const confirmed = await confirmAction(
+    shell
+      ? `将下载 v${version} 完整程序，替换当前程序后自动重新启动 ProxyBridge。所有运行中的代理和指纹浏览器会被停止。`
+      : `将下载 v${version} 并重启后端。所有运行中的代理和指纹浏览器会被停止，重启后按原设置自动恢复。`,
+    { title: "安装更新", confirmLabel: shell ? "下载并重新启动" : "立即更新" },
+  );
+  if (!confirmed) return;
+  updateReloadFromVersion = appState.version;
+  try {
+    appState.update = await api("/api/update/apply", { version });
+    renderUpdateSettings();
+    showToast(shell ? "正在下载新版本，完成后 ProxyBridge 会自动重新启动" : "正在下载并安装新版本…");
+  } catch (error) {
+    updateReloadFromVersion = "";
+    showToast(error.message, "error");
+  }
+}
+
+async function rollbackUpdate() {
+  const bundled = appState.update?.bundled_version;
+  const confirmed = await confirmAction(
+    `将停用当前安装的新版本，回退到程序内置的${bundled ? ` v${bundled}` : "版本"}并重启后端。运行中的代理和指纹浏览器会被停止。`,
+    { title: "回退版本", confirmLabel: "回退" },
+  );
+  if (!confirmed) return;
+  updateReloadFromVersion = appState.version;
+  try {
+    appState.update = await api("/api/update/rollback", {});
+    renderUpdateSettings();
+  } catch (error) {
+    updateReloadFromVersion = "";
+    showToast(error.message, "error");
+  }
+}
+
 function renderNetworkSettings() {
   const network = appState.network;
   const networkStatus = appState.networkStatus;
@@ -1025,6 +1166,7 @@ function renderNetworkSettings() {
   if (languageSelect && document.activeElement !== languageSelect) languageSelect.value = i18n.getLocale();
   const healthToggle = $("#healthAutoSwitch");
   if (healthToggle && document.activeElement !== healthToggle) healthToggle.checked = appState.healthSettings?.auto_switch === true;
+  renderUpdateSettings();
 
   const settingsHint = $("#networkSettingsHint");
   if (settingsHint) {
@@ -1722,6 +1864,9 @@ function applyStatusSnapshot(status) {
   } else appState.networkStatus = "error";
   appState.sync = status.sync || appState.sync || null;
   appState.healthSettings = status.health_settings || appState.healthSettings || { auto_switch: false };
+  const previousUpdate = appState.update;
+  appState.update = status.update || null;
+  noteUpdateStatus(previousUpdate, appState.update);
   if ("sync_openssl" in status) appState.syncOpenssl = Boolean(status.sync_openssl);
   render();
 }
@@ -5581,6 +5726,24 @@ function bindEvents() {
     if ($("#nodeViewport")) $("#nodeViewport").scrollTop = 0;
     renderNodes();
   }));
+  $("#updateCheckButton")?.addEventListener("click", () => checkForUpdates());
+  $("#updateApplyButton")?.addEventListener("click", () => applyUpdate());
+  $("#updateRollbackButton")?.addEventListener("click", () => rollbackUpdate());
+  $("#updateAutoCheck")?.addEventListener("change", async (event) => {
+    const next = event.target.checked;
+    event.target.disabled = true;
+    try {
+      const result = await api("/api/settings/updates", { auto_check: next });
+      appState.update = result.update || appState.update;
+      showToast(next ? "已开启自动检查更新" : "已关闭自动检查更新");
+    } catch (error) {
+      event.target.checked = !next;
+      showToast(error.message, "error");
+    } finally {
+      event.target.disabled = false;
+      renderUpdateSettings();
+    }
+  });
   $("#healthAutoSwitch")?.addEventListener("change", async (event) => {
     const next = event.target.checked;
     event.target.disabled = true;

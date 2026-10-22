@@ -166,6 +166,18 @@ New-Item -ItemType Directory -Force -Path $OutDir, $WorkDir, $DistDir, $Metadata
 # PyInstaller 使用独立文件写入 Windows 资源；包内 VERSION 供后端和控制台在运行时显示同一完整版本。
 $BundledVersionPath = Join-Path $MetadataDir "VERSION"
 Set-Content -LiteralPath $BundledVersionPath -Value $Version -Encoding ASCII
+# 外壳修订号：发布流水线通过 PROXY_BRIDGE_SHELL_REVISION 注入（与更新清单使用同一个值），本地构建时按外壳源文件计算。
+# 后端据此判断新版本能否只热更新后端载荷，还是需要替换整个 exe。
+$ShellRevision = "$env:PROXY_BRIDGE_SHELL_REVISION".Trim()
+if (-not $ShellRevision) {
+  $revisionArgs = @((Join-Path $RootDir "scripts\build_update_release.py"), "shell-revision", "--shell", "windows-exe")
+  $ShellRevision = ((Invoke-Python @revisionArgs) | Out-String).Trim()
+}
+if ($ShellRevision -notmatch '^[0-9a-f]{64}$') {
+  throw "Invalid shell revision: $ShellRevision"
+}
+$ShellRevisionPath = Join-Path $MetadataDir "SHELL_REVISION"
+Set-Content -LiteralPath $ShellRevisionPath -Value $ShellRevision -Encoding ASCII
 $VersionResourcePath = Join-Path $MetadataDir "ProxyBridge.version.txt"
 $VersionResource = @"
 VSVersionInfo(
@@ -227,6 +239,8 @@ $WebDavSource = Join-Path $RootDir "webdav_sync.py"
 $RemoteBrowserSource = Join-Path $RootDir "remote_browser.py"
 $BrowserFingerprintSource = Join-Path $RootDir "browser_fingerprint.py"
 $VersionModuleSource = Join-Path $RootDir "proxybridge_version.py"
+$AppPayloadSource = Join-Path $RootDir "app_payload.py"
+$AppUpdateSource = Join-Path $RootDir "app_update.py"
 $StaticSource = Join-Path $RootDir "static"
 $DesktopSource = Join-Path $RootDir "desktop"
 $TrayEntry = Join-Path $RootDir "desktop\tray_host.py"
@@ -240,6 +254,10 @@ $addData = @(
   # 版本解析模块和构建生成的 VERSION 必须同时进入 onefile 临时目录。
   "$VersionModuleSource;.",
   "$BundledVersionPath;.",
+  # 软件更新：载荷启动器、更新模块与外壳修订号。
+  "$AppPayloadSource;.",
+  "$AppUpdateSource;.",
+  "$ShellRevisionPath;.",
   "$StaticSource;static",
   "$DesktopSource;desktop"
 )
@@ -268,6 +286,8 @@ $pyiArgs += @(
   "--hidden-import", "remote_browser",
   "--hidden-import", "browser_fingerprint",
   "--hidden-import", "proxybridge_version",
+  "--hidden-import", "app_payload",
+  "--hidden-import", "app_update",
   "--hidden-import", "desktop",
   "--hidden-import", "desktop.tray_host",
   "--hidden-import", "desktop.autostart",

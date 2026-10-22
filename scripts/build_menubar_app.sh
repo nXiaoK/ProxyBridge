@@ -81,6 +81,7 @@ Environment:
   PROXY_BRIDGE_BUILD_NUMBER=12             写入 CFBundleVersion 的纯数字构建号。
   TARGET_ARCH=arm64                        目标 CPU 架构；当前发布仅支持 Apple Silicon。
   PROXY_BRIDGE_BUNDLED_PACKAGES=/path      等同 --bundle-packages，用于构建完整版。
+  PROXY_BRIDGE_SHELL_REVISION=<64位十六进制>  外壳修订号；为空时按外壳源文件计算。
 EOF
       exit 0
       ;;
@@ -265,6 +266,20 @@ vendor_python_dependencies() {
   PYTHONPATH="$VENDOR_DIR" "$VENDOR_PYTHON" -c 'import yaml; assert yaml.safe_load("ok: true") == {"ok": True}'
 }
 
+# 外壳修订号：发布流水线通过 PROXY_BRIDGE_SHELL_REVISION 注入（与更新清单使用同一个值），
+# 本地构建时按外壳源文件现场计算。客户端据此判断新版本能否只热更新后端载荷。
+write_shell_revision() {
+  local revision="${PROXY_BRIDGE_SHELL_REVISION:-}"
+  if [[ -z "$revision" ]]; then
+    revision="$("$VENDOR_PYTHON" "$ROOT_DIR/scripts/build_update_release.py" shell-revision --shell macos-app)"
+  fi
+  if [[ ! "$revision" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "外壳修订号无效：$revision" >&2
+    exit 1
+  fi
+  printf '%s\n' "$revision" > "$BRIDGE_DIR/SHELL_REVISION"
+}
+
 bundle_proxy_cores() {
   local sing_box_source=""
   local sing_box_binary=""
@@ -353,9 +368,13 @@ cp "$ROOT_DIR/remote_browser.py" "$BRIDGE_DIR/remote_browser.py"
 cp "$ROOT_DIR/browser_fingerprint.py" "$BRIDGE_DIR/browser_fingerprint.py"
 # 完整构建版本写入包内，运行时 API 与 macOS/Windows 文件元数据使用同一来源。
 cp "$ROOT_DIR/proxybridge_version.py" "$BRIDGE_DIR/proxybridge_version.py"
+# 软件更新：app_payload.py 是后端启动器（菜单栏 App 运行它而不是 app.py），app_update.py 负责检查与安装。
+cp "$ROOT_DIR/app_payload.py" "$BRIDGE_DIR/app_payload.py"
+cp "$ROOT_DIR/app_update.py" "$BRIDGE_DIR/app_update.py"
 printf '%s\n' "$APP_VERSION" > "$BRIDGE_DIR/VERSION"
 ditto "$ROOT_DIR/static" "$BRIDGE_DIR/static"
 vendor_python_dependencies
+write_shell_revision
 if [[ "$BUNDLE_CORES" == "1" ]]; then
   bundle_proxy_cores
 else

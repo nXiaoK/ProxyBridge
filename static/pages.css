@@ -996,8 +996,8 @@ tbody tr.node-group-header td {
 .sync-status-meta > span { color: var(--text-tertiary); font-size: var(--font-size-xs); }
 .sync-status-meta strong { color: var(--text-secondary); font-weight: 550; }
 .sync-status-error { margin: 0; color: var(--danger); font-size: var(--font-size-xs); line-height: 1.45; overflow-wrap: anywhere; }
-.health-settings .settings-toggle-row { padding: 0; }
-.health-settings .settings-toggle-row > input[type="checkbox"] {
+:is(.health-settings, .update-settings) .settings-toggle-row { padding: 0; }
+:is(.health-settings, .update-settings) .settings-toggle-row > input[type="checkbox"] {
   position: relative;
   width: 42px;
   height: 24px;
@@ -1009,7 +1009,7 @@ tbody tr.node-group-header td {
   cursor: pointer;
   transition: background var(--transition), border-color var(--transition);
 }
-.health-settings .settings-toggle-row > input[type="checkbox"]::after {
+:is(.health-settings, .update-settings) .settings-toggle-row > input[type="checkbox"]::after {
   position: absolute;
   top: 2px;
   left: 2px;
@@ -1021,9 +1021,14 @@ tbody tr.node-group-header td {
   content: "";
   transition: transform var(--transition);
 }
-.health-settings .settings-toggle-row > input[type="checkbox"]:checked { border-color: var(--success); background: var(--success); }
-.health-settings .settings-toggle-row > input[type="checkbox"]:checked::after { transform: translateX(18px); }
-.health-settings .settings-toggle-row > input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:is(.health-settings, .update-settings) .settings-toggle-row > input[type="checkbox"]:checked { border-color: var(--success); background: var(--success); }
+:is(.health-settings, .update-settings) .settings-toggle-row > input[type="checkbox"]:checked::after { transform: translateX(18px); }
+:is(.health-settings, .update-settings) .settings-toggle-row > input[type="checkbox"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.update-settings .import-card-title { justify-content: space-between; }
+.update-status-text { margin: 0; color: var(--text-secondary); font-size: var(--font-size-sm); line-height: 1.5; overflow-wrap: anywhere; }
+.update-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.update-actions > [hidden] { display: none; }
+.update-actions a.toolbar-button { text-decoration: none; }
 
 /* Responsive navigation and panels */
 @media (max-width: 980px) {

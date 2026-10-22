@@ -101,6 +101,8 @@ Web 前端
 | `browser_fingerprint.py` | 浏览器记录的指纹配置校验、启动参数拼接、时区语言选择、Cookie 格式转换、CRX 解析与仅连 127.0.0.1 的 CDP WebSocket 客户端（纯逻辑，不读写状态） |
 | `browser_broker.py` | Docker Engine 客户端、远程浏览器 worker 创建/查询/销毁与端口分配 |
 | `webdav_sync.py` | WebDAV 客户端、同步引擎、Profile 打包、校验、加密和 LWW 应用 |
+| `app_payload.py` | 外壳与载荷共用的后端启动器：选择数据目录中已安装的后端载荷、确认与失败回退（仅标准库，兼容 Python 3.10） |
+| `app_update.py` | 软件更新：检查 GitHub Release、Ed25519 清单验签、载荷热更新、外壳整包替换与回退 |
 | `static/index.html` | Web 控制台页面结构与所有视图 |
 | `static/app.js` | 前端状态、API 调用、渲染、事件和业务交互 |
 | `static/auth.js` | URL fragment 管理令牌的读取、清除、会话保存和响应校验 |
@@ -152,7 +154,9 @@ Web 前端
 6. 启动订阅自动刷新调度线程。
 7. 按配置启动核心自动安装线程。
 8. 从 `state.json` 恢复应继续运行的 Bridge。
-9. 创建 `ProxyBridgeHTTPServer` 并进入 `serve_forever()`。
+9. 创建 `ProxyBridgeHTTPServer`；监听成功后确认本次运行的后端载荷（见 `app_payload.confirm_payload`），清理过期载荷并启动更新检查调度，然后进入 `serve_forever()`。
+
+macOS App 不直接运行 `app.py`，而是运行 `bridge/app_payload.py`：它选择数据目录 `app-updates/payloads/<版本>/` 中已确认或待确认的载荷，以 `__main__` 身份运行其 `app.py`；载荷在确认前抛出异常时记录失败并用 `os.execv` 重新启动内置后端。Windows 托盘 exe 在 `--backend-only` 子进程中调用 `prepare_frozen_backend`，通过 meta path finder 让后端模块从载荷目录导入。新增被 `app.py` 导入的同级模块时，必须同步加入 `scripts/build_update_release.py` 的 `PAYLOAD_MODULES`、各平台构建脚本与 Dockerfile（`tests/test_app_update.py` 会检查）。修改外壳与后端之间的约定（环境变量、启动参数、`/api/status` 中的 `shell_request`）时要保持向后兼容，因为旧外壳会运行新载荷。
 
 `ProxyBridgeHTTPServer` 继承 `ThreadingHTTPServer`，每个 HTTP 请求可在独立线程中处理；后台线程均应为 daemon，避免阻止进程退出。
 

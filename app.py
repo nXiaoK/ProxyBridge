@@ -39,6 +39,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+import app_update
 import browser_fingerprint
 import webdav_sync
 from proxybridge_version import VERSION as APP_VERSION
@@ -46,6 +47,11 @@ from remote_browser import RemoteBrowserBrokerClient, RemoteBrowserError
 
 
 def _detect_app_root() -> Path:
+    module_root = Path(__file__).resolve().parent
+    # 冻结的 Windows 进程运行已安装的后端载荷时（见 app_payload.py），模块来自载荷目录，
+    # static/ 与 vendor/ 也必须从载荷目录读取，而不是 exe 解包目录。
+    if os.environ.get("PROXY_BRIDGE_PAYLOAD_VERSION") and (module_root / "static").is_dir():
+        return module_root
     # PyInstaller onefile/onedir exposes bundled files under sys._MEIPASS.
     meipass = getattr(sys, "_MEIPASS", None)
     if getattr(sys, "frozen", False) and meipass:
@@ -70,6 +76,16 @@ REMOTE_BROWSER_SESSION_CACHE: dict[str, Any] = {
     "epoch": 0,
     "fetching": False,
 }
+
+
+def shell_resource_root() -> Path:
+    """随外壳分发的资源目录（bin/、bundled/）。
+
+    PROXY_BRIDGE_SHELL_ROOT 由外壳启动器 app_payload.py 写入：运行已安装的后端载荷时
+    APP_ROOT 指向数据目录中的载荷，而离线包与内置核心仍在 App / exe 内。未设置时与 APP_ROOT 相同。
+    """
+    configured = str(os.environ.get("PROXY_BRIDGE_SHELL_ROOT") or "").strip()
+    return Path(configured) if configured else APP_ROOT
 
 
 def host_os_token() -> str:
@@ -463,6 +479,66 @@ def notify_status_change() -> None:
     with STATUS_EVENT_CONDITION:
         STATUS_EVENT_REVISION += 1
         STATUS_EVENT_CONDITION.notify_all()
+
+
+def _work_root_path() -> Path:
+    return WORK_ROOT
+
+
+def _update_download_asset(asset: dict[str, Any], target: Path) -> None:
+    _download_asset(asset, target)
+
+
+def _update_extract_zip(archive: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    _safe_extract_zip(archive, destination)
+
+
+UPDATE_MANAGER = app_update.UpdateManager(
+    current_version=APP_VERSION,
+    work_root=_work_root_path,
+    fetch_json=lambda url: _github_json(url),
+    download_asset=_update_download_asset,
+    extract_zip=_update_extract_zip,
+    log=lambda message, level="info", category="更新": log_event(message, level=level, category=category),
+    runtime_mode=lambda: runtime_mode(),
+    on_change=notify_status_change,
+)
+
+
+def update_auto_check_enabled() -> bool:
+    with STATE_LOCK:
+        return normalize_update_settings((load_state().get("settings") or {}).get("updates"))["auto_check"]
+
+
+def update_status_payload() -> dict[str, Any]:
+    return UPDATE_MANAGER.snapshot(auto_check=update_auto_check_enabled())
+
+
+def update_check() -> dict[str, Any]:
+    UPDATE_MANAGER.check()
+    return update_status_payload()
+
+
+def update_apply(payload: dict[str, Any]) -> dict[str, Any]:
+    UPDATE_MANAGER.start_apply(str(payload.get("version") or ""))
+    return update_status_payload()
+
+
+def update_rollback() -> dict[str, Any]:
+    UPDATE_MANAGER.rollback()
+    return update_status_payload()
+
+
+def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload.get("auto_check"), bool):
+        raise ValueError("auto_check 必须是布尔值")
+    with STATE_LOCK:
+        state = load_state()
+        state["settings"]["updates"] = normalize_update_settings({"auto_check": payload["auto_check"]})
+        save_state(state)
+        settings = dict(state["settings"]["updates"])
+    return {"ok": True, "settings": settings, "update": update_status_payload()}
 
 
 @dataclass
@@ -2797,6 +2873,12 @@ def parse_subscription_payload(payload: str, source: str = "手动导入") -> li
     return list(nodes.values())
 
 
+def normalize_update_settings(raw: Any) -> dict[str, Any]:
+    """软件更新设置：auto_check 为是否定期检查 GitHub 最新 Release（默认开启，只提示不自动安装）。"""
+    value = raw if isinstance(raw, dict) else {}
+    return {"auto_check": value.get("auto_check") is not False}
+
+
 def empty_state() -> dict[str, Any]:
     return {
         "subscriptions": [],
@@ -2815,6 +2897,7 @@ def empty_state() -> dict[str, Any]:
             "smart_gateway": normalize_smart_gateway_settings({}),
             # 自动切换默认关闭；绑定浏览器记录的节点始终禁止自动改变出口。
             "health": {"auto_switch": False},
+            "updates": normalize_update_settings({}),
         },
     }
 
@@ -2859,6 +2942,7 @@ def _normalize_loaded_state(state: Any, *, reset_running: bool = False) -> dict[
     )
     health = state["settings"].get("health")
     state["settings"]["health"] = {"auto_switch": isinstance(health, dict) and health.get("auto_switch") is True}
+    state["settings"]["updates"] = normalize_update_settings(state["settings"].get("updates"))
     for node in state["nodes"]:
         normalize_node_core_settings(node)
         node["favorite"] = node.get("favorite") is True
@@ -3367,7 +3451,7 @@ def _core_binary_candidates(base_name: str) -> list[str]:
 
 
 def core_paths() -> dict[str, str | None]:
-    core_dir = Path(os.environ.get("PROXY_BRIDGE_CORE_DIR", APP_ROOT / "bin")).expanduser()
+    core_dir = Path(os.environ.get("PROXY_BRIDGE_CORE_DIR", shell_resource_root() / "bin")).expanduser()
 
     def executable(path: Path) -> str | None:
         return str(path) if _is_executable_file(path) else None
@@ -3981,7 +4065,7 @@ def bundled_package_roots() -> list[Path]:
     configured = str(os.environ.get("PROXY_BRIDGE_BUNDLED_DIR") or "").strip()
     if configured:
         return [Path(configured).expanduser()]
-    roots = [APP_ROOT / "bundled"]
+    roots = [shell_resource_root() / "bundled"]
     if getattr(sys, "frozen", False):
         executable_root = Path(sys.executable).resolve().parent / "bundled"
         if executable_root not in roots:
@@ -4946,6 +5030,11 @@ def _status_payload(
             "network": network,
             "smart_gateway": smart_gateway_status_payload(state, lan_addresses=lan_addresses),
             "version": APP_VERSION,
+            "update": UPDATE_MANAGER.snapshot(
+                auto_check=normalize_update_settings(state["settings"].get("updates"))["auto_check"]
+            ),
+            # 后端请求外壳执行的动作（restart-backend / quit），由 macOS App 与 Windows 托盘轮询处理。
+            "shell_request": UPDATE_MANAGER.shell_request(),
         }
 
 
@@ -13887,6 +13976,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 json_response(self, update_node_core_settings(payload))
             elif self.path == "/api/nodes/update":
                 json_response(self, update_node_details(payload))
+            elif self.path == "/api/update/check":
+                json_response(self, update_check())
+            elif self.path == "/api/update/apply":
+                json_response(self, update_apply(payload))
+            elif self.path == "/api/update/rollback":
+                json_response(self, update_rollback())
+            elif self.path == "/api/settings/updates":
+                json_response(self, update_settings(payload))
             elif self.path == "/api/settings/health":
                 json_response(self, update_health_settings(payload))
             elif self.path == "/api/cores/update":
@@ -14461,6 +14558,13 @@ def main(argv: list[str] | None = None) -> None:
     except Exception as exc:
         log_event(f"启动同步检查调度失败: {exc}", level="warn", category="同步")
     server = ProxyBridgeHTTPServer((host, port), AppHandler)
+    # HTTP 服务已成功监听：确认本次运行的后端载荷可用，并启动软件更新维护与定期检查。
+    try:
+        UPDATE_MANAGER.confirm_running_payload()
+        UPDATE_MANAGER.maintain()
+    except Exception as exc:
+        log_event(f"软件更新维护失败: {exc}", level="warn", category="更新")
+    UPDATE_MANAGER.start_scheduler(update_auto_check_enabled, SHUTTING_DOWN)
     public_host = str(_configured_docker_console_ip() or "127.0.0.1")
     console_url = f"http://{public_host}:{port}"
     authenticated_console_url = console_access_url(console_url)

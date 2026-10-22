@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import app_payload
 from proxybridge_version import VERSION as APP_VERSION
 
 try:
@@ -40,6 +42,14 @@ READINESS_POLL_INTERVAL = 0.2
 TERMINATE_TIMEOUT = 8.0
 STATUS_REFRESH_INTERVAL = 5.0
 BACKEND_ONLY_FLAG = "--backend-only"
+# 软件更新整包替换：新版本 exe 以 --apply-update <旧 exe 路径> --wait-pid <PID>... 启动，
+# 等待旧托盘与后端退出后覆盖旧 exe 并重新启动（参数约定与 app_update.py 保持一致）。
+APPLY_UPDATE_FLAG = "--apply-update"
+WAIT_PID_FLAG = "--wait-pid"
+APPLY_UPDATE_WAIT_TIMEOUT = 120.0
+APPLY_UPDATE_REPLACE_TIMEOUT = 90.0
+# 写入后端环境的外壳类型；只有 Windows 打包 exe 支持载荷热更新与整包替换。
+WINDOWS_SHELL_KIND = "windows-exe"
 TRAY_LOG_MAX_BYTES = 4 * 1024 * 1024
 TRAY_LOG_BACKUP_COUNT = 3
 TRAY_LOG_LOCK = threading.RLock()
@@ -368,6 +378,10 @@ class BackendProcess:
             env["PROXY_BRIDGE_PARENT_PID"] = str(os.getpid())
             env["PROXY_BRIDGE_INSTANCE_TOKEN"] = self.instance_token
             env["PROXY_BRIDGE_SHELL_MODE"] = "tray"
+            if is_frozen() and os.name == "nt":
+                # 声明外壳支持应用内更新；后端据此提供热更新与整包替换（见 app_update.py）。
+                env["PROXY_BRIDGE_SHELL_KIND"] = WINDOWS_SHELL_KIND
+                env["PROXY_BRIDGE_SHELL_PATH"] = str(Path(sys.executable).resolve())
             # Avoid inheriting a broken PYTHONPATH from the tray launcher.
             env.pop("PYTHONPATH", None)
 
@@ -492,12 +506,13 @@ class BackendProcess:
             self.process = None
             self._close_log()
 
-    def restart(self) -> dict[str, Any]:
+    def restart(self, *, keep_token: bool = False) -> dict[str, Any]:
         self.stop()
         # Re-pick port only if previous preferred port is busy for another owner.
         if not is_port_free(self.config.port, self.config.host):
             self.config.port = choose_backend_port(self.config.port)
-        self.instance_token = secrets.token_urlsafe(18)
+        if not keep_token:
+            self.instance_token = secrets.token_urlsafe(18)
         self.start()
         return self.wait_until_ready()
 
@@ -560,6 +575,8 @@ class TrayApp:
         self._worker: threading.Thread | None = None
         self._autostart_enabled = autostart.is_autostart_enabled()
         self._instance_lock = None
+        self._backend_version = ""
+        self._handled_shell_requests: set[str] = set()
 
     def run(self) -> int:
         try:
@@ -574,8 +591,7 @@ class TrayApp:
         ensure_dirs(self.config.work_root)
         self._set_status("starting backend")
         try:
-            self.backend.start()
-            self.backend.wait_until_ready()
+            self._start_backend_with_payload_fallback()
             self._set_status("ready")
             if self.config.open_console_on_ready:
                 self.open_console()
@@ -590,7 +606,7 @@ class TrayApp:
             icon=load_tray_icon(),
             menu=Menu(
                 MenuItem(lambda item: self._title(), None, enabled=False),
-                MenuItem(f"ProxyBridge · v{APP_VERSION}", None, enabled=False),
+                MenuItem(lambda item: f"ProxyBridge · v{self._backend_version or APP_VERSION}", None, enabled=False),
                 Menu.SEPARATOR,
                 MenuItem("打开控制台", lambda icon, item: self.open_console()),
                 MenuItem("重启后端", lambda icon, item: self.restart_backend()),
@@ -632,16 +648,49 @@ class TrayApp:
     def open_console(self) -> None:
         webbrowser.open(self.backend.access_url)
 
-    def restart_backend(self) -> None:
+    def _start_backend_with_payload_fallback(self, *, keep_token: bool = False, restart: bool = False) -> None:
+        started_at = time.time()
+        try:
+            if restart:
+                self.backend.restart(keep_token=keep_token)
+            else:
+                self.backend.start()
+                self.backend.wait_until_ready()
+            return
+        except Exception:
+            # 新安装的后端载荷启动失败时，子进程或指针会记录失败；立即重试一次即可回到内置后端。
+            if not app_payload.payload_failed_since(self.config.work_root, started_at):
+                raise
+        _write_tray_host_log("installed backend payload failed to start; retrying with bundled backend")
+        self.backend.restart(keep_token=True)
+
+    def restart_backend(self, *, open_console: bool = True, keep_token: bool = False) -> None:
         self._error = None
         self._set_status("restarting")
         try:
-            self.backend.restart()
+            self._start_backend_with_payload_fallback(keep_token=keep_token, restart=True)
             self._set_status("ready")
-            self.open_console()
+            if open_console:
+                self.open_console()
         except Exception as error:  # noqa: BLE001
             self._error = str(error)
             self._set_status("backend failed")
+
+    def handle_shell_request(self, request: Any) -> None:
+        """处理后端在 /api/status 中发出的外壳请求（软件更新后重启后端或退出以完成替换）。"""
+        if not isinstance(request, dict):
+            return
+        request_id = str(request.get("id") or "")
+        if not request_id or request_id in self._handled_shell_requests:
+            return
+        self._handled_shell_requests.add(request_id)
+        action = request.get("action")
+        _write_tray_host_log(f"backend shell request: {action}")
+        if action == "restart-backend":
+            # 保留端口与实例令牌，已打开的控制台页面可以直接重新加载新版本。
+            self.restart_backend(open_console=False, keep_token=True)
+        elif action == "quit":
+            self.quit()
 
     def stop_all_bridges(self) -> None:
         try:
@@ -701,11 +750,14 @@ class TrayApp:
                         if isinstance(bridge, dict) and bridge.get("status") in {"running", "starting"}
                     )
                 self._bridge_count = running
+                self._backend_version = str(payload.get("version") or "") if isinstance(payload, dict) else ""
                 self._error = None
                 self._set_status("ready")
             except Exception:
                 # Keep previous title; transient network blips are fine.
-                pass
+                continue
+            if isinstance(payload, dict) and payload.get("shell_request"):
+                self.handle_shell_request(payload.get("shell_request"))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -763,14 +815,132 @@ def run_backend_only(argv: list[str] | None = None) -> int:
     """Entry used by packaged executables to host app.py in a child process."""
     # Keep only flags that app.main understands; strip our private flag.
     cleaned = [item for item in (argv if argv is not None else sys.argv[1:]) if item != BACKEND_ONLY_FLAG]
+    selection: app_payload.PayloadSelection | None = None
+    work_root = Path(os.environ.get("PROXY_BRIDGE_WORKDIR") or default_work_root())
     # Ensure bundled resources resolve when frozen.
     if is_frozen():
         os.environ.setdefault("PROXY_BRIDGE_SHELL_MODE", "tray-backend")
         # Point workdir remains caller-controlled via env.
-    import app as backend_app
+        if os.environ.get("PROXY_BRIDGE_SHELL_KIND") == WINDOWS_SHELL_KIND:
+            # 优先运行软件更新安装到数据目录的新版后端载荷；不满足条件时使用 exe 内置后端。
+            selection = app_payload.prepare_frozen_backend(work_root, resource_root())
+    try:
+        import app as backend_app
+    except Exception as error:
+        if selection is None:
+            raise
+        app_payload.abandon_frozen_payload(
+            work_root, selection, f"新版本导入失败：{type(error).__name__}: {error}"
+        )
+        selection = None
+        import app as backend_app
 
-    backend_app.main(cleaned)
+    try:
+        backend_app.main(cleaned)
+    except Exception as error:
+        if selection is not None and app_payload.payload_is_pending(work_root, selection.version):
+            app_payload.mark_payload_failed(
+                work_root, selection.version, f"新版本启动失败：{type(error).__name__}: {error}"
+            )
+        raise
     return 0
+
+
+def wait_for_process_exit(pid: int, timeout: float) -> bool:
+    """等待指定 PID 退出。Windows 上不能用 os.kill(pid, 0) 探测，它会直接结束目标进程。"""
+    if pid <= 0:
+        return True
+    if os.name == "nt":
+        import ctypes
+
+        synchronize = 0x00100000
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not handle:
+            return True
+        try:
+            return kernel32.WaitForSingleObject(handle, int(max(0.0, timeout) * 1000)) == 0
+        finally:
+            kernel32.CloseHandle(handle)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        time.sleep(0.2)
+    return False
+
+
+def replace_executable(source: Path, target: Path, timeout: float = APPLY_UPDATE_REPLACE_TIMEOUT) -> str:
+    """把 source 覆盖到 target；旧进程或杀毒软件短暂占用文件时重试。返回错误信息，空串表示成功。"""
+    if source.resolve() == target.resolve():
+        return "新旧可执行文件路径相同"
+    temp = target.with_name(f".{target.name}.new")
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while True:
+        try:
+            shutil.copyfile(source, temp)
+            os.replace(temp, target)
+            return ""
+        except OSError as error:
+            last_error = str(error)
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.5)
+    try:
+        temp.unlink()
+    except OSError:
+        pass
+    return last_error or "替换超时"
+
+
+def relaunch_environment(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """重新启动托盘时去掉旧进程注入的后端变量，只保留数据目录设置。"""
+    env = app_payload.independent_process_environment(environ)
+    for key in list(env):
+        if key.startswith("PROXY_BRIDGE_") and key != "PROXY_BRIDGE_WORKDIR":
+            env.pop(key, None)
+    return env
+
+
+def run_apply_update(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="proxybridge-apply-update")
+    parser.add_argument(APPLY_UPDATE_FLAG, dest="target", required=True)
+    parser.add_argument(WAIT_PID_FLAG, dest="wait_pids", type=int, action="append", default=[])
+    args, _unknown = parser.parse_known_args(argv)
+    target = Path(args.target)
+    source = Path(sys.executable).resolve()
+    work_root = Path(os.environ.get("PROXY_BRIDGE_WORKDIR") or default_work_root())
+    _write_tray_host_log(f"applying update {source} -> {target}")
+    for pid in args.wait_pids:
+        if not wait_for_process_exit(pid, APPLY_UPDATE_WAIT_TIMEOUT):
+            _write_tray_host_log(f"process {pid} did not exit before update timeout")
+    error = replace_executable(source, target)
+    try:
+        app_payload.write_json_atomic(
+            app_payload.updates_root(work_root) / "shell-update.json",
+            {"ok": not error, "message": error, "source": str(source), "at": int(time.time())},
+        )
+    except OSError:
+        pass
+    _write_tray_host_log("update applied" if not error else f"update failed: {error}")
+    # 无论替换是否成功都重新启动目标 exe：失败时用户仍能继续使用旧版本。
+    creationflags = 0x00000008 | 0x00000200 if os.name == "nt" else 0
+    subprocess.Popen(
+        [str(target)],
+        cwd=str(target.parent),
+        env=relaunch_environment(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        creationflags=creationflags,
+    )
+    return 0 if not error else 1
 
 
 def _write_tray_host_log(message: str) -> None:
@@ -786,6 +956,8 @@ def _write_tray_host_log(message: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if APPLY_UPDATE_FLAG in raw_argv:
+        return run_apply_update(raw_argv)
     if BACKEND_ONLY_FLAG in raw_argv:
         return run_backend_only(raw_argv)
 

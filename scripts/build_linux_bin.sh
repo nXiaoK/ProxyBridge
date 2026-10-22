@@ -24,6 +24,8 @@ python3 -m PyInstaller \
   --add-data "browser_fingerprint.py:." \
   --add-data "VERSION:." \
   --add-data "proxybridge_version.py:." \
+  --add-data "app_payload.py:." \
+  --add-data "app_update.py:." \
   --add-data "static:static" \
   --add-data "desktop:desktop" \
   --hidden-import app \
@@ -31,6 +33,8 @@ python3 -m PyInstaller \
   --hidden-import remote_browser \
   --hidden-import browser_fingerprint \
   --hidden-import proxybridge_version \
+  --hidden-import app_payload \
+  --hidden-import app_update \
   --hidden-import desktop \
   --hidden-import desktop.tray_host \
   --hidden-import desktop.autostart \

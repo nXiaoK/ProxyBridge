@@ -2,7 +2,7 @@
 
 本文保留各运行方式、配置、数据与开发验证的详细说明。首次使用请先阅读 [项目首页](../README.md)；以下命令默认在仓库根目录执行。
 
-- [下载发布版](#下载自动打包版本)
+- [下载发布版](#下载自动打包版本)与[软件更新](#软件更新)
 - [macOS 构建](#构建机准备)与[菜单栏 App](#菜单栏-app)
 - [本地导入内核](#本地导入代理与指纹内核)
 - [源码 Web 控制台](#无壳跨平台-web-控制台linux--windows--macos)
@@ -19,12 +19,72 @@
 - `ProxyBridge-macOS-arm64-full-<版本>.zip`：完整版 macOS App，额外内置 sing-box、Xray 与指纹浏览器内核的官方安装包。
 - `ProxyBridge-Windows-x64-full-<版本>.zip`：完整版 Windows 便携包，解压后包含 `ProxyBridge.exe` 与 `bundled\` 目录（内置同样三个官方安装包），两者需放在同一目录。
 - `SHA256SUMS.txt`：上述产物的 SHA-256 校验值。
+- `ProxyBridge-payload-<版本>.zip`、`update-manifest.json`、`update-manifest.json.sig`：供应用内[软件更新](#软件更新)使用，无需手动下载。
 
 完整版首次启动时，若工作目录中还没有对应组件，会按「本地导入」相同的校验流程从包内安装（指纹内核只在尚未安装任何版本时安装），无需再从 GitHub 下载代理核心和指纹内核；之后仍可在内核管理中升级、切换或删除，内核列表中来源显示为「离线包」。macOS 完整版首次启动仍会下载 Python 运行时（本机已有 Python 3.10+ 时直接使用）。内置版本取自打包时上游的最新发布：sing-box / Xray 取最新版本，指纹内核取最近一个提供该平台安装包的版本。
 
 仓库根目录 `VERSION` 是人工维护的基础版本，当前为 `0.3.0`。`main` 每次 push 都会触发发布门禁与双平台打包；成功后使用 `0.3.0-build.<Actions 运行序号>` 创建唯一 Release。修改基础版本时只改 `VERSION`，并同步 macOS 源 plist 中的可读默认值。
 
 自动构建的 macOS App 仅使用 ad-hoc 签名、未做 Apple 公证；Windows EXE 也未购买代码签名证书。首次启动可能遇到 Gatekeeper 或 SmartScreen 提示，处理方式见下方平台说明。
+
+## 软件更新
+
+macOS 菜单栏 App 与 Windows 便携 exe 支持应用内更新：在 **设置 → 通用 → 软件更新** 中检查并安装 GitHub 最新 Release。默认在后端启动 90 秒后及每 12 小时自动检查一次，只提示、不自动安装；关闭「自动检查更新」后只在手动点击时检查。
+
+程序分为两层，更新时只替换变化的一层：
+
+| 层 | 内容 | 更新方式 |
+|---|---|---|
+| 后端载荷 | `app.py` 等后端模块、`static/` 前端、`vendor/` 依赖 | 下载约 1–2 MB 的 `ProxyBridge-payload-<版本>.zip`，解压到数据目录，重启后端即生效；App / exe 本身不变 |
+| 外壳 | macOS Swift 菜单栏程序、Windows 托盘 exe | 只有外壳源文件变化时才需要：macOS 原子替换 `.app` 后自动重新打开；Windows 由新 exe 等待旧进程退出后覆盖旧 exe 并重新启动 |
+
+每个 Release 附带 `update-manifest.json`，记录版本、载荷与安装包的 SHA-256，以及 macOS / Windows 外壳修订号（外壳源文件的 SHA-256 汇总）。已安装外壳的修订号与清单一致时只热更新载荷，否则走整包替换。清单由发布流水线用 Ed25519 私钥签名（`update-manifest.json.sig`），客户端用内置公钥校验；签名缺失或不匹配时只提示手动下载，不会安装。
+
+安装前会重新获取 Release 并再次验证签名与 SHA-256。安装更新会重启后端，运行中的代理和指纹浏览器会被停止，随后按原设置恢复。
+
+回退与故障处理：
+
+- 新载荷首次启动必须在 HTTP 服务监听后确认；导入或启动失败时自动回退到外壳内置后端，并在软件更新卡片中提示该版本曾启动失败。
+- 运行已安装载荷时可点击「回退到内置版本」，停用该载荷并重启后端。
+- 排障时可设置环境变量 `PROXY_BRIDGE_PAYLOAD_DISABLED=1` 启动，强制忽略已安装的载荷。
+
+以下情况只提示新版本、不自动安装：源码运行（使用 `git pull`）、Docker（重新构建镜像）、Linux 托盘、清单未签名，以及 macOS App 位于系统隔离位置（App Translocation，需先移到「应用程序」文件夹）或所在目录不可写。整包替换时 macOS 完整版会换成轻量版外壳；已安装的代理核心与指纹内核保存在数据目录，不受影响。
+
+数据目录中的更新文件位于 `app-updates/`：
+
+| 路径 | 说明 |
+|---|---|
+| `app-updates/active.json` | 当前启用的载荷：版本、所需外壳修订号、`pending`（待确认）或 `confirmed` |
+| `app-updates/payloads/<版本>/` | 解压后的载荷；启动时自动清理未启用的旧版本 |
+| `app-updates/failed.json` | 启动失败或被手动回退的版本记录 |
+| `app-updates/check.json` | 最近一次检查结果，仅用于界面显示 |
+
+外壳与后端之间通过以下环境变量约定运行形态，均由外壳或启动器自动设置，通常无需手动配置：
+
+| 环境变量 | 说明 |
+|---|---|
+| `PROXY_BRIDGE_SHELL_KIND` | 支持应用内更新的外壳类型：`macos-app` 或 `windows-exe`；未设置表示只提示新版本 |
+| `PROXY_BRIDGE_SHELL_PATH` | 外壳自身位置（`.app` 目录或 `ProxyBridge.exe`），整包替换时使用 |
+| `PROXY_BRIDGE_SHELL_ROOT` | 外壳内置后端目录；运行载荷时仍从这里查找 `bin/`、`bundled/` |
+| `PROXY_BRIDGE_SHELL_REVISION` | 当前外壳修订号，来自构建时写入的 `SHELL_REVISION` 文件 |
+| `PROXY_BRIDGE_PAYLOAD_VERSION` | 正在运行的载荷版本；为空表示运行内置后端 |
+| `PROXY_BRIDGE_PAYLOAD_DISABLED` | 设为 `1` 时忽略已安装的载荷 |
+
+### 发布签名密钥
+
+发布流水线从仓库 Secret `PROXY_BRIDGE_UPDATE_SIGNING_KEY` 读取签名私钥（64 位十六进制的 Ed25519 种子），对应公钥写在 `app_update.py` 的 `TRUSTED_SIGNING_KEYS` 中。未配置 Secret 时 Release 仍会生成，但清单未签名，客户端只提示手动下载；私钥与内置公钥不匹配时发布任务直接失败。
+
+```bash
+# 生成新的私钥（只在需要新密钥时执行），并打印对应公钥用于 TRUSTED_SIGNING_KEYS
+python3 -c "import secrets; print(secrets.token_hex(32))" > update-signing-key.hex
+python3 -c "import sys; sys.path.insert(0, '.'); import app_update; print(app_update.ed25519_public_key(bytes.fromhex(open('update-signing-key.hex').read().strip())).hex())"
+# 把私钥写入仓库 Secret；私钥文件妥善备份，不要提交到仓库
+gh secret set PROXY_BRIDGE_UPDATE_SIGNING_KEY -R nXiaoK/ProxyBridge < update-signing-key.hex
+```
+
+更换密钥时，先把新公钥追加到 `TRUSTED_SIGNING_KEYS` 并发布一个版本，再替换 Secret；否则已安装的客户端无法验证新清单，只能手动升级一次。
+
+本地可用 `scripts/build_update_release.py` 复现发布产物：`shell-revision --shell macos-app|windows-exe` 输出外壳修订号，`payload --version <版本> --out <目录>` 生成载荷，`manifest ...` 生成清单并在设置了签名私钥时签名。macOS / Windows 构建脚本会把外壳修订号写入包内 `SHELL_REVISION`；发布流水线通过 `PROXY_BRIDGE_SHELL_REVISION` 注入同一个值。
 
 ## 构建机准备
 
@@ -217,6 +277,7 @@ Proxy Bridge console: http://127.0.0.1:8787/#token=...
 | `PROXY_BRIDGE_FP_CHROMIUM` | 手动指定指纹 Chromium 可执行文件；设置后始终作为默认内核，浏览器配置中固定的其他版本仍按各自版本启动 |
 | `PROXY_BRIDGE_BUNDLED_DIR` | 离线包目录，内含 `sing-box/`、`xray/`、`fingerprint-chromium/` 子目录及官方安装包；未设置时查找程序资源目录下的 `bundled/`（macOS App 为 `Contents/Resources/bridge/bundled`）以及 Windows 可执行文件旁的 `bundled\`。对应组件未安装时首次启动自动从这里安装 |
 | `PROXY_BRIDGE_BROWSER_STOP_ON_LAST_WINDOW` | 仅 macOS：默认开启，关闭浏览器最后一个窗口后自动停止该浏览器；设为 `0` / `false` / `off` 时保持 Chromium 的 Dock 驻留行为 |
+| `PROXY_BRIDGE_PAYLOAD_DISABLED` | 设为 `1` 时忽略软件更新安装的后端载荷，使用 App / exe 内置后端；其他更新相关变量见[软件更新](#软件更新) |
 
 说明：
 

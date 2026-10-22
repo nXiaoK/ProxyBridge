@@ -10,6 +10,23 @@ struct StatusPayload: Decodable {
     let bridges: [Bridge]
     let tests: [String: NodeTestResult]?
     let version: String
+    let shellRequest: ShellRequest?
+
+    enum CodingKeys: String, CodingKey {
+        case cores
+        case subscriptions
+        case nodes
+        case bridges
+        case tests
+        case version
+        case shellRequest = "shell_request"
+    }
+}
+
+/// 后端请求外壳执行的动作：软件更新安装后端载荷后 restart-backend，整包替换 App 后 quit。
+struct ShellRequest: Decodable {
+    let id: String
+    let action: String
 }
 
 struct Subscription: Decodable {
@@ -608,6 +625,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusRefreshGeneration: UInt64 = 0
     private var activeStatusRefreshGeneration: UInt64?
     private var statusRefreshPending = false
+    private var handledShellRequestIDs = Set<String>()
+    private var reopenConsoleWhenReady = false
     private let helperTerminationGraceTimeout: TimeInterval = 2
     private let helperShutdownTimeout: TimeInterval = 4
     private let backendTerminationTimeout: TimeInterval = 12
@@ -824,6 +843,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func resourceBridgeScript() -> URL? {
+        // app_payload.py 是后端启动器：优先运行软件更新安装到数据目录的新版后端载荷，
+        // 不满足条件或启动失败时回退到 App 内置的 bridge/app.py。
+        if let launcher = Bundle.main.resourceURL?.appendingPathComponent("bridge/app_payload.py"), FileManager.default.fileExists(atPath: launcher.path) {
+            return launcher
+        }
         if let bundled = Bundle.main.resourceURL?.appendingPathComponent("bridge/app.py"), FileManager.default.fileExists(atPath: bundled.path) {
             return bundled
         }
@@ -1393,6 +1417,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             env["PROXY_BRIDGE_WORKDIR"] = appSupportURL.path
             env["PROXY_BRIDGE_PARENT_PID"] = "\(ProcessInfo.processInfo.processIdentifier)"
             env["PROXY_BRIDGE_INSTANCE_TOKEN"] = instanceToken
+            if script.lastPathComponent == "app_payload.py" {
+                // 声明外壳支持应用内更新：后端据此提供载荷热更新与 .app 整包替换。
+                env["PROXY_BRIDGE_SHELL_KIND"] = "macos-app"
+                env["PROXY_BRIDGE_SHELL_PATH"] = Bundle.main.bundleURL.path
+            }
             process.environment = env
 
             let logURL = appSupportURL.appendingPathComponent("menubar-backend.log")
@@ -1527,6 +1556,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.startupStatus = nil
                     self.lastError = nil
                     self.rebuildMenu()
+                    if self.reopenConsoleWhenReady {
+                        // 软件更新重启后端前控制台是打开的：就绪后重新打开，加载新版本页面。
+                        self.reopenConsoleWhenReady = false
+                        self.showConsole()
+                    }
                 case .failure:
                     DispatchQueue.main.asyncAfter(deadline: .now() + self.backendReadinessPollInterval) { [weak self] in
                         self?.waitForBackendReady(
@@ -1703,12 +1737,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.lastError = error.localizedDescription
                 }
                 self.rebuildMenu()
+                if case .success(let status) = result, let request = status.shellRequest {
+                    self.handleShellRequest(request)
+                    return
+                }
                 if runPendingRefresh {
                     DispatchQueue.main.async { [weak self] in
                         self?.refreshNow()
                     }
                 }
             }
+        }
+    }
+
+    /// 处理后端在 /api/status 中发出的外壳请求，每个请求 ID 只执行一次。
+    private func handleShellRequest(_ request: ShellRequest) {
+        guard !request.id.isEmpty, !handledShellRequestIDs.contains(request.id) else { return }
+        handledShellRequestIDs.insert(request.id)
+        switch request.action {
+        case "restart-backend":
+            reopenConsoleWhenReady = consoleWindowController?.hasOpenWindow == true
+            restartBackend()
+        case "quit":
+            // 新版本 App 已就位，后端启动的辅助进程会在本进程退出后重新打开 App。
+            quitApp()
+        default:
+            NSLog("ProxyBridge: 未知的外壳请求 %@", request.action)
         }
     }
 

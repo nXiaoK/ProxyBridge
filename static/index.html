@@ -570,6 +570,19 @@
                 <div><span class="settings-field-label">版本</span><strong id="aboutVersion">—</strong></div>
               </div>
             </section>
+            <section class="settings-card update-settings" id="updateSettingsCard" aria-labelledby="updateSettingsTitle">
+              <div class="import-card-title"><h2 id="updateSettingsTitle" data-i18n>软件更新</h2><span class="status-pill is-idle" id="updateStatusPill" aria-live="polite">未检查</span></div>
+              <div class="settings-meta-row"><span data-i18n>当前版本</span><code id="updateCurrentVersion">—</code></div>
+              <div class="settings-meta-row"><span data-i18n>最新版本</span><code id="updateLatestVersion">—</code></div>
+              <p class="update-status-text" id="updateStatusText" role="status">尚未检查更新</p>
+              <label class="settings-toggle-row"><span class="settings-toggle-copy"><strong data-i18n>自动检查更新</strong><span data-i18n>启动后及每 12 小时检查一次 GitHub 最新版本，只提示，不会自动安装。</span></span><input id="updateAutoCheck" type="checkbox" aria-label="自动检查更新" data-i18n-aria-label></label>
+              <div class="update-actions">
+                <button class="toolbar-button" type="button" id="updateCheckButton" data-i18n>检查更新</button>
+                <button class="toolbar-button" type="button" id="updateApplyButton" hidden>立即更新</button>
+                <a class="toolbar-button" id="updateDownloadLink" href="https://github.com/nXiaoK/ProxyBridge/releases/latest" target="_blank" rel="noopener noreferrer" hidden data-i18n>前往下载</a>
+                <button class="toolbar-button" type="button" id="updateRollbackButton" hidden data-i18n>回退到内置版本</button>
+              </div>
+            </section>
             <section class="settings-card health-settings" aria-labelledby="healthSettingsTitle">
               <div class="import-card-title"><h2 id="healthSettingsTitle">代理健康检查</h2></div>
               <label class="settings-toggle-row"><span class="settings-toggle-copy"><strong>无浏览器绑定的节点故障后自动切换</strong><span>默认关闭。切换会中断连接并改变出口；浏览器绑定节点始终保持原出口。</span></span><input id="healthAutoSwitch" type="checkbox" aria-label="允许健康检查自动切换节点"></label>

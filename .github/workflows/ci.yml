@@ -38,7 +38,7 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Compile Python sources
         # 同时编译版本模块、主服务侧 Broker 客户端与独立 Broker，避免打包专用入口出现语法回归。
-        run: python -m compileall -q app.py proxybridge_version.py webdav_sync.py remote_browser.py browser_fingerprint.py browser_broker.py desktop tests
+        run: python -m compileall -q app.py app_payload.py app_update.py proxybridge_version.py webdav_sync.py remote_browser.py browser_fingerprint.py browser_broker.py desktop scripts/build_update_release.py tests
 
   frontend-and-shell:
     name: Frontend and shell syntax

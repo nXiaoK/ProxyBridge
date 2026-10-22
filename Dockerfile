@@ -26,6 +26,8 @@ RUN python -m pip install --no-cache-dir -r /tmp/requirements.txt
 COPY --chown=proxybridge:proxybridge app.py webdav_sync.py remote_browser.py browser_fingerprint.py ./
 # VERSION 是基础版本唯一来源；解析模块允许发布构建通过环境变量覆盖完整版本。
 COPY --chown=proxybridge:proxybridge VERSION proxybridge_version.py ./
+# 软件更新模块：Docker 中只用于检查并提示新版本，不会自动安装。
+COPY --chown=proxybridge:proxybridge app_update.py app_payload.py ./
 COPY --chown=proxybridge:proxybridge static ./static
 
 RUN mkdir -p /data && chown proxybridge:proxybridge /data
